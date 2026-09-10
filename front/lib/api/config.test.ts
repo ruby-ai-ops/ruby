@@ -71,3 +71,23 @@ describe("getOAuthRedirectBaseUrl", () => {
     expect(config.getOAuthRedirectBaseUrl()).toBe("https://oauth.example.com");
   });
 });
+
+describe("getWorkOSApiHostname", () => {
+  const originalEnv = { ...process.env };
+
+  afterEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  it("uses the Ruby authentication API domain by default", () => {
+    delete process.env.WORKOS_API_HOSTNAME;
+
+    expect(config.getWorkOSApiHostname()).toBe("auth-api.ruby.ad");
+  });
+
+  it("uses the configured hostname for local WorkOS environments", () => {
+    process.env.WORKOS_API_HOSTNAME = "api.workos.com";
+
+    expect(config.getWorkOSApiHostname()).toBe("api.workos.com");
+  });
+});
