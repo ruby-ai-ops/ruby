@@ -1,0 +1,118 @@
+import AgentBuilder from "@app/components/agent_builder/AgentBuilder";
+import { AgentBuilderProvider } from "@app/components/agent_builder/AgentBuilderContext";
+import type { BuilderFlow } from "@app/components/agent_builder/types";
+import { BUILDER_FLOWS } from "@app/components/agent_builder/types";
+import { NotAvailableErrorPage } from "@app/components/pages/builder/agents/NotAvailableErrorPage";
+import Custom404 from "@app/components/pages/Custom404";
+import { throwIfInvalidAgentConfiguration } from "@app/lib/actions/types/guards";
+import { useAuth, useWorkspace } from "@app/lib/auth/AuthContext";
+import { useSearchParam } from "@app/lib/platform";
+import {
+  useAgentConfiguration,
+  useAssistantTemplate,
+} from "@app/lib/swr/assistants";
+import { useWorkspacePermissions } from "@app/lib/swr/permissions";
+import { hasHealthyProviders } from "@app/lib/utils/providersHealth";
+import type {
+  AgentConfigurationScope,
+  AgentConfigurationType,
+} from "@app/types/assistant/agent";
+import { Spinner } from "@ruby-ai/sparkle";
+
+function isBuilderFlow(value: string): value is BuilderFlow {
+  return BUILDER_FLOWS.some((flow) => flow === value);
+}
+
+export function NewAgentPage() {
+  const owner = useWorkspace();
+  const { user, isAdmin, providersHealth } = useAuth();
+  const { hasPermission } = useWorkspacePermissions();
+
+  const flowParam = useSearchParam("flow");
+  const flow: BuilderFlow =
+    flowParam && isBuilderFlow(flowParam) ? flowParam : "personal_assistants";
+
+  const duplicateAgentId = useSearchParam("duplicate");
+  const templateId = useSearchParam("templateId");
+  const conversationId = useSearchParam("conversationId");
+
+  const canCreateAgent = hasPermission("create", "agent");
+
+  const {
+    agentConfiguration,
+    isAgentConfigurationLoading,
+    isAgentConfigurationError,
+  } = useAgentConfiguration({
+    workspaceId: owner.sId,
+    agentConfigurationId: duplicateAgentId,
+    disabled: !duplicateAgentId,
+  });
+
+  const shouldPassConversationId = agentConfiguration === null;
+
+  const {
+    assistantTemplate,
+    isAssistantTemplateLoading,
+    isAssistantTemplateError,
+  } = useAssistantTemplate({ templateId });
+
+  let duplicateConfiguration: AgentConfigurationType | null = null;
+  if (agentConfiguration && duplicateAgentId) {
+    const scope: AgentConfigurationScope =
+      flow === "personal_assistants" ? "hidden" : "visible";
+    duplicateConfiguration =
+      agentConfiguration.scope === scope
+        ? agentConfiguration
+        : { ...agentConfiguration, scope };
+  }
+
+  const isDuplicateLoading = !!duplicateAgentId && isAgentConfigurationLoading;
+
+  if (!canCreateAgent) {
+    return <Custom404 />;
+  }
+
+  if (!hasHealthyProviders(providersHealth)) {
+    return <NotAvailableErrorPage isAdmin={isAdmin} owner={owner} />;
+  }
+
+  if (
+    (duplicateAgentId &&
+      (isAgentConfigurationError ||
+        (!isAgentConfigurationLoading && !agentConfiguration))) ||
+    (templateId &&
+      (isAssistantTemplateError ||
+        (!isAssistantTemplateLoading && !assistantTemplate)))
+  ) {
+    return <Custom404 />;
+  }
+
+  if (isDuplicateLoading || (templateId && isAssistantTemplateLoading)) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Spinner size="lg" />
+      </div>
+    );
+  }
+
+  if (duplicateConfiguration) {
+    throwIfInvalidAgentConfiguration(duplicateConfiguration);
+  }
+
+  return (
+    <AgentBuilderProvider
+      owner={owner}
+      user={user}
+      isAdmin={isAdmin}
+      assistantTemplate={assistantTemplate}
+    >
+      <AgentBuilder
+        agentConfiguration={duplicateConfiguration ?? undefined}
+        duplicateAgentId={duplicateAgentId}
+        conversationId={
+          shouldPassConversationId ? (conversationId ?? undefined) : undefined
+        }
+      />
+    </AgentBuilderProvider>
+  );
+}

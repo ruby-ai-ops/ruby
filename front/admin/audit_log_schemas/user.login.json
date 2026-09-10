@@ -1,0 +1,13 @@
+{
+  "action": "user.login",
+  "targets": [
+    {
+      "type": "user"
+    }
+  ],
+  "metadata": {
+    "is_sso": "string",
+    "authentication_method": "string",
+    "actor_type": "string"
+  }
+}

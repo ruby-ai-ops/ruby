@@ -1,0 +1,17 @@
+export {
+  RubyFileSystem,
+  RubyFileSystemError,
+  parseScopedPrefix,
+  sanitizeFileSystemName,
+} from "@app/lib/api/file_system/ruby_file_system";
+export type { FileSystemEntry } from "@app/types/api/file_system/types";
+export type {
+  RubyFileSystemErrorCode,
+  FileSystemMount,
+} from "@app/types/file_system";
+export {
+  LEGACY_PREFIX_CONVERSATION,
+  LEGACY_PREFIX_PROJECT,
+  SCOPED_PREFIX_CONVERSATION,
+  SCOPED_PREFIX_POD,
+} from "@app/types/file_system";

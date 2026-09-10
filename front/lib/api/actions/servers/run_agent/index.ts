@@ -1,0 +1,983 @@
+import { MCPError } from "@app/lib/actions/mcp_errors";
+import { AGENT_CONFIGURATION_URI_PATTERN } from "@app/lib/actions/mcp_internal_actions/input_schemas";
+import type {
+  MCPProgressNotificationType,
+  RunAgentQueryProgressOutput,
+} from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import type {
+  ToolDefinition,
+  ToolHandlerExtra,
+  ToolHandlerResult,
+} from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import {
+  makeInternalMCPServer,
+  makeMCPToolExit,
+} from "@app/lib/actions/mcp_internal_actions/utils";
+import { registerTool } from "@app/lib/actions/mcp_internal_actions/wrappers";
+import type { HandledToolAbortClassification } from "@app/lib/actions/tool_interruptions";
+import {
+  classifyToolAbortSignal,
+  makeToolInterruptionError,
+} from "@app/lib/actions/tool_interruptions";
+import type {
+  ActionGeneratedFileType,
+  ToolContext,
+} from "@app/lib/actions/types";
+import { isAgentLoopRunContext } from "@app/lib/actions/types";
+import {
+  isLightServerSideMCPToolConfiguration,
+  isServerSideMCPServerConfiguration,
+} from "@app/lib/actions/types/guards";
+import { RUN_AGENT_ACTION_NUM_RESULTS } from "@app/lib/actions/utils";
+import { getOrCreateConversation } from "@app/lib/api/actions/servers/run_agent/conversation";
+import {
+  getRunAgentToolDescription,
+  RUN_AGENT_CONFIGURABLE_PROPERTIES,
+  RUN_AGENT_PLACEHOLDER_TOOL_NAME,
+  RUN_AGENT_TOOL_SCHEMA,
+} from "@app/lib/api/actions/servers/run_agent/metadata";
+import { isTransientStreamError } from "@app/lib/api/actions/servers/run_agent/network_errors";
+import type {
+  ChildAgentBlob,
+  RunAgentBlockingEvent,
+} from "@app/lib/api/actions/servers/run_agent/types";
+import { makeToolBlockedAwaitingInputResponse } from "@app/lib/api/actions/servers/run_agent/types";
+import {
+  getCitationsFromActions,
+  getRefs,
+} from "@app/lib/api/assistant/citations";
+import { getAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
+import { getGlobalAgentMetadata } from "@app/lib/api/assistant/global_agents/global_agent_metadata";
+import { cancelAgentLoop } from "@app/lib/api/assistant/pubsub";
+import config from "@app/lib/api/config";
+import type { Authenticator } from "@app/lib/auth";
+import { getApiKeyNameHeader, prodAPICredentialsForOwner } from "@app/lib/auth";
+import { serializeMention } from "@app/lib/mentions/format";
+import { AgentConfigurationModel } from "@app/lib/models/agent/agent";
+import { getConversationRoute } from "@app/lib/utils/router";
+import logger from "@app/logger/logger";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import { isGlobalAgentId } from "@app/types/assistant/assistant";
+import type { CitationType } from "@app/types/assistant/conversation";
+import { getHeaderFromRole } from "@app/types/groups";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { getHeaderFromUserEmail } from "@app/types/user";
+import type {
+  AgentMessagePublicType,
+  ConversationPublicType,
+} from "@ruby-ai/client";
+
+import { RubyAPI, INTERNAL_MIME_TYPES, isAgentMessage } from "@ruby-ai/client";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { RequestMeta } from "@modelcontextprotocol/sdk/types.js";
+import assert from "assert";
+import maxBy from "lodash/maxBy";
+import type z from "zod";
+
+function canRunChildAgent(agent: LightAgentConfigurationType): boolean {
+  switch (agent.status) {
+    case "active":
+    case "draft":
+      return agent.canRead;
+    case "disabled_free_workspace":
+    case "disabled_missing_datasource":
+    case "disabled_by_admin":
+    case "archived":
+    case "pending":
+      return false;
+    default:
+      assertNever(agent.status);
+  }
+}
+
+/**
+ * Headers for the public API calls that create and drive the sub-conversation.
+ *
+ * We use a system API key to override the user here (not the groups) so that the sub-agent can
+ * access the same spaces as the user but also as the sub-agent may rely on personal actions that
+ * have to be operated in the name of the user initiating the interaction.
+ *
+ * The role is forwarded too: the system-key exchange otherwise scopes the sub-conversation down to
+ * a plain member, and a sub-agent gated on `managers`/`admins` (e.g. `@analyst`) would then be
+ * invisible to it. The exchange caps the forwarded role by the user's own membership.
+ */
+function subAgentApiHeaders(auth: Authenticator): Record<string, string> {
+  return {
+    ...getHeaderFromUserEmail(auth.user()?.email),
+    ...getApiKeyNameHeader(auth),
+    ...getHeaderFromRole(auth.role()),
+  };
+}
+
+function makeChildAgentUnavailableError(childAgentName: string): MCPError {
+  return new MCPError(
+    `Agent @${childAgentName} is not available to the user running this conversation. ` +
+      "Ask a workspace admin to grant access to the agent and its spaces.",
+    { tracked: false }
+  );
+}
+
+async function getRunnableChildAgent(
+  auth: Authenticator,
+  {
+    agentId,
+    childAgentName = agentId,
+  }: {
+    agentId: string;
+    childAgentName?: string;
+  }
+): Promise<Result<ChildAgentBlob, MCPError>> {
+  const childAgent = await getAgentConfiguration(auth, {
+    agentId,
+    variant: "extra_light",
+  });
+
+  if (!childAgent || !canRunChildAgent(childAgent)) {
+    return new Err(makeChildAgentUnavailableError(childAgentName));
+  }
+
+  return new Ok({
+    name: childAgent.name,
+    description: childAgent.description,
+  });
+}
+
+function parseAgentConfigurationUri(uri: string): Result<string, Error> {
+  const match = uri.match(AGENT_CONFIGURATION_URI_PATTERN);
+  if (!match) {
+    return new Err(new Error(`Invalid URI for an agent configuration: ${uri}`));
+  }
+  return new Ok(match[2]);
+}
+
+export const runAgent = async (
+  {
+    query,
+    childAgentId,
+    executionMode,
+    toolsetsToAdd,
+    fileOrContentFragmentIds,
+    filePaths,
+  }: {
+    query: string;
+    childAgentId: string;
+    executionMode: "run-agent" | "handoff";
+    toolsetsToAdd?: string[] | null;
+    fileOrContentFragmentIds?: string[] | null;
+    filePaths?: string[] | null;
+  },
+  {
+    auth,
+    toolContext,
+    sendNotification,
+    _meta,
+    signal,
+    toolName,
+    childAgentBlob: configuredChildAgentBlob,
+  }: {
+    auth: Authenticator;
+    toolContext?: ToolContext;
+    sendNotification?: (
+      notification: MCPProgressNotificationType
+    ) => Promise<void>;
+    _meta?: RequestMeta;
+    signal?: AbortSignal | null;
+    toolName: string;
+    childAgentBlob?: ChildAgentBlob;
+  }
+): Promise<ToolHandlerResult> => {
+  assert(
+    isAgentLoopRunContext(toolContext?.runContext),
+    "AgentLoopRunContext expected"
+  );
+
+  const abortSignal = signal ?? null;
+  let childCancellationPromise: Promise<{
+    failedMessageIds: string[];
+  } | void> | null = null;
+  const finalizeAndReturn = async <T>(
+    result: Result<T, MCPError>
+  ): Promise<Result<T, MCPError>> => {
+    if (childCancellationPromise) {
+      await childCancellationPromise;
+    }
+    return result;
+  };
+  const isHandoff = executionMode === "handoff";
+
+  if (isHandoff && filePaths && filePaths.length > 0) {
+    return finalizeAndReturn(
+      new Err(
+        new MCPError(
+          "`filePaths` is not supported in handoff mode: the sub-agent continues in the same " +
+            "conversation, so files are already visible to it.",
+          { tracked: false }
+        )
+      )
+    );
+  }
+
+  const { agentConfiguration: mainAgent, conversation: mainConversation } =
+    toolContext.runContext;
+
+  const childAgentRes = await getRunnableChildAgent(auth, {
+    agentId: childAgentId,
+    childAgentName: configuredChildAgentBlob?.name,
+  });
+  if (childAgentRes.isErr()) {
+    return finalizeAndReturn(childAgentRes);
+  }
+  const childAgentBlob = configuredChildAgentBlob ?? childAgentRes.value;
+
+  const prodCredentials = await prodAPICredentialsForOwner(
+    auth.getNonNullableWorkspace()
+  );
+  const api = new RubyAPI(
+    config.getRubyAPIConfig(),
+    {
+      ...prodCredentials,
+      extraHeaders: subAgentApiHeaders(auth),
+    },
+    logger
+  );
+
+  const instructions = toolContext.runContext.agentConfiguration.instructions;
+
+  // Store the query resource early so the UI can show it immediately while the child
+  // conversation is being created. A second store fires below once conversationId and
+  // agentMessageId are known, so the panel can connect to the child stream on replay.
+  if (_meta?.progressToken && sendNotification) {
+    await sendNotification({
+      method: "notifications/progress",
+      params: {
+        progress: 0,
+        total: 1,
+        progressToken: _meta.progressToken,
+        _meta: {
+          data: {
+            label: `Storing query resource`,
+            output: {
+              type: "store_resource",
+              contents: [
+                {
+                  type: "resource",
+                  resource: {
+                    mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.RUN_AGENT_QUERY,
+                    text: query,
+                    childAgentId,
+                    uri: "",
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+  }
+
+  const convRes = await getOrCreateConversation(
+    api,
+    auth,
+    toolContext.runContext,
+    {
+      childAgentBlob,
+      childAgentId,
+      mainAgent,
+      mainConversation,
+      query: isHandoff
+        ? `The user's query is being handed off to you from @${mainAgent.name} within the same conversation. The calling agent's instructions are: <caller_agent_instructions>${instructions ?? ""}</caller_agent_instructions>. The tool ${toolName} is not available to you, do not attempt to use it.`
+        : query,
+      toolsetsToAdd: toolsetsToAdd ?? null,
+      fileOrContentFragmentIds: fileOrContentFragmentIds ?? null,
+      filePaths: filePaths ?? null,
+      conversationId: isHandoff ? mainConversation.sId : null,
+      originMessage: toolContext.runContext.agentMessage,
+    }
+  );
+
+  if (convRes.isErr()) {
+    return finalizeAndReturn(convRes);
+  }
+
+  if (isHandoff) {
+    const mentionMain = serializeMention(mainAgent);
+    const mentionChild = serializeMention({
+      name: childAgentBlob.name,
+      sId: childAgentId,
+    });
+    return finalizeAndReturn(
+      new Ok(
+        makeMCPToolExit({
+          message: `Handoff from ${mentionMain} to ${mentionChild} successfully launched.`,
+          isError: false,
+        }).content
+      )
+    );
+  }
+
+  const { conversation, isNewConversation, userMessageId } = convRes.value;
+
+  // Early finish: if the child conversation already succeeded, return its stored result.
+  const agentMessage = getLatestVersionByParentMessageId(
+    conversation,
+    userMessageId
+  );
+
+  if (!agentMessage) {
+    return finalizeAndReturn(
+      new Err(makeChildAgentUnavailableError(childAgentBlob.name))
+    );
+  }
+
+  if (_meta?.progressToken && sendNotification) {
+    await sendNotification({
+      method: "notifications/progress",
+      params: {
+        progress: 0,
+        total: 1,
+        progressToken: _meta.progressToken,
+        _meta: {
+          data: {
+            label: `Storing query resource`,
+            output: {
+              type: "store_resource",
+              contents: [
+                {
+                  type: "resource",
+                  resource: {
+                    mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.RUN_AGENT_QUERY,
+                    text: query,
+                    childAgentId,
+                    uri: "",
+                    conversationId: conversation.sId,
+                    agentMessageId: agentMessage.sId,
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+  }
+
+  const requestChildCancellation = () => {
+    /* eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing */
+    if (!childCancellationPromise) {
+      childCancellationPromise = cancelAgentLoop(auth, {
+        messageIds: [agentMessage.sId],
+        conversationId: conversation.sId,
+      }).catch((cancelError) => {
+        logger.warn(
+          {
+            error: normalizeError(cancelError),
+            childConversationId: conversation.sId,
+            userMessageId,
+          },
+          "Failed to cancel child agent conversation"
+        );
+      });
+    }
+  };
+
+  const handleAbortedSignal = (
+    abortClassification: HandledToolAbortClassification
+  ): Promise<Result<never, MCPError>> => {
+    switch (abortClassification) {
+      case "deploy_interruption":
+        throw makeToolInterruptionError();
+
+      case "user_cancellation":
+        requestChildCancellation();
+        assert(abortSignal);
+        return finalizeAndReturn(
+          new Err(
+            new MCPError(`Agent run cancelled, reason: ${abortSignal.reason}`, {
+              tracked: false,
+            })
+          )
+        );
+
+      default:
+        assertNever(abortClassification);
+    }
+  };
+
+  const abortClassification = classifyToolAbortSignal(abortSignal);
+  if (abortClassification !== "none") {
+    return handleAbortedSignal(abortClassification);
+  }
+
+  if (abortSignal) {
+    abortSignal.addEventListener(
+      "abort",
+      () => {
+        // run_agent is retryable and resumable on interruptions such as
+        // timeouts, deploys, etc. The abort signal is used for both these
+        // unintended interruptions and requested cancellations. For interruptions
+        // we let the activity retry/resume; for cancellations we cancel the child.
+        if (classifyToolAbortSignal(abortSignal) === "user_cancellation") {
+          requestChildCancellation();
+        }
+      },
+      {
+        once: true,
+      }
+    );
+  }
+
+  if (isNewConversation) {
+    logger.info(
+      {
+        childConversationId: conversation.sId,
+        conversationId: mainConversation.sId,
+      },
+      "Conversation created for run_agent"
+    );
+  }
+
+  if (_meta?.progressToken && sendNotification && isNewConversation) {
+    // Send notification indicating that a run_agent started to store resume state.
+    const notification: MCPProgressNotificationType = {
+      method: "notifications/progress",
+      params: {
+        progress: 1,
+        total: 1,
+        progressToken: _meta.progressToken,
+        _meta: {
+          data: {
+            label: `Running agent ${childAgentBlob.name}`,
+            output: {
+              type: "run_agent",
+              query,
+              childAgentId,
+              conversationId: conversation.sId,
+              userMessageId,
+              agentMessageId: agentMessage?.sId ?? null,
+            } satisfies RunAgentQueryProgressOutput,
+          },
+        },
+      },
+    };
+    await sendNotification(notification);
+  }
+
+  // Helper to build the success content payload consistently (citations + files).
+  const buildSuccessContent = ({
+    conversationId,
+    finalContent,
+    chainOfThought,
+    refsFromAgent,
+    files,
+  }: {
+    conversationId: string;
+    finalContent: string;
+    chainOfThought: string;
+    refsFromAgent: Record<string, CitationType>;
+    files: ActionGeneratedFileType[];
+  }) => {
+    let text = finalContent;
+
+    const convoUrl = getConversationRoute(
+      auth.getNonNullableWorkspace().sId,
+      conversationId,
+      config.getAppUrl()
+    );
+    const { citationsOffset } = isAgentLoopRunContext(toolContext.runContext)
+      ? toolContext.runContext.stepContext
+      : { citationsOffset: 0 };
+
+    const refs = getRefs().slice(
+      citationsOffset,
+      citationsOffset + RUN_AGENT_ACTION_NUM_RESULTS
+    );
+
+    const newRefs: Record<string, CitationType> = {};
+    Object.keys(refsFromAgent).forEach((refKeyFromAgent, index) => {
+      const newRef = refs[index];
+      if (newRef) {
+        // Replace citation references only within :cite[...] blocks
+        const citationRegex = new RegExp(
+          `(:cite\\[[^\\]]*\\b)${refKeyFromAgent}\\b([^\\]]*\\])`,
+          "g"
+        );
+        text = text.replace(citationRegex, `$1${newRef}$2`);
+        newRefs[newRef] = refsFromAgent[refKeyFromAgent];
+      } else {
+        // Remove trailing or extra commas as we ran out of refs capacity.
+        const citationRegex = new RegExp(
+          `(:cite\\[[^\\]]*\\b)${refKeyFromAgent}\\b(?:,([^\\]]*\\])|([^\\]]*\\]))`,
+          "g"
+        );
+        text = text.replace(citationRegex, "$1$2$3");
+      }
+    });
+
+    // Clean up trailing commas and empty citations
+    text = text.replace(/:cite\[([^\]]*),\]/g, ":cite[$1]");
+    text = text.replaceAll(":cite[]", "");
+
+    return [
+      {
+        type: "resource" as const,
+        resource: {
+          mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.RUN_AGENT_RESULT,
+          conversationId,
+          text,
+          chainOfThought:
+            chainOfThought && chainOfThought.length > 0
+              ? chainOfThought
+              : undefined,
+          uri: convoUrl,
+          refs: Object.keys(newRefs).length > 0 ? newRefs : undefined,
+        },
+      },
+      ...files.map((file) => ({
+        type: "resource" as const,
+        resource: {
+          mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.FILE,
+          fileId: file.fileId,
+          title: file.title,
+          contentType: file.contentType,
+          snippet: file.snippet,
+          uri: convoUrl,
+          text: "File generated by a sub-agent",
+        },
+      })),
+    ];
+  };
+
+  const getFinishedContent = (agentMessage: AgentMessagePublicType) => {
+    return {
+      finalText: agentMessage.content ?? "",
+      cot: agentMessage.chainOfThought ?? "",
+      refsFromAgent: getCitationsFromActions(agentMessage.actions),
+      files: agentMessage.actions.flatMap((action) =>
+        action.generatedFiles.filter((f) => !f.hidden)
+      ),
+    };
+  };
+
+  if (agentMessage && agentMessage.status === "succeeded") {
+    const { finalText, cot, refsFromAgent, files } =
+      getFinishedContent(agentMessage);
+    return finalizeAndReturn(
+      new Ok(
+        buildSuccessContent({
+          conversationId: conversation.sId,
+          finalContent: finalText,
+          chainOfThought: cot,
+          refsFromAgent,
+          files,
+        })
+      )
+    );
+  }
+
+  const streamRes = await api.streamAgentAnswerEvents({
+    conversation: conversation,
+    userMessageId,
+    signal: abortSignal ?? undefined,
+    options: {
+      maxReconnectAttempts: 10,
+      reconnectDelay: 10000,
+      autoReconnect: true,
+    },
+  });
+
+  if (streamRes.isErr()) {
+    const abortClassification = classifyToolAbortSignal(abortSignal);
+    if (abortClassification !== "none") {
+      return handleAbortedSignal(abortClassification);
+    }
+
+    const errorMessage = `Failed to stream agent answer: ${streamRes.error.message}`;
+    return finalizeAndReturn(new Err(new MCPError(errorMessage)));
+  }
+
+  const collectedBlockingEvents: RunAgentBlockingEvent[] = [];
+
+  // TODO(DURABLE_AGENT 2025-08-25): We should make this more robust and use the existing
+  // conversation content if present.
+  let finalContent = "";
+  let chainOfThought = "";
+  let refsFromAgent: Record<string, CitationType> = {};
+  let files: ActionGeneratedFileType[] = [];
+  try {
+    for await (const event of streamRes.value.eventStream) {
+      if (event.type === "generation_tokens") {
+        // Separate content based on classification.
+        if (event.classification === "chain_of_thought") {
+          chainOfThought += event.text;
+        } else if (event.classification === "tokens") {
+          finalContent += event.text;
+        } else if (
+          event.classification === "closing_delimiter" &&
+          event.delimiterClassification === "chain_of_thought" &&
+          chainOfThought.length > 0
+        ) {
+          // For closing chain of thought delimiters, add a newline.
+          chainOfThought += "\n";
+        }
+      } else if (event.type === "agent_error") {
+        const errorMessage = `Agent error: ${event.error.message}`;
+        // Errors from sub-agents are typically captured by the monitoring stack through the
+        // actual sub-agent run, so avoid tracking them again as run_agent MCP errors.
+        return await finalizeAndReturn(
+          new Err(
+            new MCPError(errorMessage, {
+              tracked: false,
+            })
+          )
+        );
+      } else if (event.type === "user_message_error") {
+        const errorMessage = `User message error: ${event.error.message}`;
+        return await finalizeAndReturn(new Err(new MCPError(errorMessage)));
+      } else if (event.type === "agent_generation_cancelled") {
+        requestChildCancellation();
+        return await finalizeAndReturn(
+          new Err(new MCPError("Agent run cancelled", { tracked: false }))
+        );
+      } else if (event.type === "agent_message_success") {
+        refsFromAgent = getCitationsFromActions(event.message.actions);
+        files = event.message.actions.flatMap((action) =>
+          action.generatedFiles.filter((f) => !f.hidden)
+        );
+        break;
+      } else if (
+        event.type === "tool_approve_execution" ||
+        event.type === "tool_personal_auth_required" ||
+        event.type === "tool_file_auth_required" ||
+        event.type === "tool_ask_user_question"
+      ) {
+        // Collect blocking events until the child marks one as the last blocking event for this
+        // step, then stop the parent run_agent call and return a blocked response upstream.
+        collectedBlockingEvents.push(event);
+
+        if (event.isLastBlockingEventForStep) {
+          const blockedResponse = makeToolBlockedAwaitingInputResponse(
+            collectedBlockingEvents,
+            {
+              conversationId: conversation.sId,
+              userMessageId,
+            }
+          );
+          return await finalizeAndReturn(new Ok(blockedResponse.content));
+        }
+      }
+    }
+  } catch (streamError) {
+    // Fallback: if the stream failed, check if the child completed successfully meanwhile.
+    const refreshed = await api.getConversation({
+      conversationId: conversation.sId,
+    });
+    if (refreshed.isOk()) {
+      const conv2 = refreshed.value;
+      const agentMessage = getLatestVersionByParentMessageId(
+        conv2,
+        userMessageId
+      );
+      if (agentMessage && agentMessage.status === "succeeded") {
+        const { finalText, cot, refsFromAgent, files } =
+          getFinishedContent(agentMessage);
+        /* eslint-disable-next-line @typescript-eslint/return-await */
+        return await finalizeAndReturn(
+          new Ok(
+            buildSuccessContent({
+              conversationId: conv2.sId,
+              finalContent: finalText,
+              chainOfThought: cot,
+              refsFromAgent,
+              files,
+            })
+          )
+        );
+      }
+    }
+
+    const abortClassification = classifyToolAbortSignal(abortSignal);
+    if (abortClassification !== "none") {
+      return handleAbortedSignal(abortClassification);
+    }
+
+    // Transient stream errors (network issues, reconnection exhaustion) should not
+    // trigger alerts as they are typically recoverable infrastructure issues.
+    const isTransient = isTransientStreamError(streamError);
+    const normalizedError = normalizeError(streamError);
+    const errorMessage = `Error processing agent stream: ${normalizedError.message}`;
+
+    return finalizeAndReturn(
+      new Err(
+        new MCPError(errorMessage, {
+          tracked: !isTransient,
+          cause: normalizedError,
+        })
+      )
+    );
+  }
+
+  finalContent = finalContent.trim();
+  chainOfThought = chainOfThought.trim();
+
+  return finalizeAndReturn(
+    new Ok(
+      buildSuccessContent({
+        conversationId: conversation.sId,
+        finalContent,
+        chainOfThought,
+        refsFromAgent,
+        files,
+      })
+    )
+  );
+};
+
+function isRunAgentHandoffMode(toolContext?: ToolContext): boolean {
+  if (!toolContext) {
+    return false;
+  }
+
+  // Check if we're in the listToolsContext (when presenting tools to the model).
+  if (toolContext.listToolsContext) {
+    const agentActionConfig =
+      toolContext.listToolsContext.agentActionConfiguration;
+    if (
+      isServerSideMCPServerConfiguration(agentActionConfig) &&
+      agentActionConfig.additionalConfiguration?.executionMode
+    ) {
+      return (
+        agentActionConfig.additionalConfiguration.executionMode === "handoff"
+      );
+    }
+  }
+
+  // Check if we're in the runContext (when executing the tool).
+  if (toolContext.runContext) {
+    const toolConfig = toolContext.runContext.toolConfiguration;
+    if (
+      isLightServerSideMCPToolConfiguration(toolConfig) &&
+      toolConfig.additionalConfiguration?.executionMode
+    ) {
+      return toolConfig.additionalConfiguration.executionMode === "handoff";
+    }
+  }
+
+  return false;
+}
+
+/**
+ * This method fetches the name and description of a child agent. It returns it even if the
+ * agent is private as it is referenced from a parent agent which requires a name and description
+ * for the associated run_agent tool rendering.
+ *
+ * Actual permissions to run the agent for the auth are checked at run time when creating the
+ * conversation. Through execution of the parent agent the child agent name and description could be
+ * leaked to the user which appears as acceptable given the proactive decision of a builder having
+ * access to it to refer it from the parent agent more broadly shared.
+ *
+ * If the agent has been archived, this method will return null leading to the tool being displayed
+ * to the model as not configured.
+ */
+async function leakyGetAgentNameAndDescriptionForChildAgent(
+  auth: Authenticator,
+  agentId: string
+): Promise<{
+  name: string;
+  description: string;
+} | null> {
+  if (isGlobalAgentId(agentId)) {
+    const metadata = getGlobalAgentMetadata(agentId);
+
+    if (!metadata) {
+      return null;
+    }
+
+    return {
+      name: metadata.name,
+      description: metadata.description,
+    };
+  }
+
+  const owner = auth.getNonNullableWorkspace();
+
+  const agentConfiguration = await AgentConfigurationModel.findOne({
+    where: {
+      sId: agentId,
+      workspaceId: owner.id,
+      status: "active",
+    },
+    attributes: ["name", "description"],
+  });
+
+  if (!agentConfiguration) {
+    return null;
+  }
+
+  return {
+    name: agentConfiguration.name,
+    description: agentConfiguration.description,
+  };
+}
+
+async function createServer(
+  auth: Authenticator,
+  toolContext?: ToolContext
+): Promise<McpServer> {
+  const server = makeInternalMCPServer("run_agent");
+
+  let childAgentId: string | null = null;
+
+  if (
+    toolContext?.listToolsContext &&
+    isServerSideMCPServerConfiguration(
+      toolContext.listToolsContext.agentActionConfiguration
+    ) &&
+    toolContext.listToolsContext.agentActionConfiguration.childAgentId
+  ) {
+    childAgentId =
+      toolContext.listToolsContext.agentActionConfiguration.childAgentId;
+  }
+
+  if (
+    toolContext?.runContext &&
+    isLightServerSideMCPToolConfiguration(
+      toolContext.runContext.toolConfiguration
+    ) &&
+    toolContext.runContext.toolConfiguration.childAgentId
+  ) {
+    childAgentId = toolContext.runContext.toolConfiguration.childAgentId;
+  }
+
+  let childAgentBlob: ChildAgentBlob | null = null;
+  if (childAgentId) {
+    childAgentBlob = await leakyGetAgentNameAndDescriptionForChildAgent(
+      auth,
+      childAgentId
+    );
+  }
+
+  // If we have no child ID (unexpected) or the child agent was archived, return a dummy server
+  // whose tool name and description informs the agent of the situation.
+  if (!childAgentBlob) {
+    registerTool(
+      auth,
+      toolContext,
+      server,
+      {
+        name: "run_agent_tool_not_available",
+        description:
+          "No child agent configured for this tool, as the child agent was probably archived. " +
+          "Do not attempt to run the tool and warn the user instead.",
+        stake: "never_ask",
+        displayLabels: {
+          running: "No child agent configured",
+          done: "No child agent configured",
+        },
+        schema: RUN_AGENT_CONFIGURABLE_PROPERTIES,
+        toolCostCategory: "basic" as const,
+        freeUsage: false,
+        handler: async () => new Err(new MCPError("No child agent configured")),
+      },
+      {
+        monitoringName: RUN_AGENT_PLACEHOLDER_TOOL_NAME,
+      }
+    );
+
+    return server;
+  }
+
+  const isHandoffConfiguration = isRunAgentHandoffMode(toolContext);
+
+  const toolName = `run_${childAgentBlob.name}`;
+  const mentionChild = serializeMention({
+    name: childAgentBlob.name,
+    sId: childAgentId!, // We are sure childAgentId is *not* undefined here, as we check for childAgentBlob above
+  });
+  const toolDescription = isHandoffConfiguration
+    ? getRunAgentToolDescription({
+        executionMode: "handoff",
+        childAgentName: childAgentBlob.name,
+        childAgentDescription: childAgentBlob.description,
+        childAgentMention: mentionChild,
+      })
+    : getRunAgentToolDescription({
+        executionMode: "run-agent",
+        childAgentName: childAgentBlob.name,
+        childAgentDescription: childAgentBlob.description,
+      });
+
+  const schema = {
+    ...RUN_AGENT_TOOL_SCHEMA,
+    ...RUN_AGENT_CONFIGURABLE_PROPERTIES,
+  };
+
+  type SchemaShapeType = typeof RUN_AGENT_TOOL_SCHEMA &
+    typeof RUN_AGENT_CONFIGURABLE_PROPERTIES;
+
+  type SchemaType = z.infer<z.ZodObject<SchemaShapeType>>;
+
+  const toolDefinition: ToolDefinition = {
+    name: toolName,
+    description: toolDescription,
+    schema: schema,
+    stake: "never_ask",
+    displayLabels: {
+      running: `Running @${childAgentBlob.name}`,
+      done: `Run @${childAgentBlob.name}`,
+    },
+    enableAlerting: true,
+    handler: (params: SchemaType, extra: ToolHandlerExtra) => {
+      const childAgentIdRes = parseAgentConfigurationUri(params.childAgent.uri);
+      if (childAgentIdRes.isErr()) {
+        return new Err(new MCPError(childAgentIdRes.error.message));
+      }
+
+      return runAgent(
+        {
+          query: params.query,
+          childAgentId: childAgentIdRes.value,
+          executionMode: params.executionMode.value,
+          toolsetsToAdd: params.toolsetsToAdd,
+          fileOrContentFragmentIds: params.fileOrContentFragmentIds,
+          filePaths: params.filePaths,
+        },
+        {
+          ...extra,
+          auth,
+          toolContext,
+          toolName,
+          childAgentBlob,
+        }
+      );
+    },
+  } as unknown as ToolDefinition;
+
+  registerTool(auth, toolContext, server, toolDefinition, {
+    monitoringName: RUN_AGENT_PLACEHOLDER_TOOL_NAME,
+  });
+
+  return server;
+}
+
+function getLatestVersionByParentMessageId(
+  conversation: ConversationPublicType,
+  userMessageId: string
+) {
+  const messageIndex = conversation.content.findLastIndex((versions) => {
+    const message = versions[versions.length - 1];
+    return isAgentMessage(message) && message.parentMessageId === userMessageId;
+  });
+
+  return messageIndex !== -1
+    ? maxBy(
+        conversation.content[messageIndex] as AgentMessagePublicType[],
+        (m) => m.version
+      )
+    : undefined;
+}
+
+export default createServer;

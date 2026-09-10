@@ -1,0 +1,11 @@
+{
+  "action": "audit_log.viewed",
+  "targets": [
+    {
+      "type": "workspace"
+    }
+  ],
+  "metadata": {
+    "actor_type": "string"
+  }
+}

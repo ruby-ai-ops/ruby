@@ -1,0 +1,34 @@
+{
+  "action": "tool.approval_resolved",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "tool"
+    }
+  ],
+  "metadata": {
+    "decision": "string",
+    "tool_name": "string",
+    "mcp_server_name": "string",
+    "stake_level": "string",
+    "conversation_id": "string",
+    "agent_message_id": "string",
+    "action_id": "string",
+    "agent_id": "string",
+    "agent_name": "string",
+    "pod_id": "string",
+    "pod_function_id": "string",
+    "pod_function_slug": "string",
+    "frame_id": "string",
+    "frame_function_id": "string",
+    "frame_function_name": "string",
+    "frame_publication_id": "string",
+    "invocation_id": "string",
+    "invocation_origin": "string",
+    "deciding_user_id": "string",
+    "deciding_user_email": "string",
+    "actor_type": "string"
+  }
+}

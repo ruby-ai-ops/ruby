@@ -1,0 +1,166 @@
+import {
+  detectSkillsFromGitHubRepo,
+  isSkillFromGitHubRepo,
+} from "@app/lib/api/skills/detection/github/detect_skills";
+import { initGitHubRepoClient } from "@app/lib/api/skills/detection/github/github_api";
+import { getWorkspaceLevelGitHubAccessToken } from "@app/lib/api/skills/detection/github/github_auth";
+import { SkillResource } from "@app/lib/resources/skill/skill_resource";
+import type {
+  DetectedSkillSummary,
+  DetectSkillsResponseBody,
+} from "@app/lib/skill_detection";
+import logger from "@app/logger/logger";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { isString } from "@app/types/shared/utils/general";
+import { workspaceApp } from "@front-api/middlewares/ctx";
+import { ensureHasWorkspacePermission } from "@front-api/middlewares/ensure_role";
+import type { HandlerResult } from "@front-api/middlewares/utils";
+import { apiError } from "@front-api/middlewares/utils";
+
+import upload from "./upload";
+
+// Mounted at /api/w/:wId/skills/detect.
+const app = workspaceApp();
+
+app.route("/upload", upload);
+
+/** @ignoreswagger */
+app.post(
+  "/",
+  ensureHasWorkspacePermission(
+    "create",
+    "skill",
+    "Detecting skills is restricted.",
+    "app_auth_error"
+  ),
+  async (ctx): HandlerResult<DetectSkillsResponseBody> => {
+    const auth = ctx.get("auth");
+    const owner = auth.getNonNullableWorkspace();
+
+    const body = await ctx.req.json().catch(() => null);
+    const repoUrl = body?.repoUrl;
+
+    if (!isString(repoUrl)) {
+      return apiError(ctx, {
+        status_code: 400,
+        api_error: {
+          type: "invalid_request_error",
+          message: "repoUrl is required and must be a string.",
+        },
+      });
+    }
+
+    const accessToken = await getWorkspaceLevelGitHubAccessToken(auth);
+    const clientResult = initGitHubRepoClient({ repoUrl, accessToken });
+    if (clientResult.isErr()) {
+      return apiError(ctx, {
+        status_code: 400,
+        api_error: {
+          type: "invalid_request_error",
+          message: clientResult.error.message,
+        },
+      });
+    }
+
+    const result = await detectSkillsFromGitHubRepo(clientResult.value);
+
+    if (result.isErr()) {
+      const { error } = result;
+
+      switch (error.type) {
+        case "invalid_url":
+          return apiError(ctx, {
+            status_code: 400,
+            api_error: {
+              type: "invalid_request_error",
+              message: error.message,
+            },
+          });
+        case "not_found":
+          return apiError(ctx, {
+            status_code: 404,
+            api_error: {
+              type: "skill_github_repository_not_found",
+              message: error.message,
+            },
+          });
+        case "auth_error":
+          return apiError(ctx, {
+            status_code: 401,
+            api_error: {
+              type: "invalid_request_error",
+              message: error.message,
+            },
+          });
+        case "github_api_error":
+          logger.error(
+            { error, workspaceId: owner.sId },
+            "Error detecting skills from GitHub repo"
+          );
+          return apiError(ctx, {
+            status_code: 500,
+            api_error: {
+              type: "invalid_request_error",
+              message: error.message,
+            },
+          });
+        case "validation_error":
+          return apiError(ctx, {
+            status_code: 400,
+            api_error: {
+              type: "invalid_request_error",
+              message: error.message,
+            },
+          });
+        default:
+          assertNever(error);
+      }
+    }
+
+    const detectedSkills = result.value;
+
+    if (detectedSkills.length === 0) {
+      return apiError(ctx, {
+        status_code: 400,
+        api_error: {
+          type: "invalid_request_error",
+          message:
+            "No skills found in this repository. Skills must contain a SKILL.md file with valid YAML frontmatter (see https://agentskills.io/specification).",
+        },
+      });
+    }
+
+    const existingSkills = await SkillResource.fetchByNames(
+      auth,
+      detectedSkills.map((s) => s.name)
+    );
+
+    const existingSkillsMap = new Map(existingSkills.map((s) => [s.name, s]));
+
+    const skillSummaries: DetectedSkillSummary[] = detectedSkills.map(
+      (skill) => {
+        const existing = existingSkillsMap.get(skill.name);
+
+        if (!existing) {
+          return {
+            name: skill.name,
+            status: "ready",
+            existingSkillId: null,
+          };
+        }
+
+        return {
+          name: skill.name,
+          status: isSkillFromGitHubRepo(existing, { repoUrl })
+            ? "skill_already_exists"
+            : "name_conflict",
+          existingSkillId: existing.sId,
+        };
+      }
+    );
+
+    return ctx.json({ skills: skillSummaries });
+  }
+);
+
+export default app;

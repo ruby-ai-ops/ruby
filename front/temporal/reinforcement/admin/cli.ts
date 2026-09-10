@@ -1,0 +1,118 @@
+import {
+  deleteReinforcementWorkspaceSchedule,
+  ensureReinforcementWorkspaceSchedules,
+  launchEnsureReinforcementSchedulesWorkflow as launchEnsureReinforcementSchedulesWorkflow,
+  startReinforcementWorkspaceSchedule,
+  startReinforcementWorkspaceWorkflow,
+  stopAllReinforcementWorkspaceSchedules as stopAllReinforcementWorkspaceSchedules,
+  stopEnsureReinforcementSchedulesWorkflow as stopEnsureReinforcementSchedulesWorkflow,
+} from "@app/temporal/reinforcement/client";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import parseArgs from "minimist";
+
+function usage() {
+  console.error(`Usage:
+  start                                                                        Ensure all workspace schedules (start missing, stop extra)
+  stop                                                                         Stop all running schedules
+  start-ensure                                                                 Start the daily ensure-crons workflow (11pm local)
+  stop-ensure                                                                  Stop the daily ensure-crons workflow
+  start-workspace --workspace-id <sId>                                         Start the schedule for a specific workspace
+  stop-workspace --workspace-id <sId>                                          Stop the schedule for a specific workspace
+  run-workspace --workspace-id <sId> [--batch] [--skill-id <sId>] [--days <n>] Run once for a specific workspace
+  run-skill --workspace-id <sId> --skill-id <sId> [--batch] [--days <n>]       Run for a specific skill (shorthand)`);
+}
+
+const main = async () => {
+  const argv = parseArgs(process.argv.slice(2), {
+    string: ["workspace-id", "skill-id"],
+    boolean: ["batch"],
+    default: { batch: false },
+  });
+
+  const [command] = argv._;
+
+  switch (command) {
+    case "start":
+      await ensureReinforcementWorkspaceSchedules();
+      return;
+    case "stop":
+      await stopAllReinforcementWorkspaceSchedules();
+      return;
+    case "start-ensure":
+      await launchEnsureReinforcementSchedulesWorkflow();
+      return;
+    case "stop-ensure":
+      await stopEnsureReinforcementSchedulesWorkflow();
+      return;
+    case "start-workspace": {
+      const workspaceId = argv["workspace-id"];
+      if (!workspaceId) {
+        console.error("Error: --workspace-id is required");
+        usage();
+        process.exit(1);
+      }
+      await startReinforcementWorkspaceSchedule({ workspaceId });
+      return;
+    }
+    case "stop-workspace": {
+      const workspaceId = argv["workspace-id"];
+      if (!workspaceId) {
+        console.error("Error: --workspace-id is required");
+        usage();
+        process.exit(1);
+      }
+      await deleteReinforcementWorkspaceSchedule({ workspaceId });
+      return;
+    }
+    case "run-workspace": {
+      const workspaceId = argv["workspace-id"];
+      if (!workspaceId) {
+        console.error("Error: --workspace-id is required");
+        usage();
+        process.exit(1);
+      }
+      const conversationLookbackDays =
+        argv["days"] !== undefined ? Number(argv["days"]) : undefined;
+      await startReinforcementWorkspaceWorkflow({
+        workspaceId,
+        useBatchMode: argv["batch"],
+        skillId: argv["skill-id"],
+        conversationLookbackDays,
+      });
+      return;
+    }
+    case "run-skill": {
+      const workspaceId = argv["workspace-id"];
+      const skillId = argv["skill-id"];
+      if (!workspaceId || !skillId) {
+        console.error("Error: --workspace-id and --skill-id are required");
+        usage();
+        process.exit(1);
+      }
+      const conversationLookbackDays =
+        argv["days"] !== undefined ? Number(argv["days"]) : undefined;
+      await startReinforcementWorkspaceWorkflow({
+        workspaceId,
+        useBatchMode: argv["batch"],
+        skillId,
+        conversationLookbackDays,
+      });
+      return;
+    }
+    default:
+      console.error(`Error: Unknown command "${command}"`);
+      usage();
+      process.exit(1);
+  }
+};
+
+main()
+  .then(() => {
+    console.error("\x1b[32m%s\x1b[0m", `Done`);
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("\x1b[31m%s\x1b[0m", `Error: ${normalizeError(err).message}`);
+    console.log(err);
+    process.exit(1);
+  });

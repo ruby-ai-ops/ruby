@@ -1,0 +1,118 @@
+import config from "@app/lib/api/config";
+import { AppResource } from "@app/lib/resources/app_resource";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import logger from "@app/logger/logger";
+import type {
+  GetAppsResponseBody,
+  PostAppResponseBody,
+} from "@app/types/api/apps";
+import { APP_NAME_REGEXP } from "@app/types/app";
+import { CoreAPI } from "@app/types/core/core_api";
+import { workspaceApp } from "@front-api/middlewares/ctx";
+import type { HandlerResult } from "@front-api/middlewares/utils";
+import { apiError } from "@front-api/middlewares/utils";
+import { validate } from "@front-api/middlewares/validator";
+import { withFeatureFlag } from "@front-api/middlewares/with_feature_flag";
+import { withSpace } from "@front-api/middlewares/with_space";
+import { z } from "zod";
+
+import aId from "./[aId]";
+
+const PostAppBodySchema = z.object({
+  name: z.string(),
+  description: z.string(),
+});
+
+// Mounted under /api/w/:wId/spaces/:spaceId/apps.
+const app = workspaceApp();
+
+// Legacy Ruby Apps are gated behind the `legacy_ruby_apps` feature flag. This
+// gates the whole surface: listing, creation, and every per-app sub-route
+// (datasets, runs, state) mounted under /:aId below.
+app.use(
+  "*",
+  withFeatureFlag("legacy_ruby_apps", {
+    message: "Ruby Apps are not enabled for this workspace.",
+  })
+);
+
+// GET / — list apps in space.
+/** @ignoreswagger */
+app.get(
+  "/",
+  withSpace({ requireCanReadOrAdministrate: true }),
+  async (ctx): HandlerResult<GetAppsResponseBody> => {
+    const auth = ctx.get("auth");
+    const space = ctx.get("space");
+    const apps = await AppResource.listBySpace(auth, space);
+    return ctx.json({ apps: apps.map((a) => a.toJSON()) });
+  }
+);
+
+// POST / — create app.
+app.post(
+  "/",
+  withSpace({ requireCanReadOrAdministrate: true }),
+  validate("json", PostAppBodySchema),
+  async (ctx): HandlerResult<PostAppResponseBody> => {
+    const auth = ctx.get("auth");
+    const space = ctx.get("space");
+    const owner = auth.getNonNullableWorkspace();
+
+    if (
+      !auth.can("write", space) ||
+      !(await auth.hasWorkspacePermission("admin", "ruby_app"))
+    ) {
+      return apiError(ctx, {
+        status_code: 403,
+        api_error: {
+          type: "app_auth_error",
+          message:
+            "You do not have permission to administrate apps in the current workspace.",
+        },
+      });
+    }
+
+    const { name, description } = ctx.req.valid("json");
+    if (!APP_NAME_REGEXP.test(name)) {
+      return apiError(ctx, {
+        status_code: 400,
+        api_error: {
+          type: "invalid_request_error",
+          message:
+            "The app name is invalid, expects a string with a length of 1-64 characters, containing only alphanumeric characters, underscores, and dashes.",
+        },
+      });
+    }
+
+    const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+    const p = await coreAPI.createProject();
+    if (p.isErr()) {
+      return apiError(ctx, {
+        status_code: 500,
+        api_error: {
+          type: "internal_server_error",
+          message: "Failed to create internal project for the app.",
+          data_source_error: p.error,
+        },
+      });
+    }
+
+    const created = await AppResource.makeNew(
+      {
+        sId: generateRandomModelSId(),
+        name,
+        description: description || null,
+        rubyAPIProjectId: p.value.project.project_id.toString(),
+        workspaceId: owner.id,
+        visibility: "private",
+      },
+      space
+    );
+    return ctx.json({ app: created.toJSON() }, 201);
+  }
+);
+
+app.route("/:aId", aId);
+
+export default app;

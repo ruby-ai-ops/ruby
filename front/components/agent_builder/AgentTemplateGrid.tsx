@@ -1,0 +1,64 @@
+import { getUniqueTemplateTags } from "@app/components/agent_builder/utils";
+import type { AssistantTemplateListType } from "@app/lib/resources/template_resource";
+import type {
+  TemplateTagCodeType,
+  TemplateTagsType,
+} from "@app/types/assistant/templates";
+import { CardGrid, CompactAssistantCard, ContextItem } from "@ruby-ai/sparkle";
+
+interface AgentTemplateGridProps {
+  templates: AssistantTemplateListType[];
+  templateTagsMapping: TemplateTagsType;
+  selectedTags: TemplateTagCodeType[];
+  onTemplateClick: (templateId: string) => void;
+}
+
+export function AgentTemplateGrid({
+  templates,
+  templateTagsMapping,
+  selectedTags,
+  onTemplateClick,
+}: AgentTemplateGridProps) {
+  if (!templates.length) {
+    return null;
+  }
+
+  const tags =
+    selectedTags.length > 0 ? selectedTags : getUniqueTemplateTags(templates);
+
+  return (
+    <div className="flex flex-col gap-6">
+      {tags
+        .map((tagName) => {
+          const templatesForTag = templates.filter((template) =>
+            template.tags.includes(tagName)
+          );
+
+          if (!templatesForTag.length) {
+            return null;
+          }
+
+          return (
+            <div key={tagName}>
+              <ContextItem.SectionHeader
+                title={templateTagsMapping[tagName].label}
+                hasBorder={false}
+              />
+              <CardGrid>
+                {templatesForTag.map((template) => (
+                  <CompactAssistantCard
+                    key={template.sId}
+                    title={template.handle}
+                    pictureUrl={template.pictureUrl}
+                    description={template.userFacingDescription ?? ""}
+                    onClick={() => onTemplateClick(template.sId)}
+                  />
+                ))}
+              </CardGrid>
+            </div>
+          );
+        })
+        .filter(Boolean)}
+    </div>
+  );
+}

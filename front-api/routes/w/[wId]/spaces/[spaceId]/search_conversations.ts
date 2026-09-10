@@ -1,0 +1,89 @@
+import { searchProjectConversations } from "@app/lib/api/projects/search";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import logger from "@app/logger/logger";
+import type { SearchConversationsResponseBody } from "@app/types/api/projects/search";
+import { workspaceApp } from "@front-api/middlewares/ctx";
+import type { HandlerResult } from "@front-api/middlewares/utils";
+import { apiError } from "@front-api/middlewares/utils";
+import { validate } from "@front-api/middlewares/validator";
+import { withSpace } from "@front-api/middlewares/with_space";
+import { z } from "zod";
+
+const SEMANTIC_SEARCH_SCORE_CUTOFF = 0.1;
+
+const SearchConversationsQuerySchema = z.object({
+  query: z.string().min(1, "Query parameter is required and cannot be empty"),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, "Limit must be at least 1")
+    .max(100, "Limit must be at most 100")
+    .optional()
+    .default(10),
+});
+
+// Mounted under /api/w/:wId/spaces/:spaceId/search_conversations.
+const app = workspaceApp();
+
+/** @ignoreswagger */
+app.get(
+  "/",
+  withSpace({ requireCanReadOrAdministrate: true }),
+  validate("query", SearchConversationsQuerySchema),
+  async (ctx): HandlerResult<SearchConversationsResponseBody> => {
+    const auth = ctx.get("auth");
+    const space = ctx.get("space");
+    const { query, limit: topK } = ctx.req.valid("query");
+
+    const searchRes = await searchProjectConversations(auth, {
+      query,
+      spaceIds: [space.sId],
+      topK,
+    });
+
+    if (searchRes.isErr()) {
+      logger.error(
+        {
+          error: searchRes.error,
+          workspaceId: auth.getNonNullableWorkspace().sId,
+          spaceId: space.sId,
+          query,
+        },
+        "Failed to search conversations in datasource"
+      );
+      return apiError(ctx, {
+        status_code: 500,
+        api_error: {
+          type: "internal_server_error",
+          message: "Failed to search conversations.",
+        },
+      });
+    }
+
+    const filteredResults = searchRes.value.filter(
+      (r) => r.score >= SEMANTIC_SEARCH_SCORE_CUTOFF
+    );
+
+    const conversations = await ConversationResource.fetchByIds(
+      auth,
+      filteredResults.map((r) => r.conversationId)
+    );
+    const conversationMap = new Map(conversations.map((ctx) => [ctx.sId, ctx]));
+
+    const results = filteredResults
+      .map((r) => {
+        const conv = conversationMap.get(r.conversationId);
+        // Sub-conversations (depth > 0) are indexed for agent search but must
+        // not surface in user-facing search.
+        if (!conv || conv.depth > 0) {
+          return null;
+        }
+        return conv.toJSON();
+      })
+      .filter((conv) => conv !== null);
+
+    return ctx.json({ conversations: results });
+  }
+);
+
+export default app;

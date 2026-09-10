@@ -1,0 +1,1249 @@
+import { renderAgentMessageContentView } from "@app/lib/api/assistant/activity_steps";
+import { getLightAgentMessageFromAgentMessage } from "@app/lib/api/assistant/citations";
+import { getAgentConfigurations } from "@app/lib/api/assistant/configuration/agent";
+import { fetchCheckpointAgentMessageContentHydration } from "@app/lib/api/assistant/conversation_rendering/checkpoint_message_hydration";
+import {
+  resolvedModelFromAgentMessageRow,
+  resolvedModelFromUserMessageRow,
+} from "@app/lib/api/assistant/models";
+import { getMessagesReactions } from "@app/lib/api/assistant/reaction";
+import type { Authenticator } from "@app/lib/auth";
+import {
+  MessageModel,
+  UserMessageModel,
+} from "@app/lib/models/agent/conversation";
+import { AgentMCPActionResource } from "@app/lib/resources/agent_mcp_action_resource";
+import { AgentStepContentResource } from "@app/lib/resources/agent_step_content_resource";
+import { ContentFragmentResource } from "@app/lib/resources/content_fragment_resource";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { MentionResource } from "@app/lib/resources/mention_resource";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import type { AgentMCPActionWithOutputType } from "@app/types/actions";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import type {
+  AgentMessageType,
+  CompactionMessageType,
+  LegacyLightMessageType,
+  LightAgentMessageType,
+  LightMessageType,
+  MessageReactionType,
+  MessageType,
+  RichMentionWithStatus,
+  UserMessageType,
+  UserMessageTypeWithoutMentions,
+} from "@app/types/assistant/conversation";
+import {
+  ConversationError,
+  isCompactionMessageType,
+  isUserMessageType,
+} from "@app/types/assistant/conversation";
+import {
+  toMentionType,
+  toRichAgentMentionType,
+  toRichUserMentionType,
+} from "@app/types/assistant/mentions";
+import type { ContentFragmentType } from "@app/types/content_fragment";
+import { isContentFragmentType } from "@app/types/content_fragment";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type { UserType } from "@app/types/user";
+import assert from "assert";
+import type { Transaction } from "sequelize";
+import { Op } from "sequelize";
+
+export function getCompletionDuration(
+  created: number,
+  completedTs: number | null,
+  actions: AgentMCPActionWithOutputType[]
+) {
+  if (!completedTs) {
+    return null;
+  }
+
+  // Assumption: Each action has two phases: wait period, then execution period
+  // Action timeline: [createdAt] ----wait---- [executionStart] ----execute---- [updatedAt]
+  // Where executionStart = updatedAt - executionDurationMs
+  //
+  // Message timeline: [created] ---blank---[action 1] --- blank --- [action 2] --- blank --- [completedTs]
+
+  const waitRanges: Array<{ start: number; end: number }> = actions
+    .filter((a) => a.executionDurationMs !== null)
+    .map((a) => ({
+      start: a.createdAt,
+      end: a.updatedAt - a.executionDurationMs!,
+    }))
+    .filter((r) => r.end > r.start) // Filter out actions with no wait time
+    .sort((a, b) => a.start - b.start);
+
+  if (waitRanges.length === 0) {
+    return completedTs - created;
+  }
+
+  // Merge overlapping wait periods
+  const mergedWaitRanges: Array<{ start: number; end: number }> = [];
+  let currentRange = waitRanges[0];
+
+  for (let i = 1; i < waitRanges.length; i++) {
+    const range = waitRanges[i];
+    if (range.start <= currentRange.end) {
+      // Overlapping or adjacent - merge by extending the end
+      currentRange = {
+        start: currentRange.start,
+        end: Math.max(currentRange.end, range.end),
+      };
+    } else {
+      // Non-overlapping - save current and start new range
+      mergedWaitRanges.push(currentRange);
+      currentRange = range;
+    }
+  }
+  mergedWaitRanges.push(currentRange);
+
+  // Calculate total wait time
+  const totalWaitTimeMs = mergedWaitRanges.reduce(
+    (sum, range) => sum + (range.end - range.start),
+    0
+  );
+
+  return completedTs - created - totalWaitTimeMs;
+}
+
+export function getRichMentionsWithStatusForMessage(
+  messageId: ModelId,
+  mentionRows: MentionResource[],
+  usersById: Map<ModelId, UserType>,
+  agentConfigurationsById: Map<string, LightAgentConfigurationType>
+): RichMentionWithStatus[] {
+  return removeNulls(
+    mentionRows
+      .filter((m) => m.messageId === messageId)
+      .map((m) => {
+        if (m.agentConfigurationId) {
+          const agentConfiguration = agentConfigurationsById.get(
+            m.agentConfigurationId
+          );
+          if (agentConfiguration) {
+            return {
+              ...toRichAgentMentionType(agentConfiguration),
+              status: m.status,
+              dismissed: m.dismissed ?? false,
+            };
+          }
+        } else if (m.userId) {
+          const mentionedUser = usersById.get(m.userId);
+          if (mentionedUser) {
+            return {
+              ...toRichUserMentionType(mentionedUser),
+              status: m.status,
+              dismissed: m.dismissed ?? false,
+            };
+          }
+        } else {
+          throw new Error(
+            "Unreachable: Mention type not supported, it must either be an agent mention or a user mention"
+          );
+        }
+      })
+  );
+}
+
+/**
+ * Render base user message fields from a MessageModel (with userMessage
+ * eager-loaded). No DB calls — uses only data on the models.
+ */
+function renderUserMessage(
+  message: MessageModel,
+  linkedUser: UserType | undefined
+): UserMessageTypeWithoutMentions {
+  if (!message.userMessage) {
+    throw new Error(
+      "Unreachable: renderUserMessage called on non-user message"
+    );
+  }
+  const userMessage = message.userMessage;
+
+  if (linkedUser && linkedUser.id !== userMessage.userId) {
+    throw new Error(
+      `linkedUser.id (${linkedUser.id}) does not match userMessage.userId (${userMessage.userId})`
+    );
+  }
+
+  let username = userMessage.userContextUsername;
+  let fullName = userMessage.userContextFullName;
+  let email = userMessage.userContextEmail;
+  let profilePictureUrl = userMessage.userContextProfilePictureUrl;
+
+  if (userMessage.userId !== null && !userMessage.agenticMessageType) {
+    if (linkedUser) {
+      username = linkedUser.username;
+      fullName = linkedUser.fullName;
+      email = linkedUser.email;
+      profilePictureUrl = linkedUser.image;
+    } else {
+      logger.warn(
+        {
+          messageId: message.sId,
+          userId: userMessage.userId,
+        },
+        "User not found for user message while it should have been fetched before. Falling back to user context."
+      );
+    }
+  }
+
+  return {
+    id: message.id,
+    sId: message.sId,
+    type: "user_message",
+    visibility: message.visibility,
+    version: message.version,
+    rank: message.rank,
+    branchId: null,
+    created: message.createdAt.getTime(),
+    user: linkedUser ?? null,
+    content: userMessage.content,
+    context: {
+      username,
+      timezone: userMessage.userContextTimezone,
+      fullName,
+      email,
+      profilePictureUrl,
+      origin: userMessage.userContextOrigin,
+      clientSideMCPServerIds: userMessage.clientSideMCPServerIds,
+      lastTriggerRunAt:
+        userMessage.userContextLastTriggerRunAt?.getTime() ?? null,
+    },
+    agenticMessageData:
+      userMessage.agenticMessageType && userMessage.agenticOriginMessageId
+        ? {
+            type: userMessage.agenticMessageType,
+            originMessageId: userMessage.agenticOriginMessageId,
+          }
+        : undefined,
+    reactions: [],
+    requestedModel: resolvedModelFromUserMessageRow(userMessage),
+  };
+}
+
+async function batchRenderUserMessages(
+  auth: Authenticator,
+  messages: MessageModel[],
+  mentionsByMessageId?: Map<ModelId, MentionResource[]>
+): Promise<UserMessageType[]> {
+  const userMessages = messages.filter(
+    (m) => m.userMessage !== null && m.userMessage !== undefined
+  );
+
+  if (userMessages.length === 0) {
+    return [];
+  }
+
+  const mentionRows = mentionsByMessageId
+    ? userMessages.flatMap((m) => mentionsByMessageId.get(m.id) ?? [])
+    : await MentionResource.listByMessageModelIds(auth, {
+        messageModelIds: userMessages.map((message) => message.id),
+      });
+
+  const userIds = [
+    ...new Set(
+      removeNulls([
+        ...userMessages.map((m) => m.userMessage?.userId),
+        ...mentionRows.map((m) => m.userId),
+      ])
+    ),
+  ];
+
+  const agentConfigurationIds = [
+    ...new Set(
+      removeNulls([...mentionRows.map((m) => m.agentConfigurationId)])
+    ),
+  ];
+
+  const users =
+    userIds.length > 0 ? await UserResource.fetchByModelIds(userIds) : [];
+  const agentConfigurations =
+    agentConfigurationIds.length > 0
+      ? await getAgentConfigurations(auth, {
+          agentIds: agentConfigurationIds,
+          variant: "extra_light",
+          // Skip permission filtering: we are rendering the mentions of a
+          // conversation the user already has access to. We want to keep
+          // displaying the agents that were mentioned historically even if the
+          // user has since lost access to the space that hosts them, otherwise
+          // those past messages would render without their agent metadata.
+          dangerouslySkipPermissionFiltering: true,
+        })
+      : [];
+  const reactionsByMessageId = await getMessagesReactions(auth, {
+    messageIds: userMessages.map((m) => m.id),
+  });
+
+  const usersById = new Map(users.map((u) => [u.id, u.toJSON()]));
+  const agentConfigurationsById = new Map(
+    agentConfigurations.map((a) => [a.sId, a])
+  );
+
+  return userMessages.map((message) => {
+    const base = renderUserMessage(
+      message,
+      message.userMessage?.userId
+        ? usersById.get(message.userMessage.userId)
+        : undefined
+    );
+
+    const richMentions = getRichMentionsWithStatusForMessage(
+      message.id,
+      mentionRows,
+      usersById,
+      agentConfigurationsById
+    );
+
+    return {
+      ...base,
+      mentions: richMentions.map(toMentionType),
+      richMentions,
+      reactions: reactionsByMessageId[message.id] ?? [],
+    } satisfies UserMessageType;
+  });
+}
+
+type RenderedAgentMessage = AgentMessageType | LightAgentMessageType;
+
+type AgentMessageContentHydration = {
+  stepContents: AgentStepContentResource[];
+  actionsWithOutputContent: AgentMCPActionResource[];
+  actionsWithoutOutputContent: AgentMCPActionResource[];
+};
+
+type FetchAgentMessageContentHydration = (
+  agentMessageModelIds: ModelId[]
+) => Promise<AgentMessageContentHydration>;
+
+async function fetchFullAgentMessageContentHydration(
+  auth: Authenticator,
+  {
+    agentMessageModelIds,
+    messagesWithToolOutputContent,
+    textContentOnly,
+    viewType,
+  }: {
+    agentMessageModelIds: ModelId[];
+    messagesWithToolOutputContent: Set<ModelId> | null;
+    textContentOnly: boolean;
+    viewType: RenderMessageVariant;
+  }
+): Promise<AgentMessageContentHydration> {
+  const stepContents = await AgentStepContentResource.fetchByAgentMessages(
+    auth,
+    {
+      agentMessageIds: agentMessageModelIds,
+      textContentOnly,
+    }
+  );
+  const actions = await AgentMCPActionResource.fetchByStepContents(auth, {
+    stepContents,
+  });
+  const actionsWithOutputContent: AgentMCPActionResource[] = [];
+  const actionsWithoutOutputContent: AgentMCPActionResource[] = [];
+
+  for (const action of actions) {
+    if (
+      viewType === "light" ||
+      (messagesWithToolOutputContent &&
+        !messagesWithToolOutputContent.has(action.agentMessageId))
+    ) {
+      actionsWithoutOutputContent.push(action);
+    } else {
+      actionsWithOutputContent.push(action);
+    }
+  }
+
+  return {
+    stepContents,
+    actionsWithOutputContent,
+    actionsWithoutOutputContent,
+  };
+}
+
+/**
+ * Render user messages without mentions or reactions.
+ * No DB calls beyond the provided transaction — safe to use inside an advisory lock.
+ */
+export async function batchRenderUserMessagesWithoutMentions({
+  messages,
+  transaction,
+}: {
+  messages: MessageModel[];
+  transaction: Transaction;
+}): Promise<UserMessageTypeWithoutMentions[]> {
+  const userMessages = messages.filter(
+    (m) => m.userMessage !== null && m.userMessage !== undefined
+  );
+
+  const userIds = [
+    ...new Set(removeNulls(userMessages.map((m) => m.userMessage?.userId))),
+  ];
+
+  const users =
+    userIds.length > 0
+      ? await UserResource.fetchByModelIds(userIds, { transaction })
+      : [];
+
+  const usersById = new Map(users.map((u) => [u.id, u.toJSON()]));
+
+  return userMessages.map((message) =>
+    renderUserMessage(
+      message,
+      message.userMessage?.userId
+        ? usersById.get(message.userMessage.userId)
+        : undefined
+    )
+  );
+}
+
+export async function batchRenderAgentMessages<V extends RenderMessageVariant>(
+  auth: Authenticator,
+  messages: MessageModel[],
+  viewType: V,
+  messagesWithToolOutputContent: Set<ModelId> | null = null,
+  mentionsByMessageId: Map<ModelId, MentionResource[]>,
+  textContentOnly: boolean = false
+): Promise<
+  Result<
+    V extends "full" ? AgentMessageType[] : LightAgentMessageType[],
+    ConversationError
+  >
+> {
+  return batchRenderAgentMessagesWithContentHydration(
+    auth,
+    messages,
+    viewType,
+    mentionsByMessageId,
+    (agentMessageModelIds) =>
+      fetchFullAgentMessageContentHydration(auth, {
+        agentMessageModelIds,
+        messagesWithToolOutputContent,
+        textContentOnly,
+        viewType,
+      })
+  );
+}
+
+async function renderAgentMessageForCheckpoint(
+  auth: Authenticator,
+  message: MessageModel,
+  mentionsByMessageId: Map<ModelId, MentionResource[]>,
+  {
+    agentMessageModelId,
+    targetStep,
+  }: {
+    agentMessageModelId: ModelId;
+    targetStep: number;
+  }
+): Promise<Result<AgentMessageType, ConversationError>> {
+  const result = await batchRenderAgentMessagesWithContentHydration(
+    auth,
+    [message],
+    "full",
+    mentionsByMessageId,
+    () =>
+      fetchCheckpointAgentMessageContentHydration(auth, {
+        agentMessageModelId,
+        targetStep,
+      })
+  );
+  if (result.isErr()) {
+    return result;
+  }
+
+  const renderedMessage = result.value[0];
+  if (!renderedMessage) {
+    return new Err(new ConversationError("message_not_found"));
+  }
+
+  return new Ok(renderedMessage);
+}
+
+async function batchRenderAgentMessagesWithContentHydration<
+  V extends RenderMessageVariant,
+>(
+  auth: Authenticator,
+  messages: MessageModel[],
+  viewType: V,
+  mentionsByMessageId: Map<ModelId, MentionResource[]>,
+  fetchContentHydration: FetchAgentMessageContentHydration
+): Promise<
+  Result<
+    V extends "full" ? AgentMessageType[] : LightAgentMessageType[],
+    ConversationError
+  >
+> {
+  const agentMessages = messages.filter((m) => !!m.agentMessage);
+
+  if (agentMessages.length === 0) {
+    return new Ok(
+      [] as unknown as V extends "full"
+        ? AgentMessageType[]
+        : LightAgentMessageType[]
+    );
+  }
+
+  const agentMessageModelIds = removeNulls(
+    agentMessages.map((m) => m.agentMessageId ?? null)
+  );
+
+  const mentionRows = agentMessages.flatMap(
+    (message) => mentionsByMessageId.get(message.id) ?? []
+  );
+
+  const userIds = [
+    ...new Set(removeNulls([...mentionRows.map((m) => m.userId)])),
+  ];
+
+  // Get all unique pairs id-version for the agent configurations
+  const agentConfigurationIds = [
+    ...new Set(
+      removeNulls([...mentionRows.map((m) => m.agentConfigurationId)])
+    ),
+    ...agentMessages.reduce((acc, m) => {
+      if (m.agentMessage) {
+        acc.add(m.agentMessage.agentConfigurationId);
+      }
+      return acc;
+    }, new Set<string>()),
+  ];
+
+  const userAndAgentConfigurationTasks: Array<
+    () => Promise<UserResource[] | LightAgentConfigurationType[]>
+  > = [
+    async () =>
+      userIds.length > 0 ? UserResource.fetchByModelIds(userIds) : [],
+    async () =>
+      agentConfigurationIds.length > 0
+        ? getAgentConfigurations(auth, {
+            agentIds: [...agentConfigurationIds],
+            variant: "extra_light",
+            // Skip permission filtering: we are rendering the agents that
+            // produced (or were mentioned in) messages of a conversation the
+            // user already has access to. We want to keep displaying these
+            // agents even if the user has since lost access to the space that
+            // hosts them, otherwise those past messages would render without
+            // their agent metadata.
+            dangerouslySkipPermissionFiltering: true,
+          })
+        : [],
+  ];
+
+  const [users, agentConfigurations] = (await concurrentExecutor(
+    userAndAgentConfigurationTasks,
+    (task): Promise<UserResource[] | LightAgentConfigurationType[]> => task(),
+    { concurrency: 2 }
+  )) as [UserResource[], LightAgentConfigurationType[]];
+
+  const usersById = new Map(users.map((u) => [u.id, u.toJSON()]));
+  const agentConfigurationsById = new Map(
+    agentConfigurations.map((a) => [a.sId, a])
+  );
+
+  const contentHydrationAndReactionTasks: Array<
+    () => Promise<
+      AgentMessageContentHydration | Record<ModelId, MessageReactionType[]>
+    >
+  > = [
+    async () => fetchContentHydration(agentMessageModelIds),
+    async () =>
+      getMessagesReactions(auth, {
+        messageIds: agentMessages.map((m) => m.id),
+      }),
+  ];
+
+  const [contentHydration, reactionsByMessageId] = (await concurrentExecutor(
+    contentHydrationAndReactionTasks,
+    (
+      task
+    ): Promise<
+      AgentMessageContentHydration | Record<ModelId, MessageReactionType[]>
+    > => task(),
+    { concurrency: 2 }
+  )) as [AgentMessageContentHydration, Record<ModelId, MessageReactionType[]>];
+
+  if (!agentConfigurations) {
+    return new Err(
+      new ConversationError("conversation_with_unavailable_agent")
+    );
+  }
+
+  const {
+    actionsWithOutputContent,
+    actionsWithoutOutputContent,
+    stepContents,
+  } = contentHydration;
+
+  const [actionsWithOutputs, actionsWithoutOutputs] = await concurrentExecutor(
+    [
+      async () =>
+        AgentMCPActionResource.enrichActionsWithOutputItems(auth, {
+          actions: actionsWithOutputContent,
+          ignoreContent: false,
+        }),
+      async () =>
+        AgentMCPActionResource.enrichActionsWithOutputItems(auth, {
+          actions: actionsWithoutOutputContent,
+          ignoreContent: true,
+        }),
+    ],
+    (task): Promise<AgentMCPActionWithOutputType[]> => task(),
+    { concurrency: 2 }
+  );
+
+  const actionsByAgentMessageId: Record<
+    number,
+    AgentMCPActionWithOutputType[]
+  > = [...actionsWithOutputs, ...actionsWithoutOutputs].reduce(
+    (acc, a) => {
+      if (!acc[a.agentMessageId]) {
+        acc[a.agentMessageId] = [];
+      }
+      acc[a.agentMessageId].push(a);
+      return acc;
+    },
+    {} as Record<number, AgentMCPActionWithOutputType[]>
+  );
+
+  const stepContentsByMessageId: Record<string, AgentStepContentResource[]> =
+    stepContents.reduce(
+      (acc, sc) => {
+        if (!acc[sc.agentMessageId]) {
+          acc[sc.agentMessageId] = [];
+        }
+        acc[sc.agentMessageId].push(sc);
+        return acc;
+      },
+      {} as Record<string, AgentStepContentResource[]>
+    );
+
+  // Create maps for efficient lookups
+  const messagesById = new Map(messages.map((m) => [m.id, m]));
+  const allMessagesById = new Map(messagesById);
+  const handoverOriginMessagesBySId = new Map<
+    string,
+    Pick<MessageModel, "sId">
+  >(messages.map((m) => [m.sId, m]));
+  const missingParentIds = [
+    ...new Set(
+      removeNulls(
+        agentMessages.map((message) => {
+          if (!message.parentId || messagesById.has(message.parentId)) {
+            return null;
+          }
+
+          return message.parentId;
+        })
+      )
+    ),
+  ];
+
+  if (missingParentIds.length > 0) {
+    const parentMessages = await MessageModel.findAll({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        id: { [Op.in]: missingParentIds },
+      },
+      include: [
+        {
+          model: UserMessageModel,
+          as: "userMessage",
+          required: true,
+        },
+      ],
+    });
+
+    for (const parentMessage of parentMessages) {
+      allMessagesById.set(parentMessage.id, parentMessage);
+    }
+  }
+
+  // Preload handover origin messages so renderSingleAgentMessage can stay
+  // purely focused on rendering and avoid per-message DB lookups.
+  const missingHandoverOriginMessageIds = new Set<string>();
+
+  for (const agentMessage of agentMessages) {
+    if (!agentMessage.parentId) {
+      continue;
+    }
+
+    const parentMessage = allMessagesById.get(agentMessage.parentId);
+    const parentUserMessage = parentMessage?.userMessage;
+
+    if (
+      parentUserMessage?.agenticMessageType === "agent_handover" &&
+      parentUserMessage.agenticOriginMessageId &&
+      !handoverOriginMessagesBySId.has(parentUserMessage.agenticOriginMessageId)
+    ) {
+      missingHandoverOriginMessageIds.add(
+        parentUserMessage.agenticOriginMessageId
+      );
+    }
+  }
+
+  if (missingHandoverOriginMessageIds.size > 0) {
+    const handoverOriginMessages = await MessageModel.findAll({
+      attributes: ["sId"],
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        conversationId: {
+          [Op.in]: [
+            ...new Set(agentMessages.map((message) => message.conversationId)),
+          ],
+        },
+        sId: {
+          [Op.in]: [...missingHandoverOriginMessageIds],
+        },
+      },
+    });
+
+    for (const handoverOriginMessage of handoverOriginMessages) {
+      handoverOriginMessagesBySId.set(
+        handoverOriginMessage.sId,
+        handoverOriginMessage
+      );
+    }
+  }
+  // Sub-agent cost credits are only aggregated when rendering a single agent
+  // message (e.g. the single-message endpoint), never in bulk conversation
+  // rendering, to avoid fanning out into an N+1 of recursive queries.
+  const subAgentCostCredits =
+    agentMessages.length === 1
+      ? await ConversationResource.sumSubAgentCostCreditsByMessageId(auth, {
+          agentMessageId: agentMessages[0].sId,
+        })
+      : null;
+
+  const renderedMessages: Array<
+    Result<RenderedAgentMessage, ConversationError>
+  > = [];
+
+  for (const message of agentMessages) {
+    renderedMessages.push(
+      await renderSingleAgentMessage(message, {
+        actionsByAgentMessageId,
+        agentConfigurations,
+        agentConfigurationsById,
+        allMessagesById,
+        auth,
+        handoverOriginMessagesBySId,
+        mentionsByMessageId,
+        reactionsByMessageId,
+        stepContentsByMessageId,
+        subAgentCostCredits,
+        usersById,
+        viewType,
+      })
+    );
+  }
+
+  const errors = renderedMessages.filter((m): m is Err<ConversationError> =>
+    m.isErr()
+  );
+  if (errors.length > 0) {
+    return errors[0];
+  }
+
+  return new Ok(
+    removeNulls(
+      renderedMessages.map((m) => (m.isOk() ? m.value : null))
+    ) as V extends "full" ? AgentMessageType[] : LightAgentMessageType[]
+  );
+}
+
+type RenderSingleAgentMessageContext = {
+  actionsByAgentMessageId: Record<number, AgentMCPActionWithOutputType[]>;
+  agentConfigurations: LightAgentConfigurationType[];
+  agentConfigurationsById: Map<string, LightAgentConfigurationType>;
+  allMessagesById: Map<ModelId, MessageModel>;
+  auth: Authenticator;
+  handoverOriginMessagesBySId: Map<string, Pick<MessageModel, "sId">>;
+  mentionsByMessageId: Map<ModelId, MentionResource[]>;
+  reactionsByMessageId: Record<ModelId, MessageReactionType[]>;
+  stepContentsByMessageId: Record<string, AgentStepContentResource[]>;
+  subAgentCostCredits: number | null;
+  usersById: Map<ModelId, UserType>;
+  viewType: RenderMessageVariant;
+};
+
+async function renderSingleAgentMessage(
+  message: MessageModel,
+  {
+    actionsByAgentMessageId,
+    agentConfigurations,
+    agentConfigurationsById,
+    allMessagesById,
+    auth,
+    handoverOriginMessagesBySId,
+    mentionsByMessageId,
+    reactionsByMessageId,
+    stepContentsByMessageId,
+    subAgentCostCredits,
+    usersById,
+    viewType,
+  }: RenderSingleAgentMessageContext
+): Promise<Result<RenderedAgentMessage, ConversationError>> {
+  if (!message.agentMessage) {
+    throw new Error(
+      "Unreachable: batchRenderAgentMessages has been filtered on agent message"
+    );
+  }
+  const agentMessage = message.agentMessage;
+
+  const actions = (actionsByAgentMessageId[agentMessage.id] ?? []).sort(
+    (a, b) => a.step - b.step
+  );
+
+  const agentConfiguration = agentConfigurationsById.get(
+    agentMessage.agentConfigurationId
+  );
+  if (!agentConfiguration) {
+    logger.error(
+      {
+        workspaceId: auth.getNonNullableWorkspace().sId,
+        messageId: message.sId,
+        agentMessageId: agentMessage.id,
+        agentConfigurationId: agentMessage.agentConfigurationId,
+        agentConfigurations,
+      },
+      "Conversation with unavailable agents"
+    );
+
+    return new Err(
+      new ConversationError("conversation_with_unavailable_agent")
+    );
+  }
+
+  let error: {
+    code: string;
+    message: string;
+    metadata: Record<string, string | number | boolean> | null;
+  } | null = null;
+
+  if (agentMessage.errorCode !== null && agentMessage.errorMessage !== null) {
+    error = {
+      code: agentMessage.errorCode,
+      message: agentMessage.errorMessage,
+      metadata: agentMessage.errorMetadata,
+    };
+  }
+
+  const agentStepContents =
+    stepContentsByMessageId[agentMessage.id]
+      ?.sort((a, b) => a.step - b.step || a.index - b.index)
+      .map((sc) => ({
+        step: sc.step,
+        content: sc.value,
+      })) ?? [];
+
+  // Single source of truth for the body, chain of thought, and activity steps:
+  // the body/steps boundary rule lives in `renderAgentMessageContentView` only. The
+  // terminal streaming events derive their display state from the same function.
+  const { content, chainOfThought, activitySteps } =
+    await renderAgentMessageContentView(
+      agentStepContents,
+      actions,
+      agentConfiguration,
+      message.sId
+    );
+
+  assert(message.parentId !== null, "Agent message must have a parentId.");
+
+  const parentMessage = allMessagesById.get(message.parentId) ?? null;
+
+  if (!parentMessage) {
+    logger.error(
+      {
+        workspaceId: auth.getNonNullableWorkspace().sId,
+        messageId: message.sId,
+        agentMessageId: agentMessage.id,
+      },
+      "Couldn't find parent message for agent message."
+    );
+  }
+
+  assert(!!parentMessage, "Parent message must be found.");
+  const userMessage = parentMessage.userMessage;
+  assert(!!userMessage, "Parent message must be a userMessage.");
+
+  let parentAgentMessage: Pick<MessageModel, "sId"> | null = null;
+
+  if (
+    userMessage.agenticMessageType === "agent_handover" &&
+    userMessage.agenticOriginMessageId
+  ) {
+    parentAgentMessage =
+      handoverOriginMessagesBySId.get(userMessage.agenticOriginMessageId) ??
+      null;
+  }
+
+  const richMentions = getRichMentionsWithStatusForMessage(
+    message.id,
+    mentionsByMessageId.get(message.id) ?? [],
+    usersById,
+    agentConfigurationsById
+  );
+
+  const created = message.createdAt.getTime();
+  const completedTs = agentMessage.completedAt?.getTime() ?? null;
+  const renderedMessage = {
+    id: message.id,
+    agentMessageId: agentMessage.id,
+    sId: message.sId,
+    created,
+    completedTs,
+    type: "agent_message" as const,
+    visibility: message.visibility,
+    version: message.version,
+    rank: message.rank,
+    branchId: null,
+    parentMessageId: parentMessage.sId,
+    parentAgentMessageId: parentAgentMessage?.sId ?? null,
+    status: agentMessage.status,
+    actions,
+    content,
+    chainOfThought,
+    contents: agentStepContents,
+    error,
+    configuration: agentConfiguration,
+    skipToolsValidation: agentMessage.skipToolsValidation,
+    modelInteractionDurationMs: agentMessage.modelInteractionDurationMs,
+    richMentions,
+    completionDurationMs: getCompletionDuration(created, completedTs, actions),
+    reactions: reactionsByMessageId[message.id] ?? [],
+    prunedContext: agentMessage.prunedContext ?? false,
+    costCredits: agentMessage.costCredits ?? null,
+    // Aggregated only when rendering a single agent message (see
+    // batchRenderAgentMessages), so it is `null` for bulk conversation rendering.
+    subAgentCostCredits,
+    resolvedModel: resolvedModelFromAgentMessageRow(agentMessage),
+    modelResolutionMethod: agentMessage.modelResolutionMethod,
+  } satisfies AgentMessageType;
+
+  if (viewType === "full") {
+    return new Ok(renderedMessage);
+  }
+
+  return new Ok({
+    ...getLightAgentMessageFromAgentMessage(renderedMessage),
+    activitySteps,
+  });
+}
+
+async function batchRenderContentFragment(
+  auth: Authenticator,
+  conversationId: string,
+  messages: MessageModel[]
+): Promise<ContentFragmentType[]> {
+  return ContentFragmentResource.batchRenderFromMessages(auth, {
+    conversationId,
+    messages,
+  });
+}
+
+async function batchRenderCompactionMessages(
+  _auth: Authenticator,
+  messages: MessageModel[]
+): Promise<CompactionMessageType[]> {
+  const compactionMessages = messages.filter((m) => !!m.compactionMessage);
+
+  return compactionMessages.map((m) => {
+    if (!m.compactionMessage) {
+      throw new Error(
+        "Unreachable: batchRenderCompactionMessages has been filtered on compaction message"
+      );
+    }
+    const compactionMessage = m.compactionMessage;
+    return {
+      type: "compaction_message" as const,
+      id: m.id,
+      compactionMessageId: compactionMessage.id,
+      sId: m.sId,
+      created: m.createdAt.getTime(),
+      visibility: m.visibility,
+      version: m.version,
+      rank: m.rank,
+      branchId: null,
+      status: compactionMessage.status,
+      content: compactionMessage.content,
+      ...(compactionMessage.sourceConversationId
+        ? { sourceConversationId: compactionMessage.sourceConversationId }
+        : {}),
+    };
+  });
+}
+
+type RenderMessageVariant = "legacy-light" | "full" | "light";
+
+export async function batchRenderMessages<V extends RenderMessageVariant>(
+  auth: Authenticator,
+  conversation: ConversationResource,
+  messages: MessageModel[],
+  viewType: V,
+  messagesWithToolOutputContent: Set<ModelId> | null = null,
+  textContentOnly: boolean = false
+): Promise<
+  Result<
+    V extends "full"
+      ? MessageType[]
+      : V extends "legacy-light"
+        ? LegacyLightMessageType[]
+        : V extends "light"
+          ? LightMessageType[]
+          : never,
+    ConversationError
+  >
+> {
+  const mentionsByMessageId = await fetchMentionsByMessageId(auth, messages);
+  const userMessages = await batchRenderUserMessages(
+    auth,
+    messages,
+    mentionsByMessageId
+  );
+  const agentMessagesRes = await batchRenderAgentMessages(
+    auth,
+    messages,
+    viewType,
+    messagesWithToolOutputContent,
+    mentionsByMessageId,
+    textContentOnly
+  );
+
+  if (agentMessagesRes.isErr()) {
+    return agentMessagesRes;
+  }
+
+  const agentMessages = agentMessagesRes.value;
+  const contentFragments = await batchRenderContentFragment(
+    auth,
+    conversation.sId,
+    messages
+  );
+  const compactionMessages = await batchRenderCompactionMessages(
+    auth,
+    messages
+  );
+
+  let renderedMessages = [
+    ...userMessages,
+    ...agentMessages,
+    ...contentFragments,
+    ...compactionMessages,
+  ].sort((a, b) => a.rank - b.rank || a.version - b.version);
+
+  if (viewType === "light") {
+    // We need to attach the content fragments to the user messages.
+    const output: LightMessageType[] = [];
+    let tempContentFragments: ContentFragmentType[] = [];
+
+    renderedMessages.forEach((message) => {
+      if (isContentFragmentType(message)) {
+        tempContentFragments.push(message); // Collect content fragments.
+      } else {
+        // let messageWithContentFragments: UserMessageTypeWithContentFragments;
+        if (isUserMessageType(message)) {
+          // Attach collected content fragments to the user message.
+          const messageWithContentFragments = {
+            ...message,
+            contentFragments: tempContentFragments,
+          };
+          tempContentFragments = []; // Reset the collected content fragments.
+
+          // Start a new group for user messages.
+          output.push(messageWithContentFragments);
+        } else if (message.type === "agent_message") {
+          // I know this is safe because we are in the light view.
+          output.push(message as LightAgentMessageType);
+        } else if (isCompactionMessageType(message)) {
+          output.push(message);
+        } else {
+          assertNever(message);
+        }
+      }
+    });
+
+    renderedMessages = output;
+  }
+
+  return new Ok(
+    renderedMessages as V extends "full"
+      ? MessageType[]
+      : V extends "legacy-light"
+        ? LegacyLightMessageType[]
+        : V extends "light"
+          ? LightMessageType[]
+          : never
+  );
+}
+
+export async function renderMessagesForCheckpoint(
+  auth: Authenticator,
+  messages: MessageModel[],
+  {
+    agentMessageId,
+    targetStep,
+    userMessageId,
+  }: {
+    agentMessageId: string;
+    targetStep: number;
+    userMessageId: string;
+  }
+): Promise<
+  Result<
+    { agentMessage: AgentMessageType; userMessage: UserMessageType },
+    ConversationError
+  >
+> {
+  const agentMessage = messages.find(
+    (message) =>
+      message.sId === agentMessageId &&
+      message.agentMessageId !== null &&
+      message.agentMessage !== null &&
+      message.agentMessage !== undefined
+  );
+  if (!agentMessage || agentMessage.agentMessageId === null) {
+    return new Err(new ConversationError("message_not_found"));
+  }
+  const userMessage = messages.find(
+    (message) =>
+      message.sId === userMessageId &&
+      message.userMessage !== null &&
+      message.userMessage !== undefined
+  );
+  if (!userMessage) {
+    return new Err(new ConversationError("message_not_found"));
+  }
+
+  const mentionsByMessageId = await fetchMentionsByMessageId(auth, messages);
+  const userMessages = await batchRenderUserMessages(
+    auth,
+    [userMessage],
+    mentionsByMessageId
+  );
+  const agentMessageResult = await renderAgentMessageForCheckpoint(
+    auth,
+    agentMessage,
+    mentionsByMessageId,
+    { agentMessageModelId: agentMessage.agentMessageId, targetStep }
+  );
+  if (agentMessageResult.isErr()) {
+    return agentMessageResult;
+  }
+
+  const renderedUserMessage = userMessages[0];
+  if (!renderedUserMessage) {
+    return new Err(new ConversationError("message_not_found"));
+  }
+
+  return new Ok({
+    agentMessage: agentMessageResult.value,
+    userMessage: renderedUserMessage,
+  });
+}
+
+async function fetchMentionsByMessageId(
+  auth: Authenticator,
+  messages: MessageModel[]
+): Promise<Map<ModelId, MentionResource[]>> {
+  const mentionsByMessageId = new Map<ModelId, MentionResource[]>();
+  const mentionableMessageIds = messages
+    .filter((message) => message.userMessage || message.agentMessage)
+    .map((message) => message.id);
+
+  if (mentionableMessageIds.length === 0) {
+    return mentionsByMessageId;
+  }
+
+  const mentionRows = await MentionResource.listByMessageModelIds(auth, {
+    messageModelIds: mentionableMessageIds,
+  });
+
+  for (const mentionRow of mentionRows) {
+    const messageMentions = mentionsByMessageId.get(mentionRow.messageId) ?? [];
+    messageMentions.push(mentionRow);
+    mentionsByMessageId.set(mentionRow.messageId, messageMentions);
+  }
+
+  return mentionsByMessageId;
+}
+
+type MessageVariant = "legacy-light" | "light";
+
+export async function fetchConversationMessages<V extends MessageVariant>(
+  auth: Authenticator,
+  {
+    conversationId,
+    limit,
+    lastRank,
+    viewType,
+  }: {
+    conversationId: string;
+    limit: number;
+    lastRank: number | null;
+    viewType: V;
+  }
+): Promise<
+  Result<
+    {
+      hasMore: boolean;
+      lastValue: number | null;
+      messages: V extends "legacy-light"
+        ? LegacyLightMessageType[]
+        : V extends "light"
+          ? LightMessageType[]
+          : never;
+    },
+    Error
+  >
+> {
+  const owner = auth.workspace();
+  if (!owner) {
+    return new Err(new Error("Unexpected `auth` without `workspace`."));
+  }
+
+  const conversation = await ConversationResource.fetchById(
+    auth,
+    conversationId
+  );
+
+  if (!conversation) {
+    return new Err(new ConversationError("conversation_not_found"));
+  }
+
+  const { hasMore, messages } = await conversation.fetchMessagesForPage(auth, {
+    limit,
+    lastRank,
+  });
+
+  const renderedMessagesRes = await batchRenderMessages(
+    auth,
+    conversation,
+    messages,
+    viewType
+  );
+
+  if (renderedMessagesRes.isErr()) {
+    return renderedMessagesRes;
+  }
+
+  const renderedMessages = renderedMessagesRes.value;
+
+  return new Ok({
+    hasMore,
+    lastValue: renderedMessages.at(0)?.rank ?? null,
+    messages: renderedMessages as V extends "legacy-light"
+      ? LegacyLightMessageType[]
+      : V extends "light"
+        ? LightMessageType[]
+        : never,
+  });
+}

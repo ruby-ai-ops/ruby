@@ -1,0 +1,612 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import {
+  MAX_PENDING_INSTRUCTIONS_SUGGESTIONS,
+  MAX_PENDING_KNOWLEDGE_SUGGESTIONS,
+  MAX_PENDING_SKILLS_SUGGESTIONS,
+  MAX_PENDING_SUB_AGENT_SUGGESTIONS,
+  MAX_PENDING_TOOLS_SUGGESTIONS,
+} from "@app/lib/api/actions/servers/agent_sidekick_context/constants";
+import {
+  DESCRIBE_MCP_TOOL_NAME,
+  DESCRIBE_SKILL_TOOL_NAME,
+} from "@app/lib/reinforcement/types";
+import { MODEL_IDS } from "@app/types/assistant/models/models";
+import { ORDERED_REASONING_EFFORTS } from "@app/types/assistant/models/reasoning";
+import {
+  AGENT_SUGGESTION_KINDS,
+  AGENT_SUGGESTION_STATES,
+  INSTRUCTIONS_ROOT_TARGET_BLOCK_ID,
+} from "@app/types/suggestions/agent_suggestion";
+import { z } from "zod";
+
+export const AGENT_SIDEKICK_CONTEXT_TOOL_NAME =
+  "agent_sidekick_context" as const;
+
+// Knowledge categories relevant for agent builder (excluding apps, actions, triggers)
+const KNOWLEDGE_CATEGORIES = ["managed", "folder", "website"] as const;
+
+// Suggestion tool schemas
+
+export const InstructionsSuggestionSchema = z.object({
+  analysis: z
+    .string()
+    .optional()
+    .describe("Analysis or reasoning for this specific suggestion"),
+  content: z
+    .string()
+    .describe(
+      "The full HTML content for this block, including the tag (e.g., '<p>New text</p>' or '<h2>Section Title</h2>')"
+    ),
+  targetBlockId: z
+    .string()
+    .describe("The data-block-id of the block to modify (e.g., '7f3a2b1c')"),
+  type: z
+    .enum(["replace"])
+    .describe("The type of modification to perform on the target block"),
+});
+
+export const ToolsSuggestionSchema = z.object({
+  action: z.enum(["add", "remove"]).describe("The action to perform"),
+  toolId: z.string().describe("The tool/server identifier"),
+});
+
+export const SkillsSuggestionSchema = z.object({
+  action: z.enum(["add", "remove"]).describe("The action to perform"),
+  skillId: z.string().describe("The skill identifier"),
+});
+
+const KNOWLEDGE_SUGGESTION_METHODS_METADATA = [
+  "search",
+  "query_tables",
+] as const;
+
+const KnowledgeSuggestionSchema = z.object({
+  action: z.enum(["add", "remove"]).describe("The action to perform"),
+  method: z
+    .enum(KNOWLEDGE_SUGGESTION_METHODS_METADATA)
+    .optional()
+    .default("search")
+    .describe(
+      "The knowledge access method. Defaults to 'search' (recommended). " +
+        "Use 'query_tables' ONLY for sources you have confirmed contain " +
+        "top-level structured tables."
+    ),
+  dataSourceViewId: z
+    .string()
+    .describe(
+      "The string id of the data source view to add or remove as knowledge (can be found from the search_knowledge results)"
+    ),
+  nodeIds: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Optional node IDs to scope the knowledge to specific documents within the data source view. Omit to add the whole data source."
+    ),
+  description: z
+    .string()
+    .optional()
+    .describe(
+      "A clear description of what content and information is available in these data sources. " +
+        "This description will be shown to the agent's LLM to help it decide when to search this data. " +
+        "Be specific about the type of content, topics, or purpose (e.g., 'Engineering documentation, " +
+        "code repositories, and technical discussions' or 'Customer support tickets and product feedback')."
+    ),
+});
+
+const ModelSuggestionSchema = z.object({
+  modelId: z.enum(MODEL_IDS).describe("The model ID to suggest"),
+  reasoningEffort: z
+    .enum(ORDERED_REASONING_EFFORTS)
+    .optional()
+    .describe("Optional reasoning effort level"),
+});
+
+export const AGENT_SIDEKICK_CONTEXT_TOOLS_METADATA = [
+  {
+    name: "get_available_models",
+    description:
+      "Get the list of available models. Can optionally filter by provider.",
+    schema: {
+      providerId: z
+        .string()
+        .optional()
+        .describe(
+          "Optional provider ID to filter models (e.g., 'openai', 'anthropic', 'google_ai_studio', 'mistral')"
+        ),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing available models",
+      done: "List available models",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "get_available_skills",
+    description:
+      "Get the list of available skills that can be added to agents. Returns skills accessible to the current user across all spaces they have access to.",
+    schema: {},
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing available skills",
+      done: "List available skills",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "get_available_tools",
+    description:
+      "Get the list of available tools (MCP servers) that can be added to agents. Returns tools accessible to the current user.",
+    schema: {},
+    stake: "never_ask",
+    eager: true,
+    displayLabels: {
+      running: "Listing available tools",
+      done: "List available tools",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: DESCRIBE_MCP_TOOL_NAME,
+    description:
+      "Get detailed information about a specific MCP server: its description, and each tool's name, description, and input parameters.",
+    schema: {
+      mcpId: z.string().describe("The sId of the MCP server to describe"),
+    },
+    stake: "never_ask",
+    eager: true,
+    displayLabels: {
+      running: "Describing MCP server",
+      done: "Describe MCP server",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: DESCRIBE_SKILL_TOOL_NAME,
+    description:
+      "Get detailed information about a skill: its name, description, instructions, and configured tools.",
+    schema: {
+      skillId: z.string().describe("The sId of the skill to describe"),
+    },
+    stake: "never_ask",
+    eager: true,
+    displayLabels: {
+      running: "Describing skill",
+      done: "Describe skill",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "get_available_agents",
+    description:
+      "Get the list of available agents that can be used as sub-agents. Returns active agents accessible to the current user, excluding global agents.",
+    schema: {
+      limit: z
+        .number()
+        .optional()
+        .default(100)
+        .describe("Maximum number of agents to return (default: 100)"),
+      agentPrefix: z
+        .string()
+        .optional()
+        .describe(
+          "Optional prefix to filter agents by name (case-insensitive, matches start of name)"
+        ),
+    },
+    stake: "never_ask",
+    eager: true,
+    displayLabels: {
+      running: "Listing available agents",
+      done: "List available agents",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "inspect_available_agent",
+    description:
+      "Get detailed information about a specific agent by its ID. Returns the agent's name, description, prompt/instructions, list of tool IDs, and list of skill IDs.",
+    schema: {
+      agentId: z.string().describe("The agent ID (sId) to inspect"),
+    },
+    stake: "never_ask",
+    eager: true,
+    displayLabels: {
+      running: "Inspecting agent",
+      done: "Inspect agent",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "get_agent_feedback",
+    description: "Get user feedback for the agent.",
+    schema: {
+      limit: z
+        .number()
+        .optional()
+        .default(50)
+        .describe("Maximum number of feedback items to return (default: 50)"),
+      filter: z
+        .enum(["active", "all"])
+        .optional()
+        .default("active")
+        .describe(
+          "Filter type: 'active' for non-dismissed feedback only (default), 'all' for all feedback"
+        ),
+      latestVersionOnly: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          "When true (default), only return feedback for the latest version of the agent. When false, return feedback for all versions."
+        ),
+    },
+    stake: "never_ask",
+    eager: true,
+    displayLabels: {
+      running: "Listing agent feedback",
+      done: "List agent feedback",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "get_agent_insights",
+    description:
+      "Get insight and analytics data for the agent, including the number of active users, " +
+      "the conversation and message counts, and the feedback statistics.",
+    schema: {
+      days: z
+        .number()
+        .optional()
+        .default(30)
+        .describe("Number of days to include in the analysis (default: 30)"),
+    },
+    stake: "never_ask",
+    eager: true,
+    displayLabels: {
+      running: "Listing agent insights",
+      done: "List agent insights",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  // Suggestion tools
+  {
+    name: "suggest_prompt_edits",
+    description:
+      "Create suggestions to modify the agent's instructions/prompt using block-based targeting. " +
+      "The instructions HTML contains blocks with data-block-id attributes (e.g., 'a3f1b20e'). " +
+      "Each suggestion targets a specific block by its ID and provides the full replacement HTML for that block. " +
+      `Each block ID must appear at most once. For full rewrites, use targetBlockId '${INSTRUCTIONS_ROOT_TARGET_BLOCK_ID}'. ` +
+      "Word-level diffs will be computed and displayed inline. " +
+      `There can't be more than ${MAX_PENDING_INSTRUCTIONS_SUGGESTIONS} pending prompt edits suggestions. ` +
+      "IMPORTANT: Include the tool output verbatim in your response - it renders as interactive card(s).",
+    schema: {
+      suggestions: z
+        .array(InstructionsSuggestionSchema)
+        .describe(
+          "Array of block modifications. Each targets a block by its data-block-id and provides new content. Each suggestion can have its own analysis."
+        ),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Suggesting prompt edits",
+      done: "Suggest prompt edits",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "suggest_tools",
+    description:
+      "Suggest adding or removing tools from the agent's configuration. " +
+      "This tool does not support sub_agent suggestions - use `suggest_sub_agent` instead for that purpose. " +
+      "If a pending suggestion for the same tool already exists, it will be automatically marked as outdated. " +
+      `There can't be more than ${MAX_PENDING_TOOLS_SUGGESTIONS} pending tools suggestions. ` +
+      "IMPORTANT: Include the tool output verbatim in your response - it renders as interactive card(s).",
+    schema: {
+      suggestions: z
+        .array(
+          ToolsSuggestionSchema.extend({
+            analysis: z
+              .string()
+              .optional()
+              .describe("Analysis or reasoning for this specific suggestion"),
+          })
+        )
+        .describe(
+          "Array of tool additions and/or deletions to suggest. Each tool ID must appear at most once."
+        ),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Suggesting tools",
+      done: "Suggest tools",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "suggest_sub_agent",
+    description:
+      "Suggest adding or removing a sub-agent from the agent's configuration. A sub-agent allows the main agent to delegate tasks to a child agent. " +
+      "If a pending suggestion for the same sub-agent already exists, it will be automatically marked as outdated. " +
+      `There can't be more than ${MAX_PENDING_SUB_AGENT_SUGGESTIONS} pending sub-agents suggestions. ` +
+      "IMPORTANT: Include the tool output verbatim in your response - it renders as interactive card.",
+    schema: {
+      action: z
+        .enum(["add", "remove"])
+        .describe(
+          "The action to perform: 'add' to add the sub-agent, 'remove' to remove it"
+        ),
+      subAgentId: z
+        .string()
+        .describe("The sId of the agent to add or remove as a sub-agent"),
+      analysis: z
+        .string()
+        .optional()
+        .describe("Analysis or reasoning for the suggestion"),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Suggesting sub-agent",
+      done: "Suggest sub-agent",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "suggest_skills",
+    description:
+      "Suggest adding or removing skills from the agent's configuration. " +
+      "If a pending suggestion for the same skill already exists, it will be automatically marked as outdated. " +
+      `There can't be more than ${MAX_PENDING_SKILLS_SUGGESTIONS} pending skills suggestions. ` +
+      "IMPORTANT: Include the tool output verbatim in your response - it renders as interactive card(s).",
+    schema: {
+      suggestions: z
+        .array(
+          SkillsSuggestionSchema.extend({
+            analysis: z
+              .string()
+              .optional()
+              .describe("Analysis or reasoning for this specific suggestion"),
+          })
+        )
+        .describe(
+          "Array of skill additions and/or deletions to suggest. Each skill ID must appear at most once."
+        ),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Suggesting skills",
+      done: "Suggest skills",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "suggest_model",
+    description:
+      "Suggest changing the agent's LLM model configuration. IMPORTANT: Include the tool output verbatim in your response - it renders as interactive card.",
+    schema: {
+      suggestion: ModelSuggestionSchema.describe(
+        "The model configuration to suggest"
+      ),
+      analysis: z
+        .string()
+        .optional()
+        .describe("Analysis or reasoning for the suggestion"),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Suggesting model",
+      done: "Suggest model",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "search_knowledge",
+    description:
+      "Browse or search workspace knowledge sources. " +
+      "Without a query: lists all available data source views. " +
+      "With a query: semantically searches and returns matching data source views with individual document nodes.",
+    schema: {
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "Natural language query describing the knowledge needed. Omit to list all available sources."
+        ),
+      topK: z
+        .number()
+        .int()
+        .positive()
+        .max(10)
+        .optional()
+        .default(5)
+        .describe(
+          "Maximum number of document hits to retrieve per data source (default: 5, only applies when query is provided)"
+        ),
+      category: z
+        .enum(KNOWLEDGE_CATEGORIES)
+        .optional()
+        .describe(
+          "Optional category to filter results: 'managed' (connected platforms), 'folder', or 'website'."
+        ),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Searching knowledge sources",
+      done: "Search knowledge sources",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "suggest_knowledge",
+    description:
+      "Suggest adding or removing knowledge. Get sources from \`search_knowledge\` (call without a query to list all); each source has a knowledgeMethod field — use that as the method here. " +
+      "method 'search': semantic search over documents, folders, websites. method 'query_tables': SQL over Snowflake/BigQuery warehouses. " +
+      "If a pending suggestion for the same data source already exists, it will be automatically marked as outdated. " +
+      `There can't be more than ${MAX_PENDING_KNOWLEDGE_SUGGESTIONS} pending knowledge suggestions. ` +
+      "IMPORTANT: Include the tool output verbatim in your response - it renders as interactive card.",
+    schema: {
+      suggestion: KnowledgeSuggestionSchema.describe(
+        "The knowledge source addition or deletion to suggest"
+      ),
+      analysis: z
+        .string()
+        .optional()
+        .describe("Analysis or reasoning for the suggestion"),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Suggesting knowledge",
+      done: "Suggest knowledge",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "list_suggestions",
+    description:
+      "List existing suggestions for the agent's configuration changes.",
+    schema: {
+      states: z
+        .array(z.enum(AGENT_SUGGESTION_STATES))
+        .optional()
+        .describe(
+          `Filter by suggestion states. Options: ${AGENT_SUGGESTION_STATES.join(", ")}. If not provided, returns all states.`
+        ),
+      kind: z
+        .enum(AGENT_SUGGESTION_KINDS)
+        .optional()
+        .describe(
+          `Filter by suggestion type. Options: ${AGENT_SUGGESTION_KINDS.join(", ")}. If not provided, returns all types.`
+        ),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(50)
+        .describe(
+          "Maximum number of suggestions to return. Results are ordered by creation date (most recent first). If not provided, returns all matching suggestions."
+        ),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing suggestions",
+      done: "List suggestions",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "update_suggestions_state",
+    description:
+      "Update the state of one or more suggestions. Use this to reject or mark suggestions as outdated.",
+    schema: {
+      suggestions: z
+        .array(
+          z.object({
+            suggestionId: z
+              .string()
+              .describe("The sId of the suggestion to update"),
+            state: z
+              .enum(["rejected", "outdated"])
+              .describe(
+                "The new state for the suggestion: 'rejected' or 'outdated'."
+              ),
+          })
+        )
+        .describe("Array of suggestions to update with their new states"),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Updating suggestion state",
+      done: "Update suggestion state",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "inspect_conversation",
+    description:
+      "Inspect a conversation to get its shape and summary. Returns the conversation title, " +
+      "a timeline of messages with user messages (content and mentions) and agent messages " +
+      "(actions taken, handoffs, status), useful for understanding what happened in a conversation.",
+    schema: {
+      conversationId: z.string().describe("The conversation to inspect"),
+      fromMessageIndex: z
+        .number()
+        .int()
+        .optional()
+        .describe("Start timeline from this message index (0-based)"),
+      toMessageIndex: z
+        .number()
+        .int()
+        .optional()
+        .describe("End timeline at this message index (0-based, exclusive)"),
+    },
+    stake: "never_ask",
+    eager: true,
+    displayLabels: {
+      running: "Inspecting conversation",
+      done: "Inspect conversation",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+  {
+    name: "inspect_message",
+    description:
+      "Inspect a specific message in a conversation. Returns detailed information about " +
+      "a user message (content, mentions, context, content fragments) or an agent message " +
+      "(actions with inputs/outputs, status, errors, chain of thought, handoffs).",
+    schema: {
+      conversationId: z.string().describe("The conversation ID"),
+      messageId: z.string().describe("The ID of the message to inspect"),
+    },
+    eager: true,
+    stake: "never_ask",
+    displayLabels: {
+      running: "Inspecting message",
+      done: "Inspect message",
+    },
+    toolCostCategory: "basic",
+    freeUsage: true,
+  },
+] as const;
+
+export const AGENT_SIDEKICK_CONTEXT_SERVER = {
+  serverInfo: {
+    name: "agent_sidekick_context",
+    version: "1.0.0",
+    description:
+      "Retrieve context about available models, skills, tools, and agent-specific feedback and insights. Create and manage suggestions for agent configuration changes.",
+    authorization: null,
+    icon: "ActionRobotIcon",
+    documentationUrl: null,
+  },
+  tools: AGENT_SIDEKICK_CONTEXT_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

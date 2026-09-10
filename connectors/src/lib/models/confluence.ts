@@ -1,0 +1,253 @@
+import { connectorsSequelize } from "@connectors/resources/storage";
+import {
+  DANGEROUSLY_UNBOUNDED_TEXT,
+  DataTypes,
+} from "@connectors/resources/storage/data_types";
+import { ConnectorBaseModel } from "@connectors/resources/storage/wrappers/model_with_connectors";
+import type { CreationOptional } from "sequelize";
+
+export class ConfluenceConfigurationModel extends ConnectorBaseModel<ConfluenceConfigurationModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare cloudId: string;
+  declare url: string;
+  declare userAccountId: string;
+}
+ConfluenceConfigurationModel.init(
+  {
+    cloudId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    url: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    userAccountId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+  },
+  {
+    sequelize: connectorsSequelize,
+    modelName: "confluence_configurations",
+    indexes: [
+      { fields: ["connectorId"], unique: true },
+      { fields: ["userAccountId"] },
+    ],
+    relationship: "hasOne",
+  }
+);
+
+// ConfluenceSpace stores the global spaces selected by the user to sync.
+export class ConfluenceSpaceModel extends ConnectorBaseModel<ConfluenceSpaceModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+  declare deletedAt: Date | null;
+
+  declare name: string;
+  declare spaceId: string;
+  declare urlSuffix?: string;
+}
+ConfluenceSpaceModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    name: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    spaceId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    urlSuffix: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    deletedAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+  },
+  {
+    sequelize: connectorsSequelize,
+    modelName: "confluence_spaces",
+    indexes: [{ fields: ["connectorId", "spaceId"], unique: true }],
+  }
+);
+
+// ConfluencePages stores the pages.
+export class ConfluencePageModel extends ConnectorBaseModel<ConfluencePageModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+  declare lastVisitedAt: CreationOptional<Date>;
+
+  declare externalUrl: string;
+  declare pageId: string;
+  declare parentId: string | null;
+  declare parentType: "page" | "folder" | null;
+  declare skipReason: string | null;
+  declare spaceId: string;
+  declare title: string;
+  declare version: number;
+}
+ConfluencePageModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    lastVisitedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    version: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+    },
+    skipReason: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    parentId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    parentType: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    pageId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    spaceId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    title: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: false,
+    },
+    externalUrl: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+  },
+  {
+    sequelize: connectorsSequelize,
+    indexes: [
+      { fields: ["connectorId", "pageId"], unique: true },
+      { fields: ["connectorId", "spaceId", "parentId"] },
+      { fields: ["connectorId", "lastVisitedAt"] },
+    ],
+    modelName: "confluence_pages",
+  }
+);
+
+export class ConfluenceFolderModel extends ConnectorBaseModel<ConfluenceFolderModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare lastVisitedAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare externalUrl: string;
+  declare folderId: string;
+  declare parentId: string | null;
+  declare parentType: "page" | "folder" | null;
+  declare skipReason: string | null;
+  declare spaceId: string;
+  declare title: string;
+  declare version: number;
+}
+
+ConfluenceFolderModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    lastVisitedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    version: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+    },
+    skipReason: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    parentId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    parentType: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    folderId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    spaceId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    title: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: false,
+    },
+    externalUrl: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+  },
+  {
+    sequelize: connectorsSequelize,
+    indexes: [
+      { fields: ["connectorId", "folderId"], unique: true },
+      { fields: ["connectorId", "spaceId", "parentId"] },
+      { fields: ["connectorId", "lastVisitedAt"] },
+    ],
+    modelName: "confluence_folders",
+  }
+);

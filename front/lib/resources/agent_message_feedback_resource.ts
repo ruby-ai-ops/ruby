@@ -1,0 +1,694 @@
+import type { AgentMessageFeedbackDirection } from "@app/lib/api/assistant/conversation/feedbacks";
+import type { PaginationParams } from "@app/lib/api/pagination";
+import type { Authenticator } from "@app/lib/auth";
+import { AgentConfigurationModel } from "@app/lib/models/agent/agent";
+import {
+  AgentMessageFeedbackModel,
+  AgentMessageModel,
+  ConversationModel,
+  MessageModel,
+} from "@app/lib/models/agent/conversation";
+import { BaseResource } from "@app/lib/resources/base_resource";
+import type { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { getFrontReplicaDbConnection } from "@app/lib/resources/storage";
+
+import type { UserModel } from "@app/lib/resources/storage/models/user";
+import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
+import { getResourceIdFromSId, makeSId } from "@app/lib/resources/string_ids";
+import { UserResource } from "@app/lib/resources/user_resource";
+import type {
+  AgentConfigurationType,
+  LightAgentConfigurationType,
+} from "@app/types/assistant/agent";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
+import type {
+  AgentMessageType,
+  ConversationWithoutContentType,
+  MessageType,
+} from "@app/types/assistant/conversation";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import type { UserType, WorkspaceType } from "@app/types/user";
+import type {
+  Attributes,
+  CreationAttributes,
+  ModelStatic,
+  Transaction,
+  WhereOptions,
+} from "sequelize";
+import { Op, QueryTypes } from "sequelize";
+
+export type AgentFeedbackDayPoint = {
+  day: Date;
+  positive: number;
+  negative: number;
+};
+
+// Attributes are marked as read-only to reflect the stateless nature of our Resource.
+// This design will be moved up to BaseResource once we transition away from Sequelize.
+
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface AgentMessageFeedbackResource
+  extends ReadonlyAttributesType<AgentMessageFeedbackModel> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class AgentMessageFeedbackResource extends BaseResource<AgentMessageFeedbackModel> {
+  static model: ModelStatic<AgentMessageFeedbackModel> =
+    AgentMessageFeedbackModel;
+
+  readonly user?: Attributes<UserModel>;
+
+  readonly _conversationId?: string; // conversationId is already taken via the Sequelize model (it's the FK).
+  readonly _messageId?: string;
+
+  constructor(
+    _: ModelStatic<AgentMessageFeedbackModel>,
+    blob: Attributes<AgentMessageFeedbackModel>,
+    {
+      messageId,
+      user,
+      conversationId,
+    }: {
+      messageId?: string;
+      user?: Attributes<UserModel>;
+      conversationId?: string;
+    } = {}
+  ) {
+    super(AgentMessageFeedbackModel, blob);
+
+    this._conversationId = conversationId;
+    this._messageId = messageId;
+    this.user = user;
+  }
+
+  get sId(): string {
+    return AgentMessageFeedbackResource.modelIdToSId({
+      id: this.id,
+      workspaceId: this.workspaceId,
+    });
+  }
+
+  static modelIdToSId({
+    id,
+    workspaceId,
+  }: {
+    id: ModelId;
+    workspaceId: ModelId;
+  }): string {
+    return makeSId("agent_message_feedback", {
+      id,
+      workspaceId,
+    });
+  }
+
+  static async makeNew(
+    blob: CreationAttributes<AgentMessageFeedbackModel>
+  ): Promise<AgentMessageFeedbackResource> {
+    const agentMessageFeedback = await this.model.create({
+      ...blob,
+    });
+
+    return new this(this.model, agentMessageFeedback.get());
+  }
+
+  async delete(
+    auth: Authenticator,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<Result<undefined, Error>> {
+    await this.model.destroy({
+      where: {
+        id: this.id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      transaction,
+    });
+    return new Ok(undefined);
+  }
+
+  async updateFields(
+    blob: Partial<
+      Pick<
+        AgentMessageFeedbackModel,
+        "content" | "thumbDirection" | "isConversationShared"
+      >
+    >
+  ) {
+    return this.update({
+      content: blob.content,
+      thumbDirection: blob.thumbDirection,
+      isConversationShared: blob.isConversationShared,
+    });
+  }
+
+  async dismiss() {
+    return this.update({ dismissed: true });
+  }
+
+  async undismiss() {
+    return this.update({ dismissed: false });
+  }
+
+  static async fetchById(
+    auth: Authenticator,
+    {
+      feedbackId,
+      agentConfigurationId,
+    }: {
+      feedbackId: string;
+      agentConfigurationId?: string;
+    }
+  ): Promise<AgentMessageFeedbackResource | null> {
+    const resourceId = getResourceIdFromSId(feedbackId);
+    if (!resourceId) {
+      return null;
+    }
+
+    const where: WhereOptions<AgentMessageFeedbackModel> = {
+      id: resourceId,
+      workspaceId: auth.getNonNullableWorkspace().id,
+    };
+
+    if (agentConfigurationId) {
+      where.agentConfigurationId = agentConfigurationId;
+    }
+
+    const feedback = await this.model.findOne({ where });
+
+    if (!feedback) {
+      return null;
+    }
+
+    return new this(this.model, feedback.get());
+  }
+
+  static async getAgentConfigurationFeedbacksByDescVersion({
+    workspace,
+    agentConfiguration,
+    paginationParams,
+    filter = "active",
+    version,
+    days,
+  }: {
+    workspace: WorkspaceType;
+    agentConfiguration: LightAgentConfigurationType;
+    paginationParams: PaginationParams;
+    filter?: "active" | "all";
+    version?: number;
+    days?: number;
+  }) {
+    const where: WhereOptions<AgentMessageFeedbackModel> = {
+      // Safety check: global models share ids across workspaces and some have had feedbacks.
+      workspaceId: workspace.id,
+      agentConfigurationId: agentConfiguration.sId,
+    };
+
+    if (version !== undefined) {
+      where.agentConfigurationVersion = version;
+    }
+
+    if (days !== undefined) {
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - days);
+      where.createdAt = { [Op.gte]: cutoffDate };
+    }
+
+    if (filter === "active") {
+      where.dismissed = false;
+    }
+
+    if (paginationParams.lastValue) {
+      const op = paginationParams.orderDirection === "desc" ? Op.lt : Op.gt;
+      where[paginationParams.orderColumn as any] = {
+        [op]: paginationParams.lastValue,
+      };
+    }
+
+    const feedbackRows = await this.model.findAll({
+      where,
+      include: [
+        {
+          model: UserResource.model,
+          as: "user",
+          attributes: ["name", "imageUrl", "email"],
+        },
+      ],
+      order: [
+        // Necessary because a feedback can be given at any time on a  message linked to an old version.
+        ["agentConfigurationVersion", "DESC"],
+        [
+          paginationParams.orderColumn,
+          paginationParams.orderDirection === "desc" ? "DESC" : "ASC",
+        ],
+      ],
+      limit: paginationParams.limit,
+    });
+
+    if (feedbackRows.length === 0) {
+      return [];
+    }
+
+    // Fetch conversation sIds and message sIds in separate queries.
+    const conversations = await ConversationModel.findAll({
+      attributes: ["id", "sId"],
+      where: {
+        workspaceId: workspace.id,
+        id: feedbackRows.map((f) => f.conversationId),
+      },
+    });
+    const conversationIdByModelId = new Map(
+      conversations.map((c) => [c.id, c.sId])
+    );
+
+    const agentMessageIds = feedbackRows.map((f) => f.agentMessageId);
+    const messages = await MessageModel.findAll({
+      attributes: ["sId", "agentMessageId"],
+      where: {
+        agentMessageId: agentMessageIds,
+        workspaceId: workspace.id,
+      },
+    });
+    const messageIdByAgentMessageId = new Map(
+      messages.map((m) => [m.agentMessageId, m.sId])
+    );
+
+    return feedbackRows.map((feedback) => {
+      return new this(this.model, feedback.get(), {
+        user: feedback.user,
+        conversationId: conversationIdByModelId.get(feedback.conversationId),
+        messageId: messageIdByAgentMessageId.get(feedback.agentMessageId),
+      });
+    });
+  }
+
+  static async getFeedbackUsageDataForWorkspace({
+    startDate,
+    endDate,
+    workspace,
+    transaction,
+  }: {
+    startDate: Date;
+    endDate: Date;
+    workspace: WorkspaceType;
+    transaction?: Transaction;
+  }) {
+    const feedbackRows = await this.model.findAll({
+      where: {
+        // IMPORTANT: Necessary for global models who share ids across workspaces.
+        workspaceId: workspace.id,
+        createdAt: {
+          [Op.and]: [{ [Op.lt]: endDate }, { [Op.gte]: startDate }],
+        },
+      },
+      include: [
+        {
+          model: UserResource.model,
+          as: "user",
+          attributes: ["sId", "name", "email"],
+        },
+      ],
+      order: [["id", "ASC"]],
+      transaction,
+    });
+
+    if (feedbackRows.length === 0) {
+      return [];
+    }
+
+    const conversations = await ConversationModel.findAll({
+      attributes: ["id", "sId"],
+      where: {
+        workspaceId: workspace.id,
+        id: feedbackRows.map((f) => f.conversationId),
+      },
+      transaction,
+    });
+    const conversationIdByModelId = new Map(
+      conversations.map((c) => [c.id, c.sId])
+    );
+
+    return feedbackRows.map((feedback) => {
+      return new this(this.model, feedback.get(), {
+        user: feedback.user ?? undefined,
+        conversationId: conversationIdByModelId.get(feedback.conversationId),
+      });
+    });
+  }
+
+  static async getFeedbackCountForAssistants(
+    auth: Authenticator,
+    agentConfigurationIds: string[],
+    daysOld?: number
+  ) {
+    const dateMinusXDays = new Date();
+    if (daysOld) {
+      dateMinusXDays.setDate(dateMinusXDays.getDate() - daysOld);
+    }
+    const workspace = auth.getNonNullableWorkspace();
+    const feedbackCount = await this.model.findAndCountAll({
+      attributes: ["agentConfigurationId", "thumbDirection"],
+      where: {
+        workspaceId: workspace.id,
+        agentConfigurationId: agentConfigurationIds,
+        ...(daysOld ? { createdAt: { [Op.gt]: dateMinusXDays } } : {}),
+      },
+      group: ["agentConfigurationId", "thumbDirection"],
+    });
+
+    return feedbackCount.count as {
+      thumbDirection: AgentMessageFeedbackDirection;
+      agentConfigurationId: string;
+      count: number;
+    }[];
+  }
+
+  static async getFeedbackCountForAssistant(
+    auth: Authenticator,
+    agentConfigurationId: string,
+    daysOld?: number
+  ): Promise<{ positive: number; negative: number }> {
+    const feedbackCounts = await this.getFeedbackCountForAssistants(
+      auth,
+      [agentConfigurationId],
+      daysOld
+    );
+
+    const positive = feedbackCounts
+      .filter((f) => f.thumbDirection === "up")
+      .reduce((sum, f) => sum + f.count, 0);
+
+    const negative = feedbackCounts
+      .filter((f) => f.thumbDirection === "down")
+      .reduce((sum, f) => sum + f.count, 0);
+
+    return { positive, negative };
+  }
+
+  /**
+   * Returns feedback counts grouped by conversationId for the given
+   * conversation model IDs.
+   */
+  static async getFeedbackCountsByConversationIds(
+    auth: Authenticator,
+    conversationIds: ModelId[]
+  ): Promise<Map<ModelId, number>> {
+    const workspace = auth.getNonNullableWorkspace();
+
+    const rows = await this.model.findAll({
+      attributes: [
+        "conversationId",
+        [
+          AgentMessageFeedbackModel.sequelize!.fn(
+            "COUNT",
+            AgentMessageFeedbackModel.sequelize!.col("id")
+          ),
+          "count",
+        ],
+      ],
+      where: {
+        workspaceId: workspace.id,
+        conversationId: { [Op.in]: conversationIds },
+      },
+      group: ["conversationId"],
+    });
+
+    const result = new Map<ModelId, number>();
+    for (const row of rows) {
+      result.set(row.conversationId, parseInt(row.get("count") as string, 10));
+    }
+    return result;
+  }
+
+  static async getConversationFeedbacksForUser(
+    auth: Authenticator,
+    conversation: ConversationWithoutContentType | ConversationResource
+  ) {
+    const user = auth.getNonNullableUser();
+
+    const feedbackRows = await this.model.findAll({
+      where: {
+        userId: user.id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+        conversationId: conversation.id,
+      },
+    });
+
+    if (feedbackRows.length === 0) {
+      return [];
+    }
+
+    // Fetch message sIds in a separate query.
+    const agentMessageIds = feedbackRows.map((f) => f.agentMessageId);
+    const messages = await MessageModel.findAll({
+      attributes: ["sId", "agentMessageId"],
+      where: {
+        agentMessageId: agentMessageIds,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+    const messageIdByAgentMessageId = new Map(
+      messages.map((m) => [m.agentMessageId, m.sId])
+    );
+
+    return feedbackRows.map((feedback) => {
+      const messageId = messageIdByAgentMessageId.get(feedback.agentMessageId);
+      return new this(this.model, feedback.get(), {
+        messageId,
+      });
+    });
+  }
+
+  static async getFeedbackWithConversationContext({
+    auth,
+    messageId,
+    conversation,
+    user,
+  }: {
+    auth: Authenticator;
+    messageId: string;
+    conversation: ConversationWithoutContentType;
+    user: UserType;
+  }): Promise<
+    Result<
+      {
+        message: Pick<MessageType, "id" | "sId">;
+        agentMessage: Pick<AgentMessageType, "id"> & {
+          agentConfigurationId: string;
+          agentConfigurationVersion: number;
+        };
+        feedback: AgentMessageFeedbackResource | null;
+        agentConfiguration: Pick<
+          AgentConfigurationType,
+          "id" | "sId" | "version"
+        >;
+        isGlobalAgent: boolean;
+      },
+      Error
+    >
+  > {
+    const message = await MessageModel.findOne({
+      attributes: ["id", "sId"],
+      where: {
+        sId: messageId,
+        conversationId: conversation.id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      include: [
+        {
+          model: AgentMessageModel,
+          as: "agentMessage",
+          attributes: [
+            "id",
+            "agentConfigurationId",
+            "agentConfigurationVersion",
+          ],
+        },
+      ],
+    });
+
+    if (!message || !message.agentMessage) {
+      return new Err(
+        new Error("Message not found or not associated with an agent message")
+      );
+    }
+
+    if (!message.agentMessage) {
+      return new Err(new Error("Agent message not found"));
+    }
+
+    const agentMessageFeedback = await this.model.findOne({
+      where: {
+        userId: user.id,
+        agentMessageId: message.agentMessage.id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+    const agentMessageFeedbackResource = agentMessageFeedback
+      ? new this(this.model, agentMessageFeedback.get())
+      : null;
+
+    const isGlobalAgent = Object.values(GLOBAL_AGENTS_SID).includes(
+      message.agentMessage.agentConfigurationId as GLOBAL_AGENTS_SID
+    );
+
+    if (isGlobalAgent) {
+      return new Ok({
+        message: {
+          id: message.id,
+          sId: message.sId,
+        },
+        agentMessage: {
+          id: message.agentMessage.id,
+          agentConfigurationId: message.agentMessage.agentConfigurationId,
+          agentConfigurationVersion:
+            message.agentMessage.agentConfigurationVersion,
+        },
+        feedback: agentMessageFeedbackResource,
+        agentConfiguration: {
+          id: -1,
+          sId: message.agentMessage.agentConfigurationId,
+          version: message.agentMessage.agentConfigurationVersion,
+        },
+        isGlobalAgent: true,
+      });
+    }
+
+    const agentConfiguration = await AgentConfigurationModel.findOne({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        sId: message.agentMessage.agentConfigurationId,
+      },
+      attributes: ["id", "sId", "version"],
+    });
+
+    if (!agentConfiguration) {
+      return new Err(new Error("Agent configuration not found"));
+    }
+
+    return new Ok({
+      message: {
+        id: message.id,
+        sId: message.sId,
+      },
+      agentMessage: {
+        id: message.agentMessage.id,
+        agentConfigurationId: message.agentMessage.agentConfigurationId,
+        agentConfigurationVersion:
+          message.agentMessage.agentConfigurationVersion,
+      },
+      feedback: agentMessageFeedbackResource,
+      agentConfiguration: {
+        id: agentConfiguration.id,
+        sId: agentConfiguration.sId,
+        version: agentConfiguration.version,
+      },
+      isGlobalAgent,
+    });
+  }
+
+  static async listByConversationModelId(
+    auth: Authenticator,
+    conversationModelId: ModelId
+  ): Promise<AgentMessageFeedbackResource[]> {
+    const workspace = auth.getNonNullableWorkspace();
+
+    const feedbacks = await this.model.findAll({
+      where: {
+        conversationId: conversationModelId,
+        workspaceId: workspace.id,
+      },
+      order: [["createdAt", "ASC"]],
+    });
+
+    return feedbacks.map((feedback) => new this(this.model, feedback.get()));
+  }
+
+  static async listByAgentMessageModelId(
+    auth: Authenticator,
+    agentMessageId: ModelId
+  ): Promise<AgentMessageFeedbackResource[]> {
+    const workspace = auth.getNonNullableWorkspace();
+
+    const feedbacks = await this.model.findAll({
+      where: {
+        agentMessageId,
+        workspaceId: workspace.id,
+      },
+      order: [["createdAt", "ASC"]],
+    });
+
+    return feedbacks.map((feedback) => {
+      return new this(this.model, feedback.get());
+    });
+  }
+
+  static async getFeedbackDistributionForAssistantByDay(
+    auth: Authenticator,
+    agentConfigurationId: string,
+    days: number
+  ): Promise<AgentFeedbackDayPoint[]> {
+    const workspace = auth.getNonNullableWorkspace();
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - days);
+
+    const replicaDb = getFrontReplicaDbConnection();
+
+    // biome-ignore lint/plugin/noRawSql: Aggregation query with GROUP BY day
+    const rows = await replicaDb.query<{
+      day: string;
+      positive: string;
+      negative: string;
+    }>(
+      `
+      SELECT
+        "createdAt"::date AS day,
+        COUNT(*) FILTER (WHERE "thumbDirection" = 'up') AS positive,
+        COUNT(*) FILTER (WHERE "thumbDirection" = 'down') AS negative
+      FROM agent_message_feedbacks
+      WHERE "workspaceId" = :workspaceId
+        AND "agentConfigurationId" = :agentConfigurationId
+        AND "createdAt" >= :cutoffDate
+      GROUP BY 1
+      ORDER BY 1 ASC
+      `,
+      {
+        replacements: {
+          workspaceId: workspace.id,
+          agentConfigurationId,
+          cutoffDate: cutoffDate.toISOString(),
+        },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    return rows.map((row) => ({
+      day: new Date(row.day),
+      positive: parseInt(row.positive, 10),
+      negative: parseInt(row.negative, 10),
+    }));
+  }
+
+  toJSON() {
+    return {
+      id: this.id,
+      sId: this.sId,
+      messageId: this._messageId,
+      agentMessageId: this.agentMessageId,
+      userId: this.userId,
+      thumbDirection: this.thumbDirection,
+      content: this.content ? this.content.replace(/\r?\n/g, "\\n") : null,
+      isConversationShared: this.isConversationShared,
+      dismissed: this.dismissed,
+      createdAt: this.createdAt,
+      agentConfigurationId: this.agentConfigurationId,
+      agentConfigurationVersion: this.agentConfigurationVersion,
+      conversationId: this._conversationId,
+      ...(this.user
+        ? {
+            userName: this.user.name,
+            userEmail: this.user.email,
+            userImageUrl: this.user.imageUrl,
+          }
+        : {}),
+    };
+  }
+}

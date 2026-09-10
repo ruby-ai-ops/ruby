@@ -1,0 +1,408 @@
+use ruby::utils;
+
+use ruby::oauth::tests::utils::{do_api_call, do_failing_api_call, HttpMethod};
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Deserialize, Debug)]
+struct ConnectionExpectedResponse {
+    connection_id: String,
+    created: u64,
+    provider: String,
+    status: String,
+    metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+#[tokio::test]
+async fn test_oauth_connexion_flow_success() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "mock",
+        "metadata": {
+            "use_case": "connection",
+            "workspace_id": "PjlCyKnRu2",
+            "user_id": "5dz5IMaoLW"
+        }
+    });
+    let api_response = do_api_call(create_url, HttpMethod::POST, &create_body).await;
+
+    assert_eq!(api_response.error.is_none(), true);
+
+    let connection: ConnectionExpectedResponse = serde_json::from_value(
+        api_response
+            .response
+            .unwrap()
+            .get("connection")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+
+    // check that created is within the last 2 seconds of now
+    assert_eq!(
+        connection.created > (utils::now() - 2000) && connection.created < utils::now(),
+        true
+    );
+
+    assert_eq!(connection.connection_id.starts_with("con_"), true);
+    assert_eq!(connection.connection_id.len(), 79);
+
+    assert_eq!(connection.provider, "mock");
+    assert_eq!(connection.status, "pending");
+    assert_eq!(connection.metadata.get("use_case").unwrap(), "connection");
+    assert_eq!(
+        connection.metadata.get("workspace_id").unwrap(),
+        "PjlCyKnRu2"
+    );
+    assert_eq!(connection.metadata.get("user_id").unwrap(), "5dz5IMaoLW");
+
+    // Now finalize the connection
+
+    let finalize_url = format!("/connections/{}/finalize", connection.connection_id);
+    let finalize_body = json!({
+        "provider": "mock",
+        "code": "54079555",
+        "redirect_uri": "http://localhost:3000/oauth/mock/finalize"
+    });
+    let finalize_api_response = do_api_call(finalize_url, HttpMethod::POST, &finalize_body).await;
+
+    assert_eq!(finalize_api_response.error.is_none(), true);
+
+    let finalized_connection: ConnectionExpectedResponse = serde_json::from_value(
+        finalize_api_response
+            .response
+            .unwrap()
+            .get("connection")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+
+    // Check that id, provider, created as well as all metadata didn't change
+    assert_eq!(finalized_connection.connection_id, connection.connection_id);
+    assert_eq!(finalized_connection.provider, connection.provider);
+    assert_eq!(finalized_connection.created, connection.created);
+    assert_eq!(finalized_connection.metadata, connection.metadata);
+
+    // Check that the status is now "finalized"
+    assert_eq!(finalized_connection.status, "finalized");
+
+    // Now get the access token
+    let access_token_url = format!("/connections/{}/access_token", connection.connection_id);
+    let access_token_body = json!({
+        "provider": "mock"
+    });
+    let access_token_api_response =
+        do_api_call(access_token_url, HttpMethod::POST, &access_token_body).await;
+
+    // Check that the response contains the access token
+    assert_eq!(access_token_api_response.error.is_none(), true);
+    assert_eq!(
+        access_token_api_response
+            .response
+            .unwrap()
+            .get("access_token")
+            .unwrap(),
+        "mock_access_token"
+    );
+}
+
+#[tokio::test]
+async fn test_oauth_connexion_flow_invalid_provider() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "invalid_provider",
+        "metadata": {
+            "use_case": "connection",
+            "workspace_id": "PjlCyKnRu2",
+            "user_id": "5dz5IMaoLW"
+        }
+    });
+
+    do_failing_api_call(create_url, HttpMethod::POST, &create_body).await;
+}
+
+#[tokio::test]
+async fn test_oauth_connexion_flow_switching_provider() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "mock",
+        "metadata": {
+            "use_case": "connection",
+            "workspace_id": "PjlCyKnRu2",
+            "user_id": "5dz5IMaoLW"
+        }
+    });
+
+    let api_response = do_api_call(create_url, HttpMethod::POST, &create_body).await;
+
+    assert_eq!(api_response.error.is_none(), true);
+
+    let connection: ConnectionExpectedResponse = serde_json::from_value(
+        api_response
+            .response
+            .unwrap()
+            .get("connection")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+
+    // Now finalize the connection
+
+    let finalize_url = format!("/connections/{}/finalize", connection.connection_id);
+    let finalize_body = json!({
+        "provider": "slack",
+        "code": "54079555",
+        "redirect_uri": "http://localhost:3000/oauth/mock/finalize"
+    });
+
+    do_failing_api_call(finalize_url, HttpMethod::POST, &finalize_body).await;
+}
+
+#[tokio::test]
+async fn test_slack_connection_auto_creates_system_credential() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "slack",
+        "metadata": {
+            "use_case": "connection",
+            "workspace_id": "W123TEST",
+            "user_id": "U456TEST"
+        }
+    });
+
+    let api_response = do_api_call(create_url, HttpMethod::POST, &create_body).await;
+
+    assert!(
+        api_response.error.is_none(),
+        "Expected no error creating Slack connection"
+    );
+
+    let connection: ConnectionExpectedResponse = serde_json::from_value(
+        api_response
+            .response
+            .unwrap()
+            .get("connection")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+
+    assert_eq!(connection.provider, "slack");
+    assert_eq!(connection.status, "pending");
+    assert_eq!(connection.metadata.get("use_case").unwrap(), "connection");
+    assert_eq!(connection.metadata.get("workspace_id").unwrap(), "W123TEST");
+    assert_eq!(connection.metadata.get("user_id").unwrap(), "U456TEST");
+}
+
+#[tokio::test]
+async fn test_slack_bot_use_case_does_not_create_credential() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "slack",
+        "metadata": {
+            "use_case": "bot",
+            "workspace_id": "W123TEST",
+            "user_id": "U456TEST"
+        }
+    });
+
+    let api_response = do_api_call(create_url, HttpMethod::POST, &create_body).await;
+
+    assert!(
+        api_response.error.is_none(),
+        "Expected no error creating Slack bot connection"
+    );
+
+    let connection: ConnectionExpectedResponse = serde_json::from_value(
+        api_response
+            .response
+            .unwrap()
+            .get("connection")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+
+    assert_eq!(connection.provider, "slack");
+    assert_eq!(connection.metadata.get("use_case").unwrap(), "bot");
+}
+
+#[tokio::test]
+async fn test_slack_connection_with_custom_credential() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "slack",
+        "metadata": {
+            "use_case": "connection",
+            "workspace_id": "W123TEST",
+            "user_id": "U456TEST"
+        },
+        "related_credential": {
+            "metadata": {
+                "workspace_id": "W123TEST",
+                "user_id": "U456TEST"
+            },
+            "content": {
+                "client_id": "custom_slack_client_id",
+                "client_secret": "custom_slack_client_secret"
+            }
+        }
+    });
+
+    let api_response = do_api_call(create_url, HttpMethod::POST, &create_body).await;
+
+    assert!(
+        api_response.error.is_none(),
+        "Expected no error creating Slack connection with custom credential"
+    );
+
+    let connection: ConnectionExpectedResponse = serde_json::from_value(
+        api_response
+            .response
+            .unwrap()
+            .get("connection")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+
+    assert_eq!(connection.provider, "slack");
+    assert_eq!(connection.status, "pending");
+    assert_eq!(connection.metadata.get("use_case").unwrap(), "connection");
+}
+
+#[tokio::test]
+async fn test_mcp_metadata_update_persists_static_ip_flag_as_string() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "mcp",
+        "metadata": {
+            "client_id": "client",
+            "token_endpoint": "https://api.example.com/oauth/token",
+            "authorization_endpoint": "https://api.example.com/oauth/authorize",
+            "code_challenge": "challenge",
+            "code_verifier": "verifier"
+        }
+    });
+    let api_response = do_api_call(create_url, HttpMethod::POST, &create_body).await;
+    let connection: ConnectionExpectedResponse = serde_json::from_value(
+        api_response
+            .response
+            .expect("create response should have a response body")
+            .get("connection")
+            .expect("create response should include connection")
+            .clone(),
+    )
+    .expect("connection response should deserialize");
+
+    let update_url = format!("/connections/{}/metadata", connection.connection_id);
+    let update_body = json!({
+        "use_static_ip_proxy": true
+    });
+    let update_response = do_api_call(update_url, HttpMethod::PATCH, &update_body).await;
+
+    assert!(update_response.error.is_none());
+
+    let updated_connection: ConnectionExpectedResponse = serde_json::from_value(
+        update_response
+            .response
+            .expect("update response should have a response body")
+            .get("connection")
+            .expect("update response should include connection")
+            .clone(),
+    )
+    .expect("connection response should deserialize");
+
+    assert_eq!(updated_connection.connection_id, connection.connection_id);
+    assert_eq!(updated_connection.provider, "mcp");
+    assert_eq!(
+        updated_connection
+            .metadata
+            .get("use_static_ip_proxy")
+            .expect("metadata should include use_static_ip_proxy"),
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_static_metadata_update_is_allowed() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "mcp_static",
+        "metadata": {
+            "client_id": "client",
+            "token_endpoint": "https://api.example.com/oauth/token",
+            "authorization_endpoint": "https://api.example.com/oauth/authorize",
+            "code_challenge": "challenge",
+            "code_verifier": "verifier"
+        }
+    });
+    let api_response = do_api_call(create_url, HttpMethod::POST, &create_body).await;
+    let connection: ConnectionExpectedResponse = serde_json::from_value(
+        api_response
+            .response
+            .expect("create response should have a response body")
+            .get("connection")
+            .expect("create response should include connection")
+            .clone(),
+    )
+    .expect("connection response should deserialize");
+
+    let update_url = format!("/connections/{}/metadata", connection.connection_id);
+    let update_body = json!({
+        "use_static_ip_proxy": false
+    });
+    let update_response = do_api_call(update_url, HttpMethod::PATCH, &update_body).await;
+
+    assert!(update_response.error.is_none());
+
+    let updated_connection: ConnectionExpectedResponse = serde_json::from_value(
+        update_response
+            .response
+            .expect("update response should have a response body")
+            .get("connection")
+            .expect("update response should include connection")
+            .clone(),
+    )
+    .expect("connection response should deserialize");
+
+    assert_eq!(
+        updated_connection
+            .metadata
+            .get("use_static_ip_proxy")
+            .expect("metadata should include use_static_ip_proxy"),
+        "false"
+    );
+}
+
+#[tokio::test]
+async fn test_metadata_update_rejects_non_mcp_provider() {
+    let create_url = "/connections".to_string();
+    let create_body = json!({
+        "provider": "mock",
+        "metadata": {
+            "use_case": "connection",
+            "workspace_id": "PjlCyKnRu2",
+            "user_id": "5dz5IMaoLW"
+        }
+    });
+    let api_response = do_api_call(create_url, HttpMethod::POST, &create_body).await;
+    let connection: ConnectionExpectedResponse = serde_json::from_value(
+        api_response
+            .response
+            .expect("create response should have a response body")
+            .get("connection")
+            .expect("create response should include connection")
+            .clone(),
+    )
+    .expect("connection response should deserialize");
+
+    let update_url = format!("/connections/{}/metadata", connection.connection_id);
+    let update_body = json!({
+        "use_static_ip_proxy": true
+    });
+
+    do_failing_api_call(update_url, HttpMethod::PATCH, &update_body).await;
+}

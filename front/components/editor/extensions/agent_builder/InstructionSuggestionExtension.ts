@@ -1,0 +1,900 @@
+import { BLOCK_ID_ATTRIBUTE } from "@app/components/editor/extensions/instructions/BlockIdExtension";
+import { INSTRUCTIONS_ROOT_NODE_NAME } from "@app/components/editor/extensions/instructions/InstructionsRootExtension";
+import { INSTRUCTIONS_ROOT_TARGET_BLOCK_ID } from "@app/types/suggestions/agent_suggestion";
+import { Extension } from "@tiptap/core";
+import type { Node as PMNode, Schema, Slice } from "@tiptap/pm/model";
+import {
+  DOMSerializer,
+  Fragment,
+  DOMParser as PMDOMParser,
+} from "@tiptap/pm/model";
+import type { EditorState } from "@tiptap/pm/state";
+import { Plugin, PluginKey } from "@tiptap/pm/state";
+import { Transform } from "@tiptap/pm/transform";
+import { Decoration, DecorationSet } from "@tiptap/pm/view";
+import { ChangeSet } from "prosemirror-changeset";
+
+// A single block operation within a suggestion.
+interface BlockOperation {
+  targetBlockId: string;
+  newContent: string; // HTML content.
+}
+
+// A stored suggestion with its operations.
+interface StoredSuggestion {
+  id: string;
+  operations: BlockOperation[];
+}
+
+interface PluginState {
+  suggestions: Map<string, StoredSuggestion>;
+  highlightedId: string | null;
+  decorations: DecorationSet;
+}
+
+// Change range from diffing old vs new content.
+export interface BlockChange {
+  fromA: number; // Range in old content.
+  toA: number;
+  fromB: number; // Range in new content.
+  toB: number;
+}
+
+const pluginKey = new PluginKey<PluginState>("suggestionPlugin");
+
+export const SUGGESTION_ID_ATTRIBUTE = "data-suggestion-id";
+
+const CLASSES = {
+  remove:
+    "suggestion-deletion rounded line-through bg-warning-100 text-warning-800 cursor-default",
+  removeDimmed:
+    "suggestion-deletion rounded line-through bg-warning-50 text-muted-foreground cursor-default",
+  add: "suggestion-addition rounded bg-highlight-100 text-highlight-800 cursor-default",
+  addDimmed:
+    "suggestion-addition rounded bg-highlight-50 text-muted-foreground cursor-default",
+  blockHighlightDimmed: "suggestion-highlight rounded bg-muted cursor-default",
+};
+
+export function diffBlockContent(
+  oldNode: PMNode,
+  newNode: PMNode,
+  schema: Schema
+): BlockChange[] {
+  // Empty old content means everything in newNode is an addition.
+  if (oldNode.content.size === 0) {
+    return [{ fromA: 0, toA: 0, fromB: 0, toB: newNode.content.size }];
+  }
+
+  // Cross-type replacement: new content isn't valid inside old node type, so we can't use
+  // Transform.replaceWith for fine-grained diffing.
+  // Return a single change covering everything as removed + added.
+  if (oldNode.type !== newNode.type) {
+    return [
+      {
+        fromA: 0,
+        toA: oldNode.content.size,
+        fromB: 0,
+        toB: newNode.content.size,
+      },
+    ];
+  }
+
+  // If the schema has an `instructionsRoot` node and the target node isn't one,
+  // we must wrap it: doc > instructionsRoot > block. This satisfies the schema
+  // constraint that `doc` only accepts `instructionsRoot` children.
+  const needsRoot =
+    schema.nodes[INSTRUCTIONS_ROOT_NODE_NAME] !== undefined &&
+    oldNode.type.name !== INSTRUCTIONS_ROOT_NODE_NAME;
+
+  const blockNode = schema.node(
+    oldNode.type.name,
+    oldNode.attrs,
+    oldNode.content
+  );
+  const docChildren = needsRoot
+    ? [schema.node(INSTRUCTIONS_ROOT_NODE_NAME, null, [blockNode])]
+    : [blockNode];
+  const oldDoc = schema.node("doc", null, docChildren);
+
+  // Extra nesting adds +1 to positions inside the content.
+  const offset = needsRoot ? 2 : 1;
+
+  const tr = new Transform(oldDoc);
+  tr.replaceWith(offset, oldNode.content.size + offset, newNode.content);
+
+  const changeSet = ChangeSet.create(oldDoc).addSteps(
+    tr.doc,
+    tr.mapping.maps,
+    null
+  );
+
+  return changeSet.changes.map((change) => ({
+    fromA: change.fromA - offset,
+    toA: change.toA - offset,
+    fromB: change.fromB - offset,
+    toB: change.toB - offset,
+  }));
+}
+
+function parseHTMLToBlocks(
+  html: string,
+  schema: Schema,
+  targetBlockId: string
+): PMNode[] {
+  const domParser = PMDOMParser.fromSchema(schema);
+  const tempDiv = document.createElement("div");
+  tempDiv.innerHTML = html;
+
+  const parsed = domParser.parse(tempDiv);
+
+  // The agent builder schema enforces doc > instructionsRoot > blocks.
+  // When we parse HTML like "<p>text</p>", the parser returns:
+  // doc > instructionsRoot > paragraph
+  // For root targets, return the instructionsRoot directly so all child blocks
+  // are preserved. For single-block targets, return all children of the
+  // instructionsRoot — this supports multi-block replacements where one block
+  // is replaced by several (e.g., "<p>A</p><p>B</p>").
+  const first = parsed.firstChild;
+  if (
+    first?.type.name === INSTRUCTIONS_ROOT_NODE_NAME &&
+    targetBlockId === INSTRUCTIONS_ROOT_TARGET_BLOCK_ID
+  ) {
+    return [first];
+  }
+
+  const container =
+    first?.type.name === INSTRUCTIONS_ROOT_NODE_NAME ? first : parsed;
+  const children: PMNode[] = [];
+  container.content.forEach((child) => children.push(child));
+  return children;
+}
+
+function findBlockByBlockId(
+  doc: PMNode,
+  targetBlockId: string
+): { node: PMNode; pos: number } | null {
+  let result: { node: PMNode; pos: number } | null = null;
+
+  doc.descendants((node, pos) => {
+    if (result) {
+      return false;
+    }
+
+    if (node.attrs[BLOCK_ID_ATTRIBUTE] === targetBlockId) {
+      result = { node, pos };
+
+      return false;
+    }
+
+    return true;
+  });
+
+  return result;
+}
+
+// Returns the content to render in an addition widget for an inserted slice.
+// Diff ranges include nested block boundaries, so a slice can wrap an
+// inline-level change in its containing block(s). When the change stays within
+// one text block, the slice is open on both ends and forms a single block chain
+// — drill down to the inline content so it renders inline rather than as a
+// phantom <p>/<li>. A genuine new block comes through closed (open depth 0) or
+// as multiple children, so it keeps its structure. Each level peeled reduces the
+// open depth by one (an open boundary always cuts through a non-leaf node, so
+// firstChild is safe to descend into).
+function inlineContentForInsertion(slice: Slice): Fragment {
+  let { content } = slice;
+  let { openStart, openEnd } = slice;
+
+  while (
+    openStart > 0 &&
+    openEnd > 0 &&
+    content.childCount === 1 &&
+    !content.firstChild!.isInline
+  ) {
+    content = content.firstChild!.content;
+    openStart -= 1;
+    openEnd -= 1;
+  }
+
+  // Drop empty leading blocks so an inserted blank line or empty list item
+  // doesn't render as extra blank widgets. `textContent` (not content.size)
+  // catches empty wrappers like listItem > paragraph(), whose size is non-zero.
+  // The childCount guard keeps the node when the whole insertion is one empty
+  // block, so a single inserted blank line still shows one widget.
+  while (content.childCount > 1 && content.firstChild!.textContent === "") {
+    content = content.cut(content.firstChild!.nodeSize);
+  }
+
+  return content;
+}
+
+// Create inline diff decorations for a single block (deletion + addition widgets).
+function buildBlockDecorations({
+  applyBlockHighlight,
+  blockPos,
+  decorations,
+  isHighlighted,
+  newNode,
+  oldNode,
+  schema,
+  suggestionId,
+}: {
+  applyBlockHighlight: boolean;
+  blockPos: number;
+  decorations: Decoration[];
+  isHighlighted: boolean;
+  newNode: PMNode;
+  oldNode: PMNode;
+  schema: Schema;
+  suggestionId: string;
+}): void {
+  const changes = diffBlockContent(oldNode, newNode, schema);
+  const contentStart = blockPos + 1;
+
+  // Selected only: entire block gets dimmed highlight.
+  if (applyBlockHighlight && changes.length > 0) {
+    decorations.push(
+      Decoration.node(blockPos, blockPos + oldNode.nodeSize, {
+        class: CLASSES.blockHighlightDimmed,
+        [SUGGESTION_ID_ATTRIBUTE]: suggestionId,
+      })
+    );
+  }
+
+  for (const change of changes) {
+    if (change.fromA !== change.toA) {
+      decorations.push(
+        Decoration.inline(
+          contentStart + change.fromA,
+          contentStart + change.toA,
+          {
+            class: isHighlighted ? CLASSES.remove : CLASSES.removeDimmed,
+            [SUGGESTION_ID_ATTRIBUTE]: suggestionId,
+          }
+        )
+      );
+    }
+
+    if (change.fromB !== change.toB) {
+      const isCrossType = oldNode.type !== newNode.type;
+      // When old block is a different type, place the addition after it so the new content doesn't render inside the old block's container.
+      const widgetPos = isCrossType
+        ? blockPos + oldNode.nodeSize
+        : contentStart + change.fromA;
+
+      decorations.push(
+        Decoration.widget(
+          widgetPos,
+          () => {
+            const span = document.createElement("span");
+            span.className = isHighlighted ? CLASSES.add : CLASSES.addDimmed;
+            span.setAttribute(SUGGESTION_ID_ATTRIBUTE, suggestionId);
+            span.contentEditable = "false";
+            // ProseMirror sets `white-space: normal` on [contenteditable="false"]
+            // elements, which collapses \n in code blocks. Override to inherit
+            // the parent <pre>'s `white-space: pre-wrap`.
+            span.style.whiteSpace = "inherit";
+
+            const serializer = DOMSerializer.fromSchema(schema);
+            if (isCrossType) {
+              // Serialize the full block node so the preview shows the new type
+              const blockEl = serializer.serializeNode(newNode, {});
+              span.appendChild(blockEl);
+            } else {
+              const insertedContent = inlineContentForInsertion(
+                newNode.slice(change.fromB, change.toB)
+              );
+              serializer.serializeFragment(insertedContent, {}, span);
+            }
+
+            // Apply styling to all child elements to ensure visibility in nested structures (e.g., list items)
+            const className = isHighlighted ? CLASSES.add : CLASSES.addDimmed;
+            span.querySelectorAll("*").forEach((el) => {
+              if (el instanceof HTMLElement) {
+                el.className = el.className
+                  ? `${el.className} ${className}`
+                  : className;
+              }
+            });
+
+            return span;
+          },
+          { side: -1 }
+        )
+      );
+    }
+  }
+}
+
+function addBlockAdditionWidget(
+  pos: number,
+  newChild: PMNode,
+  isHighlighted: boolean,
+  decorations: Decoration[],
+  schema: Schema,
+  suggestionId: string
+): void {
+  const className = isHighlighted ? CLASSES.add : CLASSES.addDimmed;
+  decorations.push(
+    Decoration.widget(
+      pos,
+      () => {
+        const div = document.createElement("div");
+        div.className = className;
+        div.setAttribute(SUGGESTION_ID_ATTRIBUTE, suggestionId);
+        div.contentEditable = "false";
+        div.style.width = "fit-content";
+
+        const serializer = DOMSerializer.fromSchema(schema);
+        serializer.serializeFragment(Fragment.from(newChild), {}, div);
+
+        div.querySelectorAll("*").forEach((el) => {
+          if (el instanceof HTMLElement) {
+            el.className = el.className
+              ? `${el.className} ${className}`
+              : className;
+          }
+        });
+
+        return div;
+      },
+      { side: -1 }
+    )
+  );
+}
+
+// Create per-child-block decorations for root-level targets. Matches old and
+// new children by position and diffs each pair for word-level inline diffs.
+// Extra new blocks are shown as full additions, extra old blocks as deletions.
+function buildRootDecorations({
+  applyBlockHighlight,
+  decorations,
+  isHighlighted,
+  newRoot,
+  oldRoot,
+  rootPos,
+  schema,
+  suggestionId,
+}: {
+  applyBlockHighlight: boolean;
+  decorations: Decoration[];
+  isHighlighted: boolean;
+  newRoot: PMNode;
+  oldRoot: PMNode;
+  rootPos: number;
+  schema: Schema;
+  suggestionId: string;
+}): void {
+  const oldChildren: PMNode[] = [];
+  const newChildren: PMNode[] = [];
+  oldRoot.content.forEach((child) => oldChildren.push(child));
+  newRoot.content.forEach((child) => newChildren.push(child));
+
+  // Apply a single decoration spanning the full root for a continuous highlight (no gaps between blocks).
+  if (applyBlockHighlight) {
+    decorations.push(
+      Decoration.node(rootPos, rootPos + oldRoot.nodeSize, {
+        class: CLASSES.blockHighlightDimmed,
+        [SUGGESTION_ID_ATTRIBUTE]: suggestionId,
+      })
+    );
+  }
+
+  const maxLen = Math.max(oldChildren.length, newChildren.length);
+  let oldOffset = 0;
+
+  for (let i = 0; i < maxLen; i++) {
+    const oldChild = oldChildren[i];
+    const newChild = newChildren[i];
+    // Position of this old child block within the document.
+    const childPos = rootPos + 1 + oldOffset;
+
+    if (oldChild && newChild) {
+      if (oldChild.content.size > 0) {
+        buildBlockDecorations({
+          applyBlockHighlight: false, // Root handles the highlight as a single decoration.
+          blockPos: childPos,
+          newNode: newChild,
+          oldNode: oldChild,
+          schema,
+          suggestionId,
+          isHighlighted,
+          decorations,
+        });
+      } else {
+        // Old block is empty (e.g. the default placeholder paragraph in a new editor).
+        // Skip pairing — pairing would place the addition widget *after* the empty block,
+        // causing a blank line before the first heading/paragraph in the card.
+        addBlockAdditionWidget(
+          childPos,
+          newChild,
+          isHighlighted,
+          decorations,
+          schema,
+          suggestionId
+        );
+      }
+      oldOffset += oldChild.nodeSize;
+    } else if (oldChild) {
+      // Block was removed: mark entire block content as deletion.
+      if (oldChild.content.size > 0) {
+        const contentStart = childPos + 1;
+        decorations.push(
+          Decoration.inline(
+            contentStart,
+            contentStart + oldChild.content.size,
+            {
+              class: isHighlighted ? CLASSES.remove : CLASSES.removeDimmed,
+              [SUGGESTION_ID_ATTRIBUTE]: suggestionId,
+            }
+          )
+        );
+      }
+      oldOffset += oldChild.nodeSize;
+    } else if (newChild) {
+      // Block was added: insert as a widget after the last old child.
+      addBlockAdditionWidget(
+        childPos,
+        newChild,
+        isHighlighted,
+        decorations,
+        schema,
+        suggestionId
+      );
+    }
+  }
+}
+
+function buildDecorations(
+  state: EditorState,
+  suggestions: Map<string, StoredSuggestion>,
+  highlightedId: string | null,
+  showBlockHighlight: boolean
+): DecorationSet {
+  if (suggestions.size === 0) {
+    return DecorationSet.empty;
+  }
+
+  const decorations: Decoration[] = [];
+  const schema = state.schema;
+
+  for (const [suggestionId, suggestion] of suggestions) {
+    // Support prefix matching: a highlightedId of "abc" highlights both "abc" and "abc:0", "abc:1", etc.
+    const isHighlighted =
+      highlightedId !== null &&
+      (suggestionId === highlightedId ||
+        suggestionId.startsWith(highlightedId + ":"));
+    const applyBlockHighlight = showBlockHighlight && isHighlighted;
+
+    for (const op of suggestion.operations) {
+      const found = findBlockByBlockId(state.doc, op.targetBlockId);
+      if (!found) {
+        continue;
+      }
+
+      const { node: blockNode, pos: blockPos } = found;
+
+      const newNodes = parseHTMLToBlocks(
+        op.newContent,
+        schema,
+        op.targetBlockId
+      );
+      if (newNodes.length === 0) {
+        continue;
+      }
+
+      // For root-level targets, diff per-child block so that word-level diffs stay within their
+      // block and block boundaries are preserved. For single-block targets, diff the first new
+      // block against the old block and show any extra new blocks as addition widgets.
+      if (
+        blockNode.type.name === INSTRUCTIONS_ROOT_NODE_NAME &&
+        newNodes[0].type.name === INSTRUCTIONS_ROOT_NODE_NAME
+      ) {
+        buildRootDecorations({
+          applyBlockHighlight,
+          oldRoot: blockNode,
+          newRoot: newNodes[0],
+          rootPos: blockPos,
+          schema,
+          suggestionId,
+          isHighlighted,
+          decorations,
+        });
+      } else {
+        buildBlockDecorations({
+          applyBlockHighlight,
+          oldNode: blockNode,
+          newNode: newNodes[0],
+          blockPos,
+          schema,
+          suggestionId,
+          isHighlighted,
+          decorations,
+        });
+
+        // Extra new blocks shown as full addition widgets after the old block.
+        const afterBlockPos = blockPos + blockNode.nodeSize;
+        for (let i = 1; i < newNodes.length; i++) {
+          addBlockAdditionWidget(
+            afterBlockPos,
+            newNodes[i],
+            isHighlighted,
+            decorations,
+            schema,
+            suggestionId
+          );
+        }
+      }
+    }
+  }
+
+  return DecorationSet.create(state.doc, decorations);
+}
+
+// Check if a transaction step modifies a specific range
+function stepModifiesRange(
+  step: { forEach: (f: (oldStart: number, oldEnd: number) => void) => void },
+  rangeStart: number,
+  rangeEnd: number
+): boolean {
+  let modifies = false;
+  step.forEach((oldStart, oldEnd) => {
+    // Ranges overlap if they don't end before or start after each other
+    if (oldEnd > rangeStart && oldStart < rangeEnd) {
+      modifies = true;
+    }
+  });
+  return modifies;
+}
+
+function createPlugin(
+  getHighlightedId: () => string | null,
+  showBlockHighlight: boolean
+) {
+  return new Plugin<PluginState>({
+    key: pluginKey,
+
+    state: {
+      init(): PluginState {
+        return {
+          decorations: DecorationSet.empty,
+          highlightedId: null,
+          suggestions: new Map(),
+        };
+      },
+
+      apply(tr, value, _oldState, newState): PluginState {
+        const meta = tr.getMeta(pluginKey);
+        let { suggestions, highlightedId } = value;
+        let dirty = false;
+
+        if (meta?.type === "add") {
+          suggestions = new Map(suggestions);
+          suggestions.set(meta.suggestion.id, meta.suggestion);
+          dirty = true;
+        }
+
+        if (meta?.type === "remove") {
+          suggestions = new Map(suggestions);
+          suggestions.delete(meta.id);
+          dirty = true;
+        }
+
+        if (meta?.type === "removeAll") {
+          suggestions = new Map(suggestions);
+          for (const id of meta.ids) {
+            suggestions.delete(id);
+          }
+          dirty = true;
+        }
+
+        if (meta?.type === "highlight") {
+          highlightedId = meta.id;
+          dirty = true;
+        }
+
+        if (dirty || tr.docChanged) {
+          const effectiveHighlightedId = highlightedId ?? getHighlightedId();
+          return {
+            suggestions,
+            highlightedId,
+            decorations: buildDecorations(
+              newState,
+              suggestions,
+              effectiveHighlightedId,
+              showBlockHighlight
+            ),
+          };
+        }
+
+        return value;
+      },
+    },
+
+    props: {
+      decorations(editorState) {
+        return (
+          pluginKey.getState(editorState)?.decorations ?? DecorationSet.empty
+        );
+      },
+    },
+
+    filterTransaction(tr, state) {
+      if (!tr.docChanged || tr.getMeta(pluginKey)) {
+        return true;
+      }
+
+      const pluginState = pluginKey.getState(state);
+      if (!pluginState || pluginState.suggestions.size === 0) {
+        return true;
+      }
+
+      // Collect all suggestion block content ranges upfront to avoid redundant lookups.
+      // Typical case: 1-5 suggestions with 1-2 operations each = ~10 ranges max.
+      // Even with 20 suggestions × 5 operations × 5 steps = 500 iterations, this is negligible.
+      const suggestionRanges: Array<{ start: number; end: number }> = [];
+      for (const suggestion of pluginState.suggestions.values()) {
+        for (const op of suggestion.operations) {
+          const found = findBlockByBlockId(state.doc, op.targetBlockId);
+          if (found) {
+            suggestionRanges.push({
+              start: found.pos + 1,
+              end: found.pos + found.node.nodeSize - 1,
+            });
+          }
+        }
+      }
+
+      // Check each transaction step against all suggestion ranges.
+      // This is O(steps × ranges) but typically O(1-5 × 1-10) = ~50 operations max.
+      for (let i = 0; i < tr.steps.length; i++) {
+        const map = tr.mapping.slice(0, i);
+
+        for (const range of suggestionRanges) {
+          const mappedStart = map.map(range.start);
+          const mappedEnd = map.map(range.end);
+
+          if (stepModifiesRange(tr.mapping.maps[i], mappedStart, mappedEnd)) {
+            return false;
+          }
+        }
+      }
+
+      return true;
+    },
+  });
+}
+
+interface ApplySuggestionOptions {
+  id: string;
+  targetBlockId: string;
+  // HTML content for the block (e.g., '<p>New text with <strong>bold</strong></p>').
+  content: string;
+}
+
+declare module "@tiptap/core" {
+  interface Commands<ReturnType> {
+    instructionSuggestion: {
+      acceptAllSuggestions: () => ReturnType;
+      acceptSuggestion: (suggestionId: string) => ReturnType;
+      applySuggestion: (options: ApplySuggestionOptions) => ReturnType;
+      rejectAllSuggestions: () => ReturnType;
+      rejectSuggestion: (suggestionId: string) => ReturnType;
+      setHighlightedSuggestion: (suggestionId: string | null) => ReturnType;
+    };
+  }
+
+  interface Storage {
+    instructionSuggestion: {
+      highlightedSuggestionId: string | null;
+    };
+  }
+}
+
+export function getActiveSuggestions(
+  state: EditorState
+): Map<string, StoredSuggestion> {
+  return pluginKey.getState(state)?.suggestions ?? new Map();
+}
+
+export function getActiveSuggestionIds(state: EditorState): string[] {
+  return Array.from(getActiveSuggestions(state).keys());
+}
+
+export function getSuggestionPosition(
+  editor: { state: EditorState },
+  suggestionId: string
+): number | null {
+  const state = pluginKey.getState(editor.state);
+  if (!state) {
+    return null;
+  }
+
+  const suggestion = state.suggestions.get(suggestionId);
+  if (!suggestion || suggestion.operations.length === 0) {
+    return null;
+  }
+
+  const found = findBlockByBlockId(
+    editor.state.doc,
+    suggestion.operations[0].targetBlockId
+  );
+  return found ? found.pos + 1 : null;
+}
+
+export const InstructionSuggestionExtension = Extension.create<{
+  showBlockHighlight: boolean;
+}>({
+  name: "instructionSuggestion",
+
+  addOptions() {
+    return {
+      showBlockHighlight: true,
+    };
+  },
+
+  addStorage() {
+    return {
+      highlightedSuggestionId: null as string | null,
+    };
+  },
+
+  addProseMirrorPlugins() {
+    return [
+      createPlugin(
+        () => this.storage.highlightedSuggestionId,
+        this.options.showBlockHighlight
+      ),
+    ];
+  },
+
+  addCommands() {
+    return {
+      applySuggestion:
+        (options: ApplySuggestionOptions) =>
+        ({ tr, state, dispatch }) => {
+          const { id, targetBlockId, content } = options;
+
+          if (!findBlockByBlockId(state.doc, targetBlockId)) {
+            return false;
+          }
+
+          if (dispatch) {
+            const suggestion: StoredSuggestion = {
+              id,
+              operations: [{ targetBlockId, newContent: content }],
+            };
+            tr.setMeta(pluginKey, { type: "add", suggestion });
+            dispatch(tr);
+          }
+
+          return true;
+        },
+
+      acceptSuggestion:
+        (suggestionId: string) =>
+        ({ state, tr, dispatch }) => {
+          const pluginState = pluginKey.getState(state);
+          const suggestion = pluginState?.suggestions.get(suggestionId);
+          if (!suggestion) {
+            return false;
+          }
+
+          if (dispatch) {
+            const schema = state.schema;
+
+            for (const op of suggestion.operations) {
+              const found = findBlockByBlockId(tr.doc, op.targetBlockId);
+              if (!found) {
+                continue;
+              }
+
+              const { node: blockNode, pos: blockPos } = found;
+              const newNodes = parseHTMLToBlocks(
+                op.newContent,
+                schema,
+                op.targetBlockId
+              );
+              if (newNodes.length === 0) {
+                continue;
+              }
+
+              if (newNodes.length === 1) {
+                const newNode = newNodes[0];
+                if (blockNode.type === newNode.type) {
+                  // Same type: replace inner content.
+                  const from = blockPos + 1;
+                  const to = blockPos + blockNode.nodeSize - 1;
+                  tr.replaceWith(from, to, newNode.content);
+                } else {
+                  // Cross-type: replace the entire block node.
+                  tr.replaceWith(
+                    blockPos,
+                    blockPos + blockNode.nodeSize,
+                    newNode
+                  );
+                }
+              } else {
+                // Multi-block: replace the old block with all new blocks.
+                tr.replaceWith(
+                  blockPos,
+                  blockPos + blockNode.nodeSize,
+                  newNodes
+                );
+              }
+            }
+
+            tr.setMeta(pluginKey, { type: "remove", id: suggestionId });
+            dispatch(tr);
+          }
+
+          return true;
+        },
+
+      rejectSuggestion:
+        (suggestionId: string) =>
+        ({ state, tr, dispatch }) => {
+          if (!pluginKey.getState(state)?.suggestions.has(suggestionId)) {
+            return false;
+          }
+
+          if (dispatch) {
+            tr.setMeta(pluginKey, { type: "remove", id: suggestionId });
+            dispatch(tr);
+          }
+
+          return true;
+        },
+
+      acceptAllSuggestions:
+        () =>
+        ({ commands, state, tr }) => {
+          const ids = getActiveSuggestionIds(state);
+          if (ids.length === 0) {
+            return false;
+          }
+
+          // commands.acceptSuggestion shares the same tr, so content
+          // replacements accumulate correctly. However each call overwrites
+          // the plugin meta, so only the last suggestion would be removed
+          // from plugin state. We fix this by overwriting the meta with all
+          // IDs after the loop.
+          const allSucceeded = ids
+            .map((id) => commands.acceptSuggestion(id))
+            .every(Boolean);
+          tr.setMeta(pluginKey, { type: "removeAll", ids });
+
+          return allSucceeded;
+        },
+
+      rejectAllSuggestions:
+        () =>
+        ({ state, tr, dispatch }) => {
+          const ids = getActiveSuggestionIds(state);
+          if (ids.length === 0) {
+            return false;
+          }
+
+          if (dispatch) {
+            tr.setMeta(pluginKey, { type: "removeAll", ids });
+            dispatch(tr);
+          }
+
+          return true;
+        },
+
+      setHighlightedSuggestion:
+        (suggestionId: string | null) =>
+        ({ tr, dispatch }) => {
+          this.storage.highlightedSuggestionId = suggestionId;
+
+          if (dispatch) {
+            tr.setMeta(pluginKey, { type: "highlight", id: suggestionId });
+            dispatch(tr);
+          }
+
+          return true;
+        },
+    };
+  },
+});

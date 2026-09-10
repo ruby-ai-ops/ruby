@@ -1,0 +1,291 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.1/schema.json",
+  "root": true,
+  "plugins": [],
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true,
+    "defaultBranch": "main"
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**/*.{js,jsx,ts,tsx}",
+      "**/package.json",
+      "**/biome.json",
+      "!!**/.next",
+      "!!**/node_modules",
+      "!!**/workers-build",
+      "!!**/dist",
+      "!!**/build",
+      "!!**/coverage",
+      "!**/.yalc/**/*.{js,jsx,ts,tsx}",
+      "!!**/x/**",
+      "!!extension/shared/lib/swr.ts",
+      "!!extension/packages",
+      "!!**/package-lock.json",
+      "!!**/__snapshots__",
+      "!!**/.git",
+      "!!cli/ruby-sandbox/functions-runner/runner.js"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "formatWithErrors": false,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineEnding": "lf",
+    "lineWidth": 80,
+    "attributePosition": "auto",
+    "bracketSameLine": false,
+    "bracketSpacing": true,
+    "expand": "auto",
+    "useEditorconfig": true
+  },
+  "linter": {
+    "includes": [
+      "sdks/js/**",
+      "viz/**",
+      "extension/**",
+      "cli/ruby-cli/**",
+      "firebase-functions/**",
+      "sparkle/**",
+      "connectors/**",
+      "front-spa/**",
+      "front/**",
+      "front-api/**",
+      "marketing/**",
+      "cli/ruby-sandbox/functions-runner/**",
+      "cli/ruby-sandbox/pod/**"
+    ],
+    "rules": {
+      "preset": "none",
+      "correctness": {
+        "noUnusedImports": { "fix": "safe", "level": "error" },
+        "noUnusedVariables": "error"
+      },
+      "style": {
+        "useBlockStatements": "error",
+        "useImportType": "error"
+      },
+      "suspicious": {
+        "noImportCycles": "error"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "front/**/*.{js,jsx,ts,tsx}",
+        "front-api/**/*.{js,jsx,ts,tsx}",
+        "connectors/src/**/*.{js,jsx,ts,tsx}",
+        "cli/ruby-cli/**/*.{js,jsx,ts,tsx}",
+        "extension/**/*.{js,jsx,ts,tsx}"
+      ],
+      "plugins": [
+        "./.grit/patterns/noBulkLodash.grit",
+        "./.grit/patterns/noDirectSparkleNotification.grit"
+      ]
+    },
+    {
+      "includes": [
+        "front/**/*.{js,jsx,ts,tsx}",
+        "front-api/**/*.{js,jsx,ts,tsx}"
+      ],
+      "plugins": [
+        "./.grit/patterns/enforceClientTypesInPublicApi.grit",
+        "./.grit/patterns/noClientDeepImports.grit"
+      ]
+    },
+    {
+      "includes": [
+        "front/**/*.{js,jsx,ts,tsx}",
+        "front-api/**/*.{js,jsx,ts,tsx}",
+        "!front/lib/api/assistant/conversation/fetch.ts",
+        "!**/*.{test,spec}.{js,jsx,ts,tsx}",
+        "!front/tests/**"
+      ],
+      "plugins": ["./.grit/patterns/noExpensiveConversationFetch.grit"]
+    },
+    {
+      "includes": ["front-api/**/*.ts", "!front-api/routes/types.ts"],
+      "plugins": ["./.grit/patterns/noInlineSuccessResponseBody.grit"]
+    },
+    {
+      "includes": [
+        "front/components/**/*.{js,jsx,ts,tsx}",
+        "front/lib/**/*.tsx",
+        "front-spa/**/*.{js,jsx,ts,tsx}",
+        "sparkle/src/**/*.{js,jsx,ts,tsx}",
+        "viz/**/*.{js,jsx,ts,tsx}",
+        "!**/*.stories.{js,jsx,ts,tsx}",
+        "!sparkle/src/lottie/**",
+        "!sparkle/playground/**"
+      ],
+      "plugins": ["./.grit/patterns/noCssImportant.grit"]
+    },
+    {
+      "includes": [
+        "front/**/*.{js,jsx,ts,tsx}",
+        "front-api/**/*.{js,jsx,ts,tsx}",
+        "connectors/src/**/*.{js,jsx,ts,tsx}"
+      ],
+      "plugins": [
+        "./.grit/patterns/noRawSql.grit",
+        "./.grit/patterns/noUnverifiedWorkspaceBypass.grit"
+      ]
+    },
+    {
+      "includes": [
+        "extension/**/*.{js,jsx,ts,tsx}",
+        "front-spa/**/*.{js,jsx,ts,tsx}",
+        "front/**/*.{js,jsx,ts,tsx}",
+        "front-api/**/*.{js,jsx,ts,tsx}",
+        "sparkle/**/*.{js,jsx,ts,tsx}",
+        "!front-api/server.ts",
+        "!sparkle/.storybook/**",
+        "!sparkle/playground/**"
+      ],
+      "plugins": ["./.grit/patterns/noNextImports.grit"]
+    },
+    {
+      "includes": ["front/**/*.tsx", "front-spa/**/*.tsx"],
+      "plugins": ["./.grit/patterns/noSparkleClassInFront.grit"]
+    },
+    {
+      "includes": ["marketing/pages/**/*.{js,jsx,ts,tsx}"],
+      "plugins": [
+        "./.grit/patterns/nextjsPageComponentNaming.grit",
+        "./.grit/patterns/nextjsNoDataFetchingInGetssp.grit"
+      ]
+    },
+    {
+      "includes": ["front-api/routes/**/*.ts"],
+      "plugins": ["./.grit/patterns/noDirectRoleCheck.grit"]
+    },
+    {
+      "includes": [
+        "connectors/src/lib/models/**/*.ts",
+        "connectors/src/resources/storage/models/**/*.ts",
+        "front/lib/models/**/*.ts",
+        "front/lib/resources/storage/models/**/*.ts",
+        "front/lib/resources/storage/wrappers/**/*.ts",
+        "!front/lib/resources/storage/data_types.ts",
+        "!connectors/src/resources/storage/data_types.ts"
+      ],
+      "plugins": [
+        "./.grit/patterns/tooLongIndexName.grit",
+        "./.grit/patterns/noSequelizeDataTypesImport.grit"
+      ]
+    },
+    {
+      "includes": ["cli/ruby-cli/**", "sparkle/**"],
+      "javascript": {
+        "jsxRuntime": "reactClassic"
+      }
+    },
+    {
+      "includes": ["front-spa/**", "front/**", "sparkle/**"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "useHookAtTopLevel": "error",
+            "useExhaustiveDependencies": "error"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["front/**/*.{js,jsx,ts,tsx}"],
+      "linter": {
+        "rules": {
+          "style": {
+            "useImportType": {
+              "level": "error",
+              "options": { "style": "separatedType" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "front/migrations/**",
+        "front/mailing/**",
+        "connectors/migrations/**"
+      ],
+      "linter": {
+        "enabled": false
+      },
+      "assist": {
+        "enabled": false
+      }
+    },
+    {
+      "includes": [
+        "sparkle/**/*.stories.tsx",
+        "sparkle/.storybook/**",
+        "sparkle/playground/**",
+        "sparkle/scripts/**",
+        "sparkle/rollup.config.js",
+        "sparkle/svgr.config.js",
+        "sparkle/postcss.config.js",
+        "sparkle/tailwind.config.js",
+        "sparkle/svgr-*-template.js"
+      ],
+      "linter": {
+        "enabled": false
+      },
+      "assist": {
+        "enabled": false
+      }
+    }
+  ],
+  "javascript": {
+    "formatter": {
+      "jsxQuoteStyle": "double",
+      "quoteProperties": "asNeeded",
+      "trailingCommas": "es5",
+      "semicolons": "always",
+      "arrowParentheses": "always",
+      "bracketSameLine": false,
+      "quoteStyle": "double",
+      "attributePosition": "auto",
+      "bracketSpacing": true
+    }
+  },
+  "html": {
+    "formatter": {
+      "indentScriptAndStyle": false,
+      "selfCloseVoidElements": "always"
+    }
+  },
+  "css": {
+    "parser": {
+      "cssModules": false
+    }
+  },
+  "assist": {
+    "includes": [
+      "sdks/js/**",
+      "viz/**",
+      "extension/**",
+      "cli/ruby-cli/**",
+      "firebase-functions/**",
+      "sparkle/**",
+      "connectors/**",
+      "front-spa/**",
+      "front/**",
+      "front-api/**",
+      "cli/ruby-sandbox/functions-runner/**",
+      "cli/ruby-sandbox/pod/**"
+    ],
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  }
+}

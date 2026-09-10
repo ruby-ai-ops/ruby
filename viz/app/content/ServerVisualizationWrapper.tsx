@@ -1,0 +1,176 @@
+import { ServerVisualizationWrapperClient } from "@viz/app/content/ServerVisualizationWrapperClient";
+import type { PreFetchedFile } from "@viz/app/lib/data-apis/cache-data-api";
+import logger from "@viz/app/lib/logger";
+import { extractFileRefs } from "@viz/app/lib/parseFileRefs";
+
+const FRAME_MIME_TYPES = new Set([
+  "application/vnd.ruby.frame",
+  "application/vnd.ruby.frame.slideshow",
+]);
+
+async function fetchFileRefsRecursively(
+  text: string,
+  frontApiUrl: string,
+  headers: Record<string, string>,
+  visited: Set<string>
+): Promise<PreFetchedFile[]> {
+  const refs = extractFileRefs(text);
+  const results: PreFetchedFile[] = [];
+
+  await Promise.all(
+    refs.map(async (ref) => {
+      const key = ref.type === "fileId" ? ref.fileId : ref.scopedPath;
+      if (visited.has(key)) {
+        return;
+      }
+      visited.add(key);
+
+      // The files endpoint accepts the "conversation/" and "pod/" prefixes (and
+      // their canonical "conversation-{id}/" / "pod-{id}/" forms), but not the
+      // legacy "project/" prefix, which older frame code may still reference and
+      // which maps to the same Pod files. Rewrite only the request path; the
+      // prefetched file stays keyed by the original scopedPath (`key`) so the
+      // frame's useFile("project/...") lookup still resolves.
+      let requestPath: string;
+      if (ref.type === "fileId") {
+        requestPath = ref.fileId;
+      } else if (ref.scopedPath.startsWith("project/")) {
+        logger.info(
+          { scopedPath: ref.scopedPath },
+          "Legacy project/ file scope referenced in frame"
+        );
+        requestPath = `pod/${ref.scopedPath.slice("project/".length)}`;
+      } else {
+        requestPath = ref.scopedPath;
+      }
+
+      const fileEndpoint = `${frontApiUrl}/api/v1/viz/files/${requestPath}`;
+
+      try {
+        const fileResponse = await fetch(fileEndpoint, {
+          headers,
+          cache: "no-store",
+        });
+
+        if (!fileResponse.ok) {
+          logger.warn(
+            { key, statusCode: fileResponse.status },
+            "Failed to fetch file ref"
+          );
+          return;
+        }
+
+        const arrayBuffer = await fileResponse.arrayBuffer();
+        const mimeType =
+          fileResponse.headers.get("content-type") ||
+          "application/octet-stream";
+
+        results.push({
+          data: Buffer.from(arrayBuffer).toString("base64"),
+          fileId: key,
+          mimeType,
+        });
+
+        // Recursively fetch refs from nested frames.
+        if (FRAME_MIME_TYPES.has(mimeType)) {
+          const nestedText = Buffer.from(arrayBuffer).toString("utf-8");
+          const nested = await fetchFileRefsRecursively(
+            nestedText,
+            frontApiUrl,
+            headers,
+            visited
+          );
+          results.push(...nested);
+        }
+      } catch (_err) {
+        logger.error({ key }, "Failed to fetch file ref");
+      }
+    })
+  );
+
+  return results;
+}
+
+interface ServerSideVisualizationWrapperProps {
+  accessToken: string;
+  allowedOrigins: string[];
+  identifier: string;
+  isFullHeight?: boolean;
+  isPdfMode?: boolean;
+}
+
+/**
+ * Server-side visualization wrapper for JWT-authenticated public frames
+ *
+ * This component runs on the server and:
+ * 1. Pre-fetches visualization code using the JWT access token
+ * 2. Extracts file refs from the code and pre-fetches all referenced files
+ * 3. Passes the pre-fetched plain data to the client wrapper
+ *
+ * This approach avoids the React Server Component serialization boundary issue
+ * by passing plain objects instead of class instances to the client component.
+ */
+export async function ServerSideVisualizationWrapper({
+  accessToken,
+  allowedOrigins,
+  identifier,
+  isFullHeight = false,
+  isPdfMode = false,
+}: ServerSideVisualizationWrapperProps) {
+  let prefetchedCode: string | undefined;
+  let preFetchedFiles: PreFetchedFile[] = [];
+  let isAuthenticatedMember = false;
+
+  try {
+    const headers: Record<string, string> = {};
+
+    // Retrieve content of the visualization using the access token.
+    headers["Authorization"] = `Bearer ${accessToken}`;
+    const endpoint = `${process.env.RUBY_FRONT_API}/api/v1/viz/content`;
+
+    const codeResponse = await fetch(endpoint, {
+      headers,
+      cache: "no-store",
+    });
+
+    if (codeResponse.ok) {
+      const responseData = await codeResponse.json();
+      prefetchedCode = responseData.content;
+      isAuthenticatedMember = responseData.isAuthenticatedMember ?? false;
+
+      if (!prefetchedCode) {
+        logger.warn({ identifier }, "No code content found for visualization");
+        prefetchedCode = undefined;
+
+        return;
+      }
+
+      // SERVER-SIDE: Recursively fetch all file refs (including nested frame imports).
+      preFetchedFiles = await fetchFileRefsRecursively(
+        prefetchedCode,
+        process.env.RUBY_FRONT_API ?? "",
+        headers,
+        new Set()
+      );
+    } else {
+      logger.warn(
+        { identifier, statusCode: codeResponse.status },
+        "Failed to fetch code"
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, "Error pre-fetching files:");
+  }
+
+  return (
+    <ServerVisualizationWrapperClient
+      allowedOrigins={allowedOrigins}
+      identifier={identifier}
+      isFullHeight={isFullHeight}
+      isPdfMode={isPdfMode}
+      prefetchedCode={prefetchedCode}
+      prefetchedFiles={preFetchedFiles}
+      isAuthenticatedMember={isAuthenticatedMember}
+    />
+  );
+}

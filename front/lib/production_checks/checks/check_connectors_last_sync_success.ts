@@ -1,0 +1,109 @@
+import config from "@app/lib/api/config";
+import {
+  isBotTypeProvider,
+  isWebhookBasedProvider,
+} from "@app/lib/connector_providers";
+import { getConnectorsPrimaryDbConnection } from "@app/lib/production_checks/utils";
+import type { ConnectorProvider } from "@app/types/data_source";
+import type { ActionLink, CheckFunction } from "@app/types/production_checks";
+import { QueryTypes } from "sequelize";
+
+// Connectors in the h1-pentest workspace, which is a test we don't want to alert on.
+const IGNORED_CONNECTOR_IDS = [55901, 55902];
+
+interface ConnectorBlob {
+  id: number;
+  type: ConnectorProvider;
+  createdAt: Date;
+  dataSourceId: string;
+  workspaceId: string;
+  pausedAt: Date | null;
+  lastSyncSuccessfulTime: Date | null;
+  lastSyncStartTime: Date | null;
+}
+
+async function listAllConnectors() {
+  const connectors: ConnectorBlob[] =
+    // biome-ignore lint/plugin/noRawSql: production check uses read replica
+    await getConnectorsPrimaryDbConnection().query(
+      `SELECT id, "dataSourceId", "workspaceId", "pausedAt", "lastSyncSuccessfulTime", "lastSyncStartTime", "createdAt", "type" FROM connectors WHERE "errorType" IS NULL AND "pausedAt" IS NULL AND "type" <> 'webcrawler'`,
+      {
+        type: QueryTypes.SELECT,
+      }
+    );
+  return connectors;
+}
+
+function isLastSyncSuccessfullOrStartLessFresh(connector: ConnectorBlob) {
+  const oneWeek = 7 * 24 * 60 * 60 * 1000;
+
+  // If we have a lastSyncSuccessfulTime and it's less than a week old then we're good.
+  if (
+    connector.lastSyncSuccessfulTime &&
+    Date.now() - connector.lastSyncSuccessfulTime.getTime() < oneWeek
+  ) {
+    return true;
+  }
+
+  // If the last sync started less than a week ago, we're good.
+  if (
+    connector.lastSyncStartTime &&
+    Date.now() - connector.lastSyncStartTime.getTime() < oneWeek
+  ) {
+    return true;
+  }
+
+  // If the connector was created less than a week ago, we're good.
+  if (Date.now() - connector.createdAt.getTime() < oneWeek) {
+    return true;
+  }
+
+  return false;
+}
+
+export const checkConnectorsLastSyncSuccess: CheckFunction = async (
+  _checkName,
+  _logger,
+  reportSuccess,
+  reportFailure,
+  heartbeat
+) => {
+  const stalledLastSyncConnectors: any[] = [];
+  const connectors = (await listAllConnectors()).filter(
+    (connector) =>
+      // Ignore webhook-based connectors, webcrawlers, and bot-type connectors
+      !isWebhookBasedProvider(connector.type) &&
+      !isBotTypeProvider(connector.type) &&
+      connector.type !== "webcrawler" &&
+      // Ignore test connectors
+      !IGNORED_CONNECTOR_IDS.includes(connector.id)
+  );
+  heartbeat();
+
+  for (const connector of connectors) {
+    const isFresh = isLastSyncSuccessfullOrStartLessFresh(connector);
+    if (!isFresh) {
+      stalledLastSyncConnectors.push({
+        provider: connector.type,
+        connectorId: connector.id,
+        workspaceId: connector.workspaceId,
+        dataSourceId: connector.dataSourceId,
+        createdAt: connector.createdAt,
+        lastSyncSuccessfulTime: connector.lastSyncSuccessfulTime,
+      });
+    }
+  }
+
+  if (stalledLastSyncConnectors.length > 0) {
+    const actionLinks: ActionLink[] = stalledLastSyncConnectors.map((c) => ({
+      label: `${c.provider}: ${c.dataSourceId}`,
+      url: `${config.getPokeAppUrl()}/${c.workspaceId}/data_sources/${c.dataSourceId}`,
+    }));
+    reportFailure(
+      { stalledLastSyncConnectors, actionLinks },
+      `Connectors have not synced in the last week.`
+    );
+  } else {
+    reportSuccess();
+  }
+};

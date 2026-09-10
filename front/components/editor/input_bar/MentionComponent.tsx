@@ -1,0 +1,39 @@
+import { MentionDisplay } from "@app/components/mentions/MentionDisplay";
+import type { WorkspaceType } from "@app/types/user";
+import { NodeViewWrapper } from "@tiptap/react";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React from "react";
+
+interface MentionComponentProps {
+  node: {
+    attrs: {
+      type: "agent" | "user";
+      id: string;
+      label: string;
+      description?: string;
+      pictureUrl?: string;
+    };
+  };
+  owner: WorkspaceType;
+}
+
+export const MentionComponent = ({ node, owner }: MentionComponentProps) => {
+  const { id, label, description, pictureUrl, type } = node.attrs;
+
+  return (
+    <NodeViewWrapper className="inline-flex">
+      <MentionDisplay
+        mention={{
+          id,
+          label,
+          description: description ?? "",
+          pictureUrl: pictureUrl ?? "",
+          type,
+        }}
+        interactive={!!owner}
+        owner={owner}
+        showTooltip={true}
+      />
+    </NodeViewWrapper>
+  );
+};

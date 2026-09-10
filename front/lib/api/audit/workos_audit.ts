@@ -1,0 +1,503 @@
+import type {
+  AuditLogActor,
+  AuditLogContext,
+  AuditLogTarget,
+} from "@app/lib/api/workos/organization";
+import { createAuditLogEvent } from "@app/lib/api/workos/organization";
+import type { Authenticator } from "@app/lib/auth";
+import { hasFeatureFlag } from "@app/lib/auth";
+import { FeatureFlagResource } from "@app/lib/resources/feature_flag_resource";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
+import { getClientIp } from "@app/lib/utils/request";
+import logger from "@app/logger/logger";
+import type { AgenticMessageData } from "@app/types/assistant/conversation";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { LightWorkspaceType } from "@app/types/user";
+
+export type AuditLogsPortal = "view_logs" | "configure_export";
+
+export type AuditLogsPortalResponse = {
+  portalUrl: string;
+};
+
+export const AUDIT_ACTIONS = [
+  // Existing Tier 1 events.
+  "user.login",
+  "user.logout",
+  "membership.created",
+  "membership.revoked",
+  "member.invited",
+  "sso.connection_deleted",
+  "domain.removed",
+  "dsync.connection_deleted",
+  "workspace.deleted",
+  // Authentication & Admin.
+  "user.login_failed",
+  "user.identity_merged",
+  "user.advanced_model_access_updated",
+  "user.relocated",
+  // API Keys & Secrets.
+  "api_key.created",
+  "api_key.revoked",
+  "api_key.updated",
+  // Membership & Invitations.
+  "membership.role_updated",
+  "membership.seat_updated",
+  "membership.origin_updated",
+  "invitation.revoked",
+  "invitation.role_updated",
+  "member.bulk_invited",
+  "member.bulk_revoked",
+  "membership.bulk_role_updated",
+  "membership.bulk_seat_updated",
+  "member.spend_limit_updated",
+  "membership.pool_cap_override_expired",
+  "group.advanced_model_access_updated",
+  "group.member_added",
+  "group.member_removed",
+  "group.spend_limit_updated",
+  "membership.upgrade_request_created",
+  "membership.upgrade_request_resolved",
+  "membership.seat_auto_upgraded",
+  // Domains & SSO.
+  "domain.verified",
+  "domain.verification_failed",
+  // OAuth & Credentials.
+  "oauth.initiated",
+  "oauth.authorized",
+  "oauth.revoked",
+  "credentials.created",
+  "credentials.updated",
+  "credentials.revoked",
+  "credentials.invalidated",
+  // MCP Connections.
+  "ruby_mcp_server.settings_updated",
+  "mcp_connection.created",
+  "mcp_connection.deleted",
+  // Skill import GitHub connection.
+  "skill_import_github_connection.created",
+  "skill_import_github_connection.deleted",
+  // Projects.
+  "project.joined",
+  "project.left",
+  // Self-improvement.
+  "self_improvement.enabled",
+  "self_improvement.batch_mode_updated",
+  "skill.self_improvement_updated",
+  // Sandbox.
+  "sandbox_egress_policy.agent_requests_setting_updated",
+  "sandbox_egress_policy.sandbox_updated",
+  "sandbox_egress_policy.updated",
+  "sandbox_env_var.allowed_domains_updated",
+  "sandbox_env_var.created",
+  "sandbox_env_var.deleted",
+  "sandbox_env_var.promoted_to_https_secret",
+  "sandbox_env_var.updated",
+  // Workspace settings.
+  "workspace.audit_logs_updated",
+  "workspace.analytics_updated",
+  "workspace.advanced_model_access_updated",
+  "workspace.conversation_external_notifications_updated",
+  "workspace.default_agent_updated",
+  "workspace.default_user_spend_limit_updated",
+  "workspace.domain_auto_join_updated",
+  "workspace.email_agents_updated",
+  "workspace.extension_mcp_tools_updated",
+  "workspace.governance_permission_updated",
+  "workspace.inactive_agent_archival_updated",
+  "workspace.inactive_agents_archived",
+  "workspace.interactive_content_sharing_updated",
+  "workspace.manual_project_knowledge_management_updated",
+  "workspace.model_provider_settings_updated",
+  "workspace.name_updated",
+  "workspace.open_projects_updated",
+  "workspace.private_conversation_urls_updated",
+  "workspace.programmatic_usage_limit_updated",
+  "workspace.published_agents_restricted_models_updated",
+  "workspace.regional_models_only_updated",
+  "workspace.reinforcement_cap_updated",
+  "workspace.self_improvement_cap_per_skill_updated",
+  "workspace.sharing_policy_updated",
+  "workspace.slack_personal_footer_removal_updated",
+  "workspace.sso_enforcement_updated",
+  "workspace.voice_transcription_updated",
+  "workspace.workos_organization_updated",
+  "workspace_branding.asset_promoted",
+  "workspace_branding.asset_deleted",
+  // SCIM / Directory Sync.
+  "scim.user_provisioned",
+  "scim.user_updated",
+  "scim.user_deprovisioned",
+  "scim.group_created",
+  "scim.group_deleted",
+  "scim.group_user_added",
+  "scim.group_user_removed",
+  // Agent & Tool Execution.
+  "agent.executed",
+  "tool.approval_requested",
+  "tool.approval_resolved",
+  "tool.executed",
+  // Triggers.
+  "trigger.created",
+  "trigger.deleted",
+  "trigger.enabled",
+  "trigger.disabled",
+  "trigger.fired",
+  "trigger.pool_updated",
+  "trigger.email_received",
+  // Wake-ups.
+  "wake_up.cancelled",
+  "wake_up.created",
+  "wake_up.expired",
+  "wake_up.fired",
+  // Agent lifecycle.
+  "agent.created",
+  "agent.updated",
+  "agent.archived",
+  "agent.restored",
+  "agent.scope_changed",
+  "agent.editors_updated",
+  // Spaces.
+  "space.accessed",
+  "space.created",
+  "space.deleted",
+  "space.permissions_updated",
+  // Conversations.
+  "conversation.accessed",
+  "conversation.space_selected",
+  // Data Sources.
+  "datasource.created",
+  "datasource.updated",
+  "datasource.deleted",
+  "datasource.deleted_admin",
+  "datasource.reauthorized",
+  // Slack workflows.
+  "slack_workflow.allowed",
+  "slack_workflow.revoked",
+
+  "webhook_source.deleted",
+  // Files.
+  "file.moved",
+  "frame.authorized_files_updated",
+  "frame.deleted_admin",
+  "frame.email_grant_added",
+  "frame.email_grant_revoked",
+  "frame.publication_activated",
+  "frame.share_scope_updated",
+  // Audit Logs.
+  "audit_log.viewed",
+  "audit_log.export_configured",
+  // Billing & Subscriptions.
+  "subscription.changed",
+  // Coupons.
+  "coupon.redeemed",
+  "coupon.revoked",
+] as const;
+
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
+
+type EmitAuditLogEventParams = {
+  auth: Authenticator;
+  action: AuditAction;
+  targets: AuditLogTarget[];
+  context?: AuditLogContext;
+  metadata?: Record<string, string | number | boolean>;
+};
+
+// Max characters allowed per metadata value before truncation. Bounds the
+// total payload size so audit logs survive emit sites that pass unbounded
+// strings (e.g. `tool.executed` joining accessed data source IDs).
+const METADATA_VALUE_MAX_CHARS = 1000;
+const METADATA_TRUNCATION_SUFFIX = "...[truncated]";
+
+/**
+ * Serializes all metadata values to strings so the emitted event matches the
+ * schema definitions, which declare every metadata value as `"string"`.
+ * Values longer than METADATA_VALUE_MAX_CHARS are truncated with a suffix
+ * so a single oversized field cannot push the whole event past the WorkOS
+ * audit log size limit.
+ */
+function serializeMetadata(
+  metadata: Record<string, string | number | boolean> | undefined
+): Record<string, string> | undefined {
+  if (!metadata) {
+    return undefined;
+  }
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    const stringValue = typeof value === "string" ? value : String(value);
+    if (stringValue.length > METADATA_VALUE_MAX_CHARS) {
+      result[key] =
+        stringValue.slice(
+          0,
+          METADATA_VALUE_MAX_CHARS - METADATA_TRUNCATION_SUFFIX.length
+        ) + METADATA_TRUNCATION_SUFFIX;
+    } else {
+      result[key] = stringValue;
+    }
+  }
+  return result;
+}
+
+/**
+ * Returns true if audit logs are enabled for the workspace.
+ * Enabled when the `audit_logs` feature flag is set or the plan allows it,
+ * unless the workspace kill switch (`metadata.disableAuditLogs`) is on.
+ * The kill switch suppresses both the audit logs UI and event emission, and
+ * can be flipped by workspace admins or by Ruby admins via poke.
+ */
+export async function isAuditLogsEnabled(
+  auth: Authenticator
+): Promise<boolean> {
+  if (auth.getNonNullableWorkspace().metadata?.disableAuditLogs === true) {
+    return false;
+  }
+  if (await hasFeatureFlag(auth, "audit_logs")) {
+    return true;
+  }
+  return auth.getNonNullablePlan().isAuditLogsAllowed;
+}
+
+/**
+ * Emits an audit log event to WorkOS if the workspace has audit logs enabled.
+ * Enabled when the feature flag is set OR the plan allows audit logs.
+ * Does not throw errors — audit log failures should not break the main operation.
+ */
+export async function emitAuditLogEvent({
+  auth,
+  action,
+  targets,
+  context,
+  metadata,
+}: EmitAuditLogEventParams): Promise<void> {
+  try {
+    if (!(await isAuditLogsEnabled(auth))) {
+      return;
+    }
+
+    const workspace = auth.getNonNullableWorkspace();
+    if (!workspace.workOSOrganizationId) {
+      return;
+    }
+
+    const actor = buildAuditActor(auth);
+    if (!actor.type) {
+      logger.warn({ action }, "Audit event emitted without actor_type");
+    }
+
+    await createAuditLogEvent({
+      workspace,
+      event: {
+        action,
+        actor,
+        targets,
+        context: context ?? { location: auth.clientIp() ?? "internal" },
+        metadata: serializeMetadata({
+          ...metadata,
+          actor_type: actor.type,
+        }),
+      },
+    });
+  } catch (error) {
+    logger.error(
+      {
+        ...normalizeError(error),
+        auditEvent: { action, targets, metadata },
+      },
+      "Failed to emit audit log event"
+    );
+  }
+}
+
+/**
+ * Emits an audit log event directly with a workspace, bypassing Authenticator.
+ * Used in routes where no Authenticator is available (e.g. login, logout, signup)
+ * or in system contexts (e.g. Temporal activities).
+ * Does not throw errors — audit log failures should not break the main operation.
+ */
+export async function emitAuditLogEventDirect({
+  workspace,
+  action,
+  actor,
+  targets,
+  context,
+  metadata,
+}: {
+  workspace: LightWorkspaceType;
+  action: AuditAction;
+  actor: AuditLogActor;
+  targets: AuditLogTarget[];
+  context: AuditLogContext;
+  metadata?: Record<string, string | number | boolean>;
+}): Promise<void> {
+  try {
+    if (!workspace.workOSOrganizationId) {
+      return;
+    }
+
+    if (workspace.metadata?.disableAuditLogs === true) {
+      return;
+    }
+
+    const [subscription, featureFlags] = await Promise.all([
+      SubscriptionResource.fetchLastByWorkspace(workspace),
+      FeatureFlagResource.listForWorkspace(workspace),
+    ]);
+
+    const hasAuditFlag = featureFlags.some((f) => f.name === "audit_logs");
+    if (
+      !hasAuditFlag &&
+      (!subscription || !subscription.getPlan().isAuditLogsAllowed)
+    ) {
+      return;
+    }
+
+    if (!actor.type) {
+      logger.warn({ action }, "Audit event emitted without actor_type");
+    }
+
+    await createAuditLogEvent({
+      workspace,
+      event: {
+        action,
+        actor,
+        targets,
+        context,
+        metadata: serializeMetadata({
+          ...metadata,
+          actor_type: actor.type,
+        }),
+      },
+    });
+  } catch (error) {
+    logger.error(
+      {
+        ...normalizeError(error),
+        auditEvent: { action, targets, metadata },
+      },
+      "Failed to emit audit log event"
+    );
+  }
+}
+
+/**
+ * Builds the audit actor from an Authenticator.
+ * Uses the authenticated user when available, falls back to the API key.
+ */
+export function buildAuditActor(auth: Authenticator): AuditLogActor {
+  if (auth.isRubySuperUser()) {
+    return {
+      type: "ruby_super_user",
+      id: auth.getPokePrincipal().email,
+      name: auth.getPokePrincipal().name ?? undefined,
+    };
+  }
+
+  const user = auth.user();
+  if (user) {
+    return {
+      type: "user",
+      id: user.sId,
+      name: user.fullName() ?? undefined,
+      metadata: {
+        email: user.email,
+      },
+    };
+  }
+
+  const key = auth.key();
+  if (key) {
+    return {
+      type: key.isSystem ? "system_key" : "api_key",
+      id: String(key.id),
+      name: key.name,
+    };
+  }
+
+  return {
+    type: "system",
+    id: auth.authMethod(),
+  };
+}
+
+type AuditTargetType =
+  | "workspace"
+  | "user"
+  | "agent"
+  | "conversation"
+  | "space"
+  | "data_source"
+  | "tool"
+  | "trigger"
+  | "wake_up"
+  | "api_key"
+  | "invitation"
+  | "group"
+  | "credential"
+  | "mcp_connection"
+  | "sandbox_env_var"
+  | "frame"
+  | "webhook_source";
+
+/**
+ * Resource shape required for each audit target type.
+ * All currently use { sId, name }; individual types can be tightened
+ * to specific resource types (e.g., LightWorkspaceType) in the future.
+ */
+type AuditTargetResourceMap = {
+  [K in AuditTargetType]: { sId: string; name: string };
+};
+
+/**
+ * Builds a typed audit log target.
+ * The generic constraint ensures the type string is a valid AuditTargetType
+ * and the resource matches the expected shape for that type.
+ */
+export function buildAuditLogTarget<T extends AuditTargetType>(
+  type: T,
+  resource: AuditTargetResourceMap[T]
+): AuditLogTarget {
+  return { type, id: resource.sId, name: resource.name };
+}
+
+/**
+ * Builds the audit log context with the client IP address.
+ * When called with a request object, extracts the IP from headers.
+ * Otherwise returns the IP from auth or "internal" as the location.
+ */
+export function getAuditLogContext(
+  auth: Authenticator,
+  req?: {
+    headers: Record<string, string | string[] | undefined>;
+    socket?: { remoteAddress?: string };
+  }
+): AuditLogContext {
+  if (req) {
+    return { location: getClientIp(req) };
+  }
+  return { location: auth.clientIp() ?? "internal" };
+}
+
+type AgentTriggerType = "user" | "agent" | "trigger" | "handover";
+
+/**
+ * Classifies how an agent run was triggered, for the `trigger_type` metadata on
+ * `agent.executed`. A sub-agent run carries `agenticMessageData` (its type wins
+ * over a trigger), otherwise a trigger-backed conversation is `"trigger"` and
+ * everything else is a plain user message.
+ */
+export function deriveAgentTriggerType(
+  agenticMessageData: AgenticMessageData | undefined,
+  triggerId: string | null
+): AgentTriggerType {
+  if (agenticMessageData?.type === "run_agent") {
+    return "agent";
+  }
+  if (agenticMessageData?.type === "agent_handover") {
+    return "handover";
+  }
+  if (triggerId) {
+    return "trigger";
+  }
+  return "user";
+}

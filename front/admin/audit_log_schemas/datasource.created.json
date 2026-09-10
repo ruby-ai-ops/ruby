@@ -1,0 +1,17 @@
+{
+  "action": "datasource.created",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "data_source"
+    }
+  ],
+  "metadata": {
+    "data_source_name": "string",
+    "provider": "string",
+    "space_id": "string",
+    "actor_type": "string"
+  }
+}

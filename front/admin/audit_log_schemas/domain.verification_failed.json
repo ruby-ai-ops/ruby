@@ -1,0 +1,13 @@
+{
+  "action": "domain.verification_failed",
+  "targets": [
+    {
+      "type": "workspace"
+    }
+  ],
+  "metadata": {
+    "domain": "string",
+    "reason": "string",
+    "actor_type": "string"
+  }
+}

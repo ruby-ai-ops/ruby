@@ -1,0 +1,16 @@
+{
+  "action": "space.deleted",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "space"
+    }
+  ],
+  "metadata": {
+    "space_name": "string",
+    "space_kind": "string",
+    "actor_type": "string"
+  }
+}

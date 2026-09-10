@@ -1,0 +1,22 @@
+engine biome(1.0)
+language js
+
+// Forbids deep imports from @ruby-ai/client subpaths (e.g. @ruby-ai/client/src,
+// @ruby-ai/client/src/toto.ts) in front/ and front-api/ code. Only the
+// package root @ruby-ai/client should be imported.
+pattern client_deep_import() {
+    `"@ruby-ai/client/$_"` where {
+        $filename <: or {
+            r".*/front/.*",
+            r".*/front-api/.*",
+        }
+    }
+}
+
+client_deep_import() as $source where {
+    register_diagnostic(
+        span = $source,
+        message = "Deep imports from '@ruby-ai/client/*' are not allowed. Import from '@ruby-ai/client' instead.",
+        severity = "error"
+    )
+}

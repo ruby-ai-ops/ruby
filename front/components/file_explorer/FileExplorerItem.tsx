@@ -1,0 +1,529 @@
+import {
+  canMoveFileToParentFolder,
+  getFileExplorerDropSurfaceClassName,
+  setFileExplorerDragData,
+  useFileExplorerDropTarget,
+} from "@app/components/file_explorer/fileExplorerDragDrop";
+import type {
+  ContentNodeEntry,
+  FileEntry,
+  FileExplorerMenuAction,
+  FileSystemTreeNode,
+  FramePackageEntry,
+} from "@app/components/file_explorer/types";
+import {
+  getCategoryFromContentType,
+  getFileExplorerSearchResultTitle,
+  getSingularFileCategoryLabelForContentType,
+  isFilePreviewableContentType,
+} from "@app/components/file_explorer/utils";
+import { cn } from "@app/components/poke/shadcn/lib/utils";
+import { getConnectorProviderLogoWithFallback } from "@app/lib/connector_providers_ui";
+import { getFileTypeIcon } from "@app/lib/file_icon_utils";
+import type { FileSystemFileEntry } from "@app/types/api/file_system/types";
+import {
+  Button,
+  CloudArrowLeftRight,
+  DotsHorizontal,
+  Download01,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  Folder,
+  FolderOpen,
+  Icon,
+  Spinner,
+  Tooltip,
+} from "@ruby-ai/sparkle";
+import { intlFormatDistance } from "date-fns";
+import type React from "react";
+import { useState } from "react";
+
+export type ViewMode = "grid" | "list";
+
+type FileExplorerItemProps = {
+  /** Merged onto the interactive surface (e.g. grab cursor while dragging). */
+  containerClassName?: string;
+  downloadOnOpen?: boolean;
+  extraMenuItems?: FileExplorerMenuAction[];
+  /** When set, replaces default hover / background (e.g. drop-target highlight). */
+  surfaceClassName?: string;
+  onDownload?: () => Promise<void>;
+  onOpen: () => void;
+  subtitle: string;
+  title: string;
+  titleClassName?: string;
+  viewMode: ViewMode;
+} & (
+  | { kind: "icon"; visual: React.ComponentType }
+  | { kind: "thumbnail"; thumbnailSrc: string | null }
+);
+
+// TODO(2026-04-27 FILE SYSTEM): Candidate for Sparkle once the GCS file explorer pattern stabilises.
+export function FileExplorerItem(props: FileExplorerItemProps) {
+  const {
+    containerClassName,
+    downloadOnOpen = false,
+    extraMenuItems,
+    onDownload,
+    onOpen,
+    surfaceClassName,
+    subtitle,
+    title,
+    titleClassName,
+    viewMode,
+  } = props;
+
+  const thumbnailContent =
+    props.kind === "icon" ? (
+      <Icon visual={props.visual} size={viewMode === "list" ? "sm" : "lg"} />
+    ) : props.thumbnailSrc ? (
+      <img
+        src={props.thumbnailSrc}
+        alt={title}
+        className="h-full w-full object-cover"
+      />
+    ) : (
+      <div className="flex h-full items-center justify-center">
+        <Spinner size="sm" />
+      </div>
+    );
+
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
+
+  const runDownload = async () => {
+    if (!onDownload || isDownloading) {
+      return;
+    }
+    setIsDownloading(true);
+    try {
+      await onDownload();
+    } finally {
+      setIsDownloading(false);
+      setMenuOpen(false);
+    }
+  };
+
+  const handleDownload = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    await runDownload();
+  };
+
+  const handleOpen = () => {
+    if (downloadOnOpen) {
+      void runDownload();
+      return;
+    }
+    onOpen();
+  };
+
+  const displayedThumbnailContent =
+    downloadOnOpen && isDownloading ? <Spinner size="sm" /> : thumbnailContent;
+
+  const hasMenu = onDownload || (extraMenuItems && extraMenuItems.length > 0);
+
+  const menu = hasMenu ? (
+    <DropdownMenu
+      open={menuOpen}
+      onOpenChange={(open) => {
+        if (!open && isDownloading) {
+          return;
+        }
+        setMenuOpen(open);
+      }}
+    >
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="xs"
+          icon={DotsHorizontal}
+          onClick={(e: React.MouseEvent) => e.stopPropagation()}
+        />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {onDownload && (
+          <DropdownMenuItem
+            label={isDownloading ? "Downloading…" : "Download"}
+            icon={Download01}
+            disabled={isDownloading}
+            onClick={handleDownload}
+          />
+        )}
+        {extraMenuItems?.map((item, i) => (
+          <DropdownMenuItem
+            key={i}
+            label={item.label}
+            icon={item.icon}
+            variant={item.variant}
+            onClick={item.onClick}
+          />
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : null;
+
+  const info = (
+    <div className="flex min-w-0 flex-1 flex-col">
+      <Tooltip
+        tooltipTriggerAsChild
+        label={title}
+        trigger={
+          <span
+            className={cn(
+              "text-sm truncate text-foreground leading-5",
+              "justify-start",
+              titleClassName
+            )}
+          >
+            {title}
+          </span>
+        }
+      />
+      <span
+        className={cn(
+          "font-normal text-xs text-muted-foreground leading-4",
+          "justify-start"
+        )}
+      >
+        {subtitle}
+      </span>
+    </div>
+  );
+
+  if (viewMode === "list") {
+    return (
+      <div
+        className={cn(
+          "flex cursor-pointer items-center gap-4 rounded-xl px-3 py-2",
+          containerClassName,
+          surfaceClassName ?? "hover:bg-muted-background"
+        )}
+        aria-busy={downloadOnOpen && isDownloading}
+        onClick={handleOpen}
+      >
+        <div className="flex h-4 w-4 shrink-0 items-center justify-center">
+          {displayedThumbnailContent}
+        </div>
+        {info}
+        {menu}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div
+        className={cn(
+          "flex h-24 cursor-pointer items-center justify-center overflow-hidden rounded-xl",
+          containerClassName,
+          surfaceClassName ?? "bg-muted-background hover:brightness-95",
+          props.kind === "icon" && "p-4"
+        )}
+        aria-busy={downloadOnOpen && isDownloading}
+        onClick={handleOpen}
+      >
+        {displayedThumbnailContent}
+      </div>
+      <div className="flex items-start justify-between gap-0.5">
+        {info}
+        {menu}
+      </div>
+    </div>
+  );
+}
+
+function getFileSubtitle(
+  entry: FileSystemFileEntry,
+  viewMode: ViewMode
+): string {
+  const typeLabel = getSingularFileCategoryLabelForContentType(
+    entry.contentType
+  );
+  const timeLabel = entry.lastModifiedMs
+    ? intlFormatDistance(entry.lastModifiedMs, Date.now(), {
+        style: viewMode === "list" ? "long" : "narrow",
+      })
+    : null;
+  return [typeLabel, timeLabel].filter(Boolean).join(" - ");
+}
+
+function FileExplorerDropTargetWrapper({
+  children,
+  disabled,
+  onDrop,
+  parentRelativePath,
+}: {
+  children: (props: {
+    surfaceClassName: string | undefined;
+  }) => React.ReactNode;
+  disabled?: boolean;
+  onDrop?: (scopedFilePath: string, parentRelativePath: string) => void;
+  parentRelativePath: string;
+}) {
+  const { isDragOver, dropTargetProps } = useFileExplorerDropTarget({
+    disabled: disabled || !onDrop,
+    onDrop: (scopedFilePath) => {
+      if (
+        onDrop &&
+        canMoveFileToParentFolder(scopedFilePath, parentRelativePath)
+      ) {
+        onDrop(scopedFilePath, parentRelativePath);
+      }
+    },
+  });
+
+  return (
+    <div {...dropTargetProps}>
+      {children({
+        surfaceClassName: getFileExplorerDropSurfaceClassName(isDragOver),
+      })}
+    </div>
+  );
+}
+
+interface FileExplorerFolderCardProps {
+  node: FileSystemTreeNode;
+  viewMode: ViewMode;
+  onDownload: () => Promise<void>;
+  onNavigate: (node: FileSystemTreeNode) => void;
+  onMoveFileDrop?: (scopedFilePath: string, parentRelativePath: string) => void;
+  extraMenuItems?: FileExplorerMenuAction[];
+}
+
+export function FileExplorerFolderCard({
+  node,
+  viewMode,
+  onDownload,
+  onNavigate,
+  onMoveFileDrop,
+  extraMenuItems,
+}: FileExplorerFolderCardProps) {
+  const childCount = node.children.length;
+  const subtitle =
+    childCount === 0
+      ? "Empty"
+      : childCount === 1
+        ? "1 item"
+        : `${childCount} items`;
+
+  return (
+    <FileExplorerDropTargetWrapper
+      disabled={!onMoveFileDrop}
+      onDrop={onMoveFileDrop}
+      parentRelativePath={node.path}
+    >
+      {({ surfaceClassName }) => (
+        <FileExplorerItem
+          kind="icon"
+          visual={Folder}
+          viewMode={viewMode}
+          title={node.name}
+          titleClassName="font-semibold"
+          subtitle={subtitle}
+          surfaceClassName={surfaceClassName}
+          onDownload={onDownload}
+          onOpen={() => onNavigate(node)}
+          extraMenuItems={extraMenuItems}
+        />
+      )}
+    </FileExplorerDropTargetWrapper>
+  );
+}
+
+interface FileExplorerFileCardProps {
+  draggable?: boolean;
+  entry: FileEntry;
+  /** When set, title shows path relative to this folder (search mode). */
+  searchFolderPath?: string;
+  viewMode: ViewMode;
+  onOpen: (entry: FileEntry) => void;
+  onDownload: (entry: FileEntry) => Promise<void>;
+  extraMenuItems?: FileExplorerMenuAction[];
+}
+
+function FileExplorerDraggableWrapper({
+  children,
+  draggable,
+  onDragStart,
+  viewMode,
+}: {
+  children: React.ReactNode;
+  draggable: boolean;
+  onDragStart: (e: React.DragEvent) => void;
+  viewMode: ViewMode;
+}) {
+  const [isDragging, setIsDragging] = useState(false);
+
+  if (!draggable) {
+    return <>{children}</>;
+  }
+
+  return (
+    <div
+      draggable
+      className={cn(
+        viewMode === "grid" && "flex flex-col gap-1",
+        isDragging && "opacity-50"
+      )}
+      onDragStart={(e) => {
+        onDragStart(e);
+        setIsDragging(true);
+      }}
+      onDragEnd={() => {
+        setIsDragging(false);
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+export function FileExplorerFileCard({
+  draggable: draggableProp = false,
+  entry,
+  searchFolderPath,
+  viewMode,
+  onOpen,
+  onDownload,
+  extraMenuItems,
+}: FileExplorerFileCardProps) {
+  const subtitle = getFileSubtitle(entry, viewMode);
+  const downloadOnOpen = !isFilePreviewableContentType(entry.contentType);
+  const title =
+    searchFolderPath !== undefined
+      ? getFileExplorerSearchResultTitle(entry, searchFolderPath)
+      : entry.fileName;
+
+  const handleDragStart = (e: React.DragEvent) => {
+    if (e.target instanceof HTMLElement && e.target.closest("button")) {
+      e.preventDefault();
+      return;
+    }
+    setFileExplorerDragData(e.dataTransfer, entry.path);
+  };
+
+  const dragContainerClassName = draggableProp
+    ? "cursor-grab active:cursor-grabbing"
+    : undefined;
+
+  const item =
+    getCategoryFromContentType(entry.contentType) === "image" &&
+    entry.thumbnailUrl ? (
+      <FileExplorerItem
+        kind="thumbnail"
+        thumbnailSrc={entry.thumbnailUrl}
+        viewMode={viewMode}
+        title={title}
+        subtitle={subtitle}
+        containerClassName={dragContainerClassName}
+        downloadOnOpen={downloadOnOpen}
+        onOpen={() => onOpen(entry)}
+        onDownload={() => onDownload(entry)}
+        extraMenuItems={extraMenuItems}
+      />
+    ) : (
+      <FileExplorerItem
+        kind="icon"
+        visual={getFileTypeIcon(entry.contentType, entry.fileName)}
+        viewMode={viewMode}
+        title={title}
+        subtitle={subtitle}
+        containerClassName={dragContainerClassName}
+        downloadOnOpen={downloadOnOpen}
+        onOpen={() => onOpen(entry)}
+        onDownload={() => onDownload(entry)}
+        extraMenuItems={extraMenuItems}
+      />
+    );
+
+  return (
+    <FileExplorerDraggableWrapper
+      draggable={draggableProp}
+      viewMode={viewMode}
+      onDragStart={handleDragStart}
+    >
+      {item}
+    </FileExplorerDraggableWrapper>
+  );
+}
+
+interface FileExplorerFramePackageCardProps {
+  entry: FramePackageEntry;
+  /** When set, title shows path relative to this folder (search mode). */
+  searchFolderPath?: string;
+  viewMode: ViewMode;
+  onDownload: () => Promise<void>;
+  onOpen: (entry: FramePackageEntry) => void;
+  extraMenuItems?: FileExplorerMenuAction[];
+}
+
+export function FileExplorerFramePackageCard({
+  entry,
+  searchFolderPath,
+  viewMode,
+  onDownload,
+  onOpen,
+  extraMenuItems,
+}: FileExplorerFramePackageCardProps) {
+  const title =
+    searchFolderPath !== undefined
+      ? getFileExplorerSearchResultTitle(entry, searchFolderPath)
+      : entry.fileName;
+
+  return (
+    <FileExplorerItem
+      kind="icon"
+      visual={getFileTypeIcon(entry.contentType, entry.fileName)}
+      viewMode={viewMode}
+      title={title}
+      subtitle="Frame"
+      onDownload={onDownload}
+      onOpen={() => onOpen(entry)}
+      extraMenuItems={extraMenuItems}
+    />
+  );
+}
+
+interface ContentNodeCardProps {
+  entry: ContentNodeEntry;
+  viewMode: ViewMode;
+  onOpen: (entry: ContentNodeEntry) => void;
+  extraMenuItems?: FileExplorerMenuAction[];
+}
+
+export function ContentNodeCard({
+  entry,
+  viewMode,
+  onOpen,
+  extraMenuItems,
+}: ContentNodeCardProps) {
+  const ProviderIcon = getConnectorProviderLogoWithFallback({
+    provider: entry.connectorProvider,
+    fallback: CloudArrowLeftRight,
+  });
+
+  return (
+    <FileExplorerItem
+      kind="icon"
+      visual={ProviderIcon}
+      viewMode={viewMode}
+      title={entry.fileName}
+      subtitle="Knowledge"
+      onOpen={() => onOpen(entry)}
+      extraMenuItems={extraMenuItems}
+    />
+  );
+}
+
+export function FileExplorerEmptyState() {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-3">
+      <Icon visual={FolderOpen} size="lg" className="text-muted-foreground" />
+      <p className="copy-base text-center text-muted-foreground">
+        Nothing to see here
+      </p>
+    </div>
+  );
+}

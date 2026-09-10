@@ -1,0 +1,143 @@
+import type { SubscriptionModel } from "@app/lib/models/plan";
+import { frontSequelize } from "@app/lib/resources/storage";
+import { DataTypes } from "@app/lib/resources/storage/data_types";
+import { BaseModel } from "@app/lib/resources/storage/wrappers/base";
+import { MODEL_PROVIDER_IDS } from "@app/types/assistant/models/providers";
+import type { EmbeddingProviderIdType } from "@app/types/assistant/models/types";
+import type {
+  WorkspacePoolCreditState,
+  WorkspaceProgrammaticCreditState,
+} from "@app/types/credits";
+import type {
+  WorkspaceSegmentationType,
+  WorkspaceSharingPolicy,
+} from "@app/types/user";
+import type { CreationOptional, NonAttribute } from "sequelize";
+
+const DEFAULT_SHARING_POLICY: WorkspaceSharingPolicy = "all_scopes";
+
+const modelProviders = [...MODEL_PROVIDER_IDS] as string[];
+// TODO(2025-10-16 flav) Move this away from the resource storage layer.
+export type ModelProviderIdType = (typeof MODEL_PROVIDER_IDS)[number];
+
+export class WorkspaceModel extends BaseModel<WorkspaceModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare sId: string;
+  declare name: string;
+  declare description: string | null;
+  declare segmentation: WorkspaceSegmentationType;
+  declare ssoEnforced?: boolean;
+  declare regionalModelsOnly: CreationOptional<boolean>;
+  declare workOSOrganizationId: string | null;
+  declare subscriptions: NonAttribute<SubscriptionModel[]>;
+  declare whiteListedProviders: ModelProviderIdType[] | null;
+  declare defaultEmbeddingProvider: EmbeddingProviderIdType | null;
+  declare metadata: Record<string, string | number | boolean | object> | null;
+  declare sharingPolicy: CreationOptional<WorkspaceSharingPolicy>;
+  declare conversationsRetentionDays: number | null;
+  declare metronomeCustomerId: string | null;
+  declare poolCreditState: CreationOptional<WorkspacePoolCreditState>;
+  declare programmaticCreditState: CreationOptional<WorkspaceProgrammaticCreditState>;
+}
+WorkspaceModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    sId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    name: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    description: {
+      type: DataTypes.STRING,
+    },
+    segmentation: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    ssoEnforced: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    regionalModelsOnly: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    workOSOrganizationId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    conversationsRetentionDays: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+    metronomeCustomerId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    whiteListedProviders: {
+      type: DataTypes.ARRAY(DataTypes.STRING),
+      defaultValue: null,
+      allowNull: true,
+      validate: {
+        isProviderValid(value: string[] | null) {
+          if (value && !value.every((val) => modelProviders.includes(val))) {
+            throw new Error("Invalid provider in whiteListedProviders");
+          }
+        },
+      },
+    },
+    defaultEmbeddingProvider: {
+      type: DataTypes.STRING,
+      defaultValue: null,
+      allowNull: true,
+      validate: {
+        isIn: [modelProviders],
+      },
+    },
+    metadata: {
+      type: DataTypes.JSONB,
+      defaultValue: null,
+      allowNull: true,
+    },
+    sharingPolicy: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: DEFAULT_SHARING_POLICY,
+    },
+    poolCreditState: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "active",
+    },
+    programmaticCreditState: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "active",
+    },
+  },
+  {
+    modelName: "workspace",
+    sequelize: frontSequelize,
+    indexes: [
+      { unique: true, fields: ["sId"] },
+      { unique: true, fields: ["workOSOrganizationId"] },
+      { fields: ["name"], concurrently: true, name: "workspaces_name" },
+    ],
+  }
+);

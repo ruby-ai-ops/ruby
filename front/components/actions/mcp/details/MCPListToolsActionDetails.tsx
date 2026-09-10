@@ -1,0 +1,60 @@
+import { ActionDetailsWrapper } from "@app/components/actions/ActionDetailsWrapper";
+import type { ToolExecutionDetailsProps } from "@app/components/actions/mcp/details/types";
+import { getIcon } from "@app/components/resources/resources_icons";
+import { getMcpServerViewDisplayName } from "@app/lib/actions/mcp_helper";
+import { isToolsetsResultResourceType } from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import { useMCPServerViews } from "@app/lib/swr/mcp_servers";
+import { useSpaces } from "@app/lib/swr/spaces";
+import { Chip, Zap } from "@ruby-ai/sparkle";
+
+export function MCPListToolsActionDetails({
+  owner,
+  toolOutput,
+  displayContext,
+}: ToolExecutionDetailsProps) {
+  const { spaces } = useSpaces({
+    kinds: ["global"],
+    workspaceId: owner.sId,
+  });
+  const { serverViews: mcpServerViews } = useMCPServerViews({
+    owner,
+    space: spaces[0] ?? undefined,
+    availability: "all",
+  });
+  const results =
+    toolOutput?.filter(isToolsetsResultResourceType).map((o) => o.resource) ??
+    [];
+
+  return (
+    <ActionDetailsWrapper
+      displayContext={displayContext}
+      actionName={
+        displayContext === "conversation" ? `Listing tools` : `List tools`
+      }
+      visual={Zap}
+    >
+      {displayContext !== "conversation" && (
+        <div className="pl-6 pt-4 text-sm font-normal text-muted-foreground">
+          <div className="flex flex-wrap gap-1">
+            {results.map((result) => {
+              const mcpServerView = mcpServerViews.find(
+                (v) => v.sId === result.id
+              );
+              if (!mcpServerView) {
+                console.log("mcpServerView not found", result);
+                return null;
+              }
+              return (
+                <Chip
+                  key={result.id}
+                  label={getMcpServerViewDisplayName(mcpServerView)}
+                  icon={getIcon(mcpServerView.server.icon)}
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </ActionDetailsWrapper>
+  );
+}

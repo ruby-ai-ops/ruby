@@ -1,0 +1,595 @@
+import { GongAPIError } from "@connectors/connectors/gong/lib/errors";
+import type {
+  GongCallTranscript,
+  GongTranscriptMetadata,
+} from "@connectors/connectors/gong/lib/gong_api";
+import { makeGongTranscriptInternalId } from "@connectors/connectors/gong/lib/internal_ids";
+import { syncGongTranscript } from "@connectors/connectors/gong/lib/upserts";
+import {
+  getGongUsers,
+  getUserBlobFromGongAPI,
+} from "@connectors/connectors/gong/lib/users";
+import {
+  fetchGongConfiguration,
+  fetchGongConnector,
+  getGongClient,
+} from "@connectors/connectors/gong/lib/utils";
+import { dataSourceConfigFromConnector } from "@connectors/lib/api/data_source_config";
+import { concurrentExecutor } from "@connectors/lib/async_utils";
+import { deleteDataSourceDocument } from "@connectors/lib/data_sources";
+import {
+  reportInitialSyncProgress,
+  syncStarted,
+  syncSucceeded,
+} from "@connectors/lib/sync_status";
+import { heartbeat } from "@connectors/lib/temporal";
+import logger from "@connectors/logger/logger";
+import type { ConnectorResource } from "@connectors/resources/connector_resource";
+import type { GongConfigurationResource } from "@connectors/resources/gong_resources";
+import {
+  GongTranscriptResource,
+  GongUserResource,
+} from "@connectors/resources/gong_resources";
+import type { ModelId } from "@connectors/types";
+import { removeNulls } from "@connectors/types/shared/utils/general";
+
+const GARBAGE_COLLECT_BATCH_SIZE = 100;
+
+type PermissionProfileFilter =
+  | { type: "unrestricted" }
+  | { type: "restricted"; userIds: Set<string> };
+
+async function resolvePermissionProfile(
+  connector: ConnectorResource,
+  configuration: GongConfigurationResource
+): Promise<PermissionProfileFilter> {
+  const { permissionProfileId } = configuration;
+  if (!permissionProfileId) {
+    return { type: "unrestricted" };
+  }
+
+  const gongClient = await getGongClient(connector);
+  const profile = await gongClient.getPermissionProfile({
+    profileId: permissionProfileId,
+  });
+
+  if (profile.callsAccess.permissionLevel === "all") {
+    return { type: "unrestricted" };
+  }
+
+  const { teamLeadIds } = profile.callsAccess;
+  if (!teamLeadIds || teamLeadIds.length === 0) {
+    return { type: "unrestricted" };
+  }
+
+  return { type: "restricted", userIds: new Set(teamLeadIds) };
+}
+
+/**
+ * Checks if a transcript title contains any excluded keywords.
+ */
+function shouldExcludeByTitle(
+  title: string | undefined,
+  excludeKeywords: string[] | null
+): boolean {
+  if (!excludeKeywords || excludeKeywords.length === 0) {
+    return false;
+  }
+  if (!title) {
+    return false;
+  }
+
+  const lowerTitle = title.toLowerCase();
+  return excludeKeywords.some((kw) => lowerTitle.includes(kw));
+  // Note: keywords are already stored lowercase from the resource setter
+}
+
+/**
+ * Determines whether a transcript should be synced.
+ * Excludes private calls. When a permission profile is configured, only syncs
+ * calls where at least one participant belongs to the profile's user list.
+ */
+function shouldSyncTranscript(
+  metadata: GongTranscriptMetadata,
+  filter: PermissionProfileFilter,
+  configuration: GongConfigurationResource
+): { shouldSync: false; reason: string } | { shouldSync: true; reason: null } {
+  const { excludeTitleKeywords } = configuration;
+
+  if (metadata.metaData.isPrivate) {
+    return { shouldSync: false, reason: "transcript is private" };
+  }
+
+  if (shouldExcludeByTitle(metadata.metaData.title, excludeTitleKeywords)) {
+    return {
+      shouldSync: false,
+      reason: "title contains excluded keyword",
+    };
+  }
+
+  if (filter.type === "unrestricted") {
+    return { shouldSync: true, reason: null };
+  }
+
+  const { parties = [] } = metadata;
+  const partyUserIds = parties
+    .map((p) => p.userId)
+    .filter((id): id is string => Boolean(id));
+
+  // Include the call owner (primaryUserId) in the match check, since they
+  // may not appear in the parties array (e.g. imported calls).
+  const { primaryUserId } = metadata.metaData;
+  const candidateUserIds = primaryUserId
+    ? [...new Set([primaryUserId, ...partyUserIds])]
+    : partyUserIds;
+
+  if (candidateUserIds.some((id) => filter.userIds.has(id))) {
+    return { shouldSync: true, reason: null };
+  }
+
+  return {
+    shouldSync: false,
+    reason: "no participant matches the permission profile",
+  };
+}
+
+export async function gongSaveStartSyncActivity({
+  connectorId,
+}: {
+  connectorId: ModelId;
+}) {
+  const connector = await fetchGongConnector({ connectorId });
+
+  const result = await syncStarted(connector.id);
+  if (result.isErr()) {
+    throw result.error;
+  }
+}
+
+export async function gongSaveSyncSuccessActivity({
+  connectorId,
+  lastSyncTimestamp,
+}: {
+  connectorId: ModelId;
+  lastSyncTimestamp: number;
+}) {
+  const connector = await fetchGongConnector({ connectorId });
+
+  const configuration = await fetchGongConfiguration(connector);
+
+  // Update the last sync timestamp.
+  await configuration.setLastSyncTimestamp(lastSyncTimestamp);
+
+  const result = await syncSucceeded(connector.id);
+  if (result.isErr()) {
+    throw result.error;
+  }
+}
+
+export async function getTranscriptsMetadata({
+  callIds,
+  connector,
+  configuration,
+}: {
+  callIds: string[];
+  connector: ConnectorResource;
+  configuration: GongConfigurationResource;
+}): Promise<GongTranscriptMetadata[]> {
+  const gongClient = await getGongClient(connector);
+  const { trackersEnabled, accountsEnabled } = configuration;
+
+  const metadata = [];
+  let cursor = null;
+  do {
+    const { callsMetadata, nextPageCursor } = await gongClient.getCallsMetadata(
+      {
+        callIds,
+        trackersEnabled,
+        accountsEnabled,
+      }
+    );
+    metadata.push(...callsMetadata);
+    cursor = nextPageCursor;
+  } while (cursor);
+
+  return metadata;
+}
+
+// Transcripts.
+export async function gongSyncTranscriptsActivity({
+  connectorId,
+  forceResync,
+  pageCursor,
+  currentRecordCount = 0,
+}: {
+  forceResync: boolean;
+  connectorId: ModelId;
+  pageCursor: string | null;
+  currentRecordCount?: number;
+}) {
+  const connector = await fetchGongConnector({ connectorId });
+  const configuration = await fetchGongConfiguration(connector);
+  const loggerArgs = {
+    connectorId: connector.id,
+    dataSourceId: connector.dataSourceId,
+    provider: "gong",
+    startTimestamp: configuration.lastSyncTimestamp,
+    workspaceId: connector.workspaceId,
+  };
+
+  const gongClient = await getGongClient(connector);
+
+  // Fetch transcripts, handling expired cursor by restarting pagination once.
+  let transcriptsResp: {
+    transcripts: GongCallTranscript[];
+    nextPageCursor: string | null;
+    totalRecords: number;
+  };
+  try {
+    logger.info(
+      { ...loggerArgs, pageCursor },
+      "[Gong] Fetching transcripts page."
+    );
+    transcriptsResp = await gongClient.getTranscripts({
+      startTimestamp: configuration.getSyncStartTimestamp(),
+      pageCursor,
+    });
+    logger.info(
+      { ...loggerArgs, pageCursor },
+      "[Gong] Success transcripts page."
+    );
+  } catch (err) {
+    const isExpiredCursorError =
+      err instanceof GongAPIError &&
+      err.status === 400 &&
+      Array.isArray(err.errors) &&
+      err.errors.some((e) => e.toLowerCase().includes("cursor has expired"));
+
+    if (isExpiredCursorError) {
+      logger.warn(
+        { ...loggerArgs, pageCursor, requestId: err.requestId },
+        "[Gong] Cursor expired; restarting pagination from beginning."
+      );
+      transcriptsResp = await gongClient.getTranscripts({
+        startTimestamp: configuration.getSyncStartTimestamp(),
+        pageCursor: null,
+      });
+    } else {
+      throw err;
+    }
+  }
+
+  const { transcripts, nextPageCursor, totalRecords } = transcriptsResp;
+
+  const processedRecords = transcripts.length;
+
+  if (totalRecords > 0) {
+    const progressMessage = `${processedRecords + currentRecordCount}/${totalRecords} transcripts`;
+    await reportInitialSyncProgress(connectorId, progressMessage);
+  }
+
+  if (transcripts.length === 0) {
+    logger.info(
+      { ...loggerArgs, pageCursor },
+      "[Gong] No more transcripts found."
+    );
+    return {
+      nextPageCursor: null,
+      processedRecords,
+    };
+  }
+
+  const transcriptsInDb = await GongTranscriptResource.fetchByCallIds(
+    transcripts.map((t) => t.callId),
+    connector
+  );
+  const transcriptsInDbMap = new Map(transcriptsInDb.map((t) => [t.callId, t]));
+
+  let transcriptsToSync = transcripts;
+  if (!forceResync) {
+    transcriptsToSync = transcripts.filter(
+      (t) => !transcriptsInDbMap.has(t.callId)
+    );
+  }
+  if (transcriptsToSync.length === 0) {
+    logger.info({ ...loggerArgs }, "[Gong] All transcripts are already in DB.");
+    return {
+      nextPageCursor,
+      processedRecords,
+    };
+  }
+
+  const callsMetadata = await getTranscriptsMetadata({
+    callIds: transcriptsToSync.map((t) => t.callId),
+    connector,
+    configuration,
+  });
+  const callsMetadataMap = new Map(
+    callsMetadata.map((c) => [c.metaData.id, c])
+  );
+
+  // Consider moving this in a dedicated activity that will be shared across pages.
+  const permissionFilter = await resolvePermissionProfile(
+    connector,
+    configuration
+  );
+
+  const callsMetadataToSync = removeNulls(
+    transcriptsToSync.map((transcript) => {
+      const transcriptMetadata = callsMetadataMap.get(transcript.callId);
+      if (!transcriptMetadata) {
+        logger.warn(
+          { ...loggerArgs, callId: transcript.callId },
+          "[Gong] Transcript metadata not found."
+        );
+        return null;
+      }
+
+      const { shouldSync, reason } = shouldSyncTranscript(
+        transcriptMetadata,
+        permissionFilter,
+        configuration
+      );
+      if (!shouldSync) {
+        logger.info(
+          { ...loggerArgs, callId: transcript.callId, reason },
+          `[Gong] Skipping transcript.`
+        );
+        return null;
+      }
+
+      return { transcript, transcriptMetadata };
+    })
+  );
+
+  const participants = await getGongUsers(connector, {
+    gongUserIds: [
+      ...new Set(
+        callsMetadataToSync.flatMap(({ transcriptMetadata }) =>
+          removeNulls(transcriptMetadata.parties?.map((p) => p.userId) ?? [])
+        )
+      ),
+    ],
+  });
+  const participantsByGongId = new Map(
+    participants.map((participant) => [participant.gongId, participant])
+  );
+
+  await heartbeat();
+
+  await concurrentExecutor(
+    callsMetadataToSync,
+    async ({ transcript, transcriptMetadata }) => {
+      await heartbeat();
+
+      const { parties = [] } = transcriptMetadata;
+
+      const participantEmails = parties
+        .map(
+          (party) =>
+            (party.userId
+              ? participantsByGongId.get(party.userId)?.email
+              : null) ?? party.emailAddress
+        )
+        .filter((email): email is string => Boolean(email));
+
+      const speakerToEmailMap = Object.fromEntries(
+        parties.map((party) => [
+          party.speakerId,
+          // Prefer gong_users table, fallback to metadata email
+          (party.userId
+            ? participantsByGongId.get(party.userId)?.email
+            : null) ?? party.emailAddress,
+        ])
+      );
+
+      await syncGongTranscript({
+        transcript,
+        transcriptMetadata,
+        speakerToEmailMap,
+        loggerArgs,
+        participantEmails,
+        connector,
+        forceResync,
+      });
+    },
+    { concurrency: 10 }
+  );
+
+  await heartbeat();
+
+  return {
+    nextPageCursor,
+    processedRecords,
+  };
+}
+
+// Users.
+export async function gongListAndSaveUsersActivity({
+  connectorId,
+}: {
+  connectorId: ModelId;
+}) {
+  const connector = await fetchGongConnector({ connectorId });
+  const configuration = await fetchGongConfiguration(connector);
+
+  const loggerArgs = {
+    connectorId: connector.id,
+    dataSourceId: connector.dataSourceId,
+    provider: "gong",
+    startTimestamp: configuration.lastSyncTimestamp,
+    workspaceId: connector.workspaceId,
+  };
+
+  // Skip the full sync of users if we are not on the initial full sync.
+  // The call to /users is costly (many users usually) and heavily rate-limited:
+  // we have seen retry-after of ~20 minutes.
+  if (configuration.lastSyncTimestamp !== null) {
+    return;
+  }
+
+  const gongClient = await getGongClient(connector);
+
+  let pageCursor = null;
+  do {
+    logger.info({ ...loggerArgs, pageCursor }, "[Gong] Fetching users page.");
+    const { users, nextPageCursor } = await gongClient.getUsers({
+      pageCursor,
+    });
+    logger.info({ ...loggerArgs, pageCursor }, "[Gong] Success users page.");
+
+    await GongUserResource.batchCreate(
+      connector,
+      removeNulls(users.map(getUserBlobFromGongAPI))
+    );
+
+    pageCursor = nextPageCursor;
+  } while (pageCursor);
+}
+
+export async function gongCheckGarbageCollectionStateActivity({
+  connectorId,
+  currentTimestamp,
+}: {
+  connectorId: ModelId;
+  currentTimestamp: number;
+}): Promise<{ shouldRunGarbageCollection: boolean }> {
+  const connector = await fetchGongConnector({ connectorId });
+  const configuration = await fetchGongConfiguration(connector);
+
+  return configuration.checkGarbageCollectionState({
+    currentTimestamp,
+  });
+}
+
+export async function gongSaveGarbageCollectionSuccessActivity({
+  connectorId,
+  lastGarbageCollectionTimestamp,
+}: {
+  connectorId: ModelId;
+  lastGarbageCollectionTimestamp: number;
+}) {
+  const connector = await fetchGongConnector({ connectorId });
+  const configuration = await fetchGongConfiguration(connector);
+
+  // Update the last garbage collection timestamp.
+  await configuration.setLastGarbageCollectionTimestamp(
+    lastGarbageCollectionTimestamp
+  );
+}
+
+export async function gongDeleteOutdatedTranscriptsActivity({
+  connectorId,
+  garbageCollectionStartTs,
+}: {
+  connectorId: ModelId;
+  garbageCollectionStartTs: number;
+}): Promise<{ hasMore: boolean }> {
+  const connector = await fetchGongConnector({ connectorId });
+  const configuration = await fetchGongConfiguration(connector);
+  const dataSourceConfig = dataSourceConfigFromConnector(connector);
+
+  const outdatedTranscripts = await GongTranscriptResource.fetchOutdated(
+    connector,
+    configuration,
+    {
+      garbageCollectionStartTs,
+      limit: GARBAGE_COLLECT_BATCH_SIZE,
+    }
+  );
+
+  // Delete the data from core.
+  for (const transcript of outdatedTranscripts) {
+    await deleteDataSourceDocument(
+      dataSourceConfig,
+      makeGongTranscriptInternalId(connector, transcript.callId),
+      {
+        workspaceId: dataSourceConfig.workspaceId,
+        dataSourceId: dataSourceConfig.dataSourceId,
+        provider: "gong",
+        callId: transcript.callId,
+      }
+    );
+  }
+
+  // Delete the data from connectors.
+  await GongTranscriptResource.batchDelete(connector, outdatedTranscripts);
+
+  return {
+    hasMore: outdatedTranscripts.length === GARBAGE_COLLECT_BATCH_SIZE,
+  };
+}
+
+/**
+ * Deletes transcripts matching exclude keywords in batches.
+ */
+export async function gongDeleteExcludedTranscriptsActivity({
+  connectorId,
+  excludeKeywords,
+  lastId,
+  maxTranscriptId,
+}: {
+  connectorId: ModelId;
+  excludeKeywords: string[];
+  lastId: ModelId | null;
+  maxTranscriptId: ModelId;
+}): Promise<{ hasMore: boolean; lastId: ModelId | null }> {
+  const connector = await fetchGongConnector({ connectorId });
+  const dataSourceConfig = dataSourceConfigFromConnector(connector);
+
+  const transcripts = await GongTranscriptResource.fetchBatch(connector, {
+    ...(lastId ? { lastId } : {}),
+    limit: GARBAGE_COLLECT_BATCH_SIZE,
+  });
+
+  if (transcripts.length === 0) {
+    logger.info(
+      { connectorId: connector.id },
+      "[Gong] Cleanup complete - no more transcripts"
+    );
+    return { hasMore: false, lastId: null };
+  }
+
+  const transcriptsToDelete = transcripts.filter((transcript) =>
+    shouldExcludeByTitle(transcript.title, excludeKeywords)
+  );
+
+  for (const transcript of transcriptsToDelete) {
+    await deleteDataSourceDocument(
+      dataSourceConfig,
+      makeGongTranscriptInternalId(connector, transcript.callId),
+      {
+        workspaceId: dataSourceConfig.workspaceId,
+        dataSourceId: dataSourceConfig.dataSourceId,
+        provider: "gong",
+        callId: transcript.callId,
+      }
+    );
+  }
+
+  await GongTranscriptResource.batchDelete(connector, transcriptsToDelete);
+
+  const lastTranscript = transcripts[transcripts.length - 1];
+  const newLastId = lastTranscript ? lastTranscript.id : null;
+
+  // Check if we've hit the maxId ceiling - stop immediately
+  if (lastTranscript && lastTranscript.id > maxTranscriptId) {
+    logger.info(
+      {
+        connectorId: connector.id,
+        lastProcessedId: lastTranscript.id,
+        maxTranscriptId,
+        deletedInBatch: transcriptsToDelete.length,
+      },
+      "[Gong] Cleanup complete - remaining transcripts were synced with current config"
+    );
+    return { hasMore: false, lastId: null };
+  }
+
+  const hasMore = transcripts.length === GARBAGE_COLLECT_BATCH_SIZE;
+
+  return {
+    hasMore,
+    lastId: newLastId,
+  };
+}

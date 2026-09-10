@@ -1,0 +1,574 @@
+import schemaVersionsJson from "@app/lib/api/audit/schema_versions.json";
+import { config as cellConfig } from "@app/lib/api/cells/config";
+import { getWorkOS } from "@app/lib/api/workos/client";
+import { getWorkOSOrganization } from "@app/lib/api/workos/organization_primitives";
+import { isFreePlan } from "@app/lib/plans/plan_codes";
+import { MembershipResource } from "@app/lib/resources/membership_resource";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { WorkOSPortalIntent } from "@app/lib/types/workos";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { LightWorkspaceType } from "@app/types/user";
+import type { Connection, Directory, Organization } from "@workos-inc/node";
+import {
+  DomainDataState,
+  GeneratePortalLinkIntent,
+  OrganizationDomainState,
+} from "@workos-inc/node";
+import assert from "assert";
+import uniqueId from "lodash/uniqueId";
+
+/**
+ * Ensure active Ruby memberships exist as WorkOS organization memberships.
+ * Idempotent create-or-update via `updateWorkOSMembershipRole`.
+ * Users without a `workOSUserId` are skipped (they cannot be linked yet).
+ *
+ * `workspace.workOSOrganizationId` must already be set.
+ */
+async function syncActiveMembershipsToWorkOSOrganization(
+  workspace: LightWorkspaceType
+): Promise<void> {
+  const { memberships } = await MembershipResource.getActiveMemberships({
+    workspace,
+  });
+
+  await concurrentExecutor(
+    memberships,
+    async (membership) => {
+      if (!membership.user?.workOSUserId) {
+        return;
+      }
+
+      await MembershipResource.updateWorkOSMembershipRole({
+        user: new UserResource(UserModel, membership.user),
+        workspace,
+        newRole: membership.role,
+      });
+    },
+    { concurrency: 10 }
+  );
+}
+
+export async function getOrCreateWorkOSOrganization(
+  workspace: LightWorkspaceType,
+  { domain }: { domain?: string } = {}
+): Promise<Result<Organization, Error>> {
+  try {
+    const organizationRes = await getWorkOSOrganization(workspace);
+    if (organizationRes.isErr()) {
+      return new Err(organizationRes.error);
+    }
+
+    // Sync members when first linking this workspace to WorkOS (missing DB id)
+    // or when creating a brand-new org. Skip on subsequent lookups (e.g. domains
+    // GET) so we do not re-walk every membership on hot paths.
+    const shouldSyncMemberships =
+      !workspace.workOSOrganizationId || !organizationRes.value;
+
+    const organization =
+      organizationRes.value ??
+      (await getWorkOS().organizations.createOrganization({
+        name: workspace.name,
+        externalId: workspace.sId,
+        metadata: {
+          region: cellConfig.getCurrentCell().region,
+          cell: cellConfig.getCurrentCell().name,
+        },
+        domainData: domain
+          ? [
+              {
+                domain,
+                state: DomainDataState.Verified,
+              },
+            ]
+          : undefined,
+      }));
+
+    if (workspace.workOSOrganizationId !== organization.id) {
+      await WorkspaceResource.updateWorkOSOrganizationId(
+        workspace.id,
+        organization.id
+      );
+    }
+
+    if (shouldSyncMemberships) {
+      await syncActiveMembershipsToWorkOSOrganization({
+        ...workspace,
+        workOSOrganizationId: organization.id,
+      });
+    }
+
+    return new Ok(organization);
+  } catch (error) {
+    const e = normalizeError(error);
+    logger.error(e, "Failed to create WorkOS organization");
+    return new Err(
+      new Error(`Failed to create WorkOS organization: ${e.message}`)
+    );
+  }
+}
+
+export async function addWorkOSOrganizationDomain(
+  workspace: LightWorkspaceType,
+  { domain }: { domain: string }
+): Promise<Result<void, Error>> {
+  const organizationRes = await getWorkOSOrganization(workspace);
+  if (organizationRes.isErr()) {
+    return new Err(organizationRes.error);
+  }
+
+  const organization = organizationRes.value;
+  if (!organization) {
+    return new Err(
+      new Error("WorkOS organization not found for this workspace.")
+    );
+  }
+
+  await getWorkOS().organizations.updateOrganization({
+    organization: organization.id,
+    domainData: [
+      ...organization.domains.map((d) => ({
+        domain: d.domain,
+        state:
+          d.state === OrganizationDomainState.Verified
+            ? DomainDataState.Verified
+            : DomainDataState.Pending,
+      })),
+      {
+        domain,
+        state: DomainDataState.Verified,
+      },
+    ],
+  });
+
+  // WARN: Hacky update done after the domain data, so that it trigger
+  // the webhook. Should be remove once WorkOS send us webhook when just
+  // the domains change.
+  await getWorkOS().organizations.updateOrganization({
+    organization: organization.id,
+    metadata: {
+      _webhookTrigger: uniqueId(),
+    },
+  });
+
+  return new Ok(undefined);
+}
+
+export async function updateWorkOSOrganizationName(
+  workspace: LightWorkspaceType
+): Promise<Result<void, Error>> {
+  const organizationRes = await getWorkOSOrganization(workspace);
+  if (organizationRes.isErr()) {
+    return new Err(organizationRes.error);
+  }
+
+  const organization = organizationRes.value;
+  if (!organization) {
+    return new Ok(undefined);
+  }
+
+  const newName = workspace.name;
+
+  if (organization.name === newName) {
+    return new Ok(undefined);
+  }
+
+  try {
+    await getWorkOS().organizations.updateOrganization({
+      organization: organization.id,
+      name: newName,
+    });
+  } catch (error) {
+    const e = normalizeError(error);
+    logger.error("Failed to update WorkOS organization name", {
+      error: e,
+      workspaceId: workspace.id,
+      organizationId: organization.id,
+    });
+    return new Err(e);
+  }
+
+  return new Ok(undefined);
+}
+
+// Mapping WorkOSPortalIntent to GeneratePortalLinkIntent,
+// as we can't use the WorkOSPortalIntent enum on any Client-Side code.
+const INTENT_MAP: Record<WorkOSPortalIntent, GeneratePortalLinkIntent> = {
+  [WorkOSPortalIntent.SSO]: GeneratePortalLinkIntent.SSO,
+  [WorkOSPortalIntent.DSync]: GeneratePortalLinkIntent.DSync,
+  [WorkOSPortalIntent.DomainVerification]:
+    GeneratePortalLinkIntent.DomainVerification,
+  [WorkOSPortalIntent.AuditLogs]: GeneratePortalLinkIntent.AuditLogs,
+  [WorkOSPortalIntent.LogStreams]: GeneratePortalLinkIntent.LogStreams,
+  [WorkOSPortalIntent.CertificateRenewal]:
+    GeneratePortalLinkIntent.CertificateRenewal,
+};
+
+export function generateWorkOSAdminPortalUrl({
+  organization,
+  workOSIntent,
+  returnUrl,
+}: {
+  organization: string;
+  workOSIntent: WorkOSPortalIntent;
+  returnUrl: string;
+}) {
+  const intent = INTENT_MAP[workOSIntent];
+
+  if (!intent) {
+    throw new Error(`Invalid intent: ${workOSIntent}`);
+  }
+
+  return getWorkOS().portal.generateLink({
+    organization,
+    intent,
+    returnUrl,
+  });
+}
+
+/**
+ * SSO Connections.
+ */
+
+export async function getWorkOSOrganizationSSOConnections({
+  workspace,
+}: {
+  workspace: LightWorkspaceType;
+}): Promise<Result<Connection[], Error>> {
+  assert(workspace.workOSOrganizationId, "WorkOS organization should exist");
+
+  try {
+    const { data: connections } = await getWorkOS().sso.listConnections({
+      organizationId: workspace.workOSOrganizationId,
+    });
+
+    return new Ok(connections);
+  } catch (error) {
+    return new Err(normalizeError(error));
+  }
+}
+
+export async function deleteWorkOSOrganizationSSOConnection(
+  connection: Connection
+): Promise<Result<void, Error>> {
+  try {
+    await getWorkOS().sso.deleteConnection(connection.id);
+
+    return new Ok(undefined);
+  } catch (error) {
+    return new Err(normalizeError(error));
+  }
+}
+
+/**
+ * Directory Sync.
+ */
+
+export async function getWorkOSOrganizationDSyncDirectories({
+  workspace,
+}: {
+  workspace: LightWorkspaceType;
+}): Promise<Result<Directory[], Error>> {
+  if (!workspace.workOSOrganizationId) {
+    return new Err(
+      new Error("WorkOS organization not found for this workspace.")
+    );
+  }
+
+  try {
+    const { data: directories } =
+      await getWorkOS().directorySync.listDirectories({
+        organizationId: workspace.workOSOrganizationId,
+      });
+
+    return new Ok(directories);
+  } catch (error) {
+    return new Err(normalizeError(error));
+  }
+}
+
+export async function deleteWorkOSOrganizationDSyncConnection(
+  directory: Directory
+): Promise<Result<void, Error>> {
+  try {
+    await getWorkOS().directorySync.deleteDirectory(directory.id);
+
+    return new Ok(undefined);
+  } catch (error) {
+    return new Err(normalizeError(error));
+  }
+}
+
+/**
+ * Disables SSO and/or SCIM for a workspace by deleting WorkOS SSO connections
+ * and/or SCIM directories, and disabling SSO enforcement.
+ * Called when a workspace downgrades to a plan that doesn't allow SSO/SCIM.
+ */
+export async function disableWorkOSSSOAndSCIM(
+  workspace: LightWorkspaceType,
+  { disableSSO, disableSCIM }: { disableSSO: boolean; disableSCIM: boolean }
+): Promise<void> {
+  const localLogger = logger.child({
+    workspaceId: workspace.sId,
+    workOSOrganizationId: workspace.workOSOrganizationId,
+  });
+
+  if (!workspace.workOSOrganizationId) {
+    localLogger.info("No WorkOS organization, skipping SSO/SCIM cleanup");
+    return;
+  }
+
+  if (disableSSO) {
+    // Delete all SSO connections.
+    const connectionsRes = await getWorkOSOrganizationSSOConnections({
+      workspace,
+    });
+    if (connectionsRes.isOk()) {
+      for (const connection of connectionsRes.value) {
+        const deleteRes =
+          await deleteWorkOSOrganizationSSOConnection(connection);
+        if (deleteRes.isErr()) {
+          localLogger.error(
+            { connectionId: connection.id, error: deleteRes.error },
+            "Failed to delete SSO connection"
+          );
+        } else {
+          localLogger.info(
+            { connectionId: connection.id },
+            "Deleted SSO connection"
+          );
+        }
+      }
+    } else {
+      localLogger.error(
+        { error: connectionsRes.error },
+        "Failed to list SSO connections"
+      );
+    }
+
+    // Disable SSO enforcement.
+    const disableRes = await WorkspaceResource.disableSSOEnforcement(
+      workspace.id
+    );
+    if (disableRes.isErr()) {
+      localLogger.error(
+        { error: disableRes.error },
+        "Failed to disable SSO enforcement"
+      );
+    } else {
+      localLogger.info("Disabled SSO enforcement");
+    }
+  }
+
+  if (disableSCIM) {
+    // Delete all SCIM directories.
+    const directoriesRes = await getWorkOSOrganizationDSyncDirectories({
+      workspace,
+    });
+    if (directoriesRes.isOk()) {
+      for (const directory of directoriesRes.value) {
+        const deleteRes =
+          await deleteWorkOSOrganizationDSyncConnection(directory);
+        if (deleteRes.isErr()) {
+          localLogger.error(
+            { directoryId: directory.id, error: deleteRes.error },
+            "Failed to delete SCIM directory"
+          );
+        } else {
+          localLogger.info(
+            { directoryId: directory.id },
+            "Deleted SCIM directory"
+          );
+        }
+      }
+    } else {
+      localLogger.error(
+        { error: directoriesRes.error },
+        "Failed to list SCIM directories"
+      );
+    }
+  }
+}
+
+/**
+ * Audit Logs.
+ */
+
+export type AuditLogActor = {
+  type: string;
+  id: string;
+  name?: string;
+  metadata?: Record<string, string | number | boolean>;
+};
+
+export type AuditLogTarget = {
+  type: string;
+  id: string;
+  name?: string;
+  metadata?: Record<string, string | number | boolean>;
+};
+
+export type AuditLogContext = {
+  location: string;
+  userAgent?: string;
+};
+
+type CreateAuditLogEventParams = {
+  action: string;
+  occurredAt?: Date;
+  actor: AuditLogActor;
+  targets: AuditLogTarget[];
+  context: AuditLogContext;
+  metadata?: Record<string, string | number | boolean>;
+};
+
+// Conservative pre-flight ceiling for the serialized event payload. WorkOS
+// rejects oversized audit-log requests with "request entity too large", which
+// produced ~26k errors/month in production. Skipping above this threshold
+// turns silent rejections into observable warnings.
+const PAYLOAD_SIZE_LIMIT_BYTES = 60_000;
+
+// Maps each audit log action to the latest registered WorkOS schema version.
+// WorkOS validates an emitted event against the version we send; omitting it
+// (or sending a stale one) causes validation failures once a schema has been
+// re-registered with changes. The map is generated by
+// `register_audit_log_schemas.ts --execute` and committed before deploy.
+// Unknown actions resolve to `undefined`, which makes WorkOS fall back to its
+// default version behaviour (matching the pre-version-map behaviour).
+const SCHEMA_VERSIONS: Record<string, number> = schemaVersionsJson;
+
+export async function createAuditLogEvent({
+  workspace,
+  event,
+}: {
+  workspace: LightWorkspaceType;
+  event: CreateAuditLogEventParams;
+}): Promise<Result<void, Error>> {
+  if (!workspace.workOSOrganizationId) {
+    return new Err(
+      new Error("WorkOS organization not found for this workspace.")
+    );
+  }
+
+  const payloadSizeBytes = JSON.stringify(event).length;
+  if (payloadSizeBytes > PAYLOAD_SIZE_LIMIT_BYTES) {
+    logger.warn(
+      {
+        workspaceId: workspace.sId,
+        action: event.action,
+        targetTypes: event.targets.map((t) => t.type),
+        payloadSizeBytes,
+        limit: PAYLOAD_SIZE_LIMIT_BYTES,
+      },
+      "Skipping oversized audit log event"
+    );
+    return new Err(
+      new Error(
+        `Audit log payload exceeds size limit (${payloadSizeBytes} > ${PAYLOAD_SIZE_LIMIT_BYTES} bytes).`
+      )
+    );
+  }
+
+  try {
+    await getWorkOS().auditLogs.createEvent(workspace.workOSOrganizationId, {
+      action: event.action,
+      version: SCHEMA_VERSIONS[event.action],
+      occurredAt: event.occurredAt ?? new Date(),
+      actor: {
+        type: event.actor.type,
+        id: event.actor.id,
+        name: event.actor.name,
+        metadata: event.actor.metadata ?? {},
+      },
+      targets: event.targets.map((target) => ({
+        type: target.type,
+        id: target.id,
+        name: target.name,
+        metadata: target.metadata,
+      })),
+      context: {
+        location: event.context.location,
+        userAgent: event.context.userAgent,
+      },
+      metadata: event.metadata,
+    });
+
+    return new Ok(undefined);
+  } catch (error) {
+    const e = normalizeError(error);
+    logger.error(
+      {
+        ...e,
+        workspaceId: workspace.sId,
+        action: event.action,
+        targetTypes: event.targets.map((t) => t.type),
+        payloadSizeBytes,
+      },
+      "Failed to create audit log event"
+    );
+    return new Err(new Error(`Failed to create audit log event: ${e.message}`));
+  }
+}
+
+export async function deleteWorksOSOrganizationWithWorkspace(
+  workspaceId: string
+): Promise<Result<undefined, Error>> {
+  const localLogger = logger.child({
+    workspaceId,
+  });
+
+  let organization: Organization;
+  try {
+    organization =
+      await getWorkOS().organizations.getOrganizationByExternalId(workspaceId);
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    // biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
+  } catch (err) {
+    localLogger.warn({ workspaceId }, "Can't get workOSOrganization");
+    return new Ok(undefined);
+  }
+
+  try {
+    await getWorkOS().organizations.deleteOrganization(organization.id);
+
+    return new Ok(undefined);
+  } catch (err) {
+    return new Err(normalizeError(err));
+  }
+}
+
+/**
+ * Ensure the workspace has a WorkOS organization once it lands on a paid plan.
+ * Idempotent — failures are logged but do not fail the caller: the org can be
+ * created later by the `/w/[wId]/domains` endpoint or a re-trigger.
+ */
+export async function ensureWorkOSOrganizationForPaidPlan({
+  workspace,
+  planCode,
+  contractId,
+}: {
+  workspace: LightWorkspaceType;
+  planCode: string;
+  contractId: string;
+}): Promise<void> {
+  if (isFreePlan(planCode)) {
+    return;
+  }
+  const workosResult = await getOrCreateWorkOSOrganization(workspace);
+  if (workosResult.isErr()) {
+    logger.error(
+      {
+        contractId,
+        planCode,
+        workspaceId: workspace.sId,
+        err: workosResult.error,
+      },
+      "[WorkOS] Failed to provision organization for paid plan"
+    );
+  }
+}

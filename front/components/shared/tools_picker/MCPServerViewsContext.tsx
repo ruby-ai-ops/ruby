@@ -1,0 +1,209 @@
+import { useSpacesContext } from "@app/components/agent_builder/SpacesContext";
+import {
+  getMcpServerViewDisplayName,
+  isToolWithKnowledge,
+  mcpServerViewSortingFn,
+} from "@app/lib/actions/mcp_helper";
+import type { MCPServerViewType } from "@app/lib/api/mcp";
+import { useFeatureFlags } from "@app/lib/auth/AuthContext";
+import { useMCPServerViewsFromSpaces } from "@app/lib/swr/mcp_servers";
+import { isComputerFeatureEnabled } from "@app/types/shared/feature_flags";
+import type { SpaceType } from "@app/types/space";
+import type { LightWorkspaceType } from "@app/types/user";
+import groupBy from "lodash/groupBy";
+import type { ReactNode } from "react";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React, { createContext, useContext, useMemo } from "react";
+
+export type MCPServerViewTypeWithLabel = MCPServerViewType & { label: string };
+// Sort MCP server views based on priority order.
+// Order: Search -> Include Data -> Query Tables -> Extract Data -> Others (alphabetically).
+const sortMCPServerViewsByPriority = (
+  views: MCPServerViewTypeWithLabel[]
+): MCPServerViewTypeWithLabel[] => {
+  const priorityOrder: Record<string, number> = {
+    search: 1,
+    query_tables: 2,
+    query_tables_v2: 2, // Same priority as query_tables
+    include_data: 3,
+    extract_data: 4,
+  };
+
+  return [...views].sort((a, b) => {
+    const priorityA = priorityOrder[a.server.name] ?? 999;
+    const priorityB = priorityOrder[b.server.name] ?? 999;
+
+    if (priorityA !== priorityB) {
+      return priorityA - priorityB;
+    }
+
+    // If priorities are the same, sort alphabetically by label.
+    return a.label.localeCompare(b.label);
+  });
+};
+
+interface MCPServerViewsContextType {
+  mcpServerViews: MCPServerViewType[];
+  mcpServerViewsWithKnowledge: MCPServerViewTypeWithLabel[];
+  mcpServerViewsWithoutKnowledge: MCPServerViewTypeWithLabel[];
+  isMCPServerViewsLoading: boolean;
+  isMCPServerViewsError: boolean;
+}
+
+export const MCPServerViewsContext = createContext<
+  MCPServerViewsContextType | undefined
+>(undefined);
+
+function getGroupedMCPServerViews({
+  mcpServerViews,
+  spaces,
+  hasSandbox,
+}: {
+  mcpServerViews: MCPServerViewType[];
+  spaces: SpaceType[];
+  hasSandbox: boolean;
+}) {
+  if (!mcpServerViews || !Array.isArray(mcpServerViews)) {
+    return {
+      mcpServerViewsWithKnowledge: [],
+      mcpServerViewsWithoutKnowledge: [],
+    };
+  }
+
+  const serverIdToCount = mcpServerViews.reduce(
+    (acc, view) => {
+      acc[view.server.sId] = (acc[view.server.sId] || 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>
+  );
+
+  const mcpServerViewsWithLabel = mcpServerViews.map((view) => {
+    const displayName = getMcpServerViewDisplayName(view);
+
+    // There can be the same tool available in different spaces, in that case we need to show the space name.
+    if (serverIdToCount[view.server.sId] > 1) {
+      const spaceName = spaces.find(
+        (space) => space.sId === view.spaceId
+      )?.name;
+
+      if (spaceName) {
+        return {
+          ...view,
+          label: `${displayName} (${spaceName})`,
+        };
+      }
+    }
+
+    return {
+      ...view,
+      label: displayName,
+    };
+  });
+
+  const { mcpServerViewsWithKnowledge, mcpServerViewsWithoutKnowledge } =
+    groupBy(mcpServerViewsWithLabel, (view) =>
+      isToolWithKnowledge(view)
+        ? "mcpServerViewsWithKnowledge"
+        : "mcpServerViewsWithoutKnowledge"
+    );
+
+  // The sandbox generates and converts files itself, so file_generation is not offered when
+  // it is available.
+  const selectableViewsWithoutKnowledge = (
+    mcpServerViewsWithoutKnowledge || []
+  ).filter((view) => !hasSandbox || view.server.name !== "file_generation");
+
+  const grouped = groupBy(
+    selectableViewsWithoutKnowledge,
+    (view) => view.server.availability
+  );
+
+  return {
+    mcpServerViewsWithKnowledge: sortMCPServerViewsByPriority(
+      mcpServerViewsWithKnowledge || []
+    ),
+    mcpServerViewsWithoutKnowledge: [
+      ...(grouped.manual || []),
+      ...(grouped.auto || []),
+    ],
+  };
+}
+
+export const useMCPServerViewsContext = () => {
+  const context = useContext(MCPServerViewsContext);
+  if (!context) {
+    throw new Error(
+      "useMCPServerViewsContext must be used within a MCPServerViewsProvider"
+    );
+  }
+  return context;
+};
+
+export const useMaybeMCPServerViewsContext = () => {
+  return useContext(MCPServerViewsContext);
+};
+
+interface MCPServerViewsProviderProps {
+  owner: LightWorkspaceType;
+  children: ReactNode;
+  includeRestrictedToSkills?: boolean;
+}
+
+export const MCPServerViewsProvider = ({
+  owner,
+  children,
+  includeRestrictedToSkills = false,
+}: MCPServerViewsProviderProps) => {
+  const { spaces, isSpacesLoading } = useSpacesContext();
+  const { featureFlags } = useFeatureFlags();
+
+  const {
+    serverViews: mcpServerViews,
+    isLoading,
+    isError: isMCPServerViewsError,
+  } = useMCPServerViewsFromSpaces(owner, spaces, {
+    includeRestrictedToSkills,
+    revalidateIfStale: false,
+    revalidateOnFocus: false,
+  });
+
+  const sortedMCPServerViews = useMemo(
+    () => mcpServerViews.sort(mcpServerViewSortingFn),
+    [mcpServerViews]
+  );
+
+  const { mcpServerViewsWithKnowledge, mcpServerViewsWithoutKnowledge } =
+    useMemo(() => {
+      return getGroupedMCPServerViews({
+        mcpServerViews: sortedMCPServerViews,
+        spaces,
+        hasSandbox: isComputerFeatureEnabled(featureFlags),
+      });
+    }, [sortedMCPServerViews, spaces, featureFlags]);
+
+  const value: MCPServerViewsContextType = useMemo(() => {
+    return {
+      mcpServerViews: sortedMCPServerViews,
+      mcpServerViewsWithKnowledge,
+      mcpServerViewsWithoutKnowledge,
+      isMCPServerViewsLoading: isLoading || isSpacesLoading, // Spaces is required to fetch server views so we check isSpacesLoading too.
+      isMCPServerViewsError,
+    };
+  }, [
+    sortedMCPServerViews,
+    mcpServerViewsWithKnowledge,
+    mcpServerViewsWithoutKnowledge,
+    isLoading,
+    isMCPServerViewsError,
+    isSpacesLoading,
+  ]);
+
+  return (
+    <MCPServerViewsContext.Provider value={value}>
+      {children}
+    </MCPServerViewsContext.Provider>
+  );
+};
+
+MCPServerViewsProvider.displayName = "MCPServerViewsProvider";

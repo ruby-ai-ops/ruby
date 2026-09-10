@@ -1,0 +1,294 @@
+import { setDefaultInitResolver } from "@app/lib/api/config";
+import { useCellContext } from "@app/lib/auth/CellContext";
+import { clientFetch } from "@app/lib/egress/client";
+import logger from "@app/logger/logger";
+import type { WhitelistableFeature } from "@app/types/shared/feature_flags";
+import type { UserTypeWithWorkspaces, WorkspaceType } from "@app/types/user";
+import { datadogLogs } from "@datadog/browser-logs";
+import { usePlatform } from "@extension/shared/context/PlatformContext";
+import type { StoredTokens } from "@extension/shared/services/auth";
+import {
+  AuthError,
+  makeEnterpriseConnectionName,
+} from "@extension/shared/services/auth";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+const PROACTIVE_REFRESH_WINDOW_MS = 1000 * 60; // 1 minute
+
+export const useAuthHook = () => {
+  const platform = usePlatform();
+
+  const [tokens, setTokens] = useState<StoredTokens | null>(null);
+  const [user, setUser] = useState<UserTypeWithWorkspaces | null>(null);
+  const [workspace, setWorkspace] = useState<WorkspaceType | undefined>();
+  const [authError, setAuthError] = useState<AuthError | null>(null);
+  const [forcedConnection, setForcedConnection] = useState<
+    string | undefined
+  >();
+  const [featureFlags, setFeatureFlags] = useState<WhitelistableFeature[]>([]);
+  const { setCellInfo } = useCellContext();
+
+  // Set default fetch init for the extension (overrides CellContext's credentials: "include").
+  // Must be declared before any fetch effects so it's active when they run.
+  // The resolver calls getAccessToken() on every request so expired tokens are
+  // transparently refreshed before each fetch / EventSource connection.
+  useEffect(() => {
+    if (tokens?.accessToken) {
+      setDefaultInitResolver(async (): Promise<RequestInit> => {
+        const accessToken = await platform.auth.getAccessToken();
+        return {
+          credentials: "omit",
+          headers: accessToken
+            ? { Authorization: `Bearer ${accessToken}` }
+            : {},
+        };
+      });
+    } else {
+      setDefaultInitResolver(async () => ({
+        credentials: "omit",
+      }));
+    }
+
+    return () => {
+      setDefaultInitResolver(null);
+    };
+  }, [tokens?.accessToken, platform.auth]);
+
+  const isAuthenticated = useMemo(
+    () => !!(tokens?.accessToken && tokens.expiresAt > Date.now()),
+    [tokens]
+  );
+
+  const isUserSetup = !!(user && user.sId && workspace);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+
+  const refreshTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const handleLogout = useCallback(async () => {
+    setIsLoading(true);
+    const success = await platform.auth.logout();
+    if (!success) {
+      setIsLoading(false);
+      return;
+    }
+    setTokens(null);
+    setWorkspace(undefined);
+    setUser(null);
+    setAuthError(null);
+    setForcedConnection(undefined);
+    if (refreshTimerRef.current) {
+      clearTimeout(refreshTimerRef.current);
+    }
+    setIsLoading(false);
+  }, []);
+
+  const scheduleRefresh = useCallback(
+    (expiresAt: number) => {
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+      }
+
+      // Refresh 1 minute before expiry, but at least 1 second from now.
+      const delayMs = Math.max(
+        expiresAt - Date.now() - PROACTIVE_REFRESH_WINDOW_MS,
+        1000
+      );
+
+      refreshTimerRef.current = setTimeout(() => {
+        void handleRefreshToken();
+      }, delayMs);
+    },
+    // handleRefreshToken is stable (useCallback with []), safe to reference.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  const handleRefreshToken = useCallback(async () => {
+    const newAccessToken = await platform.auth.getAccessToken(true);
+    if (!newAccessToken) {
+      setAuthError(
+        new AuthError(
+          "not_authenticated",
+          "Session expired. Please sign in again."
+        )
+      );
+      setIsLoading(false);
+      return;
+    }
+
+    const storedTokens = await platform.auth.getStoredTokens();
+    if (storedTokens) {
+      scheduleRefresh(storedTokens.expiresAt);
+    }
+    setTokens((prev) => {
+      if (!prev) {
+        return null;
+      }
+
+      return {
+        ...prev,
+        ...storedTokens,
+      };
+    });
+    setAuthError(null);
+  }, [scheduleRefresh]);
+
+  // Listen for changes in storage to make sure we always have the latest tokens.
+  useEffect(() => {
+    const unsub = platform.storage.onChanged((changes) => {
+      if ("accessToken" in changes && !changes.accessToken) {
+        logger.info("Access token removed from storage.");
+        setTokens(null);
+        setUser(null);
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
+  // Fetch user data from /api/user when authenticated.
+  useEffect(() => {
+    if (!isAuthenticated || !tokens?.accessToken) {
+      return;
+    }
+
+    void (async () => {
+      try {
+        const res = await clientFetch("/api/user");
+        if (res.ok) {
+          const data = await res.json();
+          const fetchedUser = data.user as UserTypeWithWorkspaces;
+          setUser(fetchedUser);
+          datadogLogs.setUser({
+            id: fetchedUser.sId,
+            email: fetchedUser.email,
+          });
+
+          const ws = fetchedUser.selectedWorkspace
+            ? fetchedUser.workspaces.find(
+                (w) => w.sId === fetchedUser.selectedWorkspace
+              )
+            : fetchedUser.workspaces[0];
+          setWorkspace(ws);
+          if (ws) {
+            datadogLogs.setGlobalContextProperty("workspaceId", ws.sId);
+            await platform.storage.set("selectedWorkspace", ws.sId);
+          }
+        }
+      } finally {
+        setIsLoading(false);
+      }
+    })();
+  }, [isAuthenticated, tokens?.accessToken]);
+
+  // Initialize from storage on mount.
+  // CellContext already restores cell info from localStorage, so we only
+  // need to restore tokens here.
+  useEffect(() => {
+    void (async () => {
+      const storedTokens = await platform.auth.getStoredTokens();
+
+      if (!storedTokens) {
+        setIsLoading(false);
+        return;
+      }
+      setTokens(storedTokens);
+
+      // Token refresh: refresh now if about to expire, otherwise schedule.
+      if (storedTokens.expiresAt < Date.now() + PROACTIVE_REFRESH_WINDOW_MS) {
+        await handleRefreshToken();
+      } else {
+        scheduleRefresh(storedTokens.expiresAt);
+      }
+
+      // isLoading stays true — the user fetch effect will clear it.
+    })();
+
+    return () => {
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Fetch feature flags when workspace is ready.
+  useEffect(() => {
+    if (!isAuthenticated || !workspace || !tokens?.accessToken) {
+      setFeatureFlags([]);
+      return;
+    }
+
+    void (async () => {
+      const res = await clientFetch(`/api/w/${workspace.sId}/feature-flags`);
+      if (res.ok) {
+        const { feature_flags } = await res.json();
+        setFeatureFlags(feature_flags ?? []);
+      } else {
+        setFeatureFlags([]);
+      }
+    })();
+  }, [workspace, tokens?.accessToken, isAuthenticated]);
+
+  const redirectToSSOLogin = useCallback(
+    async (workspace: WorkspaceType) => {
+      logger.info({ workspaceId: workspace.sId }, "Enforcing SSO.");
+      setAuthError(
+        new AuthError(
+          "sso_enforced",
+          "Access requires Single Sign-On (SSO) authentication. Use your SSO provider to sign in."
+        )
+      );
+      setForcedConnection(makeEnterpriseConnectionName(workspace.sId));
+      await platform.auth.logout();
+    },
+    [setAuthError, setForcedConnection]
+  );
+
+  const handleLogin = useCallback(
+    async (args?: { organizationId?: string }) => {
+      setIsLoading(true);
+      const response = await platform.auth.login({
+        forcedConnection,
+        organizationId: args?.organizationId,
+      });
+      if (response.isErr()) {
+        setAuthError(response.error);
+        setIsLoading(false);
+        void platform.clearStoredData();
+        return;
+      }
+
+      const { tokens: newTokens, cellInfo: newCellInfo } = response.value;
+
+      setTokens(newTokens);
+      setCellInfo(newCellInfo, { keepInStorage: true });
+      setAuthError(null);
+      scheduleRefresh(newTokens.expiresAt);
+      // isLoading stays true — the user fetch effect will clear it.
+    },
+    [forcedConnection, scheduleRefresh]
+  );
+
+  const handleSelectOrganization = useCallback(
+    async (organizationId: string) => {
+      await handleLogin({ organizationId });
+    },
+    [handleLogin]
+  );
+
+  return {
+    token: tokens?.accessToken ?? null,
+    isAuthenticated,
+    setAuthError,
+    authError,
+    redirectToSSOLogin,
+    user,
+    workspace,
+    isUserSetup,
+    isLoading,
+    handleLogin,
+    handleLogout,
+    handleSelectOrganization,
+    featureFlags,
+  };
+};

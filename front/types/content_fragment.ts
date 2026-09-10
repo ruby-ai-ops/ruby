@@ -1,0 +1,154 @@
+/* eslint-disable ruby/enforce-client-types-in-public-api */
+
+import type { ConnectorProvider } from "@app/types/data_source";
+// biome-ignore lint/plugin/enforceClientTypesInPublicApi: existing usage
+import type { RubyMimeType } from "@ruby-ai/client";
+
+import type {
+  LegacyLightMessageType,
+  MessageType,
+  MessageVisibility,
+} from "./assistant/conversation";
+import type { ContentNodeType } from "./core/content_node";
+import type { DataSourceViewContentNode } from "./data_source_view";
+import type { AllSupportedFileContentType } from "./files";
+import type { ModelId } from "./shared/model_id";
+
+export type ContentFragmentExpiredReason =
+  | "data_source_deleted"
+  | "file_deleted";
+
+export type ContentFragmentContextType = {
+  username: string | null;
+  fullName: string | null;
+  email: string | null;
+  profilePictureUrl: string | null;
+};
+
+export type ContentFragmentVersion = "superseded" | "latest";
+
+export type SupportedContentFragmentType =
+  | AllSupportedFileContentType
+  | RubyMimeType
+  | "ruby-application/slack"; // Legacy
+
+export type ContentFragmentNodeData = {
+  nodeId: string;
+  nodeDataSourceViewId: string;
+  nodeType: ContentNodeType;
+  provider: ConnectorProvider | null;
+  spaceName: string;
+};
+
+export type BaseContentFragmentType = {
+  type: "content_fragment";
+  id: ModelId;
+  sId: string;
+  created: number;
+  visibility: MessageVisibility;
+  version: number;
+  rank: number;
+  sourceUrl: string | null;
+  title: string;
+  contentType: SupportedContentFragmentType;
+  context: ContentFragmentContextType;
+  contentFragmentId: string;
+  contentFragmentVersion: ContentFragmentVersion;
+  expiredReason: ContentFragmentExpiredReason | null;
+};
+
+export type ContentNodeContentFragmentType = BaseContentFragmentType & {
+  contentFragmentType: "content_node";
+} & (
+    | {
+        expiredReason: null;
+        nodeId: string;
+        nodeDataSourceViewId: string;
+        nodeType: ContentNodeType;
+        contentNodeData: ContentFragmentNodeData;
+      }
+    | {
+        expiredReason: ContentFragmentExpiredReason;
+        nodeId: null;
+        nodeDataSourceViewId: null;
+        nodeType: null;
+        contentNodeData: null;
+      }
+  );
+
+export type FileContentFragmentType = BaseContentFragmentType & {
+  contentFragmentType: "file";
+  path?: string | null;
+  processedPath?: string | null;
+  skipFileProcessing?: boolean;
+} & (
+    | {
+        expiredReason: null;
+        fileId: string | null;
+        snippet: string | null;
+        generatedTables: string[];
+        textUrl: string;
+        textBytes: number | null;
+        sourceProvider: string | null;
+        sourceIcon: string | null;
+        isInProjectContext: boolean;
+        hidden: boolean;
+      }
+    | {
+        expiredReason: ContentFragmentExpiredReason;
+        fileId: null;
+        snippet: null;
+        generatedTables: [];
+        textUrl: null;
+        textBytes: null;
+        sourceProvider: null;
+        sourceIcon: null;
+        isInProjectContext: null;
+        hidden: boolean;
+      }
+  );
+
+/**
+ * @swaggerschema ContentFragment (swagger_schemas.ts), PrivateContentFragment (swagger_private_schemas.ts)
+ */
+export type ContentFragmentType =
+  | FileContentFragmentType
+  | ContentNodeContentFragmentType;
+
+export type UploadedContentFragment = {
+  fileId: string;
+  title: string;
+  contentType: SupportedContentFragmentType;
+  url?: string;
+};
+
+export type ContentFragmentsType = {
+  uploaded: UploadedContentFragment[];
+  contentNodes: DataSourceViewContentNode[];
+};
+
+export function isContentFragmentType(
+  arg: MessageType | LegacyLightMessageType
+): arg is ContentFragmentType {
+  return arg.type === "content_fragment";
+}
+
+export function isFileContentFragment(
+  arg: ContentFragmentType
+): arg is FileContentFragmentType {
+  return arg.contentFragmentType === "file";
+}
+
+export function isContentNodeContentFragment(
+  arg: ContentFragmentType
+): arg is ContentNodeContentFragmentType {
+  return arg.contentFragmentType === "content_node";
+}
+
+export function isExpiredContentFragment(
+  arg: ContentFragmentType
+): arg is ContentFragmentType & {
+  expiredReason: ContentFragmentExpiredReason;
+} {
+  return arg.expiredReason !== null;
+}

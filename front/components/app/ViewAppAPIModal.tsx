@@ -1,0 +1,206 @@
+import "@uiw/react-textarea-code-editor/dist.css";
+
+import { SuspensedCodeEditor } from "@app/components/SuspensedCodeEditor";
+import { useTheme } from "@app/components/sparkle/ThemeContext";
+import config from "@app/lib/api/config";
+import type { AppType } from "@app/types/app";
+import type { RunConfig, RunType } from "@app/types/run";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import type { WorkspaceType } from "@app/types/user";
+import {
+  Button,
+  Clipboard,
+  Cube01,
+  Hoverable,
+  Page,
+  Sheet,
+  SheetContainer,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@ruby-ai/sparkle";
+import { useState } from "react";
+
+const cleanUpConfig = (config: RunConfig) => {
+  if (!config) {
+    return "{}";
+  }
+  const c = {} as { [key: string]: any };
+  for (const key in config.blocks) {
+    if (config.blocks[key].type !== "input") {
+      c[key] = config.blocks[key];
+      delete c[key].type;
+    }
+  }
+  return JSON.stringify(c);
+};
+
+const DEFAULT_INPUTS = [{ hello: "world" }];
+
+interface ViewAppAPIModalProps {
+  owner: WorkspaceType;
+  app: AppType;
+  run: RunType;
+  inputs?: unknown[];
+  disabled: boolean;
+}
+
+export function ViewAppAPIModal({
+  owner,
+  app,
+  run,
+  inputs = DEFAULT_INPUTS,
+  disabled,
+}: ViewAppAPIModalProps) {
+  const cURLRequest = (type: "run") => {
+    switch (type) {
+      case "run":
+        return `curl ${config.getApiBaseUrl()}/api/v1/w/${owner.sId}/spaces/${app.space.sId}/apps/${app.sId}/runs \\
+    -H "Authorization: Bearer YOUR_API_KEY" \\
+    -H "Content-Type: application/json" \\
+    -d '{
+      "specification_hash": "${run?.app_hash}",
+      "config": ${cleanUpConfig(run?.config)},
+      "blocking": true,
+      "inputs": ${JSON.stringify(inputs)}
+    }'`;
+      default:
+        assertNever(type);
+    }
+  };
+
+  const [copyRunButtonText, setCopyRunButtonText] = useState("Copy");
+
+  // Copy the cURL request to the clipboard
+  const handleCopyClick = async (type: "run") => {
+    await navigator.clipboard.writeText(cURLRequest(type));
+
+    switch (type) {
+      case "run":
+        setCopyRunButtonText("Copied!");
+        setTimeout(() => {
+          setCopyRunButtonText("Copy");
+        }, 1500);
+        break;
+      default:
+        assertNever(type);
+    }
+  };
+
+  const { isDark } = useTheme();
+
+  return (
+    <Sheet>
+      <SheetTrigger>
+        <Button
+          icon={Cube01}
+          tooltip={
+            disabled
+              ? "You need to run this app at least once successfully to view the endpoint"
+              : "View how to run this app programmatically"
+          }
+          label="Use with API"
+          variant="primary"
+          disabled={disabled}
+        />
+      </SheetTrigger>
+      <SheetContent>
+        <SheetHeader>
+          <SheetTitle>Apps API</SheetTitle>
+        </SheetHeader>
+        <SheetContainer>
+          <div className="w-full">
+            <Page.Vertical sizing="grow">
+              <Page.P>
+                <ul className="text-muted-foreground">
+                  <li>
+                    spaceId: <span className="font-bold">
+                      {app.space.sId}
+                    </span>{" "}
+                  </li>
+                  <li>
+                    appId: <span className="font-bold">{app.sId}</span>
+                  </li>
+                </ul>
+              </Page.P>
+
+              <Page.Separator />
+
+              <Page.SectionHeader title="Run app" />
+              <Page.P>
+                Use the following cURL command to run the app{" "}
+                <span className="italic">{app.name}</span>:
+              </Page.P>
+              <SuspensedCodeEditor
+                data-color-mode={isDark ? "dark" : "light"}
+                readOnly={true}
+                value={`$ ${cURLRequest("run")}`}
+                language="shell"
+                padding={15}
+                className="mt-5 rounded-md bg-muted-background px-4 py-4 font-mono text-[13px]"
+                style={{
+                  fontSize: 13,
+                  fontFamily:
+                    "ui-monospace, SFMono-Regular, SF Mono, Consolas, Liberation Mono, Menlo, monospace",
+                  width: "100%",
+                  marginTop: "0rem",
+                }}
+              />
+
+              <div className="flex w-full flex-row items-end">
+                <div className="flex-grow"></div>
+                <div className="flex">
+                  <Button
+                    variant="outline"
+                    onClick={() => handleCopyClick("run")}
+                    label={copyRunButtonText}
+                    icon={Clipboard}
+                  />
+                </div>
+              </div>
+
+              <Page.Separator />
+
+              <Page.SectionHeader title="API Keys" />
+              <Page.P>
+                <div className="pb-2">
+                  {owner.role === "admin" ? (
+                    <Hoverable
+                      href={`/w/${owner.sId}/developers/api-keys`}
+                      variant="highlight"
+                    >
+                      Manage workspace API keys
+                    </Hoverable>
+                  ) : (
+                    <span>API keys are managed by workspace admins.</span>
+                  )}
+                </div>
+                <span>
+                  Handle API keys with care as they provide access to your
+                  company data.
+                </span>
+              </Page.P>
+
+              <Page.Separator />
+
+              <Page.SectionHeader title="Documentation" />
+              <Page.P>
+                For a detailed documentation of the Data source API, please
+                refer to the{" "}
+                <Hoverable
+                  href={
+                    "https://docs.ruby.ad/reference/post_api-v1-w-wid-vaults-vid-apps-aid-runs"
+                  }
+                  variant="highlight"
+                >
+                  API Reference
+                </Hoverable>
+              </Page.P>
+            </Page.Vertical>
+          </div>
+        </SheetContainer>
+      </SheetContent>
+    </Sheet>
+  );
+}

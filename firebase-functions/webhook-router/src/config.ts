@@ -1,0 +1,60 @@
+import { defineString } from "firebase-functions/params";
+
+// Define environment parameters.
+const gcpGlobalProjectId = defineString("GCP_GLOBAL_PROJECT_ID");
+const gcpUsProjectId = defineString("GCP_US_PROJECT_ID");
+const gcpEuProjectId = defineString("GCP_EU_PROJECT_ID");
+const gcpCell00002ProjectId = defineString("GCP_CELL_00002_PROJECT_ID");
+
+export const CONFIG = {
+  FETCH_TIMEOUT_MS: 20_000,
+
+  // Environment secrets.
+  RUBY_CONNECTORS_WEBHOOKS_SECRET: process.env.RUBY_CONNECTORS_WEBHOOKS_SECRET,
+
+  // Slack environment secrets.
+  SLACK_SIGNING_SECRET: process.env.SLACK_SIGNING_SECRET,
+
+  // Microsoft Bot environment secrets.
+  MICROSOFT_BOT_ID_SECRET: process.env.MICROSOFT_BOT_ID_SECRET,
+
+  // Notion environment secrets.
+  NOTION_SIGNING_SECRET: process.env.NOTION_SIGNING_SECRET,
+
+  // Shopify environment secrets.
+  OAUTH_SHOPIFY_CLIENT_SECRET: process.env.OAUTH_SHOPIFY_CLIENT_SECRET,
+
+  // Endpoints.
+  US_CONNECTOR_URL:
+    process.env.US_CONNECTOR_URL ?? "https://connectors.ruby.ad",
+  EU_CONNECTOR_URL:
+    process.env.EU_CONNECTOR_URL ?? "https://eu.connectors.ruby.ad",
+  CELL_00002_CONNECTOR_URL:
+    process.env.CELL_00002_CONNECTOR_URL ??
+    "https://cell-00002.cells.ruby.ad/connectors",
+
+  // Secret names.
+  SECRET_NAME: "connectors-RUBY_CONNECTORS_WEBHOOKS_SECRET",
+
+  // Slack related secrets.
+  SLACK_SIGNING_SECRET_NAME: "SLACK_SIGNING_SECRET",
+
+  // Microsoft Bot related secrets.
+  MICROSOFT_BOT_ID_SECRET_NAME: "MICROSOFT_BOT_ID_SECRET",
+
+  // Notion related secrets.
+  NOTION_SIGNING_SECRET_NAME: "NOTION_SIGNING_SECRET",
+
+  // Shopify related secrets.
+  OAUTH_SHOPIFY_CLIENT_SECRET_NAME: "OAUTH_SHOPIFY_CLIENT_SECRET",
+
+  RUBY_WEBHOOK_ROUTER_CONFIG_FILE_PATH: "webhook-router-config.json",
+} as const;
+
+// Runtime getters for Firebase params.
+export const getProjectIds = () => ({
+  GCP_GLOBAL_PROJECT_ID: gcpGlobalProjectId.value(),
+  GCP_US_PROJECT_ID: gcpUsProjectId.value(),
+  GCP_EU_PROJECT_ID: gcpEuProjectId.value(),
+  GCP_CELL_00002_PROJECT_ID: gcpCell00002ProjectId.value(),
+});

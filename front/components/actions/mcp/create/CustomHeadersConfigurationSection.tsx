@@ -1,0 +1,68 @@
+import type { CreateMCPServerDialogFormValues } from "@app/components/actions/mcp/forms/types";
+import { MCPServerHeaders } from "@app/components/actions/mcp/MCPServerHeaders";
+import { requiresBearerTokenConfiguration } from "@app/lib/actions/mcp_helper";
+import type { DefaultRemoteMCPServerConfig } from "@app/lib/actions/mcp_internal_actions/remote_servers";
+import type { MCPServerType } from "@app/lib/api/mcp";
+import {
+  Icon,
+  InfoCircle,
+  Label,
+  SliderToggle,
+  Tooltip,
+} from "@ruby-ai/sparkle";
+import { useController, useFormContext } from "react-hook-form";
+
+interface CustomHeadersConfigurationSectionProps {
+  defaultServerConfig?: DefaultRemoteMCPServerConfig;
+  internalMCPServer?: MCPServerType;
+}
+
+export function CustomHeadersConfigurationSection({
+  defaultServerConfig,
+  internalMCPServer,
+}: CustomHeadersConfigurationSectionProps) {
+  const form = useFormContext<CreateMCPServerDialogFormValues>();
+  const { field: useCustomHeadersField } = useController({
+    control: form.control,
+    name: "useCustomHeaders",
+  });
+
+  const useCustomHeaders = useCustomHeadersField.value;
+  const predefinedHeaderKeys = form.watch("predefinedHeaderKeys");
+
+  const showToggle =
+    !defaultServerConfig &&
+    !predefinedHeaderKeys?.length &&
+    (!internalMCPServer || requiresBearerTokenConfiguration(internalMCPServer));
+
+  return (
+    <>
+      {showToggle && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <Label htmlFor="customHeaders">Use custom headers</Label>
+              <Tooltip
+                trigger={
+                  <Icon
+                    visual={InfoCircle}
+                    size="xs"
+                    className="text-muted-foreground"
+                  />
+                }
+                label="Custom headers can be added for advanced networking such as firewalls."
+              />
+            </div>
+            <SliderToggle
+              disabled={false}
+              selected={useCustomHeaders}
+              onClick={() => useCustomHeadersField.onChange(!useCustomHeaders)}
+            />
+          </div>
+        </div>
+      )}
+
+      {useCustomHeaders && <MCPServerHeaders />}
+    </>
+  );
+}

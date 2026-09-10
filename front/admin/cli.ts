@@ -1,0 +1,1022 @@
+import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
+import { renderConversationForModel } from "@app/lib/api/assistant/conversation_rendering";
+import { getTextRepresentationFromMessages } from "@app/lib/api/assistant/utils";
+import { default as config } from "@app/lib/api/config";
+import {
+  getDataSources,
+  softDeleteDataSourceAndLaunchScrubWorkflow,
+} from "@app/lib/api/data_sources";
+import { garbageCollectGoogleDriveDocument } from "@app/lib/api/poke/plugins/data_sources/garbage_collect_google_drive_document";
+import { getLlmCredentials } from "@app/lib/api/provider_credentials";
+import { Authenticator } from "@app/lib/auth";
+import { createWorkspaceInternal } from "@app/lib/iam/workspaces";
+import { getModelConfigByModelId } from "@app/lib/llms/model_configurations";
+import { FREE_UPGRADED_PLAN_CODE } from "@app/lib/plans/plan_codes";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { DataSourceResource } from "@app/lib/resources/data_source_resource";
+import { KeyResource } from "@app/lib/resources/key_resource";
+import { LabsTranscriptsConfigurationResource } from "@app/lib/resources/labs_transcripts_resource";
+import { MembershipResource } from "@app/lib/resources/membership_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { WebhookRequestResource } from "@app/lib/resources/webhook_request_resource";
+import { WebhookSourceResource } from "@app/lib/resources/webhook_source_resource";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { tokenCountForTexts } from "@app/lib/tokenization";
+import {
+  getWebhookRequestPayloadFromGCS,
+  processWebhookRequest,
+} from "@app/lib/triggers/webhook";
+import logger from "@app/logger/logger";
+import { launchScrubSpaceWorkflow } from "@app/poke/temporal/client";
+import {
+  launchRetrieveTranscriptsWorkflow,
+  stopRetrieveTranscriptsWorkflow,
+} from "@app/temporal/labs/transcripts/client";
+import { REGISTERED_CHECKS } from "@app/temporal/production_checks/activities";
+import { ConnectorsAPI } from "@app/types/connectors/connectors_api";
+import { labsTranscriptsProviders } from "@app/types/labs";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { removeNulls } from "@app/types/shared/utils/general";
+import { isAssignableRoleType } from "@app/types/user";
+import fs from "fs/promises";
+import parseArgs from "minimist";
+import path from "path";
+
+// `cli` takes an object type and a command as first two arguments and then a list of arguments.
+const workspace = async (command: string, args: parseArgs.ParsedArgs) => {
+  switch (command) {
+    case "create": {
+      if (!args.name) {
+        throw new Error("Missing --name argument");
+      }
+
+      const w = await createWorkspaceInternal({
+        name: args.name,
+        isBusiness: false,
+        planCode: null,
+        endDate: null,
+      });
+
+      args.wId = w.sId;
+      return;
+    }
+
+    case "upgrade": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+
+      const w = await WorkspaceResource.fetchById(args.wId);
+      if (!w) {
+        throw new Error(`Workspace not found: wId='${args.wId}'`);
+      }
+
+      await SubscriptionResource.internalSubscribeWorkspaceToFreePlan({
+        workspaceId: w.sId,
+        planCode: FREE_UPGRADED_PLAN_CODE,
+        endDate: null,
+      });
+      await workspace("show", args);
+      return;
+    }
+
+    case "downgrade": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+
+      const w = await WorkspaceResource.fetchById(args.wId);
+      if (!w) {
+        throw new Error(`Workspace not found: wId='${args.wId}'`);
+      }
+
+      await SubscriptionResource.internalSubscribeWorkspaceToFreeNoPlan({
+        workspaceId: w.sId,
+      });
+      await workspace("show", args);
+      return;
+    }
+
+    case "pause-connectors": {
+      if (!args.wIds && !args.wId) {
+        throw new Error("Missing --wIds argument");
+      }
+      if (args.wIds && args.wId) {
+        throw new Error("Cannot use --wIds and --wId together");
+      }
+      const wIds: string[] = args.wIds ? args.wIds.split(",") : [args.wId];
+
+      for (const wId of wIds) {
+        console.log(`Pausing connectors for workspace: wId=${wId}`);
+        const w = await WorkspaceResource.fetchById(wId);
+        if (!w) {
+          throw new Error(`Workspace not found: wId='${args.wId}'`);
+        }
+
+        const auth = await Authenticator.internalAdminForWorkspace(w.sId);
+        const dataSources = await getDataSources(auth);
+        const connectorIds = removeNulls(dataSources.map((d) => d.connectorId));
+        const connectorsAPI = new ConnectorsAPI(
+          config.getConnectorsAPIConfig(),
+          logger
+        );
+        for (const connectorId of connectorIds) {
+          console.log(`Pausing connectorId=${connectorId}`);
+          const res = await connectorsAPI.pauseConnector(connectorId);
+          if (res.isErr()) {
+            throw new Error(res.error.message);
+          }
+        }
+      }
+
+      console.log("Connectors paused");
+      return;
+    }
+
+    case "unpause-connectors": {
+      if (!args.wIds && !args.wId) {
+        throw new Error("Missing --wIds argument");
+      }
+      if (args.wIds && args.wId) {
+        throw new Error("Cannot use --wIds and --wId together");
+      }
+      const wIds: string[] = args.wIds ? args.wIds.split(",") : [args.wId];
+
+      for (const wId of wIds) {
+        const w = await WorkspaceResource.fetchById(wId);
+        if (!w) {
+          throw new Error(`Workspace not found: wId='${args.wId}'`);
+        }
+        console.log(`Unpausing connectors for workspace: wId=${w.sId}`);
+
+        const auth = await Authenticator.internalAdminForWorkspace(w.sId);
+        const dataSources = await getDataSources(auth);
+        const connectorIds = removeNulls(dataSources.map((d) => d.connectorId));
+        const connectorsAPI = new ConnectorsAPI(
+          config.getConnectorsAPIConfig(),
+          logger
+        );
+        for (const connectorId of connectorIds) {
+          logger.info(`Unpausing connectorId=${connectorId}`);
+          const res = await connectorsAPI.unpauseConnector(connectorId);
+          if (res.isErr()) {
+            if (res.error.message === "Connector is not stopped") {
+              logger.error(res.error.message);
+            } else {
+              throw new Error(res.error.message);
+            }
+          }
+        }
+      }
+
+      console.log("Connectors unpaused");
+      return;
+    }
+
+    case "block": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+
+      const w = await WorkspaceResource.fetchById(args.wId);
+      if (!w) {
+        throw new Error(`Workspace not found: wId='${args.wId}'`);
+      }
+
+      const updateResult = await w.updateWorkspaceKillSwitch({
+        operation: "block",
+      });
+      if (updateResult.isErr()) {
+        throw new Error(updateResult.error.message);
+      }
+      if (!updateResult.value.wasUpdated) {
+        logger.info({ wId: w.sId }, "Workspace was already blocked");
+        return;
+      }
+
+      logger.info({ wId: w.sId }, "Workspace blocked");
+      return;
+    }
+
+    case "unblock": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+
+      const w = await WorkspaceResource.fetchById(args.wId);
+      if (!w) {
+        throw new Error(`Workspace not found: wId='${args.wId}'`);
+      }
+
+      const updateResult = await w.updateWorkspaceKillSwitch({
+        operation: "unblock",
+      });
+      if (updateResult.isErr()) {
+        throw new Error(updateResult.error.message);
+      }
+      if (!updateResult.value.wasUpdated) {
+        logger.info({ wId: w.sId }, "Workspace was not blocked");
+        return;
+      }
+
+      logger.info({ wId: w.sId }, "Workspace unblocked");
+      return;
+    }
+
+    default:
+      console.log(`Unknown workspace command: ${command}`);
+      console.log(
+        "Possible values: `create`, `upgrade`, `downgrade`, `pause-connectors`, `unpause-connectors`, `block`, `unblock`"
+      );
+  }
+};
+
+const user = async (command: string, args: parseArgs.ParsedArgs) => {
+  switch (command) {
+    case "find": {
+      if (!args.username) {
+        throw new Error("Missing --username argument");
+      }
+
+      const users = await UserResource.listByUsername(args.username);
+
+      users.forEach((u) => {
+        console.log(
+          `> id='${u.id}' username='${u.username}' name='${u.name}' email='${u.email}'`
+        );
+      });
+      return;
+    }
+    case "show": {
+      if (!args.userId) {
+        throw new Error("Missing --userId argument");
+      }
+
+      const u = await UserResource.fetchByModelId(args.userId);
+      if (!u) {
+        throw new Error(`User not found: userId='${args.userId}'`);
+      }
+
+      console.log(`user:`);
+      console.log(`  id: ${u.id}`);
+      console.log(`  username: ${u.username}`);
+      console.log(`  name: ${u.name}`);
+      console.log(`  email: ${u.email}`);
+
+      const { memberships } = await MembershipResource.getLatestMemberships({
+        users: [u],
+      });
+
+      const workspaces = await WorkspaceResource.fetchByModelIds(
+        memberships.map((m) => m.workspaceId)
+      );
+
+      console.log(`  workspaces:`);
+
+      workspaces.forEach((w) => {
+        const m = memberships.find((m) => m.workspaceId === w.id);
+        console.log(`    - wId: ${w.sId}`);
+        console.log(`      name: ${w.name}`);
+        if (m) {
+          console.log(`      role: ${m.isRevoked() ? "revoked" : m.role}`);
+          console.log(`      startAt: ${m.startAt}`);
+          console.log(`      endAt: ${m.endAt}`);
+        }
+      });
+
+      return;
+    }
+    default:
+      console.log(`Unknown user command: ${command}`);
+      console.log("Possible values: `find`, `show`");
+  }
+};
+
+const dataSource = async (command: string, args: parseArgs.ParsedArgs) => {
+  switch (command) {
+    case "delete-document": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+      if (!args.dsId) {
+        throw new Error("Missing --dsId argument");
+      }
+      if (!args.documentId) {
+        throw new Error("Missing --documentId argument");
+      }
+
+      const auth = await Authenticator.internalAdminForWorkspace(args.wId);
+
+      const dataSource = await DataSourceResource.fetchById(auth, args.dsId);
+      if (!dataSource) {
+        throw new Error(
+          `DataSource not found: wId='${args.wId}' dsId='${args.dsId}'`
+        );
+      }
+
+      const gcRes = await garbageCollectGoogleDriveDocument(dataSource, {
+        documentId: args.documentId,
+      });
+      if (gcRes.isErr()) {
+        throw new Error(`Error deleting document: ${gcRes.error.message}`);
+      }
+
+      console.log(`Data Source document deleted: ${args.documentId}`);
+
+      return;
+    }
+    case "delete": {
+      // It's possible to delete a data source directly from Poké UI but
+      // it's not accessible for a relocated workspace. This command is there to let us
+      // delete a data source for a relocated workspace.
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+      if (!args.dsId) {
+        throw new Error("Missing --dsId argument");
+      }
+
+      const auth = await Authenticator.internalAdminForWorkspace(args.wId);
+
+      const dataSource = await DataSourceResource.fetchById(auth, args.dsId, {
+        includeDeleted: true,
+      });
+      if (!dataSource) {
+        throw new Error(
+          `DataSource not found: wId='${args.wId}' dsId='${args.dsId}'`
+        );
+      }
+
+      await softDeleteDataSourceAndLaunchScrubWorkflow(auth, { dataSource });
+
+      console.log(`Data Source deleted: ${args.dsId}`);
+
+      return;
+    }
+
+    default:
+      console.log(`Unknown data-source command: ${command}`);
+      console.log("Possible values: `delete`, `delete-document`");
+  }
+};
+
+const space = async (command: string, args: parseArgs.ParsedArgs) => {
+  switch (command) {
+    case "scrub": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+      if (!args.spaceId) {
+        throw new Error("Missing --spaceId argument");
+      }
+
+      const auth = await Authenticator.internalAdminForWorkspace(args.wId);
+
+      const space = await SpaceResource.fetchById(auth, args.spaceId, {
+        includeDeleted: true,
+      });
+      if (!space) {
+        throw new Error(
+          `Space not found: wId='${args.wId}' spaceId='${args.spaceId}'`
+        );
+      }
+
+      if (space.deletedAt === null) {
+        throw new Error(
+          `Space is not soft-deleted, refusing to scrub: spaceId='${args.spaceId}'`
+        );
+      }
+
+      await launchScrubSpaceWorkflow(auth, space);
+
+      console.log(`Scrub space workflow launched: ${args.spaceId}`);
+
+      return;
+    }
+
+    default:
+      console.log(`Unknown space command: ${command}`);
+      console.log("Possible values: `scrub`");
+  }
+};
+
+const conversation = async (command: string, args: parseArgs.ParsedArgs) => {
+  switch (command) {
+    case "block": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+      if (!args.cId) {
+        throw new Error("Missing --cId argument");
+      }
+
+      const w = await WorkspaceResource.fetchById(args.wId);
+      if (!w) {
+        throw new Error(`Workspace not found: wId='${args.wId}'`);
+      }
+
+      const auth = await Authenticator.internalAdminForWorkspace(args.wId);
+      const conversationId = args.cId;
+      const conversation = await ConversationResource.fetchById(
+        auth,
+        conversationId
+      );
+      if (!conversation) {
+        throw new Error(`Conversation not found: cId='${conversationId}'`);
+      }
+
+      const updateResult = await w.updateConversationKillSwitch({
+        conversationId,
+        operation: "block",
+      });
+      if (updateResult.isErr()) {
+        throw new Error(updateResult.error.message);
+      }
+      if (!updateResult.value.wasUpdated) {
+        logger.info(
+          {
+            wId: w.sId,
+            cId: conversationId,
+          },
+          "Conversation was already blocked"
+        );
+        return;
+      }
+
+      logger.info(
+        {
+          wId: w.sId,
+          cId: conversationId,
+        },
+        "Conversation blocked"
+      );
+      return;
+    }
+
+    case "unblock": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+      if (!args.cId) {
+        throw new Error("Missing --cId argument");
+      }
+
+      const w = await WorkspaceResource.fetchById(args.wId);
+      if (!w) {
+        throw new Error(`Workspace not found: wId='${args.wId}'`);
+      }
+
+      const conversationId = args.cId;
+      const updateResult = await w.updateConversationKillSwitch({
+        conversationId,
+        operation: "unblock",
+      });
+      if (updateResult.isErr()) {
+        throw new Error(updateResult.error.message);
+      }
+      if (!updateResult.value.wasUpdated) {
+        logger.info(
+          {
+            wId: w.sId,
+            cId: conversationId,
+          },
+          "Conversation was not blocked"
+        );
+        return;
+      }
+
+      logger.info(
+        {
+          wId: w.sId,
+          cId: conversationId,
+        },
+        "Conversation unblocked"
+      );
+      return;
+    }
+
+    case "render-for-model": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+      if (!args.cId) {
+        throw new Error("Missing --cId argument");
+      }
+      if (!args.modelId) {
+        throw new Error("Missing --modelId argument");
+      }
+      const model = getModelConfigByModelId(args.modelId);
+      if (!model) {
+        throw new Error(`Model not found: '${args.modelId}'`);
+      }
+      const verbose = args.verbose === "true";
+
+      const auth = await Authenticator.internalAdminForWorkspace(args.wId);
+      // biome-ignore lint/plugin/noExpensiveConversationFetch: intentional full conversation load
+      const conversationRes = await getConversation(auth, args.cId as string);
+
+      if (conversationRes.isErr()) {
+        throw new Error(conversationRes.error.message);
+      }
+      const conversation = conversationRes.value;
+
+      const MIN_GENERATION_TOKENS = 2048;
+      const allowedTokenCount = model.contextSize - MIN_GENERATION_TOKENS;
+      const prompt = "";
+      const tools = "";
+
+      const convoRes = await renderConversationForModel(auth, {
+        conversation,
+        enabledSkills: [],
+        model,
+        prompt,
+        tools,
+        allowedTokenCount,
+      });
+
+      if (convoRes.isErr()) {
+        throw new Error(convoRes.error.message);
+      }
+      const renderedConvo = convoRes.value;
+      const messages = renderedConvo.modelConversation.messages;
+
+      const credentials = await getLlmCredentials(auth, {
+        skipEmbeddingApiKeyRequirement: true,
+      });
+      const tokenCountRes = await tokenCountForTexts(
+        getTextRepresentationFromMessages(messages),
+        model,
+        credentials
+      );
+      if (tokenCountRes.isErr()) {
+        throw new Error(tokenCountRes.error.message);
+      }
+      const tokenCount = tokenCountRes.value;
+
+      console.log(
+        `Token used: ${renderedConvo.tokensUsed} (this includes a margin of 64 tokens).`
+      );
+      console.log(
+        `Number of messages: ${renderedConvo.modelConversation.messages.length}`
+      );
+      console.log(`Tokens per message: ${tokenCount}.`);
+
+      if (verbose) {
+        // For convenience we shorten the content when role = "tool"
+        renderedConvo.modelConversation.messages =
+          renderedConvo.modelConversation.messages.map((m) => {
+            if (m.role === "function") {
+              return {
+                ...m,
+                content:
+                  typeof m.content === "string"
+                    ? m.content.slice(0, 200) + "..."
+                    : m.content,
+              };
+            }
+            return m;
+          });
+
+        renderedConvo.modelConversation.messages.forEach((m) => {
+          console.log(m);
+        });
+      } else {
+        console.log(
+          "Add option --verbose=true to print also the content of the messages."
+        );
+      }
+
+      return;
+    }
+
+    default:
+      logger.error(`Unknown conversation command: ${command}`);
+      logger.error("Possible values: `block`, `unblock`, `render-for-model`");
+  }
+};
+
+// The active IDs file is a JSON array of string configuration sIds, e.g.:
+// ["trc_...", "trc_...", ...]
+// A config is considered 'active' if isActive === true OR dataSourceViewId is set (truthy).
+// You can override the path with --activeIdsFile=/path/to/file.json
+function getActiveIdsFile(args: parseArgs.ParsedArgs) {
+  return args.activeIdsFile
+    ? path.resolve(args.activeIdsFile)
+    : path.join(__dirname, "active_labs_workflow_ids.json");
+}
+
+const transcripts = async (command: string, args: parseArgs.ParsedArgs) => {
+  const auth = await Authenticator.internalAdminForWorkspace(args.wId);
+  switch (command) {
+    case "stop": {
+      if (!args.cId) {
+        throw new Error("Missing --cId argument");
+      }
+      const transcriptsConfiguration =
+        await LabsTranscriptsConfigurationResource.fetchById(auth, args.cId);
+
+      if (!transcriptsConfiguration) {
+        throw new Error(
+          `Transcripts configuration not found: cId='${args.cId}'`
+        );
+      }
+
+      await stopRetrieveTranscriptsWorkflow(transcriptsConfiguration);
+
+      logger.info(
+        {
+          transcriptsConfiguration,
+        },
+        "Transcript retrieval workflow stopped."
+      );
+
+      return;
+    }
+    case "start": {
+      if (!args.cId) {
+        throw new Error("Missing --cId argument");
+      }
+      const transcriptsConfiguration =
+        await LabsTranscriptsConfigurationResource.fetchById(auth, args.cId);
+
+      if (!transcriptsConfiguration) {
+        throw new Error(
+          `Transcripts configuration not found: cId='${args.cId}'`
+        );
+      }
+
+      await launchRetrieveTranscriptsWorkflow(transcriptsConfiguration);
+      await transcriptsConfiguration.setStatus("active");
+
+      logger.info(
+        {
+          transcriptsConfiguration,
+        },
+        "Transcript retrieval workflow started."
+      );
+      return;
+    }
+    case "pause-all": {
+      const execute = !!args.execute;
+      const activeIdsFile = getActiveIdsFile(args);
+      logger.info(
+        `Pausing all LabsTranscripts workflows and recording active ones... (activeIdsFile: ${activeIdsFile})`
+      );
+      const allWorkspaces = await WorkspaceResource.listAll();
+      const activeConfigIds: string[] = [];
+      for (const ws of allWorkspaces) {
+        const configs =
+          await LabsTranscriptsConfigurationResource.findByWorkspaceId(ws.id);
+        for (const config of configs) {
+          if (config.status === "active" || !!config.dataSourceViewId) {
+            activeConfigIds.push(config.sId);
+            if (execute) {
+              await stopRetrieveTranscriptsWorkflow(config);
+            } else {
+              logger.info(
+                `[DRY RUN] Would stop workflow for config sId=${config.sId}`
+              );
+            }
+          }
+        }
+      }
+      await fs.writeFile(
+        activeIdsFile,
+        JSON.stringify(activeConfigIds, null, 2)
+      );
+      logger.info(
+        `Paused all workflows. Active workflow sIds recorded: ${activeConfigIds.length}`
+      );
+      return;
+    }
+    case "restart-active": {
+      const execute = !!args.execute;
+      const activeIdsFile = getActiveIdsFile(args);
+      logger.info(
+        `Restarting only previously active LabsTranscripts workflows... (activeIdsFile: ${activeIdsFile})`
+      );
+      let activeConfigIds: string[] = [];
+      try {
+        const data = await fs.readFile(activeIdsFile, "utf-8");
+        activeConfigIds = JSON.parse(data);
+      } catch (e) {
+        logger.error(`Could not read ${activeIdsFile}: ${e}`);
+        process.exit(1);
+      }
+      for (const sId of activeConfigIds) {
+        const config = await LabsTranscriptsConfigurationResource.fetchById(
+          auth,
+          sId
+        );
+        if (!config) {
+          logger.warn(`Config sId=${sId} not found, skipping.`);
+          continue;
+        }
+        if (execute) {
+          await launchRetrieveTranscriptsWorkflow(config);
+        } else {
+          logger.info(
+            `[DRY RUN] Would restart workflow for config sId=${config.sId}`
+          );
+        }
+      }
+      logger.info(`Restarted ${activeConfigIds.length} workflows.`);
+      return;
+    }
+    case "stop-all": {
+      const provider = labsTranscriptsProviders.find(
+        (p) => p === args.provider
+      );
+      if (!provider) {
+        throw new Error(
+          `Missing or invalid --provider argument. Valid values: ${labsTranscriptsProviders.join(", ")}`
+        );
+      }
+
+      const providerConfigs =
+        await LabsTranscriptsConfigurationResource.listByWorkspaceAndProvider({
+          auth,
+          provider,
+        });
+
+      if (providerConfigs.length === 0) {
+        logger.info(
+          `No transcript configurations found for provider '${provider}' in workspace '${args.wId}'.`
+        );
+        return;
+      }
+
+      let stoppedCount = 0;
+      for (const config of providerConfigs) {
+        if (config.isActive()) {
+          await stopRetrieveTranscriptsWorkflow(config);
+          stoppedCount++;
+          logger.info(
+            { configId: config.sId },
+            `Stopped transcript workflow for config ${config.sId}.`
+          );
+        }
+      }
+
+      logger.info(
+        `Stopped ${stoppedCount}/${providerConfigs.length} workflows for provider '${provider}'.`
+      );
+      return;
+    }
+  }
+};
+
+const productionCheck = async (command: string, args: parseArgs.ParsedArgs) => {
+  switch (command) {
+    case "run": {
+      if (!args.check) {
+        throw new Error("Missing --check argument");
+      }
+
+      const check = REGISTERED_CHECKS.find((c) => c.name === args.check);
+      if (!check) {
+        console.log(args.check);
+        throw new Error(
+          `Invalid check, possible values: ${REGISTERED_CHECKS.map((c) => c.name).join(", ")}`
+        );
+      }
+
+      const reportSuccess = (reportPayload: unknown) => {
+        logger.info({ reportPayload }, "Check succeeded");
+      };
+      const reportFailure = (reportPayload: unknown, message: string) => {
+        logger.error(
+          { reportPayload, errorMessage: message },
+          "Production check failed"
+        );
+      };
+      const heartbeat = () => {};
+
+      await check.check(
+        check.name,
+        logger,
+        reportSuccess,
+        reportFailure,
+        heartbeat
+      );
+      return;
+    }
+  }
+};
+
+async function apikeys(command: string, args: parseArgs.ParsedArgs) {
+  switch (command) {
+    case "set-role": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+
+      if (!args.name) {
+        throw new Error("Missing --name argument");
+      }
+
+      if (!args.role || !isAssignableRoleType(args.role)) {
+        throw new Error(
+          "Missing or Incorrect --role argument. Must be admin | manager | user."
+        );
+      }
+
+      const auth = await Authenticator.internalAdminForWorkspace(
+        String(args.wId)
+      );
+
+      const key = await KeyResource.fetchByName(auth, { name: args.name });
+      if (!key) {
+        throw new Error(`Key not found`);
+      }
+
+      await key.updateRole({
+        newRole: args.role,
+      });
+
+      return;
+    }
+  }
+}
+
+async function trigger(command: string, args: parseArgs.ParsedArgs) {
+  switch (command) {
+    case "replay-failed-webhooks": {
+      if (!args.wId) {
+        throw new Error("Missing --wId argument");
+      }
+
+      const execute = !!args.execute;
+
+      if (!execute) {
+        logger.info(
+          "[DRY RUN] Use --execute to actually replay the webhooks. Running in dry-run mode."
+        );
+      }
+
+      const auth = await Authenticator.internalAdminForWorkspace(args.wId);
+
+      const failedWebhooks = await WebhookRequestResource.listByStatus(auth, {
+        status: "failed",
+      });
+
+      if (failedWebhooks.length === 0) {
+        logger.info("No failed webhook requests found.");
+        return;
+      }
+
+      logger.info(
+        { count: failedWebhooks.length },
+        `Found ${failedWebhooks.length} failed webhook requests.`
+      );
+
+      for (const webhookRequest of failedWebhooks) {
+        const localLogger = logger.child({
+          webhookRequestId: webhookRequest.id,
+          webhookSourceId: webhookRequest.webhookSourceId,
+          workspaceId: auth.getNonNullableWorkspace().sId,
+          createdAt: webhookRequest.createdAt,
+          initialErrorMessage: webhookRequest.errorMessage,
+        });
+        if (execute) {
+          const res = await getWebhookRequestPayloadFromGCS(auth, {
+            webhookRequest,
+          });
+          if (res.isErr()) {
+            localLogger.error(
+              { errorMessage: res.error.message },
+              `Failed to get webhook payload from GCS: ${res.error.message}`
+            );
+            continue;
+          }
+
+          const { headers, body } = res.value;
+
+          const webhookSource = await WebhookSourceResource.findByPk(
+            auth,
+            webhookRequest.webhookSourceId
+          );
+
+          if (!webhookSource) {
+            localLogger.error(
+              { errorMessage: "Webhook source not found" },
+              `Webhook source not found for webhook request.`
+            );
+            continue;
+          }
+
+          const result = await processWebhookRequest(auth, {
+            webhookRequest,
+            webhookSource,
+            headers,
+            body,
+            rawBody: JSON.stringify(body),
+          });
+          if (result.isErr()) {
+            localLogger.error(
+              { error: result.error.message },
+              `Failed to process webhook request: ${result.error.message}`
+            );
+            continue;
+          }
+          logger.info("Webhook workflow launched successfully.");
+        } else {
+          logger.info(
+            "[DRY RUN] Would launch workflow for this webhook request."
+          );
+        }
+      }
+
+      logger.info(
+        {
+          total: failedWebhooks.length,
+        },
+        "Webhook replay completed."
+      );
+
+      return;
+    }
+
+    default:
+      console.log(`Unknown trigger command: ${command}`);
+  }
+}
+
+const CLI_OBJECT_TYPES = [
+  "workspace",
+  "user",
+  "data-source",
+  "space",
+  "conversation",
+  "transcripts",
+  "production-check",
+  "api-key",
+  "trigger",
+] as const;
+
+type CliObjectType = (typeof CLI_OBJECT_TYPES)[number];
+
+function isCliObjectType(val: string): val is CliObjectType {
+  return (CLI_OBJECT_TYPES as unknown as string[]).includes(val);
+}
+
+const main = async () => {
+  const argv = parseArgs(process.argv.slice(2));
+
+  if (argv._.length < 2) {
+    console.log(
+      "Expects object type and command as first two arguments, eg: `cli workspace create ...`"
+    );
+    return;
+  }
+
+  const [objectType, command] = argv._;
+
+  if (!isCliObjectType(objectType)) {
+    console.log(
+      "Unknown object type, possible values: " + CLI_OBJECT_TYPES.join(", ")
+    );
+    return;
+  }
+
+  switch (objectType) {
+    case "workspace":
+      await workspace(command, argv);
+      return;
+    case "user":
+      await user(command, argv);
+      return;
+    case "data-source":
+      await dataSource(command, argv);
+      return;
+    case "space":
+      await space(command, argv);
+      return;
+    case "conversation":
+      return conversation(command, argv);
+    case "transcripts":
+      return transcripts(command, argv);
+    case "production-check":
+      return productionCheck(command, argv);
+    case "api-key":
+      return apikeys(command, argv);
+    case "trigger":
+      return trigger(command, argv);
+    default:
+      assertNever(objectType);
+  }
+};
+
+main()
+  .then(() => {
+    console.error("\x1b[32m%s\x1b[0m", `Done`);
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("\x1b[31m%s\x1b[0m", `Error: ${normalizeError(err).message}`);
+    console.log(err);
+    process.exit(1);
+  });

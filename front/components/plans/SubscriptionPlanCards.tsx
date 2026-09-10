@@ -1,0 +1,151 @@
+import config from "@app/lib/api/config";
+import {
+  BUSINESS_PLAN_COST_MONTHLY,
+  PRO_PLAN_COST_MONTHLY,
+  PRO_PLAN_COST_YEARLY,
+  usePriceWithCurrency,
+} from "@app/lib/client/subscription";
+import { isWhitelistedBusinessPlan } from "@app/lib/plans/plan_codes";
+import type { BillingPeriod } from "@app/types/plan";
+import type { WorkspaceType } from "@app/types/user";
+import { Button, Check, Icon } from "@ruby-ai/sparkle";
+
+const PRO_FEATURES = [
+  "From 1 user",
+  "Advanced AI models: GPT-5, Claude 4.5, Gemini, Mistral, and more",
+  "Data connections: Slack, Notion, Google Drive, GitHub, and more",
+  "Native integrations (Zendesk, Slack, Chrome Extension)",
+  "Email support: Get help when you need it",
+  "Free credits for programmatic usage (API, GSheet, Zapier)",
+];
+
+const BUSINESS_EXTRA_FEATURES = [
+  "US / EU data hosting",
+  "Single Sign-On (SSO) (Okta, Entra ID, Jumpcloud)",
+  "Advanced connections (Salesforce, etc)",
+];
+
+const ENTERPRISE_FEATURES = [
+  "Everything in Pro",
+  "Advanced security and controls",
+  "Larger storage and file size limits",
+  "Access to programmatic usage",
+  "Single Sign-On (SSO) (Okta, Entra ID, Jumpcloud)",
+  "User provisioning (SCIM)",
+  "Flexible billing options (SEPA, Credit Card)",
+  "Advanced connections (Salesforce, etc)",
+  "Priority access to new features",
+  "US / EU data hosting",
+  "Priority support",
+  "Dedicated Customer Success",
+];
+
+interface SubscriptionPlanCardsProps {
+  billingPeriod: BillingPeriod;
+  onSubscribe: () => void;
+  isProcessing: boolean;
+  owner?: WorkspaceType;
+}
+
+export function SubscriptionPlanCards({
+  billingPeriod,
+  onSubscribe,
+  isProcessing,
+  owner,
+}: SubscriptionPlanCardsProps) {
+  const isBusiness = isWhitelistedBusinessPlan(owner);
+  const rawPrice = isBusiness
+    ? BUSINESS_PLAN_COST_MONTHLY
+    : billingPeriod === "monthly"
+      ? PRO_PLAN_COST_MONTHLY
+      : PRO_PLAN_COST_YEARLY;
+  const price = usePriceWithCurrency(rawPrice);
+
+  return (
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+      {/* Pro card */}
+      <div className="flex flex-col rounded-2xl border border-border p-5">
+        <div className="mb-4">
+          <h3 className="text-lg font-medium text-foreground">
+            {isBusiness ? "Enterprise (Seat-based)" : "Pro"}
+          </h3>
+          <div className="mt-1 flex items-baseline gap-2">
+            <span className="text-3xl font-bold tabular-nums text-foreground">
+              {price}
+            </span>
+            <span className="text-sm text-muted-foreground">per user</span>
+          </div>
+        </div>
+        <div className="mb-4 border-t border-border" />
+        <ul className="flex flex-1 flex-col gap-3">
+          {[
+            ...PRO_FEATURES,
+            ...(isBusiness ? BUSINESS_EXTRA_FEATURES : []),
+          ].map((feature, index) => (
+            <li key={index} className="flex items-start gap-2">
+              <Icon
+                visual={Check}
+                size="sm"
+                className="mt-0.5 shrink-0 text-highlight-500"
+              />
+              <span className="text-sm text-foreground">{feature}</span>
+            </li>
+          ))}
+        </ul>
+        <div className="mt-6">
+          <Button
+            variant="highlight"
+            size="md"
+            label={
+              isBusiness
+                ? "Subscribe to Enterprise (Seat-based)"
+                : "Subscribe to Pro"
+            }
+            onClick={onSubscribe}
+            disabled={isProcessing}
+            className="w-full"
+          />
+        </div>
+      </div>
+
+      {/* Enterprise card */}
+      <div className="flex flex-col rounded-2xl border border-border p-5">
+        <div className="mb-4">
+          <h3 className="text-lg font-medium text-foreground">Enterprise</h3>
+          <div className="mt-1 flex items-baseline gap-2">
+            <span className="text-3xl font-bold tabular-nums text-foreground">
+              Custom
+            </span>
+            <span className="text-sm text-muted-foreground">
+              based on active users
+            </span>
+          </div>
+        </div>
+        <div className="mb-4 border-t border-border" />
+        <ul className="flex flex-1 flex-col gap-3">
+          {ENTERPRISE_FEATURES.map((feature, index) => (
+            <li key={index} className="flex items-start gap-2">
+              <Icon
+                visual={Check}
+                size="sm"
+                className="mt-0.5 shrink-0 text-highlight-500"
+              />
+              <span className="text-sm text-foreground">{feature}</span>
+            </li>
+          ))}
+        </ul>
+        <div className="mt-6">
+          <Button
+            variant="outline"
+            size="md"
+            label="Contact sales"
+            href={`${config.getStaticWebsiteUrl()}/home/contact`}
+            target="_blank"
+            disabled={isProcessing}
+            className="w-full"
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

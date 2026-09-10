@@ -1,0 +1,16 @@
+{
+  "action": "scim.user_updated",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "user"
+    }
+  ],
+  "metadata": {
+    "directory_id": "string",
+    "updated_attributes": "string",
+    "actor_type": "string"
+  }
+}

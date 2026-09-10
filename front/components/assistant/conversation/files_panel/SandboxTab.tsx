@@ -1,0 +1,224 @@
+import type { FilePanelCategory } from "@app/components/file_explorer/types";
+import {
+  CATEGORY_CONFIG,
+  getCategoryFromContentType,
+  MIN_FILES_FOR_SEARCH,
+} from "@app/components/file_explorer/utils";
+import { useConversationSandboxFiles } from "@app/hooks/conversations/useConversationSandboxFiles";
+import { useDebounce } from "@app/hooks/useDebounce";
+import { getFileTypeIcon } from "@app/lib/file_icon_utils";
+import type { FileSystemFileEntry } from "@app/types/api/file_system/types";
+import type { LightWorkspaceType } from "@app/types/user";
+import {
+  Card,
+  CardGrid,
+  Icon,
+  ScrollArea,
+  SearchInput,
+  Spinner,
+  Tooltip,
+} from "@ruby-ai/sparkle";
+import moment from "moment";
+import { useMemo } from "react";
+
+interface SandboxImageCardProps {
+  entry: FileSystemFileEntry;
+  onClick: () => void;
+}
+
+function SandboxImageCard({ entry, onClick }: SandboxImageCardProps) {
+  // thumbnailUrl is populated by RubyFileSystem for image entries.
+  // Fall back to the processed-file URL when the entry has a fileId (legacy
+  // records uploaded before the unified path endpoint existed).
+  const src = entry.thumbnailUrl ?? null;
+
+  return (
+    <Card
+      key={entry.path}
+      size="sm"
+      variant="primary"
+      onClick={onClick}
+      containerClassName="h-24 overflow-hidden rounded-xl"
+      className="overflow-hidden"
+    >
+      {src ? (
+        <img
+          src={src}
+          alt={entry.fileName}
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+      ) : (
+        <div className="flex h-full w-full items-center justify-center">
+          <Spinner size="sm" />
+        </div>
+      )}
+      <div className="absolute inset-x-0 bottom-0 bg-linear-to-t from-black/80 via-black/40 to-transparent p-2 pt-6">
+        <Tooltip
+          tooltipTriggerAsChild
+          label={entry.fileName}
+          trigger={
+            <div className="truncate text-sm font-medium text-white">
+              {entry.fileName}
+            </div>
+          }
+        />
+        <div className="text-xs text-white/70">
+          {entry.lastModifiedMs ? moment(entry.lastModifiedMs).fromNow() : null}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+interface SandboxTabProps {
+  conversationId: string;
+  disabled?: boolean;
+  owner: LightWorkspaceType;
+  onFileClick: (entry: FileSystemFileEntry) => void;
+}
+
+export function SandboxTab({
+  conversationId,
+  disabled,
+  owner,
+  onFileClick,
+}: SandboxTabProps) {
+  const { sandboxFiles, isSandboxFilesLoading } = useConversationSandboxFiles({
+    conversationId,
+    owner,
+    options: { disabled },
+  });
+
+  const {
+    inputValue: search,
+    debouncedValue: debouncedSearch,
+    setValue: setSearch,
+  } = useDebounce("", { delay: 200 });
+
+  const files = useMemo(
+    () =>
+      sandboxFiles.filter(
+        (f): f is FileSystemFileEntry =>
+          !f.isDirectory && !f.fileName.startsWith(".")
+      ),
+    [sandboxFiles]
+  );
+
+  const filteredFiles = useMemo(() => {
+    const query = debouncedSearch.trim().toLowerCase();
+    if (!query) {
+      return files;
+    }
+    return files.filter((f) => f.fileName.toLowerCase().includes(query));
+  }, [files, debouncedSearch]);
+
+  const groupedByCategory = useMemo(() => {
+    const groups = new Map<FilePanelCategory, FileSystemFileEntry[]>();
+    for (const file of filteredFiles) {
+      const category = getCategoryFromContentType(file.contentType);
+      const existing = groups.get(category);
+      if (existing) {
+        existing.push(file);
+      } else {
+        groups.set(category, [file]);
+      }
+    }
+    return groups;
+  }, [filteredFiles]);
+
+  if (isSandboxFilesLoading) {
+    return (
+      <div className="flex w-full items-center justify-center p-8">
+        <Spinner />
+      </div>
+    );
+  }
+
+  if (files.length === 0) {
+    return (
+      <div className="p-4 text-sm text-muted-foreground">
+        No files in the Computer yet.
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-1 flex-col overflow-hidden">
+      {files.length > MIN_FILES_FOR_SEARCH && (
+        <div className="shrink-0 px-4 pt-4">
+          <SearchInput
+            name="sandbox-search"
+            placeholder="Search files..."
+            value={search}
+            onChange={setSearch}
+          />
+        </div>
+      )}
+      <ScrollArea className="flex-1 p-4">
+        <div className="flex flex-col gap-8">
+          {CATEGORY_CONFIG.map(({ value, plural }) => {
+            const categoryFiles = groupedByCategory.get(value);
+            if (!categoryFiles || categoryFiles.length === 0) {
+              return null;
+            }
+            return (
+              <div key={value}>
+                <div className="heading-sm pb-2 text-foreground">{plural}</div>
+                <CardGrid>
+                  {categoryFiles.map((entry) => {
+                    if (value === "image") {
+                      return (
+                        <SandboxImageCard
+                          key={entry.path}
+                          entry={entry}
+                          onClick={() => onFileClick(entry)}
+                        />
+                      );
+                    }
+
+                    const FileIcon = getFileTypeIcon(
+                      entry.contentType,
+                      entry.fileName
+                    );
+                    return (
+                      <Card
+                        key={entry.path}
+                        size="sm"
+                        variant="primary"
+                        onClick={() => onFileClick(entry)}
+                      >
+                        <div className="flex w-full flex-col gap-3">
+                          <div className="flex items-center gap-2">
+                            <Icon
+                              visual={FileIcon}
+                              size="sm"
+                              className="shrink-0"
+                            />
+                            <Tooltip
+                              tooltipTriggerAsChild
+                              label={entry.fileName}
+                              trigger={
+                                <div className="min-w-0 flex-1 truncate text-sm font-medium">
+                                  {entry.fileName}
+                                </div>
+                              }
+                            />
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            {entry.lastModifiedMs
+                              ? moment(entry.lastModifiedMs).fromNow()
+                              : null}
+                          </div>
+                        </div>
+                      </Card>
+                    );
+                  })}
+                </CardGrid>
+              </div>
+            );
+          })}
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}

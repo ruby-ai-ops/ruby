@@ -1,0 +1,514 @@
+import { MCPServerViewModel } from "@app/lib/models/agent/actions/mcp_server_view";
+import { frontSequelize } from "@app/lib/resources/storage";
+import {
+  DANGEROUSLY_UNBOUNDED_TEXT,
+  DataTypes,
+} from "@app/lib/resources/storage/data_types";
+import { DataSourceModel } from "@app/lib/resources/storage/models/data_source";
+import { DataSourceViewModel } from "@app/lib/resources/storage/models/data_source_view";
+import { FileModel } from "@app/lib/resources/storage/models/files";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import { WorkspaceAwareModel } from "@app/lib/resources/storage/wrappers/workspace_models";
+import type {
+  SkillAvailability,
+  SkillReinforcementMode,
+  SkillSourceMetadata,
+  SkillSourceType,
+  SkillStatus,
+} from "@app/types/assistant/skill_configuration";
+import { DEFAULT_SKILL_AVAILABILITY } from "@app/types/assistant/skill_configuration";
+import isNil from "lodash/isNil";
+import type { CreationOptional, ForeignKey, ModelAttributes } from "sequelize";
+
+const SKILL_MODEL_ATTRIBUTES = {
+  createdAt: {
+    type: DataTypes.DATE,
+    allowNull: false,
+    defaultValue: DataTypes.NOW,
+  },
+  updatedAt: {
+    type: DataTypes.DATE,
+    allowNull: false,
+    defaultValue: DataTypes.NOW,
+  },
+  status: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  name: {
+    type: DANGEROUSLY_UNBOUNDED_TEXT,
+    allowNull: false,
+  },
+  agentFacingDescription: {
+    type: DANGEROUSLY_UNBOUNDED_TEXT,
+    allowNull: false,
+  },
+  userFacingDescription: {
+    type: DANGEROUSLY_UNBOUNDED_TEXT,
+    allowNull: true,
+  },
+  instructions: {
+    type: DANGEROUSLY_UNBOUNDED_TEXT,
+    allowNull: false,
+  },
+  instructionsHtml: {
+    type: DANGEROUSLY_UNBOUNDED_TEXT,
+    allowNull: true,
+  },
+  requestedSpaceIds: {
+    type: DataTypes.ARRAY(DataTypes.BIGINT),
+    allowNull: false,
+  },
+  manuallyRequestedSpaceIds: {
+    type: DataTypes.ARRAY(DataTypes.BIGINT),
+    allowNull: false,
+    defaultValue: [],
+  },
+  icon: {
+    type: DANGEROUSLY_UNBOUNDED_TEXT,
+    allowNull: true,
+  },
+  source: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  sourceMetadata: {
+    type: DataTypes.JSONB,
+    allowNull: true,
+  },
+  availability: {
+    type: DataTypes.STRING,
+    allowNull: false,
+    defaultValue: DEFAULT_SKILL_AVAILABILITY,
+  },
+} as const satisfies ModelAttributes;
+
+/**
+ * Shared validation for skill in conversation models.
+ * Ensures exactly one of customSkillId or globalSkillId is set.
+ */
+export function eitherGlobalOrCustomSkillValidation(this: {
+  customSkillId: unknown;
+  globalSkillId: unknown;
+}): void {
+  const hasCustomSkill = !isNil(this.customSkillId);
+  const hasGlobalSkill = !isNil(this.globalSkillId);
+  const hasExactlyOne = hasCustomSkill !== hasGlobalSkill;
+  if (!hasExactlyOne) {
+    throw new Error(
+      "Exactly one of customSkillId or globalSkillId must be set"
+    );
+  }
+}
+
+export class SkillConfigurationModel extends WorkspaceAwareModel<SkillConfigurationModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare status: SkillStatus;
+
+  declare name: string;
+  declare agentFacingDescription: string;
+  declare userFacingDescription: string;
+  declare instructions: string;
+  declare instructionsHtml: string | null;
+  declare icon: string | null;
+
+  declare editedBy: ForeignKey<UserModel["id"]> | null;
+
+  declare source: SkillSourceType | null;
+  declare sourceMetadata: SkillSourceMetadata | null;
+  declare availability: CreationOptional<SkillAvailability>;
+  declare favoriteCount: CreationOptional<number>;
+
+  declare reinforcement: CreationOptional<SkillReinforcementMode>;
+  declare lastReinforcementAnalysisAt: CreationOptional<Date | null>;
+  declare selfImprovementCostsCapMicroUsd: CreationOptional<number | null>;
+  // Same cap expressed in AWU credits, used for workspaces billed by
+  // Metronome. Null means "use the workspace default".
+  declare selfImprovementCostsCapAwuCredits: CreationOptional<number | null>;
+  // Lock toggling of self-improvement to admin only.
+  declare selfImprovementLock: CreationOptional<boolean>;
+
+  declare requestedSpaceIds: number[];
+  // The subset of `requestedSpaceIds` a person picked by hand under "Data and access". The rest is
+  // derived from the skill's tools, attached knowledge and nested skills, and disappears with them;
+  // these stay until someone removes them explicitly.
+  declare manuallyRequestedSpaceIds: CreationOptional<number[]>;
+}
+
+SkillConfigurationModel.init(
+  {
+    ...SKILL_MODEL_ATTRIBUTES,
+    favoriteCount: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    reinforcement: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "on",
+    },
+    lastReinforcementAnalysisAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    selfImprovementCostsCapMicroUsd: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+      defaultValue: null,
+    },
+    selfImprovementCostsCapAwuCredits: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+      defaultValue: null,
+    },
+    selfImprovementLock: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+  },
+  {
+    modelName: "skill_configuration",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["workspaceId", "status"],
+        concurrently: true,
+      },
+      {
+        fields: ["workspaceId", "status", "availability"],
+        concurrently: true,
+      },
+      {
+        fields: ["workspaceId", "editedBy"],
+        concurrently: true,
+      },
+      {
+        unique: true,
+        fields: ["workspaceId", "name", "status"],
+        concurrently: true,
+      },
+    ],
+  }
+);
+
+export class SkillVersionModel extends SkillConfigurationModel {
+  declare skillConfigurationId: ForeignKey<SkillConfigurationModel["id"]>;
+  declare mcpServerViewIds: number[];
+  declare fileAttachmentIds: number[];
+  declare version: number;
+}
+
+SkillVersionModel.init(
+  {
+    ...SKILL_MODEL_ATTRIBUTES,
+    skillConfigurationId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+    },
+    mcpServerViewIds: {
+      type: DataTypes.ARRAY(DataTypes.BIGINT),
+      allowNull: false,
+    },
+    fileAttachmentIds: {
+      type: DataTypes.ARRAY(DataTypes.BIGINT),
+      allowNull: false,
+      defaultValue: [],
+    },
+    version: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "skill_version",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["workspaceId", "skillConfigurationId"],
+        concurrently: true,
+      },
+      {
+        fields: ["workspaceId", "editedBy"],
+        concurrently: true,
+      },
+      {
+        unique: true,
+        fields: ["workspaceId", "skillConfigurationId", "version"],
+        concurrently: true,
+      },
+    ],
+  }
+);
+
+// Skill config <> Edited by
+UserModel.hasMany(SkillConfigurationModel, {
+  foreignKey: { name: "editedBy", allowNull: true },
+  onDelete: "RESTRICT",
+});
+SkillConfigurationModel.belongsTo(UserModel, {
+  foreignKey: { name: "editedBy", allowNull: true },
+  as: "editedByUser",
+});
+
+// Skill version <> Edited by
+UserModel.hasMany(SkillVersionModel, {
+  foreignKey: { name: "editedBy", allowNull: true },
+  onDelete: "RESTRICT",
+});
+SkillVersionModel.belongsTo(UserModel, {
+  foreignKey: { name: "editedBy", allowNull: true },
+  as: "editedByUser",
+});
+
+// Skill MCP Server Configuration (tools associated with a skill)
+export class SkillMCPServerConfigurationModel extends WorkspaceAwareModel<SkillMCPServerConfigurationModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare skillConfigurationId: ForeignKey<SkillConfigurationModel["id"]>;
+  declare mcpServerViewId: ForeignKey<MCPServerViewModel["id"]>;
+}
+
+SkillMCPServerConfigurationModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    mcpServerViewId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+      references: {
+        model: MCPServerViewModel,
+        key: "id",
+      },
+    },
+  },
+  {
+    modelName: "skill_mcp_server_configuration",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["workspaceId", "skillConfigurationId"],
+        name: "idx_skill_mcp_server_config_workspace_skill_config",
+      },
+      {
+        fields: ["mcpServerViewId"],
+        concurrently: true,
+      },
+    ],
+  }
+);
+
+// Skill config <> MCP Server Configuration
+SkillConfigurationModel.hasMany(SkillMCPServerConfigurationModel, {
+  foreignKey: { name: "skillConfigurationId", allowNull: false },
+  onDelete: "RESTRICT",
+  as: "mcpServerConfigurations",
+});
+SkillMCPServerConfigurationModel.belongsTo(SkillConfigurationModel, {
+  foreignKey: { name: "skillConfigurationId", allowNull: false },
+  as: "skillConfiguration",
+});
+
+// Skill MCP Server Configuration <> MCP Server View
+MCPServerViewModel.hasMany(SkillMCPServerConfigurationModel, {
+  foreignKey: { name: "mcpServerViewId", allowNull: false },
+  onDelete: "RESTRICT",
+});
+SkillMCPServerConfigurationModel.belongsTo(MCPServerViewModel, {
+  foreignKey: { name: "mcpServerViewId", allowNull: false },
+  as: "mcpServerView",
+});
+
+// Skill File Attachment (files attached to a skill for sandbox sync)
+export class SkillFileAttachmentModel extends WorkspaceAwareModel<SkillFileAttachmentModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare skillConfigurationId: ForeignKey<SkillConfigurationModel["id"]>;
+  declare fileId: ForeignKey<FileModel["id"]>;
+  declare fileName: string;
+}
+
+SkillFileAttachmentModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    skillConfigurationId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+      references: {
+        model: SkillConfigurationModel,
+        key: "id",
+      },
+    },
+    fileId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+      references: {
+        model: FileModel,
+        key: "id",
+      },
+    },
+    fileName: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "skill_file_attachment",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["workspaceId", "skillConfigurationId"],
+        name: "idx_skill_file_attachment_workspace_skill_config",
+      },
+      {
+        fields: ["workspaceId", "fileId"],
+        name: "idx_skill_file_attachment_workspace_file",
+        unique: true,
+      },
+      // The `fileId` foreign key is ON DELETE RESTRICT, so Postgres checks this table on every
+      // `files` row deletion. That check filters on `fileId` alone, which the composite index
+      // above cannot serve.
+      {
+        fields: ["fileId"],
+        name: "idx_skill_file_attachment_file",
+        concurrently: true,
+      },
+    ],
+  }
+);
+
+// Skill config <> File Attachment
+SkillConfigurationModel.hasMany(SkillFileAttachmentModel, {
+  foreignKey: { name: "skillConfigurationId", allowNull: false },
+  onDelete: "RESTRICT",
+  as: "fileAttachments",
+});
+SkillFileAttachmentModel.belongsTo(SkillConfigurationModel, {
+  foreignKey: { name: "skillConfigurationId", allowNull: false },
+  as: "skillConfiguration",
+});
+
+// File Attachment <> File
+SkillFileAttachmentModel.belongsTo(FileModel, {
+  foreignKey: { name: "fileId", allowNull: false },
+  onDelete: "RESTRICT",
+  as: "file",
+});
+
+SkillConfigurationModel.hasMany(SkillVersionModel, {
+  foreignKey: { name: "skillConfigurationId", allowNull: false },
+  onDelete: "RESTRICT",
+  as: "versions",
+});
+SkillVersionModel.belongsTo(SkillConfigurationModel, {
+  foreignKey: { name: "skillConfigurationId", allowNull: false },
+  as: "skillConfiguration",
+});
+
+/**
+ * Configuration of Data Sources used by Skills for knowledge attachments.
+ */
+
+export class SkillDataSourceConfigurationModel extends WorkspaceAwareModel<SkillDataSourceConfigurationModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare parentsIn: string[];
+
+  declare skillConfigurationId: ForeignKey<SkillConfigurationModel["id"]>;
+  declare dataSourceId: ForeignKey<DataSourceModel["id"]>;
+  declare dataSourceViewId: ForeignKey<DataSourceViewModel["id"]>;
+}
+
+SkillDataSourceConfigurationModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    skillConfigurationId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+    },
+    dataSourceId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+    },
+    dataSourceViewId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+    },
+    parentsIn: {
+      type: DataTypes.ARRAY(DataTypes.STRING),
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "skill_data_source_configuration",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["workspaceId", "skillConfigurationId"],
+        name: "idx_skill_data_source_config_workspace_skill_config",
+      },
+      {
+        fields: ["workspaceId", "dataSourceId"],
+        name: "idx_skill_data_source_config_workspace_data_source",
+      },
+      {
+        fields: ["workspaceId", "dataSourceViewId"],
+        name: "idx_skill_data_source_config_workspace_data_source_view",
+      },
+      {
+        fields: ["workspaceId", "skillConfigurationId", "dataSourceViewId"],
+        name: "idx_skill_data_source_config_workspace_skill_data_source_view",
+        unique: true,
+      },
+    ],
+  }
+);
+
+SkillConfigurationModel.hasMany(SkillDataSourceConfigurationModel, {
+  foreignKey: "skillConfigurationId",
+});
+
+SkillDataSourceConfigurationModel.belongsTo(SkillConfigurationModel, {
+  foreignKey: "skillConfigurationId",
+});
+
+SkillDataSourceConfigurationModel.belongsTo(DataSourceModel, {
+  foreignKey: "dataSourceId",
+});
+
+SkillDataSourceConfigurationModel.belongsTo(DataSourceViewModel, {
+  foreignKey: "dataSourceViewId",
+});

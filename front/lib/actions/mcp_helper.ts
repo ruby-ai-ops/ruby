@@ -1,0 +1,321 @@
+import type { AgentBuilderMCPConfiguration } from "@app/components/agent_builder/types";
+import type { BuilderAction } from "@app/components/shared/tools_picker/types";
+import type { MCPServerConfigurationType } from "@app/lib/actions/mcp";
+import type {
+  AutoInternalMCPServerNameType,
+  InternalMCPServerNameType,
+} from "@app/lib/actions/mcp_internal_actions/constants";
+import {
+  getInternalMCPServerNameAndWorkspaceId,
+  INTERNAL_MCP_SERVERS,
+} from "@app/lib/actions/mcp_internal_actions/constants";
+import { getMCPServerRequirements } from "@app/lib/actions/mcp_internal_actions/input_configuration";
+import type {
+  MCPServerType,
+  MCPServerTypeWithViews,
+  MCPServerViewType,
+  RemoteMCPServerType,
+} from "@app/lib/api/mcp";
+import {
+  dangerouslyMakeSIdWithCustomFirstPrefix,
+  getResourceNameAndIdFromSId,
+  LEGACY_REGION_BIT,
+  makeSId,
+} from "@app/lib/resources/string_ids";
+import type {
+  MultiActionPreset,
+  TemplateActionPreset,
+} from "@app/types/assistant/templates";
+import type { ModelId } from "@app/types/shared/model_id";
+import {
+  asDisplayName,
+  asDisplayToolName,
+} from "@app/types/shared/utils/string_utils";
+import { McpError } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  JsonSchemaType,
+  JsonSchemaValidator,
+  jsonSchemaValidator,
+} from "@modelcontextprotocol/sdk/validation/types.js";
+
+/**
+ * Disables MCP SDK output-schema validation.
+ *
+ * Since SDK 1.22, `Client.listTools()` pre-compiles AJV validators for each tool's
+ * `outputSchema`. Some remote servers (e.g. Google Stitch) declare `$ref`s in
+ * `outputSchema` without in-document `$defs`, which makes `listTools()` throw even
+ * though the RPC response is valid. Ruby only consumes `inputSchema` from
+ * `tools/list` and does not validate structured tool output, so we skip
+ * output-schema compilation entirely (same intent as MCP Inspector's try/catch
+ * around `ajv.compile`).
+ */
+class NoOpJsonSchemaValidator implements jsonSchemaValidator {
+  getValidator<T>(_schema: JsonSchemaType): JsonSchemaValidator<T> {
+    return (input) => ({
+      valid: true,
+      data: input as T,
+      errorMessage: undefined,
+    });
+  }
+}
+
+export const NO_OP_MCP_JSON_SCHEMA_VALIDATOR = new NoOpJsonSchemaValidator();
+
+/**
+ * JSON-RPC error code for request timeout (MCP RequestTimeout).
+ * @see https://github.com/modelcontextprotocol/typescript-sdk/pull/103
+ */
+const MCP_REQUEST_TIMEOUT_ERROR_CODE = -32001;
+
+/**
+ * Type guard for MCP request timeout errors.
+ * Use when handling errors from MCP client operations (connect, listTools, callTool).
+ */
+export function isMcpTimeoutError(e: unknown): e is McpError {
+  return e instanceof McpError && e.code === MCP_REQUEST_TIMEOUT_ERROR_CODE;
+}
+
+export const getServerTypeAndIdFromSId = (
+  mcpServerId: string
+): {
+  serverType: "internal" | "remote";
+  id: number;
+} => {
+  const sIdParts = getResourceNameAndIdFromSId(mcpServerId);
+  if (!sIdParts) {
+    throw new Error(`Invalid MCP server ID: ${mcpServerId}`);
+  }
+
+  const { resourceName, resourceModelId } = sIdParts;
+
+  switch (resourceName) {
+    case "internal_mcp_server":
+      return { serverType: "internal" as const, id: resourceModelId };
+    case "remote_mcp_server":
+      return { serverType: "remote" as const, id: resourceModelId };
+    default:
+      throw new Error(
+        `Invalid MCP server ID: ${mcpServerId} resourceName: ${resourceName}`
+      );
+  }
+};
+
+export const internalMCPServerNameToSId = ({
+  name,
+  workspaceId,
+  prefix,
+}: {
+  name: InternalMCPServerNameType;
+  workspaceId: ModelId;
+  prefix: number;
+}): string => {
+  return dangerouslyMakeSIdWithCustomFirstPrefix("internal_mcp_server", {
+    id: INTERNAL_MCP_SERVERS[name].id,
+    workspaceId,
+    firstPrefix: prefix,
+  });
+};
+
+export const autoInternalMCPServerNameToSId = ({
+  name,
+  workspaceId,
+}: {
+  name: AutoInternalMCPServerNameType;
+  workspaceId: ModelId;
+}): string => {
+  return dangerouslyMakeSIdWithCustomFirstPrefix("internal_mcp_server", {
+    id: INTERNAL_MCP_SERVERS[name].id,
+    workspaceId,
+    firstPrefix: LEGACY_REGION_BIT,
+  });
+};
+
+export const remoteMCPServerNameToSId = ({
+  remoteMCPServerId,
+  workspaceId,
+}: {
+  remoteMCPServerId: ModelId;
+  workspaceId: ModelId;
+}): string => {
+  return makeSId("remote_mcp_server", {
+    id: remoteMCPServerId,
+    workspaceId,
+  });
+};
+
+export const mcpServerViewSortingFn = (
+  a: MCPServerViewType,
+  b: MCPServerViewType
+) => {
+  return mcpServersSortingFn(
+    { mcpServer: a.server, mcpServerView: a },
+    { mcpServer: b.server, mcpServerView: b }
+  );
+};
+
+export const mcpServersSortingFn = (
+  a: {
+    mcpServer: MCPServerType | MCPServerTypeWithViews;
+    mcpServerView?: MCPServerViewType;
+  },
+  b: {
+    mcpServer: MCPServerType | MCPServerTypeWithViews;
+    mcpServerView?: MCPServerViewType;
+  }
+) => {
+  const aDisplayName = a.mcpServerView
+    ? getMcpServerViewDisplayName(a.mcpServerView)
+    : getMcpServerDisplayName(a.mcpServer);
+  const bDisplayName = b.mcpServerView
+    ? getMcpServerViewDisplayName(b.mcpServerView)
+    : getMcpServerDisplayName(b.mcpServer);
+  return aDisplayName.localeCompare(bDisplayName);
+};
+
+export function isRemoteMCPServerType(
+  server: MCPServerType
+): server is RemoteMCPServerType {
+  const serverType = getServerTypeAndIdFromSId(server.sId).serverType;
+  return serverType === "remote";
+}
+
+export function getMcpServerViewDescription(view: {
+  description: string | null;
+  server: Pick<MCPServerType, "description">;
+}): string {
+  return view.description ?? view.server.description;
+}
+
+export function getMcpServerViewDisplayName(
+  view: {
+    name: string | null;
+    server: Pick<MCPServerType, "sId" | "name">;
+  },
+  action?:
+    | AgentBuilderMCPConfiguration
+    | BuilderAction
+    | MCPServerConfigurationType
+) {
+  if (view.name) {
+    return asDisplayName(view.name);
+  }
+  return getMcpServerDisplayName(view.server, action);
+}
+
+export function getMcpServerDisplayName(
+  server: Pick<MCPServerType, "sId" | "name">,
+  action?:
+    | AgentBuilderMCPConfiguration
+    | BuilderAction
+    | MCPServerConfigurationType
+): string {
+  // Unreleased internal servers are displayed with a suffix in the UI.
+  const res = getInternalMCPServerNameAndWorkspaceId(server.sId);
+  let displayName = asDisplayToolName(server.name);
+
+  if (res.isOk()) {
+    const isCustomName = action?.name && action.name !== server.name;
+
+    // If there is a custom name, add it to the display name (except run_ruby_app, which is handled below).
+    if (isCustomName && res.value.name !== "run_ruby_app") {
+      displayName += " - " + asDisplayName(action.name);
+    }
+
+    const serverConfig = INTERNAL_MCP_SERVERS[res.value.name];
+
+    if (serverConfig.isPreview === true) {
+      displayName += " (Preview)";
+    }
+    // Only matches the old internal Notion server; the new official Notion is a remote
+    // MCP server, so its sId doesn't decode here and this branch is skipped.
+    if (res.value.name === "notion") {
+      displayName += " (old)";
+    }
+    // Will append Ruby App name.
+    if (res.value.name === "run_ruby_app" && action) {
+      displayName += " - " + action.name;
+    }
+  }
+  return displayName;
+}
+
+export function doesInternalMCPServerRequireBearerToken(
+  serverId: string
+): boolean {
+  const res = getInternalMCPServerNameAndWorkspaceId(serverId);
+  if (res.isErr()) {
+    return false;
+  }
+  const serverConfig = INTERNAL_MCP_SERVERS[res.value.name];
+  return (
+    "requiresBearerToken" in serverConfig &&
+    serverConfig.requiresBearerToken === true
+  );
+}
+
+export function requiresBearerTokenConfiguration(
+  server: MCPServerType
+): boolean {
+  if (isRemoteMCPServerType(server)) {
+    return true;
+  }
+  return doesInternalMCPServerRequireBearerToken(server.sId);
+}
+
+// Only includes action types that are actually used in templates.
+const TEMPLATE_ACTION_TO_MCP_SERVER: Record<
+  MultiActionPreset,
+  InternalMCPServerNameType
+> = {
+  RETRIEVAL_SEARCH: "search",
+  TABLES_QUERY: "query_tables_v2",
+  PROCESS: "extract_data",
+  WEB_NAVIGATION: "web_search_&_browse",
+};
+
+export function getMCPServerNameForTemplateAction(
+  presetAction: TemplateActionPreset
+): InternalMCPServerNameType | null {
+  return TEMPLATE_ACTION_TO_MCP_SERVER[presetAction.type] ?? null;
+}
+
+export function isKnowledgeTemplateAction(
+  presetAction: TemplateActionPreset
+): boolean {
+  return (
+    presetAction.type === "RETRIEVAL_SEARCH" ||
+    presetAction.type === "TABLES_QUERY" ||
+    presetAction.type === "PROCESS"
+  );
+}
+
+/**
+ * Checks whether an MCP server view is a "knowledge" tool — i.e. it requires
+ * data source, data warehouse, or table configuration.
+ *
+ * The interactive_content server is explicitly excluded because it includes
+ * list/cat tools for convenience but is not primarily a data source tool.
+ */
+export function isToolWithKnowledge(view: MCPServerViewType): boolean {
+  if (view.server.name === "interactive_content") {
+    return false;
+  }
+
+  const {
+    requiresDataSourceConfiguration,
+    requiresDataWarehouseConfiguration,
+    requiresTableConfiguration,
+  } = getMCPServerRequirements(view);
+
+  return (
+    requiresDataSourceConfiguration ||
+    requiresDataWarehouseConfiguration ||
+    requiresTableConfiguration
+  );
+}
+
+export function isDirectAddTemplateAction(
+  presetAction: TemplateActionPreset
+): boolean {
+  return presetAction.type === "WEB_NAVIGATION";
+}

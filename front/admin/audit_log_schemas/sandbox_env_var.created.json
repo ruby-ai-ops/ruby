@@ -1,0 +1,11 @@
+{
+  "action": "sandbox_env_var.created",
+  "targets": [{ "type": "workspace" }, { "type": "sandbox_env_var" }],
+  "metadata": {
+    "name": "string",
+    "kind": "string",
+    "space_id": "string",
+    "allowed_domains": "string",
+    "actor_type": "string"
+  }
+}

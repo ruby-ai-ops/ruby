@@ -1,0 +1,296 @@
+import config from "@app/lib/api/config";
+import type { OAuthError } from "@app/lib/api/oauth";
+import { getWorkspaceOAuthConnectionIdForMCPServer } from "@app/lib/api/oauth/mcp_server_connection_auth";
+import type {
+  BaseOAuthStrategyProvider,
+  RelatedCredential,
+} from "@app/lib/api/oauth/providers/base_oauth_stragegy_provider";
+import {
+  finalizeUriForProvider,
+  getStringFromQuery,
+} from "@app/lib/api/oauth/utils";
+import { shouldUseStaticIpProxy } from "@app/lib/api/workspace_has_domains";
+import type { Authenticator } from "@app/lib/auth";
+import { getPKCEConfig } from "@app/lib/utils/pkce";
+import logger from "@app/logger/logger";
+import type { MCPOAuthConnectionMetadataType } from "@app/types/api/oauth/providers/mcp";
+import {
+  BaseMCPMetadataSchema,
+  MCPOAuthConnectionMetadataSchema,
+} from "@app/types/api/oauth/providers/mcp";
+import type {
+  ExtraConfigType,
+  OAuthConnectionType,
+  OAuthProvider,
+  OAuthUseCase,
+} from "@app/types/oauth/lib";
+import { OAuthAPI } from "@app/types/oauth/oauth_api";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import type { ParsedUrlQuery } from "querystring";
+import { z } from "zod";
+
+const MCP_OAUTH_RESPONSE_TYPE = "code";
+const MCP_OAUTH_CODE_CHALLENGE_METHOD = "S256";
+
+const MCPMetadataSchema = BaseMCPMetadataSchema.extend({
+  code_challenge: z.string(),
+  code_verifier: z.string(),
+  token_endpoint_auth_method: z.string().optional(),
+  // Stamped authoritatively in `getUpdatedExtraConfig` from the final persisted token endpoint;
+  // never caller-supplied. Optional because absence fails safe: `core` (and the freshness sync)
+  // treat a missing flag as `"false"` (untrusted egress), so a forgotten stamp can never escalate
+  // to static IP.
+  use_static_ip_proxy: z.enum(["true", "false"]).optional(),
+});
+
+type MCPMetadataType = z.infer<typeof MCPMetadataSchema>;
+
+export class MCPOAuthProvider implements BaseOAuthStrategyProvider {
+  provider: OAuthProvider = "mcp";
+  requiresWorkspaceConnectionForPersonalAuth = true;
+
+  setupUri({
+    connection,
+  }: {
+    connection: OAuthConnectionType;
+    useCase: OAuthUseCase;
+  }) {
+    const code_challenge = connection.metadata.code_challenge;
+    const client_id = connection.metadata.client_id;
+    const authorization_endpoint = connection.metadata.authorization_endpoint;
+    const scope = connection.metadata.scope;
+    const resource = connection.metadata.resource;
+
+    if (!code_challenge) {
+      throw new Error("Missing code challenge");
+    }
+    if (!client_id) {
+      throw new Error("Missing client id");
+    }
+    if (!authorization_endpoint) {
+      throw new Error("Missing authorization endpoint");
+    }
+
+    const authUrl = new URL(authorization_endpoint);
+
+    authUrl.searchParams.set("response_type", MCP_OAUTH_RESPONSE_TYPE);
+    authUrl.searchParams.set("client_id", client_id);
+    authUrl.searchParams.set("code_challenge", code_challenge);
+    authUrl.searchParams.set(
+      "code_challenge_method",
+      MCP_OAUTH_CODE_CHALLENGE_METHOD
+    );
+    authUrl.searchParams.set(
+      "redirect_uri",
+      finalizeUriForProvider(this.provider)
+    );
+    authUrl.searchParams.set("state", connection.connection_id);
+
+    if (scope) {
+      authUrl.searchParams.set("scope", scope);
+    }
+
+    if (resource) {
+      authUrl.searchParams.set("resource", resource);
+    }
+
+    // Google OAuth requires `access_type=offline` to issue a refresh token and
+    // `prompt=consent` to ensure it is returned on subsequent authorizations.
+    // Without these, Google only issues a short-lived access token (~1 hour)
+    // causing MCP connections to drop when the token expires.
+    if (authUrl.hostname === "accounts.google.com") {
+      authUrl.searchParams.set("access_type", "offline");
+      authUrl.searchParams.set("prompt", "consent");
+    }
+
+    return authUrl.toString();
+  }
+
+  codeFromQuery(query: ParsedUrlQuery) {
+    return getStringFromQuery(query, "code");
+  }
+
+  connectionIdFromQuery(query: ParsedUrlQuery) {
+    return getStringFromQuery(query, "state");
+  }
+
+  isExtraConfigValid(
+    extraConfig: ExtraConfigType,
+    useCase: OAuthUseCase
+  ): extraConfig is MCPOAuthConnectionMetadataType {
+    if (useCase === "personal_actions") {
+      // If we have an mcp_server_id it means the admin already setup the connection and we have
+      // everything we need, otherwise we'll need the instance_url and client_id.
+      if (extraConfig.mcp_server_id) {
+        return true;
+      }
+    }
+
+    return MCPOAuthConnectionMetadataSchema.safeParse(extraConfig).success;
+  }
+
+  async getRelatedCredential(
+    auth: Authenticator,
+    {
+      extraConfig,
+      workspaceId,
+      userId,
+      useCase,
+    }: {
+      extraConfig: ExtraConfigType;
+      workspaceId: string;
+      userId: string;
+      useCase: OAuthUseCase;
+    }
+  ): Promise<Result<RelatedCredential, OAuthError>> {
+    if (useCase === "personal_actions") {
+      // For personal actions we reuse the existing connection credential id from the existing
+      // workspace connection (setup by admin) if we have it.
+      const { mcp_server_id } = extraConfig;
+
+      if (mcp_server_id) {
+        const oauthConnectionIdRes =
+          await getWorkspaceOAuthConnectionIdForMCPServer(auth, mcp_server_id);
+        if (oauthConnectionIdRes.isErr()) {
+          return new Err({
+            code: "credential_retrieval_failed",
+            message: oauthConnectionIdRes.error.message,
+          });
+        }
+
+        const oauthApi = new OAuthAPI(config.getOAuthAPIConfig(), logger);
+        const connectionRes = await oauthApi.getConnectionMetadata({
+          connectionId: oauthConnectionIdRes.value,
+        });
+        if (connectionRes.isErr()) {
+          return new Err({
+            code: "credential_retrieval_failed",
+            message:
+              "Failed to get connection metadata: " +
+              connectionRes.error.message,
+            oAuthAPIError: connectionRes.error,
+          });
+        }
+        const connection = connectionRes.value.connection;
+        const connectionId = connection.connection_id;
+
+        return new Ok({
+          content: {
+            from_connection_id: connectionId,
+          },
+          metadata: { workspace_id: workspaceId, user_id: userId },
+        });
+      }
+    } else if (useCase === "platform_actions") {
+      const { client_secret } = extraConfig;
+
+      const content: { client_id: string; client_secret?: string } = {
+        client_id: extraConfig.client_id,
+      };
+
+      // Only include client_secret if it's provided
+      if (client_secret) {
+        content.client_secret = client_secret;
+      }
+
+      return new Ok({
+        content,
+        metadata: { workspace_id: workspaceId, user_id: userId },
+      });
+    }
+    return new Err({
+      code: "credential_retrieval_failed",
+      message: "MCP oauth provider does not support use case: " + useCase,
+    });
+  }
+
+  async getUpdatedExtraConfig(
+    auth: Authenticator,
+    {
+      extraConfig,
+      useCase,
+    }: {
+      extraConfig: ExtraConfigType;
+      useCase: OAuthUseCase;
+    }
+  ): Promise<ExtraConfigType> {
+    if (useCase === "personal_actions") {
+      // For personal actions we reuse the existing connection credential id from the existing
+      // workspace connection (setup by admin) if we have it.
+      const {
+        mcp_server_id,
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars -- caller-controlled proxy routing is ignored.
+        use_static_ip_proxy: _ignoredUseStaticIpProxy,
+        ...restConfig
+      } = extraConfig;
+
+      if (mcp_server_id) {
+        const oauthConnectionIdRes =
+          await getWorkspaceOAuthConnectionIdForMCPServer(auth, mcp_server_id);
+        if (oauthConnectionIdRes.isErr()) {
+          throw new Error(oauthConnectionIdRes.error.message);
+        }
+
+        const oauthApi = new OAuthAPI(config.getOAuthAPIConfig(), logger);
+        const connectionRes = await oauthApi.getConnectionMetadata({
+          connectionId: oauthConnectionIdRes.value,
+        });
+        if (connectionRes.isErr()) {
+          throw new Error(
+            "Failed to get connection metadata: " + connectionRes.error.message
+          );
+        }
+        const connection = connectionRes.value.connection;
+
+        const { code_verifier, code_challenge } = await getPKCEConfig();
+        const tokenEndpoint = connection.metadata.token_endpoint;
+
+        return {
+          ...restConfig,
+          client_id: connection.metadata.client_id,
+          token_endpoint: tokenEndpoint,
+          authorization_endpoint: connection.metadata.authorization_endpoint,
+          scope: connection.metadata.scope,
+          resource: connection.metadata.resource,
+          token_endpoint_auth_method:
+            connection.metadata.token_endpoint_auth_method,
+          code_verifier,
+          code_challenge,
+          use_static_ip_proxy: String(
+            await shouldUseStaticIpProxy(auth, tokenEndpoint)
+          ),
+        };
+      }
+    } else if (useCase === "platform_actions") {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars -- we filter out the client_secret from the extraConfig
+      const {
+        client_secret,
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars -- caller-controlled proxy routing is ignored.
+        use_static_ip_proxy: _ignoredUseStaticIpProxy,
+        ...restConfig
+      } = extraConfig;
+
+      const { code_verifier, code_challenge } = await getPKCEConfig();
+      const finalConfig: ExtraConfigType = {
+        ...restConfig,
+        code_challenge,
+        code_verifier,
+      };
+
+      return {
+        ...finalConfig,
+        use_static_ip_proxy: String(
+          await shouldUseStaticIpProxy(auth, finalConfig.token_endpoint)
+        ),
+      };
+    }
+    throw new Error("MCP oauth provider does not support use case: " + useCase);
+  }
+
+  isExtraConfigValidPostRelatedCredential(
+    extraConfig: ExtraConfigType
+  ): extraConfig is MCPMetadataType {
+    return MCPMetadataSchema.safeParse(extraConfig).success;
+  }
+}

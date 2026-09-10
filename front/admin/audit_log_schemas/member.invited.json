@@ -1,0 +1,15 @@
+{
+  "action": "member.invited",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "user"
+    }
+  ],
+  "metadata": {
+    "role": "string",
+    "actor_type": "string"
+  }
+}

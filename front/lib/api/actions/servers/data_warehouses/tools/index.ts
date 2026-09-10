@@ -1,0 +1,261 @@
+import { MCPError } from "@app/lib/actions/mcp_errors";
+import type { ToolHandlers } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { buildTools } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { getAgentDataSourceConfigurations } from "@app/lib/actions/mcp_internal_actions/tools/utils";
+import {
+  getAvailableWarehouses,
+  getWarehouseNodes,
+  makeBrowseResource,
+  validateTables,
+} from "@app/lib/api/actions/servers/data_warehouses/helpers";
+import { DATA_WAREHOUSES_TOOLS_METADATA } from "@app/lib/api/actions/servers/data_warehouses/metadata";
+import { executeQuery } from "@app/lib/api/actions/servers/query_tables_v2/helpers";
+import {
+  getDatabaseExampleRowsContent,
+  getQueryWritingInstructionsContent,
+  getSchemaContent,
+} from "@app/lib/api/actions/servers/tables_query/schema";
+import config from "@app/lib/api/config";
+import { DataSourceResource } from "@app/lib/resources/data_source_resource";
+import logger from "@app/logger/logger";
+import { CoreAPI } from "@app/types/core/core_api";
+import { Err, Ok } from "@app/types/shared/result";
+import { INTERNAL_MIME_TYPES } from "@ruby-ai/client";
+
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+
+const handlers: ToolHandlers<typeof DATA_WAREHOUSES_TOOLS_METADATA> = {
+  list: async ({ nodeId, limit, nextPageCursor, dataSources }, { auth }) => {
+    const effectiveNodeId = !!nodeId ? nodeId : null;
+    const effectiveCursor = !!nextPageCursor ? nextPageCursor : undefined;
+
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+    const effectiveLimit = Math.min(limit || DEFAULT_LIMIT, MAX_LIMIT);
+
+    const dataSourceConfigurationsResult =
+      await getAgentDataSourceConfigurations(
+        auth,
+        dataSources.map((ds) => ({
+          ...ds,
+          mimeType: INTERNAL_MIME_TYPES.TOOL_INPUT.DATA_SOURCE,
+        }))
+      );
+
+    if (dataSourceConfigurationsResult.isErr()) {
+      return dataSourceConfigurationsResult;
+    }
+
+    const agentDataSourceConfigurations = dataSourceConfigurationsResult.value;
+
+    const result =
+      effectiveNodeId === null
+        ? await getAvailableWarehouses(auth, agentDataSourceConfigurations, {
+            limit: effectiveLimit,
+            nextPageCursor: effectiveCursor,
+          })
+        : await getWarehouseNodes(auth, agentDataSourceConfigurations, {
+            nodeId: effectiveNodeId,
+            limit: effectiveLimit,
+            nextPageCursor: effectiveCursor,
+          });
+
+    if (result.isErr()) {
+      return new Err(result.error);
+    }
+
+    const { nodes, nextPageCursor: newCursor } = result.value;
+
+    return new Ok([
+      {
+        type: "resource" as const,
+        resource: makeBrowseResource({
+          nodeId: effectiveNodeId,
+          nodes,
+          nextPageCursor: newCursor,
+          resultCount: dataSources.length,
+        }),
+      },
+    ]);
+  },
+
+  find: async (
+    { query, rootNodeId, limit, nextPageCursor, dataSources },
+    { auth }
+  ) => {
+    const effectiveRootNodeId = !!rootNodeId ? rootNodeId : null;
+    const effectiveCursor = !!nextPageCursor ? nextPageCursor : undefined;
+
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+    const effectiveLimit = Math.min(limit || DEFAULT_LIMIT, MAX_LIMIT);
+
+    const dataSourceConfigurationsResult =
+      await getAgentDataSourceConfigurations(
+        auth,
+        dataSources.map((ds) => ({
+          ...ds,
+          mimeType: INTERNAL_MIME_TYPES.TOOL_INPUT.DATA_SOURCE,
+        }))
+      );
+
+    if (dataSourceConfigurationsResult.isErr()) {
+      return dataSourceConfigurationsResult;
+    }
+
+    const agentDataSourceConfigurations = dataSourceConfigurationsResult.value;
+
+    const result = await getWarehouseNodes(
+      auth,
+      agentDataSourceConfigurations,
+      {
+        nodeId: effectiveRootNodeId,
+        query,
+        limit: effectiveLimit,
+        nextPageCursor: effectiveCursor,
+      }
+    );
+
+    if (result.isErr()) {
+      return new Err(new MCPError(result.error.message));
+    }
+
+    const { nodes, nextPageCursor: newCursor } = result.value;
+
+    return new Ok([
+      {
+        type: "resource" as const,
+        resource: makeBrowseResource({
+          nodeId: effectiveRootNodeId,
+          nodes,
+          nextPageCursor: newCursor,
+          resultCount: dataSources.length,
+        }),
+      },
+    ]);
+  },
+
+  describe_tables: async ({ dataSources, tableIds }, { auth }) => {
+    const dataSourceConfigurationsResult =
+      await getAgentDataSourceConfigurations(
+        auth,
+        dataSources.map((ds) => ({
+          ...ds,
+          mimeType: INTERNAL_MIME_TYPES.TOOL_INPUT.DATA_SOURCE,
+        }))
+      );
+
+    if (dataSourceConfigurationsResult.isErr()) {
+      return dataSourceConfigurationsResult;
+    }
+
+    const agentDataSourceConfigurations = dataSourceConfigurationsResult.value;
+
+    const validationResult = await validateTables(
+      auth,
+      tableIds,
+      agentDataSourceConfigurations
+    );
+
+    if (validationResult.isErr()) {
+      return validationResult;
+    }
+
+    const { validatedNodes, dataSourceId } = validationResult.value;
+
+    const dataSource = await DataSourceResource.fetchById(auth, dataSourceId);
+
+    if (!dataSource) {
+      return new Err(
+        new MCPError("Data source not found", {
+          tracked: false,
+        })
+      );
+    }
+
+    const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+    const schemaResult = await coreAPI.getDatabaseSchema({
+      tables: validatedNodes.map((node) => ({
+        project_id: parseInt(dataSource.rubyAPIProjectId, 10),
+        data_source_id: dataSource.rubyAPIDataSourceId,
+        table_id: node.node_id,
+      })),
+    });
+
+    if (schemaResult.isErr()) {
+      // Not tracked: schema retrieval failures typically reflect customer-side
+      // warehouse configuration (IP allowlists, credentials, network) that Ruby
+      // cannot action. The underlying error message is surfaced to the model so
+      // it can relay actionable guidance (e.g. IP to allowlist) to the user.
+      return new Err(
+        new MCPError(
+          `Error retrieving database schema: ${schemaResult.error.message}`,
+          { tracked: false }
+        )
+      );
+    }
+
+    return new Ok([
+      ...getSchemaContent(schemaResult.value.schemas),
+      ...getQueryWritingInstructionsContent(schemaResult.value.dialect),
+      ...getDatabaseExampleRowsContent(schemaResult.value.schemas),
+    ]);
+  },
+
+  query: async (
+    { dataSources, tableIds, query, fileName },
+    { auth, runContext }
+  ) => {
+    const dataSourceConfigurationsResult =
+      await getAgentDataSourceConfigurations(
+        auth,
+        dataSources.map((ds) => ({
+          ...ds,
+          mimeType: INTERNAL_MIME_TYPES.TOOL_INPUT.DATA_SOURCE,
+        }))
+      );
+
+    if (dataSourceConfigurationsResult.isErr()) {
+      return dataSourceConfigurationsResult;
+    }
+
+    const agentDataSourceConfigurations = dataSourceConfigurationsResult.value;
+
+    const validationResult = await validateTables(
+      auth,
+      tableIds,
+      agentDataSourceConfigurations
+    );
+
+    if (validationResult.isErr()) {
+      return validationResult;
+    }
+
+    const { validatedNodes, dataSourceId } = validationResult.value;
+
+    const dataSource = await DataSourceResource.fetchById(auth, dataSourceId);
+
+    if (!dataSource) {
+      return new Err(
+        new MCPError("Data source not found", {
+          tracked: false,
+        })
+      );
+    }
+
+    const connectorProvider = dataSource.connectorProvider;
+
+    return executeQuery(auth, {
+      tables: validatedNodes.map((node) => ({
+        project_id: parseInt(dataSource.rubyAPIProjectId, 10),
+        data_source_id: dataSource.rubyAPIDataSourceId,
+        table_id: node.node_id,
+      })),
+      query,
+      runContext,
+      fileName,
+      connectorProvider,
+    });
+  },
+};
+
+export const TOOLS = buildTools(DATA_WAREHOUSES_TOOLS_METADATA, handlers);

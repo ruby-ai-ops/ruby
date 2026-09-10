@@ -1,0 +1,65 @@
+input INPUT {
+  expected: {query}
+}
+
+data MUSIC_CLASSIFICATION_FEW_SHOT {
+  dataset_id: music_classification_few_shot
+  hash: e2h23b
+}
+
+llm CLASSIFY_MUSIC_MODEL {
+  max_tokens: 2
+  temperature: 0.7
+  few_shot_count: 8
+  few_shot_prompt:
+```
+QUERY: ${MUSIC_CLASSIFICATION_FEW_SHOT.query}
+CLASS: ${MUSIC_CLASSIFICATION_FEW_SHOT.class}
+
+```
+  prompt:
+```
+QUERY: ${INPUT.query}
+```
+}
+
+code CLASSIFY_MUSIC {
+code:
+```
+_fun = (env) => {
+  let completion = env['state']['CLASSIFY_MUSIC_MODEL']['completion']['text'];
+  return {
+    "music": completion == "CLASS: music",
+    "not_music": completion == "CLASS: not_music",
+  };
+}
+```
+}
+
+if IS_MUSIC {
+  run_if:
+```
+  _fun = (env) => { return env['state']['CLASSIFY_MUSIC']['class'] == 'music'; }
+```
+}
+
+llm MUSIC_INTENTION {
+  max_tokens: 128
+  temperature: 0.7
+}
+
+end IS_MUSIC {}
+
+if IS_NOT_MUSIC {
+  run_if:
+```
+  _fun = (env) => { return env['state']['CLASSIFY_MUSIC']['class'] == 'not_music'; }
+```
+}
+
+llm NOT_MUSIC_RESPONSE {
+  max_tokens: 128
+  temperature: 0.7
+}
+
+end IS_NOT_MUSIC {}

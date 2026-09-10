@@ -1,0 +1,38 @@
+import type { ReactNode } from "react";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React from "react";
+
+interface AgentBuilderSectionContainerProps {
+  title: string;
+  description?: ReactNode;
+  headerActions?: ReactNode;
+  children: ReactNode;
+}
+
+export function AgentBuilderSectionContainer({
+  title,
+  description,
+  headerActions,
+  children,
+}: AgentBuilderSectionContainerProps) {
+  return (
+    <section className="flex flex-col gap-3">
+      <div className="flex flex-col items-start justify-between gap-2 sm:flex-row sm:items-end">
+        <div className="max-w-9/10">
+          <div className="flex flex-row items-center gap-2">
+            <h2 className="heading-lg text-foreground">{title}</h2>
+          </div>
+          {description && (
+            <p className="text-sm text-muted-foreground">{description}</p>
+          )}
+        </div>
+        {headerActions && (
+          <div className="flex w-full flex-col gap-2 sm:w-auto">
+            <div className="flex items-center gap-2">{headerActions}</div>
+          </div>
+        )}
+      </div>
+      {children}
+    </section>
+  );
+}

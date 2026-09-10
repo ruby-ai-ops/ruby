@@ -1,0 +1,1847 @@
+import { computeFrameContentHash } from "@app/lib/api/viz/authorized_file_access_policy";
+import { uploadFrameContent } from "@app/lib/api/viz/upload_frame_content";
+import { Authenticator } from "@app/lib/auth";
+import { getPrivateUploadBucket } from "@app/lib/file_storage";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { FileResource } from "@app/lib/resources/file_resource";
+import { SandboxFunctionResource } from "@app/lib/resources/sandbox_function_resource";
+import {
+  AuthorizedFileAccessModel,
+  FileModel,
+} from "@app/lib/resources/storage/models/files";
+import { copyContent } from "@app/lib/utils/files";
+import { withTransaction } from "@app/lib/utils/sql_utils";
+import { ConversationFactory } from "@app/tests/utils/ConversationFactory";
+import { FileFactory } from "@app/tests/utils/FileFactory";
+import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
+import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
+import type { MockFileVersion } from "@app/tests/utils/mocks/file_storage";
+import { fileStorageMock } from "@app/tests/utils/mocks/file_storage";
+import { SpaceFactory } from "@app/tests/utils/SpaceFactory";
+import { UserFactory } from "@app/tests/utils/UserFactory";
+import { FRAME_MANIFEST_FILE } from "@app/types/api/frame_manifest";
+import { getFramePublicationUiBundlePath } from "@app/types/api/frame_storage";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
+import type {
+  AllSupportedFileContentType,
+  FileUseCaseMetadata,
+} from "@app/types/files";
+import {
+  frameContentType,
+  frameV2ContentType,
+  isUnverifiableFrameFileRefsShareError,
+  sandboxFunctionContentType,
+} from "@app/types/files";
+import { getConversationFilesBasePath } from "@app/types/mount_path";
+import { Readable } from "stream";
+import { assert, beforeEach, describe, expect, it, vi } from "vitest";
+
+async function createFrameWithFunction(
+  auth: Authenticator,
+  publicationId: string,
+  { withSource = false }: { withSource?: boolean } = {}
+): Promise<FileResource> {
+  const owner = auth.getNonNullableWorkspace();
+  const conversation = withSource
+    ? await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      })
+    : null;
+  const frame = await FileFactory.create(auth, null, {
+    contentType: frameV2ContentType,
+    fileName: "manifest.json",
+    fileSize: 100,
+    status: "created",
+    useCase: "conversation",
+    useCaseMetadata: {
+      conversationId: conversation?.sId ?? "conv-frame-delete",
+    },
+    mountFilePath: conversation
+      ? `${getConversationFilesBasePath({
+          workspaceId: owner.sId,
+          conversationId: conversation.sId,
+        })}Frame/${FRAME_MANIFEST_FILE}`
+      : null,
+  });
+  await withTransaction((transaction) =>
+    SandboxFunctionResource.createForFramePublication(
+      auth,
+      {
+        frame,
+        publicationId,
+        functions: [
+          {
+            name: "delete-task",
+            description: "Delete a task.",
+            userIdentity: "workspace_user_required",
+            executionMode: "durable",
+            defaultStake: "low",
+            bundleCode: "export default async function run() {}",
+            inputSchema: { type: "object" },
+            outputSchema: { type: "object" },
+          },
+        ],
+      },
+      transaction
+    )
+  );
+
+  return frame;
+}
+
+// Mock copyContent from utils/files.ts
+vi.mock("@app/lib/utils/files", () => ({
+  copyContent: vi.fn(),
+}));
+
+describe("FileResource", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("fetchByShareTokenWithContent", () => {
+    const expectedContent = "<html>Frame content</html>";
+
+    beforeEach(() => {
+      vi.spyOn(FileResource.prototype, "getSharedReadStream").mockReturnValue(
+        new Readable({
+          read() {
+            this.push(expectedContent);
+            this.push(null); // End the stream.
+          },
+        })
+      );
+    });
+
+    it("should return file and content for active conversation", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create conversation.
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+
+      // Create frame file linked to conversation.
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: "frame.html",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      // Frame file should have mount path set (resolved during markAsReady).
+      const row = await FileModel.findOne({
+        where: { id: frameFile.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBe(
+        `w/${workspace.sId}/conversations/${conversation.sId}/files/frame.html`
+      );
+
+      const frameShareInfo = await frameFile.getShareInfo();
+
+      const token = frameShareInfo?.shareUrl.split("/").at(-1);
+      assert(token, "Share token should be defined");
+
+      // Should successfully fetch file.
+      const result = await FileResource.fetchByShareTokenWithContent(token);
+
+      expect(result).not.toBeNull();
+      expect(result?.file.id).toBe(frameFile.id);
+      expect(result?.content).toEqual(expectedContent);
+    });
+
+    it("returns the active Frames v2 publication", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+      const publicationId = "active-publication";
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameV2ContentType,
+        fileName: "manifest.json",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: {
+          activePublicationId: publicationId,
+          conversationId: conversation.sId,
+        },
+      });
+      fileStorageMock.setObject(
+        getFramePublicationUiBundlePath({
+          workspaceId: workspace.sId,
+          frameId: frameFile.sId,
+          publicationId,
+        }),
+        expectedContent
+      );
+      const shareInfo = await frameFile.getShareInfo();
+      const token = shareInfo?.shareUrl.split("/").at(-1);
+      assert(token, "Share token should be defined");
+
+      const result = await FileResource.fetchByShareTokenWithContent(token);
+
+      expect(result?.file.id).toBe(frameFile.id);
+      expect(result?.content).toBe(expectedContent);
+    });
+
+    it("should return null for soft-deleted conversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create conversation.
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+
+      // Create frame file linked to conversation.
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: "frame.html",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      await frameFile.markAsReady(auth);
+
+      const frameShareInfo = await frameFile.getShareInfo();
+
+      const token = frameShareInfo?.shareUrl.split("/").at(-1);
+      assert(token, "Share token should be defined");
+
+      // Soft-delete the conversation.
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      assert(conversationResource, "Conversation resource should be defined");
+      await conversationResource.updateVisibilityToDeleted(auth);
+
+      // Should successfully fetch file.
+      const result = await FileResource.fetchByShareTokenWithContent(token);
+
+      expect(result).toBeNull();
+    });
+
+    it("should return file and content for conversation in restricted space", async () => {
+      const {
+        authenticator: adminAuth,
+        globalSpace,
+        user: adminUser,
+        workspace,
+      } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create a regular user with limited access.
+      const regularUser = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, regularUser, {
+        role: "user",
+      });
+
+      // Create a restricted space only accessible to the admin user.
+      const restrictedSpace = await SpaceFactory.regular(workspace);
+      const res = await restrictedSpace.addMembers(adminAuth, {
+        userIds: [adminUser.sId],
+      });
+      assert(res.isOk(), "Failed to add member to restricted space");
+
+      // Refresh admin auth after space membership.
+      const refreshedAdminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        adminUser.sId,
+        workspace.sId
+      );
+
+      // Create conversation in the restricted space.
+      const conversation = await ConversationFactory.create(
+        refreshedAdminAuth,
+        {
+          agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+          requestedSpaceIds: [globalSpace.id, restrictedSpace.id], // Restricted space.
+          messagesCreatedAt: [new Date()],
+        }
+      );
+
+      // Create frame file linked to conversation.
+      const frameFile = await FileFactory.create(adminAuth, null, {
+        contentType: frameContentType,
+        fileName: "frame.html",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      await frameFile.markAsReady(adminAuth);
+
+      const frameShareInfo = await frameFile.getShareInfo();
+      const token = frameShareInfo?.shareUrl.split("/").at(-1);
+      assert(token, "Share token should be defined");
+
+      // Should successfully fetch file even though conversation is in restricted space.
+      // This tests that dangerouslySkipPermissionFiltering works correctly.
+      const result = await FileResource.fetchByShareTokenWithContent(token);
+
+      expect(result).not.toBeNull();
+      expect(result?.file.id).toBe(frameFile.id);
+      expect(result?.content).toEqual(expectedContent);
+      expect(result?.shareScope).toBe("workspace_and_emails");
+    });
+  });
+
+  describe("copy", () => {
+    const testFileContent = "test file content for copying";
+
+    it("should successfully copy a file with new useCase and metadata", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create source file.
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "source.txt",
+        fileSize: testFileContent.length,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "original-conv-id" },
+        snippet: "copied snippet",
+      });
+
+      // Copy the file.
+      const result = await FileResource.copy(auth, {
+        sourceId: sourceFile.sId,
+        useCase: "project_context",
+        useCaseMetadata: { conversationId: "new-conv-id" },
+      });
+
+      // Verify success.
+      assert(result.isOk(), "Copy should succeed");
+      const copiedFile = result.value;
+
+      // Verify the copied file has correct properties.
+      expect(copiedFile.contentType).toBe(sourceFile.contentType);
+      expect(copiedFile.fileName).toBe(sourceFile.fileName);
+      expect(copiedFile.fileSize).toBe(sourceFile.fileSize);
+      expect(copiedFile.useCase).toBe("project_context");
+      expect(copiedFile.snippet).toBe("copied snippet");
+      expect(copiedFile.useCaseMetadata?.conversationId).toBe("new-conv-id");
+      expect(copiedFile.isReady).toBe(true);
+      const copyCall = vi.mocked(copyContent).mock.calls.at(-1);
+      expect(copyCall?.[0]).toBe(auth);
+      expect(copyCall?.[1].sId).toBe(sourceFile.sId);
+      expect(copyCall?.[2].sId).toBe(copiedFile.sId);
+      expect(copyCall?.[3]).toEqual({ includeProcessedVersion: undefined });
+    });
+
+    it("should return error when source file not found", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const result = await FileResource.copy(auth, {
+        sourceId: "non-existent-file-id",
+        useCase: "conversation",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain("Source file not found");
+      }
+    });
+
+    it("should return error when source file is not ready", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create a file that is not ready.
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "not-ready.txt",
+        fileSize: 100,
+        status: "created",
+        useCase: "conversation",
+      });
+
+      const result = await FileResource.copy(auth, {
+        sourceId: sourceFile.sId,
+        useCase: "project_context",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain("not ready for copying");
+        expect(result.error.message).toContain("created");
+      }
+    });
+
+    it("should return error when source file has failed status", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create a failed file.
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "failed.txt",
+        fileSize: 100,
+        status: "failed",
+        useCase: "conversation",
+      });
+
+      const result = await FileResource.copy(auth, {
+        sourceId: sourceFile.sId,
+        useCase: "project_context",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain("not ready for copying");
+      }
+    });
+
+    it("should copy file with different use case but same content type", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "application/pdf",
+        fileName: "document.pdf",
+        fileSize: 5000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      const result = await FileResource.copy(auth, {
+        sourceId: sourceFile.sId,
+        useCase: "upsert_document",
+        useCaseMetadata: { spaceId: "space-1" },
+      });
+
+      assert(result.isOk(), "Copy should succeed");
+      const copiedFile = result.value;
+
+      expect(copiedFile.contentType).toBe("application/pdf");
+      expect(copiedFile.useCase).toBe("upsert_document");
+      expect(copiedFile.useCaseMetadata?.spaceId).toBe("space-1");
+      expect(copiedFile.useCaseMetadata?.conversationId).toBeUndefined();
+      const copyCall = vi.mocked(copyContent).mock.calls.at(-1);
+      expect(copyCall?.[0]).toBe(auth);
+      expect(copyCall?.[1].sId).toBe(sourceFile.sId);
+      expect(copyCall?.[2].sId).toBe(copiedFile.sId);
+      expect(copyCall?.[3]).toEqual({ includeProcessedVersion: undefined });
+    });
+
+    it("should copy a conversation file to a different conversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "source.txt",
+        fileSize: testFileContent.length,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: {
+          conversationId: "parent-conv-id",
+          generatedTables: ["TABLE:parent"],
+          lastEditedByAgentConfigurationId: "agent-config",
+          sourceConversationId: "origin-conv-id",
+          sourceProvider: "github",
+          sourceIcon: "github",
+          hideFromUser: true,
+        },
+        snippet: "preserved snippet",
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+      });
+
+      assert(result.isOk(), "copyToConversation should succeed");
+      const copiedFile = result.value;
+
+      expect(copiedFile.sId).not.toBe(sourceFile.sId);
+      expect(copiedFile.useCase).toBe("conversation");
+      expect(copiedFile.snippet).toBe("preserved snippet");
+      expect(copiedFile.useCaseMetadata).toEqual({
+        conversationId: "child-conv-id",
+        sourceConversationId: "origin-conv-id",
+        sourceProvider: "github",
+        sourceIcon: "github",
+        hideFromUser: true,
+      });
+      const copyCall = vi.mocked(copyContent).mock.calls.at(-1);
+      expect(copyCall?.[0]).toBe(auth);
+      expect(copyCall?.[1].sId).toBe(sourceFile.sId);
+      expect(copyCall?.[2].sId).toBe(copiedFile.sId);
+      expect(copyCall?.[3]).toEqual({ includeProcessedVersion: undefined });
+    });
+
+    it("should opt into processed version copying for conversation copies when requested", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "application/pdf",
+        fileName: "source.pdf",
+        fileSize: testFileContent.length,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "parent-conv-id" },
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+        includeProcessedVersion: true,
+      });
+
+      assert(result.isOk(), "copyToConversation should succeed");
+
+      const copyCall = vi.mocked(copyContent).mock.calls.at(-1);
+      expect(copyCall?.[0]).toBe(auth);
+      expect(copyCall?.[1].sId).toBe(sourceFile.sId);
+      expect(copyCall?.[2].sId).toBe(result.value.sId);
+      expect(copyCall?.[3]).toEqual({ includeProcessedVersion: true });
+    });
+
+    it("should preserve tool_output use case when copying to a conversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "output.txt",
+        fileSize: testFileContent.length,
+        status: "ready",
+        useCase: "tool_output",
+        useCaseMetadata: {
+          conversationId: "parent-conv-id",
+          hideFromUser: true,
+        },
+        snippet: "tool output snippet",
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+      });
+
+      assert(result.isOk(), "copyToConversation should succeed");
+      const copiedFile = result.value;
+
+      expect(copiedFile.useCase).toBe("tool_output");
+      expect(copiedFile.snippet).toBe("tool output snippet");
+      expect(copiedFile.useCaseMetadata).toEqual({
+        conversationId: "child-conv-id",
+        hideFromUser: true,
+      });
+    });
+
+    it("should reject non-conversation source use cases", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "application/pdf",
+        fileName: "project.pdf",
+        fileSize: 100,
+        status: "ready",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "space-1" },
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain(
+          "Only conversation files can be copied to a conversation"
+        );
+      }
+    });
+
+    it("should return error when source file is missing for copyToConversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: "non-existent-file-id",
+        conversationId: "child-conv-id",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain("Source file not found");
+      }
+    });
+
+    it("should return error when source file is not ready for copyToConversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "not-ready.txt",
+        fileSize: 100,
+        status: "created",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "parent-conv-id" },
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain("not ready for copying");
+      }
+    });
+  });
+
+  describe("mount path resolution", () => {
+    it("should resolve mount path via markAsReady for conversation file", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "data.json",
+        fileSize: 500,
+        status: "created",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-mark" },
+      });
+
+      await file.markAsReady(auth);
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.status).toBe("ready");
+      expect(row?.mountFilePath).toBe(
+        `w/${workspace.sId}/conversations/conv-mark/files/data.json`
+      );
+    });
+
+    it("should resolve mount path for tool_output use case", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "output.csv",
+        fileSize: 200,
+        status: "created",
+        useCase: "tool_output",
+        useCaseMetadata: { conversationId: "conv-xyz" },
+      });
+
+      await file.markAsReady(auth);
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBe(
+        `w/${workspace.sId}/conversations/conv-xyz/files/output.csv`
+      );
+    });
+
+    it("should no-op for non-conversation use cases", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "test.txt",
+        fileSize: 100,
+        status: "created",
+        useCase: "avatar",
+      });
+
+      await file.markAsReady(auth);
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBeNull();
+    });
+
+    it("should no-op when conversationId is missing from metadata", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "test.txt",
+        fileSize: 100,
+        status: "created",
+        useCase: "conversation",
+      });
+
+      await file.markAsReady(auth);
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBeNull();
+    });
+
+    it("should expose the transcript sibling for audio files only", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const makeConversationFile = async (
+        contentType: AllSupportedFileContentType,
+        fileName: string,
+        useCaseMetadata: FileUseCaseMetadata
+      ) => {
+        const file = await FileFactory.create(auth, null, {
+          contentType,
+          fileName,
+          fileSize: 100,
+          status: "created",
+          useCase: "conversation",
+          useCaseMetadata,
+        });
+        await file.markAsReady(auth);
+        return file;
+      };
+
+      const audio = await makeConversationFile("audio/webm", "voice.webm", {
+        conversationId: "conv-audio",
+      });
+      expect(audio.getTextProcessedMountFilePath()).toBe(
+        `w/${workspace.sId}/conversations/conv-audio/files/voice.processed.txt`
+      );
+
+      // Images process to a resized image, not to text.
+      const image = await makeConversationFile("image/png", "shot.png", {
+        conversationId: "conv-image",
+      });
+      expect(image.getTextProcessedMountFilePath()).toBeNull();
+
+      // Raw-mounted files are never processed, so no sibling is written.
+      const rawAudio = await makeConversationFile("audio/webm", "raw.webm", {
+        conversationId: "conv-raw",
+        skipFileProcessing: true,
+      });
+      expect(rawAudio.getTextProcessedMountFilePath()).toBeNull();
+    });
+
+    it("should not re-resolve when mountFilePath is already set", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "test.txt",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      // Manually set a mountFilePath in DB.
+      await FileModel.update(
+        { mountFilePath: "w/existing/path.txt" },
+        { where: { id: file.id, workspaceId: workspace.id } }
+      );
+
+      // Reload to get fresh data, then trigger resolution via setUseCaseMetadata.
+      const reloaded = await FileResource.fetchById(auth, file.sId);
+      assert(reloaded, "File should exist");
+
+      await reloaded.setUseCaseMetadata(auth, { conversationId: "conv-new" });
+
+      // mountFilePath should remain unchanged.
+      const afterResolve = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(afterResolve?.mountFilePath).toBe("w/existing/path.txt");
+    });
+
+    it("should disambiguate with sId when path is already taken", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      // First file gets the clean path.
+      const file1 = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "report.txt",
+        fileSize: 100,
+        status: "created",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+      await file1.markAsReady(auth);
+
+      // Second file with the same name in the same conversation.
+      const file2 = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "report.txt",
+        fileSize: 200,
+        status: "created",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+      await file2.markAsReady(auth);
+
+      const row1 = await FileModel.findOne({
+        where: { id: file1.id, workspaceId: workspace.id },
+      });
+      const row2 = await FileModel.findOne({
+        where: { id: file2.id, workspaceId: workspace.id },
+      });
+
+      expect(row1?.mountFilePath).toBe(
+        `w/${workspace.sId}/conversations/conv-1/files/report.txt`
+      );
+      expect(row2?.mountFilePath).toBe(
+        `w/${workspace.sId}/conversations/conv-1/files/report_${file2.sId}.txt`
+      );
+    });
+
+    it("should disambiguate files without extension", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file1 = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "Makefile",
+        fileSize: 100,
+        status: "created",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+      await file1.markAsReady(auth);
+
+      const file2 = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "Makefile",
+        fileSize: 200,
+        status: "created",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+      await file2.markAsReady(auth);
+
+      const row2 = await FileModel.findOne({
+        where: { id: file2.id, workspaceId: workspace.id },
+      });
+      expect(row2?.mountFilePath).toBe(
+        `w/${workspace.sId}/conversations/conv-1/files/Makefile_${file2.sId}`
+      );
+    });
+
+    it("should resolve mount path via setUseCaseMetadata when conversationId is set retroactively", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create a ready file without conversationId.
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "attachment.pdf",
+        fileSize: 300,
+        status: "ready",
+        useCase: "conversation",
+      });
+
+      // Set conversationId retroactively (like maybeUpsertFileAttachment does).
+      await file.setUseCaseMetadata(auth, { conversationId: "conv-retro" });
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBe(
+        `w/${workspace.sId}/conversations/conv-retro/files/attachment.pdf`
+      );
+    });
+
+    it("should resolve mount path via markAsReady for project_context file", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "spec.md",
+        fileSize: 200,
+        status: "created",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "spc-1" },
+      });
+
+      await file.markAsReady(auth);
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBe(
+        `w/${workspace.sId}/pods/spc-1/files/spec.md`
+      );
+    });
+
+    it("should no-op for project_context when spaceId is missing", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "spec.md",
+        fileSize: 200,
+        status: "created",
+        useCase: "project_context",
+      });
+
+      await file.markAsReady(auth);
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBeNull();
+    });
+
+    it("should disambiguate project_context files with the same name in a space", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file1 = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "notes.md",
+        fileSize: 100,
+        status: "created",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "spc-1" },
+      });
+      await file1.markAsReady(auth);
+
+      const file2 = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "notes.md",
+        fileSize: 200,
+        status: "created",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "spc-1" },
+      });
+      await file2.markAsReady(auth);
+
+      const row2 = await FileModel.findOne({
+        where: { id: file2.id, workspaceId: workspace.id },
+      });
+      expect(row2?.mountFilePath).toBe(
+        `w/${workspace.sId}/pods/spc-1/files/notes_${file2.sId}.md`
+      );
+    });
+  });
+
+  describe("toScopedPath", () => {
+    it("returns null when mountFilePath is not set", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "orphan.txt",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        // no conversationId → no mountFilePath
+      });
+
+      expect(file.toScopedPath(auth)).toBeNull();
+    });
+
+    it("returns the canonical conversation-{cId}/filename path for a conversation file", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "notes.txt",
+        fileSize: 100,
+        status: "created",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-scoped-1" },
+      });
+      await file.markAsReady(auth);
+
+      const ready = await FileResource.fetchById(auth, file.sId);
+      assert(ready, "File should exist after markAsReady");
+
+      expect(ready.toScopedPath(auth)).toBe(
+        `conversation-conv-scoped-1/notes.txt`
+      );
+      // Verify the GCS mount path that backs it.
+      expect(ready.mountFilePath).toBe(
+        `w/${workspace.sId}/conversations/conv-scoped-1/files/notes.txt`
+      );
+    });
+
+    it("returns the canonical pod-{spaceId}/filename path for a project_context file", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "spec.md",
+        fileSize: 200,
+        status: "created",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "spc-scoped-1" },
+      });
+      await file.markAsReady(auth);
+
+      const ready = await FileResource.fetchById(auth, file.sId);
+      assert(ready, "File should exist after markAsReady");
+
+      expect(ready.toScopedPath(auth)).toBe(`pod-spc-scoped-1/spec.md`);
+      // Verify the GCS mount path that backs it.
+      expect(ready.mountFilePath).toBe(
+        `w/${workspace.sId}/pods/spc-scoped-1/files/spec.md`
+      );
+    });
+
+    it("returns null for a use case that does not produce a scoped path", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "image/png",
+        fileName: "avatar.png",
+        fileSize: 500,
+        status: "ready",
+        useCase: "avatar",
+      });
+
+      expect(file.toScopedPath(auth)).toBeNull();
+    });
+  });
+
+  describe("getContentBucketAndPath", () => {
+    it("should resolve to 'original' version for plain text files", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "readme.txt",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/original");
+    });
+
+    it("should resolve to 'original' version for Python files", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/x-python",
+        fileName: "script.py",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/original");
+    });
+
+    it("should resolve to 'original' version for CSV files", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/csv",
+        fileName: "data.csv",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/original");
+    });
+
+    it("should resolve to 'original' version for PDF files (no pre-processing; lazy via extract_text tool)", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "application/pdf",
+        fileName: "document.pdf",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/original");
+    });
+
+    it("should resolve to 'original' version for Word documents (no pre-processing; lazy via extract_text tool)", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType:
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        fileName: "document.docx",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/original");
+    });
+
+    it("should resolve to 'original' version for spreadsheets when file processing is skipped", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType:
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        fileName: "large.xlsx",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: {
+          conversationId: "conv-1",
+          skipFileProcessing: true,
+        },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/original");
+    });
+
+    it("should resolve to 'processed' version for images in conversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "image/png",
+        fileName: "photo.png",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/processed");
+    });
+
+    it("should resolve to 'original' version for JSON files", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "application/json",
+        fileName: "config.json",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-1" },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/original");
+    });
+  });
+
+  describe("uploadContent dual write", () => {
+    it("should write to both canonical and mount path when mountFilePath is set", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create a frame file with conversationId and markAsReady(auth) sets mountFilePath.
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: "frame.html",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-dual" },
+      });
+
+      // Verify mount path was set.
+      const row = await FileModel.findOne({
+        where: { id: frameFile.id, workspaceId: workspace.id },
+      });
+      assert(row?.mountFilePath, "Mount path should be set");
+
+      // Clear call counts so we can track the uploadContent calls cleanly.
+      vi.mocked(getPrivateUploadBucket).mockClear();
+
+      // Upload new content (simulates a frame edit).
+      await frameFile.uploadContent(auth, "<html>Updated frame</html>");
+
+      // Collect all uploadRawContentToBucket calls across all bucket instances.
+      const allUploadCalls = vi
+        .mocked(getPrivateUploadBucket)
+        .mock.results.flatMap((r) =>
+          r.type === "return"
+            ? vi.mocked(r.value.uploadRawContentToBucket).mock.calls
+            : []
+        );
+
+      // Should have written to both canonical and mount path.
+      const filePaths = allUploadCalls.map((call) => call[0].filePath);
+      expect(filePaths).toContain(row.mountFilePath);
+    });
+
+    it("should not write to mount path when mountFilePath is not set", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      // Create a file without conversationId — no mount path.
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "plain.txt",
+        fileSize: 100,
+        status: "created",
+        useCase: "conversation",
+      });
+
+      vi.mocked(getPrivateUploadBucket).mockClear();
+
+      await file.uploadContent(auth, "some content");
+
+      // Collect all uploadRawContentToBucket calls.
+      const allUploadCalls = vi
+        .mocked(getPrivateUploadBucket)
+        .mock.results.flatMap((r) =>
+          r.type === "return"
+            ? vi.mocked(r.value.uploadRawContentToBucket).mock.calls
+            : []
+        );
+
+      // Only canonical write, no mount path write.
+      expect(allUploadCalls).toHaveLength(1);
+    });
+  });
+
+  describe("revert", () => {
+    // revert() reads versions and refreshes the mount entirely through getPrivateUploadBucket(),
+    // which fileStorageMock already stubs globally (see tests/utils/mocks/file_storage.ts).
+    // setSortedFileVersions/setCopyFileFails drive it without reaching into FileResource's
+    // private methods. fileStorageMock.reset() (global beforeEach) clears both between tests.
+    function mockVersion(): MockFileVersion {
+      return {
+        copy: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue(undefined),
+      };
+    }
+
+    it("refreshes the mount copy from the restored canonical version", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: "frame.html",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-revert" },
+      });
+
+      const row = await FileModel.findOne({
+        where: { id: frameFile.id, workspaceId: workspace.id },
+      });
+      assert(row?.mountFilePath, "Mount path should be set");
+
+      fileStorageMock.setSortedFileVersions(() => [
+        mockVersion(),
+        mockVersion(),
+      ]);
+
+      const result = await frameFile.revert(auth, {
+        revertedByAgentConfigurationId: "agent-1",
+      });
+
+      expect(result.isOk()).toBe(true);
+
+      const allCopyFileCalls = vi
+        .mocked(getPrivateUploadBucket)
+        .mock.results.flatMap((r) =>
+          r.type === "return" ? vi.mocked(r.value.copyFile).mock.calls : []
+        );
+
+      // The mount copy must be refreshed to the restored canonical version, so reads through
+      // the mount and the next publish see the reverted content rather than the stale mount.
+      expect(
+        allCopyFileCalls.some((call) => call[1] === row.mountFilePath)
+      ).toBe(true);
+    });
+
+    it("still succeeds when refreshing the mount copy fails", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: "frame.html",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-revert-fail" },
+      });
+
+      fileStorageMock.setSortedFileVersions(() => [
+        mockVersion(),
+        mockVersion(),
+      ]);
+
+      // The restore copy succeeds (the version object's own .copy() call), but the mount
+      // refresh's copyFile() call fails. Best-effort: the revert must not fail because of it,
+      // since the canonical restore already succeeded by that point. setUseCaseMetadata
+      // (called earlier in revert(), unrelated to this fix) also refreshes the mount as a
+      // side effect, so only the call after the restore should fail.
+      let copyFileCallCount = 0;
+      fileStorageMock.setCopyFileFails(() => {
+        copyFileCallCount += 1;
+        return copyFileCallCount > 1;
+      });
+
+      const result = await frameFile.revert(auth, {
+        revertedByAgentConfigurationId: "agent-1",
+      });
+
+      expect(result.isOk()).toBe(true);
+    });
+  });
+
+  describe("authorized file access", () => {
+    beforeEach(() => {
+      vi.restoreAllMocks();
+      vi.spyOn(
+        FileResource.prototype,
+        "getSharedReadStream"
+      ).mockImplementation(function getSharedReadStream(this: FileResource) {
+        return Readable.from([Buffer.from(this.fileName, "utf-8")]);
+      });
+    });
+
+    it("refreshAuthorizedFileAccess replaces prior rows with the refreshed allowlist", async () => {
+      const { authenticator: auth } = await createResourceTest({});
+
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: "Frame.tsx",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      const shareableFile = await FileResource.shareableFileModel.findOne({
+        where: { fileId: frameFile.id, workspaceId: frameFile.workspaceId },
+      });
+      expect(shareableFile).not.toBeNull();
+
+      const existingAllowedAt = new Date("2026-01-01T00:00:00.000Z");
+      await AuthorizedFileAccessModel.create({
+        workspaceId: frameFile.workspaceId,
+        shareableFileId: shareableFile!.id,
+        kind: "file_id",
+        ref: "fil_OLDREF0001",
+        fileName: null,
+        legacyPath: null,
+        shareScope: shareableFile!.shareScope,
+        generatedByUserId: auth.user()!.id,
+        frameContentHash: "old-hash",
+        allowedAt: existingAllowedAt,
+      });
+
+      vi.spyOn(FileResource.prototype, "getSharedReadStream").mockReturnValue(
+        Readable.from([Buffer.from('useFile("fil_ABCDEFGHIJ");', "utf-8")])
+      );
+      vi.spyOn(FileResource, "fetchById").mockResolvedValue(null);
+
+      const refreshed = await frameFile.refreshAuthorizedFileAccess(auth);
+
+      expect(refreshed.frameContentHash).toBe(
+        computeFrameContentHash('useFile("fil_ABCDEFGHIJ");')
+      );
+      expect(refreshed.unverifiableRefs).toEqual(["fil_ABCDEFGHIJ"]);
+
+      const rows = await AuthorizedFileAccessModel.findAll({
+        where: {
+          shareableFileId: shareableFile!.id,
+          workspaceId: frameFile.workspaceId,
+        },
+      });
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.kind).toBe("unverifiable");
+      expect(rows[0]?.ref).toBe("fil_ABCDEFGHIJ");
+    });
+
+    it("uploadFrameContent blocks when static refs cannot be verified", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: 'useFile("fil_ZZZZZZZZZZ");',
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      vi.spyOn(FileResource, "fetchById").mockResolvedValue(null);
+
+      const result = await uploadFrameContent(
+        auth,
+        frameFile,
+        'useFile("fil_ZZZZZZZZZZ");'
+      );
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(isUnverifiableFrameFileRefsShareError(result.error)).toBe(true);
+      }
+
+      const shareableFile = await FileResource.shareableFileModel.findOne({
+        where: { fileId: frameFile.id, workspaceId: frameFile.workspaceId },
+      });
+      const rows = await AuthorizedFileAccessModel.findAll({
+        where: {
+          shareableFileId: shareableFile!.id,
+          workspaceId: frameFile.workspaceId,
+        },
+      });
+      expect(rows).toHaveLength(0);
+    });
+
+    it("uploadFrameContent updates the allowlist for verifiable refs", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+
+      const dataFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "data.txt",
+        fileSize: 10,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      const frameContent = `useFile("${dataFile.sId}");`;
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: frameContent,
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      const result = await uploadFrameContent(auth, frameFile, frameContent);
+      expect(result.isOk()).toBe(true);
+
+      const shareableFile = await FileResource.shareableFileModel.findOne({
+        where: { fileId: frameFile.id, workspaceId: frameFile.workspaceId },
+      });
+      const rows = await AuthorizedFileAccessModel.findAll({
+        where: {
+          shareableFileId: shareableFile!.id,
+          workspaceId: frameFile.workspaceId,
+        },
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.kind).toBe("file_id");
+      expect(rows[0]?.ref).toBe(dataFile.sId);
+      expect(rows[0]?.fileName).toBe("data.txt");
+      expect(rows[0]?.generatedByUserId).toBe(auth.user()!.id);
+    });
+
+    it("getActiveAuthorizedFileAccessAllowlist resolves computedByUserId from generatedByUserId FK", async () => {
+      const { authenticator: auth } = await createResourceTest({});
+
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: "Frame.tsx",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      const shareableFile = await FileResource.shareableFileModel.findOne({
+        where: { fileId: frameFile.id, workspaceId: frameFile.workspaceId },
+      });
+      expect(shareableFile).not.toBeNull();
+
+      await AuthorizedFileAccessModel.create({
+        workspaceId: frameFile.workspaceId,
+        shareableFileId: shareableFile!.id,
+        kind: "file_id",
+        ref: "fil_PLACEHOLDER",
+        fileName: null,
+        legacyPath: null,
+        shareScope: shareableFile!.shareScope,
+        generatedByUserId: auth.user()!.id,
+        frameContentHash: "hash123",
+        allowedAt: new Date(),
+      });
+
+      const allowlist =
+        await frameFile.getActiveAuthorizedFileAccessAllowlist();
+
+      expect(allowlist?.generatedByUserId).toBe(auth.user()!.id);
+    });
+
+    it("setShareScope updates share scope without recomputing the allowlist", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: "Frame.tsx",
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      await frameFile.setShareScope(auth, "public");
+
+      const shareableFile = await FileResource.shareableFileModel.findOne({
+        where: { fileId: frameFile.id, workspaceId: frameFile.workspaceId },
+      });
+      expect(shareableFile?.shareScope).toBe("public");
+
+      const rows = await AuthorizedFileAccessModel.findAll({
+        where: {
+          shareableFileId: shareableFile!.id,
+          workspaceId: frameFile.workspaceId,
+        },
+      });
+      expect(rows).toHaveLength(0);
+    });
+
+    it("fetchByShareToken returns the active authorized file access allowlist", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+        messagesCreatedAt: [new Date()],
+      });
+
+      const dataFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "data.txt",
+        fileSize: 10,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      const frameContent = `useFile("${dataFile.sId}");`;
+      const frameFile = await FileFactory.create(auth, null, {
+        contentType: frameContentType,
+        fileName: frameContent,
+        fileSize: 100,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: conversation.sId },
+      });
+
+      const uploadResult = await uploadFrameContent(
+        auth,
+        frameFile,
+        frameContent
+      );
+      expect(uploadResult.isOk()).toBe(true);
+
+      const shareInfo = await frameFile.getShareInfo();
+      const token = shareInfo?.shareUrl.split("/").at(-1);
+      assert(token, "Share token should be defined");
+
+      const result = await FileResource.fetchByShareToken(token);
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.authorizedFileAccess).not.toBeNull();
+        expect(result.value.authorizedFileAccess?.refs).toEqual([
+          {
+            kind: "file_id",
+            ref: dataFile.sId,
+            fileName: "data.txt",
+          },
+        ]);
+      }
+    });
+  });
+
+  describe("sandbox function mount routing", () => {
+    it("resolves a sandbox function bundle under the dedicated prefix", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+      const space = await SpaceFactory.regular(workspace);
+
+      const bundleFile = await FileFactory.create(auth, null, {
+        contentType: sandboxFunctionContentType,
+        fileName: "greet.ts",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: space.sId },
+      });
+
+      const row = await FileModel.findOne({
+        where: { id: bundleFile.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBe(
+        `w/${workspace.sId}/pods/${space.sId}/sandbox-functions/greet.ts`
+      );
+    });
+
+    it("keeps regular project files under the pod files prefix", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+      const space = await SpaceFactory.regular(workspace);
+
+      const projectFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "notes.txt",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: space.sId },
+      });
+
+      const row = await FileModel.findOne({
+        where: { id: projectFile.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBe(
+        `w/${workspace.sId}/pods/${space.sId}/files/notes.txt`
+      );
+    });
+  });
+
+  describe("deleteAllForWorkspace", () => {
+    const makeFile = (auth: Authenticator, fileName: string) =>
+      FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName,
+        fileSize: 10,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "conv-delete-all" },
+      });
+
+    it("should delete every file of the workspace", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      for (const fileName of ["a.txt", "b.txt", "c.txt"]) {
+        await makeFile(auth, fileName);
+      }
+
+      const deletedCount = await FileResource.deleteAllForWorkspace(auth);
+
+      expect(deletedCount).toBe(3);
+      expect(
+        await FileModel.count({ where: { workspaceId: workspace.id } })
+      ).toBe(0);
+    });
+
+    it("should leave the files of other workspaces untouched", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+      const { authenticator: otherAuth, workspace: otherWorkspace } =
+        await createResourceTest({ role: "admin" });
+
+      await makeFile(auth, "mine.txt");
+      await makeFile(otherAuth, "theirs.txt");
+
+      await FileResource.deleteAllForWorkspace(auth);
+
+      expect(
+        await FileModel.count({ where: { workspaceId: otherWorkspace.id } })
+      ).toBe(1);
+    });
+
+    it("deletes Frames v2 function rows before workspace files", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+      const frame = await createFrameWithFunction(auth, "workspace-delete");
+      expect(
+        await SandboxFunctionResource.listByFramePublication(auth, {
+          frame,
+          publicationId: "workspace-delete",
+        })
+      ).toHaveLength(1);
+
+      const deletedCount = await FileResource.deleteAllForWorkspace(auth);
+
+      expect(deletedCount).toBe(1);
+      expect(await FileResource.fetchById(auth, frame.sId)).toBeNull();
+    });
+  });
+
+  it("deletes Frames v2 function rows before the Frame file", async () => {
+    const { authenticator: auth } = await createResourceTest({
+      role: "admin",
+    });
+    const frame = await createFrameWithFunction(auth, "frame-delete", {
+      withSource: true,
+    });
+    expect(
+      await SandboxFunctionResource.listByFramePublication(auth, {
+        frame,
+        publicationId: "frame-delete",
+      })
+    ).toHaveLength(1);
+
+    const result = await frame.delete(auth);
+
+    expect(result.isOk(), result.isErr() ? result.error.message : "").toBe(
+      true
+    );
+    expect(await FileResource.fetchById(auth, frame.sId)).toBeNull();
+  });
+
+  it("rejects Frame deletion from another workspace", async () => {
+    const { authenticator: frameAuth } = await createResourceTest({
+      role: "admin",
+    });
+    const { authenticator: otherAuth } = await createResourceTest({
+      role: "admin",
+    });
+    const frame = await createFrameWithFunction(frameAuth, "frame-delete");
+    const result = await frame.delete(otherAuth);
+
+    expect(result.isErr()).toBe(true);
+    expect(await FileResource.fetchById(frameAuth, frame.sId)).not.toBeNull();
+  });
+
+  it("keeps Frame functions and identity when source deletion fails", async () => {
+    const { authenticator: auth } = await createResourceTest({
+      role: "admin",
+    });
+    const frame = await createFrameWithFunction(auth, "frame-delete-failure");
+    const deletedPrefixes: string[] = [];
+    fileStorageMock.setOnDeleteByPrefix((prefix) =>
+      deletedPrefixes.push(prefix)
+    );
+
+    const result = await frame.delete(auth);
+
+    expect(result.isErr()).toBe(true);
+    expect(
+      await SandboxFunctionResource.listByFramePublication(auth, {
+        frame,
+        publicationId: "frame-delete-failure",
+      })
+    ).toHaveLength(1);
+    expect(await FileResource.fetchById(auth, frame.sId)).not.toBeNull();
+    expect(deletedPrefixes).toEqual([]);
+  });
+});

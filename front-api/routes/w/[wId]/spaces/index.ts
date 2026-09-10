@@ -1,0 +1,299 @@
+import {
+  buildAuditLogTarget,
+  emitAuditLogEvent,
+  getAuditLogContext,
+} from "@app/lib/api/audit/workos_audit";
+import { enrichProjectsWithMetadata } from "@app/lib/api/projects/list";
+import { createSpaceAndGroup } from "@app/lib/api/spaces";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { areOpenPodsAllowed } from "@app/lib/workspace_policies";
+import type {
+  GetSpacesResponseBody,
+  PostSpaceRequestBodyType,
+  PostSpacesResponseBody,
+} from "@app/types/api/spaces";
+import { PostSpaceRequestBodySchema } from "@app/types/api/spaces";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import {
+  type EnrichedSpaceType,
+  type PodType,
+  SPACE_KINDS,
+} from "@app/types/space";
+import { workspaceApp } from "@front-api/middlewares/ctx";
+import type { HandlerResult } from "@front-api/middlewares/utils";
+import { apiError } from "@front-api/middlewares/utils";
+import { validate } from "@front-api/middlewares/validator";
+import { z } from "zod";
+import spaceId from "./[spaceId]";
+import accessCheck from "./access-check";
+import checkName from "./check-name";
+import projectsLookup from "./projects-lookup";
+import searchProjects from "./search_projects";
+
+export type {
+  GetSpacesResponseBody,
+  PostSpaceRequestBodyType,
+  PostSpacesResponseBody,
+};
+
+// Mounted under /api/w/:wId/spaces. workspaceAuth is applied by the parent
+// workspace sub-app, so ctx.get("auth") is always available here.
+const app = workspaceApp();
+
+const GetSpacesQuerySchema = z.object({
+  role: z.string().optional(),
+  kind: z.union([z.enum(SPACE_KINDS), z.array(z.enum(SPACE_KINDS))]).optional(),
+});
+
+/**
+ * @swagger
+ * /api/w/{wId}/spaces:
+ *   get:
+ *     summary: List spaces
+ *     description: Returns all spaces in the workspace.
+ *     tags:
+ *       - Private Spaces
+ *     parameters:
+ *       - in: path
+ *         name: wId
+ *         required: true
+ *         description: ID of the workspace
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: role
+ *         required: false
+ *         description: Filter by role (e.g. admin to list all workspace spaces)
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: kind
+ *         required: false
+ *         description: Filter by one or more space kinds. Repeat the parameter to include several kinds.
+ *         style: form
+ *         explode: true
+ *         schema:
+ *           type: array
+ *           items:
+ *             type: string
+ *             enum: [global, system, conversations, regular, project]
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Success
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 spaces:
+ *                   type: array
+ *                   items:
+ *                     oneOf:
+ *                       - $ref: '#/components/schemas/PrivateSpace'
+ *                       - $ref: '#/components/schemas/PrivateProject'
+ *       401:
+ *         description: Unauthorized
+ *   post:
+ *     summary: Create a space
+ *     description: Creates a new space in the workspace.
+ *     tags:
+ *       - Private Spaces
+ *     parameters:
+ *       - in: path
+ *         name: wId
+ *         required: true
+ *         description: ID of the workspace
+ *         schema:
+ *           type: string
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - isRestricted
+ *               - name
+ *               - spaceKind
+ *             properties:
+ *               isRestricted:
+ *                 type: boolean
+ *               name:
+ *                 type: string
+ *               spaceKind:
+ *                 type: string
+ *                 enum: [regular, project]
+ *               memberIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 description: The space's manual member list. Omitted or empty means the space starts with no manual member.
+ *               groupIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 description: The groups given access to the space. Omitted or empty means no group has access to it.
+ *     responses:
+ *       201:
+ *         description: Successfully created space
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 space:
+ *                   $ref: '#/components/schemas/PrivateSpace'
+ *       401:
+ *         description: Unauthorized
+ */
+
+app.get(
+  "/",
+  validate("query", GetSpacesQuerySchema),
+  async (ctx): HandlerResult<GetSpacesResponseBody> => {
+    const auth = ctx.get("auth");
+    const { role, kind } = ctx.req.valid("query");
+    const kinds = kind
+      ? Array.isArray(kind)
+        ? Array.from(new Set(kind))
+        : [kind]
+      : undefined;
+
+    let spaces: SpaceResource[] = [];
+    if (role === "admin") {
+      if (kind === "system") {
+        const systemSpace = await SpaceResource.fetchWorkspaceSystemSpace(auth);
+        spaces = systemSpace ? [systemSpace] : [];
+      } else {
+        spaces = await SpaceResource.listWorkspaceSpaces(auth);
+      }
+    } else {
+      spaces = await SpaceResource.listWorkspaceSpacesAsMember(auth, {
+        kinds,
+      });
+    }
+
+    spaces = spaces.filter((s) => s.kind !== "conversations");
+    const nonProjectSpaces = spaces.filter((s) => s.kind !== "project");
+    const projectSpaces = spaces.filter((s) => s.kind === "project");
+
+    const nonProjectsJson: EnrichedSpaceType[] =
+      await SpaceResource.enrichSpacesWithAccess(auth, nonProjectSpaces);
+    const projectsJson: PodType[] =
+      projectSpaces.length > 0
+        ? await enrichProjectsWithMetadata(auth, projectSpaces)
+        : [];
+
+    return ctx.json({
+      spaces: [...nonProjectsJson, ...projectsJson],
+    });
+  }
+);
+
+app.post(
+  "/",
+  validate("json", PostSpaceRequestBodySchema),
+  async (ctx): HandlerResult<PostSpacesResponseBody> => {
+    const auth = ctx.get("auth");
+    const requestBody = ctx.req.valid("json");
+    const owner = auth.getNonNullableWorkspace();
+
+    if (
+      requestBody.spaceKind === "project" &&
+      !requestBody.isRestricted &&
+      !areOpenPodsAllowed(owner)
+    ) {
+      return apiError(ctx, {
+        status_code: 403,
+        api_error: {
+          type: "invalid_request_error",
+          message:
+            "Open projects are disabled by your workspace admin. Create a private project instead.",
+        },
+      });
+    }
+
+    const spaceRes = await createSpaceAndGroup(auth, requestBody);
+    if (spaceRes.isErr()) {
+      switch (spaceRes.error.code) {
+        case "limit_reached":
+          return apiError(ctx, {
+            status_code: 403,
+            api_error: {
+              type: "plan_limit_error",
+              message:
+                "Limit of spaces allowed for your plan reached. Contact support to upgrade.",
+            },
+          });
+        case "space_already_exists":
+          return apiError(ctx, {
+            status_code: 400,
+            api_error: {
+              type: "space_already_exists",
+              message: "Space with that name already exists.",
+            },
+          });
+        case "internal_error":
+          return apiError(ctx, {
+            status_code: 500,
+            api_error: {
+              type: "internal_server_error",
+              message: spaceRes.error.message,
+            },
+          });
+        case "invalid_request_error":
+          return apiError(ctx, {
+            status_code: 400,
+            api_error: {
+              type: "invalid_request_error",
+              message: spaceRes.error.message,
+            },
+          });
+        case "unauthorized":
+          return apiError(ctx, {
+            status_code: 403,
+            api_error: {
+              type: "workspace_auth_error",
+              message:
+                "Only users that are `admins` can create regular spaces.",
+            },
+          });
+        default:
+          assertNever(spaceRes.error.code);
+      }
+    }
+
+    const space = spaceRes.value;
+
+    void emitAuditLogEvent({
+      auth,
+      action: "space.created",
+      targets: [
+        buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
+        buildAuditLogTarget("space", space),
+      ],
+      context: getAuditLogContext(auth),
+      metadata: {
+        space_name: space.name,
+        space_kind: space.kind,
+        is_restricted: String(requestBody.isRestricted),
+      },
+    });
+
+    return ctx.json({ space: space.toJSON() }, 201);
+  }
+);
+
+// Register static paths BEFORE `/:spaceId` so the param route does not
+// swallow these names as ids.
+app.route("/access-check", accessCheck);
+app.route("/check-name", checkName);
+app.route("/projects-lookup", projectsLookup);
+app.route("/search_projects", searchProjects);
+app.route("/:spaceId", spaceId);
+
+export default app;

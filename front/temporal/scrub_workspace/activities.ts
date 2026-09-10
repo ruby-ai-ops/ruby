@@ -1,0 +1,470 @@
+import { archiveAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
+import { getAgentConfigurationsForView } from "@app/lib/api/assistant/configuration/views";
+import { destroyConversation } from "@app/lib/api/assistant/conversation/destroy";
+import config from "@app/lib/api/config";
+import {
+  getDataSources,
+  softDeleteDataSourceAndLaunchScrubWorkflow,
+} from "@app/lib/api/data_sources";
+import { sendAdminDataDeletionEmail } from "@app/lib/api/email";
+import { softDeleteSpaceAndLaunchScrubWorkflow } from "@app/lib/api/spaces";
+import { disableWorkOSSSOAndSCIM } from "@app/lib/api/workos/organization";
+import {
+  getMembers,
+  getWorkspaceInfos,
+  unsafeGetWorkspacesByModelId,
+} from "@app/lib/api/workspace";
+import { Authenticator } from "@app/lib/auth";
+import { getWorkspaceDataRetention } from "@app/lib/data_retention";
+import {
+  FREE_NO_PLAN_CODE,
+  FREE_TEST_PLAN_CODE,
+} from "@app/lib/plans/plan_codes";
+import { AgentMemoryResource } from "@app/lib/resources/agent_memory_resource";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { DataSourceResource } from "@app/lib/resources/data_source_resource";
+import { GroupPermissionResource } from "@app/lib/resources/group_permission_resource";
+import { KeyResource } from "@app/lib/resources/key_resource";
+import { MembershipResource } from "@app/lib/resources/membership_resource";
+import { MembershipUpgradeRequestResource } from "@app/lib/resources/membership_upgrade_request_resource";
+import { OnboardingTaskResource } from "@app/lib/resources/onboarding_task_resource";
+import { SandboxEnvVarResource } from "@app/lib/resources/sandbox_env_var_resource";
+import { SkillResource } from "@app/lib/resources/skill/skill_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
+import { TagResource } from "@app/lib/resources/tags_resource";
+import { TakeawaysResource } from "@app/lib/resources/takeaways_resource";
+import { TriggerResource } from "@app/lib/resources/trigger_resource";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { CustomerioServerSideTracking } from "@app/lib/tracking/customerio/server";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import { renderLightWorkspaceType } from "@app/lib/workspace";
+import logger from "@app/logger/logger";
+import { MAX_WORKSPACES_TO_DOWNGRADE_PER_RUN } from "@app/temporal/scrub_workspace/config";
+import { isGlobalAgentId } from "@app/types/assistant/assistant";
+import { ConnectorsAPI } from "@app/types/connectors/connectors_api";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { removeNulls } from "@app/types/shared/utils/general";
+import chunk from "lodash/chunk";
+import groupBy from "lodash/groupBy";
+import keyBy from "lodash/keyBy";
+import uniqBy from "lodash/uniqBy";
+
+export async function sendDataDeletionEmail({
+  remainingDays,
+  workspaceId,
+  isLast,
+}: {
+  remainingDays: number;
+  workspaceId: string;
+  isLast: boolean;
+}) {
+  try {
+    const auth = await Authenticator.internalAdminForWorkspace(workspaceId);
+    const ws = auth.workspace();
+    if (!ws) {
+      throw new Error("No workspace found");
+    }
+
+    const subscription = await SubscriptionResource.fetchLastByWorkspace(ws);
+
+    const { members: admins } = await getMembers(auth, {
+      roles: ["admin"],
+      activeOnly: true,
+    });
+    for (const a of admins) {
+      await sendAdminDataDeletionEmail({
+        email: a.email,
+        workspaceName: ws.name,
+        remainingDays,
+        planCode: subscription?.getPlan().code,
+        isLast,
+      });
+    }
+  } catch (e) {
+    logger.error(
+      { panic: true, error: e },
+      "Failed to send data deletion email"
+    );
+    throw e;
+  }
+}
+
+export async function getWorkspaceRetentionDays({
+  workspaceId,
+}: {
+  workspaceId: string;
+}): Promise<number> {
+  const auth = await Authenticator.internalAdminForWorkspace(workspaceId);
+  const retentionDays = await getWorkspaceDataRetention(auth);
+  return retentionDays;
+}
+
+export async function shouldStillScrubData({
+  workspaceId,
+}: {
+  workspaceId: string;
+}): Promise<boolean> {
+  const workspace = await getWorkspaceInfos(workspaceId);
+  if (!workspace) {
+    return false;
+  }
+  return !(
+    await Authenticator.internalAdminForWorkspace(workspaceId)
+  ).isUpgraded();
+}
+
+export async function scrubWorkspaceData({
+  workspaceId,
+}: {
+  workspaceId: string;
+}) {
+  const workspace = await WorkspaceResource.fetchById(workspaceId);
+  if (!workspace) {
+    logger.info(
+      { workspaceId },
+      "Workspace not found, it was probably already deleted"
+    );
+    return true;
+  }
+
+  const auth = await Authenticator.internalAdminForWorkspace(workspaceId, {
+    dangerouslyRequestAllGroups: true,
+  });
+  await deleteGroupPermissions(auth);
+  await deleteAllConversations(auth);
+  await deleteTakeaways(auth);
+  await deleteKeys(auth);
+  await archiveAssistants(auth);
+  await deleteAgentMemories(auth);
+  await deleteSkills(auth);
+  await deleteOnboardingTasks(auth);
+  await deleteMembershipUpgradeRequests(auth);
+  await deleteTags(auth);
+  await deleteSandboxEnvVars(auth);
+  await deleteDatasources(auth);
+  await deleteSpaces(auth);
+  await cleanupCustomerio(auth);
+  await disableWorkOSSSOAndSCIM(renderLightWorkspaceType({ workspace }), {
+    disableSSO: true,
+    disableSCIM: true,
+  });
+}
+
+export async function pauseAllConnectors({
+  workspaceId,
+}: {
+  workspaceId: string;
+}) {
+  const auth = await Authenticator.internalAdminForWorkspace(workspaceId);
+  const dataSources = await getDataSources(auth);
+  const connectorsAPI = new ConnectorsAPI(
+    config.getConnectorsAPIConfig(),
+    logger
+  );
+  for (const ds of dataSources) {
+    if (!ds.connectorId) {
+      continue;
+    }
+    await connectorsAPI.pauseConnector(ds.connectorId);
+  }
+}
+
+export async function pauseAllTriggers({
+  workspaceId,
+}: {
+  workspaceId: string;
+}) {
+  const auth = await Authenticator.internalAdminForWorkspace(workspaceId);
+  const disableResult = await TriggerResource.disableAllForWorkspace(
+    auth,
+    "downgraded"
+  );
+  if (disableResult.isErr()) {
+    // Don't fail the whole scrub workflow if we can't disable triggers, just log it.
+    logger.error(
+      { workspaceId, error: disableResult.error },
+      "Failed to disable workspace triggers during scrub"
+    );
+  }
+}
+
+// The scrub leaves the workspace itself alive, so it keeps the spaces the workspace cannot work
+// without and removes everything its users created.
+function isKeptByScrub(space: SpaceResource): boolean {
+  switch (space.kind) {
+    case "system":
+    case "global":
+    case "conversations":
+      return true;
+    case "regular":
+    case "project":
+      return false;
+    default:
+      assertNever(space.kind);
+  }
+}
+
+async function listAllSpaces(auth: Authenticator) {
+  return SpaceResource.listWorkspaceSpaces(auth, {
+    includeConversationsSpace: true,
+    includeProjectSpaces: true,
+  });
+}
+
+async function deleteGroupPermissions(auth: Authenticator) {
+  // The spaces the scrub keeps keep their grants: wiping them would leave the workspace with
+  // spaces nobody can reach.
+  const keptSpaceModelIds = new Set(
+    (await listAllSpaces(auth)).filter(isKeptByScrub).map((space) => space.id)
+  );
+
+  const permissions = await GroupPermissionResource.listForWorkspace(auth);
+  const permissionsToDelete = permissions.filter(
+    (permission) =>
+      !(
+        permission.resourceType === "space" &&
+        keptSpaceModelIds.has(permission.resourceId)
+      )
+  );
+
+  await GroupPermissionResource.deleteByModelIds(
+    auth,
+    permissionsToDelete.map((permission) => permission.id)
+  );
+}
+
+async function deleteTakeaways(auth: Authenticator) {
+  await TakeawaysResource.deleteAllForWorkspace(auth);
+}
+
+export async function deleteKeys(auth: Authenticator) {
+  await KeyResource.deleteAllForWorkspace(auth);
+}
+
+export async function deleteAllConversations(auth: Authenticator) {
+  const workspace = auth.getNonNullableWorkspace();
+  // Full-workspace teardown: bypass access filtering so we destroy every conversation, including
+  // those referencing deleted spaces (filtered out by the default permission path), whose
+  // user_messages would otherwise survive and block deleteKeys via the FK on userContextApiKeyId.
+  const conversations = await ConversationResource.listAll(auth, {
+    includeDeleted: true,
+    dangerouslySkipPermissionFiltering: true,
+  });
+  logger.info(
+    { workspaceId: workspace.sId, conversationsCount: conversations.length },
+    "Deleting all conversations for workspace."
+  );
+  // unique conversations
+  const uniqueConversations = uniqBy(conversations, (c) => c.sId);
+  await concurrentExecutor(
+    uniqueConversations,
+    async (conversation) => {
+      const result = await destroyConversation(auth, { conversation });
+      if (result.isErr()) {
+        throw result.error;
+      }
+    },
+    {
+      concurrency: 4,
+    }
+  );
+}
+
+async function archiveAssistants(auth: Authenticator) {
+  const agentConfigurations = await getAgentConfigurationsForView({
+    auth,
+    agentsGetView: "admin_internal",
+    variant: "light",
+  });
+
+  const agentConfigurationsToArchive = agentConfigurations.filter(
+    (ac) => !isGlobalAgentId(ac.sId)
+  );
+  for (const agentConfiguration of agentConfigurationsToArchive) {
+    await archiveAgentConfiguration(auth, agentConfiguration.sId);
+  }
+}
+
+async function deleteAgentMemories(auth: Authenticator) {
+  await AgentMemoryResource.deleteAllForWorkspace(auth);
+}
+
+async function deleteSkills(auth: Authenticator) {
+  await SkillResource.deleteAllForWorkspace(auth);
+}
+
+async function deleteOnboardingTasks(auth: Authenticator) {
+  await OnboardingTaskResource.deleteAllForWorkspace(auth);
+}
+
+async function deleteMembershipUpgradeRequests(auth: Authenticator) {
+  await MembershipUpgradeRequestResource.deleteAllForWorkspace(auth);
+}
+
+async function deleteTags(auth: Authenticator) {
+  const tags = await TagResource.findAll(auth);
+  for (const tag of tags) {
+    await tag.delete(auth);
+  }
+}
+
+async function deleteSandboxEnvVars(auth: Authenticator) {
+  await SandboxEnvVarResource.deleteAllForWorkspace(auth);
+}
+
+async function deleteDatasources(auth: Authenticator) {
+  // Retrieve and delete all data sources associated with the spaces the scrub keeps. The others
+  // will be deleted when deleting their space.
+  const keptSpaces = (await listAllSpaces(auth)).filter(isKeptByScrub);
+
+  const dataSources = await DataSourceResource.listBySpaces(auth, keptSpaces);
+
+  for (const ds of dataSources) {
+    // Perform a soft delete and initiate a workflow for permanent deletion of the data source.
+    const r = await softDeleteDataSourceAndLaunchScrubWorkflow(auth, {
+      dataSource: ds,
+    });
+    if (r.isErr()) {
+      throw new Error(`Failed to delete data source: ${r.error.message}`);
+    }
+  }
+}
+
+// Remove all user-created spaces and their associated groups, preserving the ones the scrub keeps.
+async function deleteSpaces(auth: Authenticator) {
+  const spacesToDelete = (await listAllSpaces(auth)).filter(
+    (space) => !isKeptByScrub(space)
+  );
+
+  for (const space of spacesToDelete) {
+    await softDeleteSpaceAndLaunchScrubWorkflow(auth, space);
+  }
+}
+
+async function cleanupCustomerio(auth: Authenticator) {
+  const w = auth.workspace();
+
+  if (!w) {
+    throw new Error("No workspace found");
+  }
+
+  // Fetch all the memberships for the workspace.
+  const { memberships: workspaceMemberships } =
+    await MembershipResource.getLatestMemberships({
+      workspace: w,
+    });
+
+  // Fetch all the users in the workspace.
+  const userIds = workspaceMemberships.map((m) => m.userId);
+  const users = await UserResource.fetchByModelIds(userIds);
+
+  // For each user, fetch all their memberships.
+  let latestMemberships: MembershipResource[] = [];
+  if (userIds.length) {
+    const { memberships } = await MembershipResource.getLatestMemberships({
+      users,
+    });
+    latestMemberships = memberships;
+  }
+
+  const allMembershipsByUserId = groupBy(latestMemberships, (m) =>
+    m.userId.toString()
+  );
+
+  // For every membership, fetch the workspace.
+  const workspaceIds = Object.values(allMembershipsByUserId)
+    .flat()
+    .map((m) => m.workspaceId);
+  const workspaceById = keyBy(
+    await unsafeGetWorkspacesByModelId(workspaceIds),
+    (w) => w.id.toString()
+  );
+
+  // Finally, fetch all the subscriptions for the workspaces.
+  const subscriptionsByWorkspaceModelId =
+    await SubscriptionResource.fetchActiveByWorkspacesModelId(
+      Object.values(workspaceById).map((w) => w.id)
+    );
+
+  // Process the workspace users in chunks of 4.
+  const chunks = chunk(users, 4);
+
+  for (const c of chunks) {
+    await Promise.all(
+      c.map((u) => {
+        // Get all the memberships of the user.
+        const allMembershipsOfUser =
+          allMembershipsByUserId[u.id.toString()] ?? [];
+        // Get all the workspaces of the user.
+        const workspacesOfUser = removeNulls(
+          allMembershipsOfUser.map(
+            (m) => workspaceById[m.workspaceId.toString()]
+          )
+        );
+        if (
+          workspacesOfUser.some((w) => {
+            const subscription = subscriptionsByWorkspaceModelId[w.id];
+            return (
+              subscription &&
+              ![FREE_TEST_PLAN_CODE, FREE_NO_PLAN_CODE].includes(
+                subscription.getPlan().code
+              )
+            );
+          })
+        ) {
+          // If any of the workspaces has a real subscription, do not delete the user.
+          return;
+        }
+
+        // Delete the user from Customer.io.
+        logger.info(
+          { userId: u.sId },
+          "User is not tied to a workspace with a real subscription anymore, deleting from Customer.io."
+        );
+
+        return CustomerioServerSideTracking.deleteUser({
+          user: u.toJSON(),
+        }).catch((err) => {
+          logger.error(
+            { userId: u.sId, err },
+            "Failed to delete user on Customer.io"
+          );
+        });
+      })
+    );
+  }
+
+  await CustomerioServerSideTracking.deleteWorkspace({
+    workspace: renderLightWorkspaceType({ workspace: w }),
+  }).catch((err) => {
+    logger.error(
+      { workspaceId: w.sId, err },
+      "Failed to delete workspace on Customer.io"
+    );
+  });
+}
+
+export async function endSubscriptionFreeEndedWorkspacesActivity(): Promise<{
+  workspaceIds: string[];
+}> {
+  const { workspaces } =
+    await SubscriptionResource.internalFetchWorkspacesWithFreeEndedSubscriptions(
+      { limit: MAX_WORKSPACES_TO_DOWNGRADE_PER_RUN }
+    );
+
+  await concurrentExecutor(
+    workspaces,
+    async (workspace) => {
+      await SubscriptionResource.endActiveSubscription(workspace);
+    },
+    {
+      concurrency: 4,
+    }
+  );
+
+  return {
+    workspaceIds: workspaces.map((w) => w.sId),
+  };
+}

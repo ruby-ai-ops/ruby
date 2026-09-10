@@ -1,0 +1,119 @@
+import { launchJoinChannelWorkflow } from "@connectors/connectors/slack/temporal/client";
+import { apiConfig } from "@connectors/lib/api/config";
+import { dataSourceConfigFromConnector } from "@connectors/lib/api/data_source_config";
+import type { Logger } from "@connectors/logger/logger";
+import { ConnectorResource } from "@connectors/resources/connector_resource";
+import { SlackConfigurationResource } from "@connectors/resources/slack_configuration_resource";
+import type { SlackAutoReadPattern } from "@connectors/types";
+import type { ConnectorProvider, Result } from "@ruby-ai/client";
+import { RubyAPI, Err, Ok } from "@ruby-ai/client";
+import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
+
+export function findMatchingChannelPatterns(
+  remoteChannelName: string,
+  autoReadChannelPatterns: SlackAutoReadPattern[]
+): SlackAutoReadPattern[] {
+  return autoReadChannelPatterns.filter((pattern) => {
+    const regex = new RegExp(`^${pattern.pattern}$`);
+    return regex.test(remoteChannelName);
+  });
+}
+
+export async function autoReadChannel(
+  teamId: string,
+  logger: Logger,
+  slackChannelId: string,
+  provider: Extract<ConnectorProvider, "slack_bot" | "slack"> = "slack"
+): Promise<Result<boolean, Error>> {
+  const slackConfigurations = await SlackConfigurationResource.listForTeamId(
+    teamId,
+    provider
+  );
+  const connectorIds = slackConfigurations.map((c) => c.connectorId);
+  const connectors = await ConnectorResource.fetchByIds(provider, connectorIds);
+  const connector = connectors.find((c) => c.type === provider);
+
+  if (!connector) {
+    // Expected on shared channels and Enterprise Grid orgs: the channel's
+    // context team may have no connector at all. Nothing to auto-read.
+    logger.info(
+      { teamId, slackChannelId, provider },
+      "Ignoring channel: no connector for team"
+    );
+    return new Ok(false);
+  }
+
+  const slackConfiguration = slackConfigurations.find(
+    (c) => c.connectorId === connector.id
+  );
+
+  if (!slackConfiguration) {
+    return new Err(
+      new Error(`Slack configuration not found for teamId ${teamId}`)
+    );
+  }
+
+  // Check if the workspace is in maintenance mode before launching the workflow
+  const dataSourceConfig = dataSourceConfigFromConnector(connector);
+  const rubyAPI = new RubyAPI(
+    {
+      url: apiConfig.getRubyFrontAPIUrl(),
+    },
+    {
+      apiKey: dataSourceConfig.workspaceAPIKey,
+      workspaceId: dataSourceConfig.workspaceId,
+    },
+    logger
+  );
+
+  // Probe the workspace: /exists does no work beyond authentication and
+  // returns an error when the workspace is gone, relocated, in maintenance or
+  // on a plan without API access. Nothing to auto-read in those cases.
+  const existsRes = await rubyAPI.exists();
+  if (existsRes.isErr()) {
+    logger.info(
+      {
+        connectorId: connector.id,
+        teamId,
+        workspaceId: dataSourceConfig.workspaceId,
+        error: existsRes.error.message,
+      },
+      "Skipping auto-read channel: workspace is unavailable"
+    );
+    return new Ok(false);
+  }
+
+  const { connectorId, autoReadChannelPatterns } = slackConfiguration;
+
+  // If no patterns are configured, nothing to do
+  if (!autoReadChannelPatterns || autoReadChannelPatterns.length === 0) {
+    return new Ok(false);
+  }
+
+  // Launch workflow which will check if channel matches patterns and process accordingly
+  const workflowResult = await launchJoinChannelWorkflow(
+    connectorId,
+    slackChannelId,
+    "auto-read"
+  );
+
+  if (workflowResult.isErr()) {
+    // Check if this is the "operation in progress" error
+    if (workflowResult.error instanceof WorkflowExecutionAlreadyStartedError) {
+      // For auto-read, if the operation is already in progress, that's fine
+      logger.info(
+        {
+          connectorId,
+          slackChannelId,
+          teamId,
+        },
+        "Auto-read channel join already in progress"
+      );
+      return new Ok(true);
+    }
+
+    return new Err(workflowResult.error);
+  }
+
+  return new Ok(true);
+}

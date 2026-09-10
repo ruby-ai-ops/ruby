@@ -1,0 +1,146 @@
+import type { Authenticator } from "@app/lib/auth";
+import { ConversationSandboxAdapter } from "@app/lib/resources/conversation_sandbox_adapter";
+import type { FrameSandboxOwner } from "@app/lib/resources/frame_sandbox_adapter";
+import { FrameSandboxAdapter } from "@app/lib/resources/frame_sandbox_adapter";
+import { PodSandboxAdapter } from "@app/lib/resources/pod_sandbox_adapter";
+import { SandboxResource } from "@app/lib/resources/sandbox_resource";
+import type { SpaceResource } from "@app/lib/resources/space_resource";
+import type { SandboxStatus } from "@app/lib/resources/storage/models/sandbox";
+import {
+  SandboxModel,
+  SandboxOwnerModel,
+} from "@app/lib/resources/storage/models/sandbox";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+
+export class SandboxFactory {
+  static async create(
+    auth: Authenticator,
+    conversation: ConversationWithoutContentType,
+    opts?: {
+      status?: SandboxStatus;
+      statusChangedAt?: Date | null;
+      lastActivityAt?: Date;
+      baseImage?: string;
+      version?: string;
+      killRequestedAt?: Date | null;
+    }
+  ): Promise<SandboxResource> {
+    const sandbox = await SandboxResource.makeNew(auth, {
+      providerId: `test-provider-${Date.now()}`,
+      status: opts?.status ?? "running",
+      baseImage: opts?.baseImage ?? "ruby-base",
+      version: opts?.version ?? "0.0.0-test",
+    });
+
+    await SandboxOwnerModel.create({
+      workspaceId: auth.getNonNullableWorkspace().id,
+      conversationId: conversation.id,
+      sandboxId: sandbox.id,
+    });
+
+    if (opts?.statusChangedAt !== undefined) {
+      await SandboxModel.update(
+        { statusChangedAt: opts.statusChangedAt } as Partial<SandboxModel>,
+        { where: { id: sandbox.id } }
+      );
+    }
+
+    if (opts?.killRequestedAt !== undefined) {
+      await SandboxModel.update(
+        { killRequestedAt: opts.killRequestedAt } as Partial<SandboxModel>,
+        { where: { id: sandbox.id } }
+      );
+    }
+
+    if (opts?.lastActivityAt !== undefined) {
+      await SandboxModel.update(
+        { lastActivityAt: opts.lastActivityAt } as Partial<SandboxModel>,
+        { where: { id: sandbox.id } }
+      );
+    }
+
+    const result = await ConversationSandboxAdapter.fetchSandbox(
+      auth,
+      conversation
+    );
+    if (!result) {
+      throw new Error("Sandbox not found after creation");
+    }
+    return result;
+  }
+
+  static async createForPod(
+    auth: Authenticator,
+    pod: SpaceResource,
+    opts?: {
+      status?: SandboxStatus;
+      killRequestedAt?: Date;
+      lastActivityAt?: Date;
+    }
+  ): Promise<SandboxResource> {
+    const sandbox = await SandboxResource.makeNew(auth, {
+      providerId: `test-provider-${Date.now()}`,
+      status: opts?.status ?? "running",
+      baseImage: "ruby-base",
+      version: "0.0.0-test",
+    });
+    if (opts?.killRequestedAt) {
+      await SandboxModel.update(
+        { killRequestedAt: opts.killRequestedAt } as Partial<SandboxModel>,
+        { where: { id: sandbox.id } }
+      );
+    }
+    if (opts?.lastActivityAt !== undefined) {
+      await SandboxModel.update(
+        { lastActivityAt: opts.lastActivityAt } as Partial<SandboxModel>,
+        { where: { id: sandbox.id } }
+      );
+    }
+
+    await SandboxOwnerModel.create({
+      workspaceId: auth.getNonNullableWorkspace().id,
+      spaceId: pod.id,
+      sandboxId: sandbox.id,
+    });
+
+    const result = await PodSandboxAdapter.fetchSandbox(auth, pod);
+    if (!result) {
+      throw new Error("Pod sandbox not found after creation");
+    }
+    return result;
+  }
+
+  static async createForFrame(
+    auth: Authenticator,
+    frame: FrameSandboxOwner,
+    opts?: {
+      status?: SandboxStatus;
+      killRequestedAt?: Date;
+    }
+  ): Promise<SandboxResource> {
+    const sandbox = await SandboxResource.makeNew(auth, {
+      providerId: `test-provider-${Date.now()}`,
+      status: opts?.status ?? "running",
+      baseImage: "ruby-base",
+      version: "0.0.0-test",
+    });
+    if (opts?.killRequestedAt) {
+      await SandboxModel.update(
+        { killRequestedAt: opts.killRequestedAt } as Partial<SandboxModel>,
+        { where: { id: sandbox.id } }
+      );
+    }
+
+    await SandboxOwnerModel.create({
+      workspaceId: auth.getNonNullableWorkspace().id,
+      frameFileModelId: frame.id,
+      sandboxId: sandbox.id,
+    });
+
+    const result = await FrameSandboxAdapter.fetchSandbox(auth, frame);
+    if (!result) {
+      throw new Error("Frame sandbox not found after creation");
+    }
+    return result;
+  }
+}

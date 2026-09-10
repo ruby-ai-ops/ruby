@@ -1,0 +1,206 @@
+import { useAgentBuilderContext } from "@app/components/agent_builder/AgentBuilderContext";
+import type { AgentBuilderFormData } from "@app/components/agent_builder/AgentBuilderFormContext";
+import { submitAgentBuilderForm } from "@app/components/agent_builder/submitAgentBuilderForm";
+import { useCreateConversationWithMessage } from "@app/hooks/useCreateConversationWithMessage";
+import { useSendNotification } from "@app/hooks/useNotification";
+import { useAuth } from "@app/lib/auth/AuthContext";
+import type { RubyError } from "@app/lib/error";
+import { useFetcher } from "@app/lib/swr/swr";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import type { ConversationType } from "@app/types/assistant/conversation";
+import type { RichMention } from "@app/types/assistant/mentions";
+import type { ContentFragmentsType } from "@app/types/content_fragment";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import isEqual from "lodash/isEqual";
+import { useCallback, useRef, useState } from "react";
+import { useFormContext } from "react-hook-form";
+
+export function useDraftAgent() {
+  const { owner, user } = useAgentBuilderContext();
+  const { fetcherWithBody } = useFetcher();
+  const sendNotification = useSendNotification();
+  const { getValues } = useFormContext<AgentBuilderFormData>();
+
+  const lastFormDataRef = useRef<AgentBuilderFormData | null>(null);
+
+  const [draftAgent, setDraftAgent] =
+    useState<LightAgentConfigurationType | null>(null);
+  const [isSavingDraftAgent, setIsSavingDraftAgent] = useState(false);
+  const [draftCreationFailed, setDraftCreationFailed] = useState(false);
+
+  const createDraftAgent =
+    useCallback(async (): Promise<LightAgentConfigurationType | null> => {
+      const formData = getValues();
+
+      const hasContent =
+        formData.instructions.trim() || formData.actions.length > 0;
+
+      if (!hasContent) {
+        setDraftCreationFailed(false);
+        return null;
+      }
+
+      setIsSavingDraftAgent(true);
+      setDraftCreationFailed(false);
+
+      lastFormDataRef.current = structuredClone(formData);
+
+      const aRes = await submitAgentBuilderForm({
+        user,
+        formData: {
+          ...formData,
+          agentSettings: {
+            ...formData.agentSettings,
+            name: formData.agentSettings.name || "Preview",
+          },
+        },
+        owner,
+        agentConfigurationId: null,
+        isDraft: true,
+        fetcherWithBody,
+      });
+
+      if (!aRes.isOk()) {
+        sendNotification({
+          title: "Error saving Draft Agent",
+          description: aRes.error.message,
+          type: "error",
+        });
+        setIsSavingDraftAgent(false);
+        setDraftCreationFailed(true);
+        return null;
+      }
+
+      const newDraft = aRes.value;
+
+      setDraftAgent(newDraft);
+      setIsSavingDraftAgent(false);
+      return newDraft;
+    }, [owner, user, sendNotification, getValues, fetcherWithBody]);
+
+  const getDraftAgent =
+    useCallback(async (): Promise<LightAgentConfigurationType | null> => {
+      const formData = getValues();
+
+      if (
+        lastFormDataRef.current &&
+        isEqual(lastFormDataRef.current, formData) &&
+        draftAgent
+      ) {
+        return draftAgent;
+      }
+      return createDraftAgent();
+    }, [getValues, draftAgent, createDraftAgent]);
+
+  return {
+    draftAgent,
+    setDraftAgent,
+    createDraftAgent,
+    isSavingDraftAgent,
+    draftCreationFailed,
+    getDraftAgent,
+  };
+}
+
+export function useDraftConversation({
+  draftAgent,
+  getDraftAgent,
+}: {
+  draftAgent: LightAgentConfigurationType | null;
+  getDraftAgent: () => Promise<LightAgentConfigurationType | null>;
+}) {
+  const { owner } = useAgentBuilderContext();
+  const { user } = useAuth();
+  const sendNotification = useSendNotification();
+  const [conversation, setConversation] = useState<
+    ConversationType | undefined
+  >();
+
+  const createConversationWithMessage = useCreateConversationWithMessage({
+    owner,
+    user,
+  });
+
+  const createConversation = useCallback(
+    async (
+      input: string,
+      mentions: RichMention[],
+      contentFragments: ContentFragmentsType
+    ): Promise<Result<undefined, RubyError>> => {
+      try {
+        // Ensure we have a current draft agent before submitting
+        const currentAgent = await getDraftAgent();
+        if (!currentAgent) {
+          return new Err({
+            code: "internal_error",
+            name: "Draft Agent Creation Failed",
+            message: "Failed to create draft agent before submitting message",
+          });
+        }
+
+        // Update mentions in the message data to use the current draft agent
+        mentions = mentions.map((mention) =>
+          mention.id === draftAgent?.sId && currentAgent?.sId
+            ? { ...mention, id: currentAgent.sId }
+            : mention
+        );
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        // biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
+      } catch (error) {
+        return new Err({
+          code: "internal_error",
+          name: "Draft Agent Creation Failed",
+          message: "Failed to create draft agent before submitting message",
+        });
+      }
+
+      const messageData = {
+        input,
+        mentions: mentions.map((mention) => ({
+          configurationId: mention.id,
+        })),
+        contentFragments,
+      };
+
+      const result = await createConversationWithMessage({
+        messageData,
+        visibility: "test",
+      });
+
+      if (result.isOk()) {
+        setConversation(result.value);
+        return new Ok(undefined);
+      }
+
+      sendNotification({
+        title: result.error.title,
+        description: result.error.message,
+        type: "error",
+      });
+
+      return new Err({
+        code: "internal_error",
+        name: result.error.title,
+        message: result.error.message,
+      });
+    },
+    [
+      createConversationWithMessage,
+      draftAgent?.sId,
+      getDraftAgent,
+      sendNotification,
+    ]
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
+  const resetConversation = useCallback(() => {
+    setConversation(undefined);
+  }, [setConversation]);
+
+  return {
+    conversation,
+    createConversation,
+    resetConversation,
+  };
+}

@@ -1,0 +1,506 @@
+import { InfiniteScroll } from "@app/components/InfiniteScroll";
+import { useSendNotification } from "@app/hooks/useNotification";
+import { getVisualForContentNode } from "@app/lib/content_nodes";
+import { classNames } from "@app/lib/utils";
+import type { ContentNode } from "@app/types/connectors/connectors_api";
+import type { APIError } from "@app/types/error";
+import type { NotificationType } from "@ruby-ai/sparkle";
+import {
+  Brackets,
+  Button,
+  CheckDone01,
+  IconButton,
+  LinkExternal01,
+  SearchInput,
+  Spinner,
+  Tree,
+  useSheetViewport,
+} from "@ruby-ai/sparkle";
+import type { ReactNode } from "react";
+import React, { useCallback, useContext, useRef, useState } from "react";
+
+const unselectedChildren = (
+  selection: Record<string, ContentNodeTreeItemStatus>,
+  node: ContentNode,
+  sendNotification: (notification: NotificationType) => void
+) => {
+  if (Object.entries(selection).some(([, v]) => v.parents === null)) {
+    sendNotification({
+      type: "error",
+      title: "Deselecting partial selection unavailable.",
+      description:
+        "Please deselect manually each node you want to unselect. This is due to nodes not being fully synchronized yet",
+    });
+    return selection;
+  }
+
+  return Object.entries(selection).reduce((acc, [k, v]) => {
+    // we checked above all parents were not null
+    const shouldUnselect = v.parents?.includes(node.internalId);
+    return {
+      ...acc,
+      [k]: {
+        ...v,
+        parents: shouldUnselect ? [] : v.parents,
+        isSelected: v.isSelected && !shouldUnselect,
+      },
+    };
+  }, {});
+};
+
+type UseResourcesHook = (parentId: string | null) => {
+  resources: ContentNode[];
+  totalResourceCount?: number; // This count can be higher than resources.length if the call is paginated.
+  isResourcesLoading: boolean;
+  isResourcesError: boolean;
+  isResourcesTruncated?: boolean;
+  resourcesError?: APIError | null;
+  nextPageCursor?: string | null;
+  loadMore?: () => void;
+  isLoadingMore?: boolean;
+};
+
+export type ContentNodeTreeItemStatus<T extends ContentNode = ContentNode> = {
+  isSelected: boolean;
+  node: T;
+  parents: string[];
+};
+
+export type TreeSelectionModelUpdater = (
+  prev: Record<string, ContentNodeTreeItemStatus>
+) => Record<string, ContentNodeTreeItemStatus>;
+
+type ContextType = {
+  onDocumentViewClick?: (documentId: string) => void;
+  selectedNodes?: Record<string, ContentNodeTreeItemStatus>;
+  setSelectedNodes?: (updater: TreeSelectionModelUpdater) => void;
+  showExpand?: boolean;
+  useResourcesHook: UseResourcesHook;
+  emptyComponent: ReactNode;
+  defaultExpandedIds?: string[];
+  getLabel?: (node: ContentNode) => string;
+};
+
+const ContentNodeTreeContext = React.createContext<ContextType | undefined>(
+  undefined
+);
+
+const ContentNodeTreeContextProvider = ({
+  children,
+  value,
+}: {
+  children: React.ReactNode;
+  value: ContextType;
+}) => {
+  return (
+    <ContentNodeTreeContext.Provider value={value}>
+      {children}
+    </ContentNodeTreeContext.Provider>
+  );
+};
+
+const useContentNodeTreeContext = () => {
+  const context = useContext(ContentNodeTreeContext);
+  if (!context) {
+    throw new Error(
+      "useContentNodeTreeContext must be used within a ContentNodeTreeContext"
+    );
+  }
+  return context;
+};
+
+interface ContentNodeTreeInfiniteScrollProps {
+  loadMore?: () => void;
+  hasMore: boolean;
+  isLoadingMore: boolean;
+}
+
+function ContentNodeTreeInfiniteScroll({
+  loadMore,
+  hasMore,
+  isLoadingMore,
+}: ContentNodeTreeInfiniteScrollProps) {
+  const sheetViewport = useSheetViewport();
+  const isLoadingMoreRef = useRef(isLoadingMore);
+  isLoadingMoreRef.current = isLoadingMore;
+
+  const handleNextPage = useCallback(() => {
+    if (loadMore && !isLoadingMoreRef.current) {
+      loadMore();
+    }
+  }, [loadMore]);
+
+  return (
+    <InfiniteScroll
+      nextPage={handleNextPage}
+      hasMore={hasMore}
+      showLoader={isLoadingMore}
+      loader={
+        <div className="flex justify-center py-2">
+          <Spinner size="sm" />
+        </div>
+      }
+      options={
+        sheetViewport ? { root: sheetViewport, rootMargin: "400px" } : undefined
+      }
+    />
+  );
+}
+
+const PERMISSIONS_ERROR_MESSAGES: Record<string, string> = {
+  rate_limit_error:
+    "Connected service's API limit reached. Please retry shortly.",
+  data_source_auth_error:
+    "Failed to retrieve permissions due to a revoked authorization. Please re-authorize the connection.",
+  connector_oauth_user_must_be_admin:
+    "The connected account does not have sufficient permissions. Please re-authorize the connection with an administrator account.",
+};
+
+interface ContentNodeTreeChildrenProps {
+  depth: number;
+  isRoundedBackground?: boolean;
+  isTitleFilterEnabled?: boolean;
+  parentId: string | null;
+  parentIds: string[];
+  parentIsSelected?: boolean;
+  additionalActions?: (contentNode: ContentNode) => ReactNode;
+}
+
+function ContentNodeTreeChildren({
+  depth,
+  isRoundedBackground,
+  isTitleFilterEnabled,
+  parentId,
+  parentIds,
+  parentIsSelected,
+  additionalActions = undefined,
+}: ContentNodeTreeChildrenProps) {
+  const {
+    onDocumentViewClick,
+    selectedNodes,
+    setSelectedNodes,
+    showExpand,
+    useResourcesHook,
+    emptyComponent,
+    defaultExpandedIds,
+    getLabel,
+  } = useContentNodeTreeContext();
+
+  const sendNotification = useSendNotification();
+  const [filter, setFilter] = useState("");
+  // This is to control when to display the "Select All" vs "unselect All" button.
+  // If the user pressed "select all", we want to display "unselect all" and vice versa.
+  // But if the user types in the search bar, we want to reset the button to "select all".
+  const [selectAllClicked, setSelectAllClicked] = useState(false);
+
+  const {
+    resources,
+    isResourcesLoading,
+    isResourcesError,
+    resourcesError,
+    nextPageCursor,
+    loadMore,
+    isLoadingMore,
+  } = useResourcesHook(parentId);
+
+  const isFiltering = filter.trim().length > 0;
+  const filteredNodes = isFiltering
+    ? resources
+        .filter((n) => n.title.includes(filter))
+        .sort((a, b) => a.title.localeCompare(b.title))
+    : resources;
+
+  const getCheckedState = useCallback(
+    (node: ContentNode) => {
+      if (!selectedNodes) {
+        return false;
+      }
+
+      // If the parent is selected, the node is considered selected.
+      if (parentIsSelected) {
+        return true;
+      }
+
+      // Check if there is a local state for this node.
+      const localState = selectedNodes[node.internalId];
+      if (localState?.isSelected) {
+        return true;
+      }
+
+      const internalPartiallySelectedId = Object.values(selectedNodes)
+        .map((status) => status.parents)
+        .flat();
+      if (internalPartiallySelectedId.includes(node.internalId)) {
+        return "partial";
+      }
+
+      // Return false if no custom function is provided.
+      return false;
+    },
+    [parentIsSelected, selectedNodes]
+  );
+
+  if (isResourcesError) {
+    const errorMessage =
+      (resourcesError?.type &&
+        PERMISSIONS_ERROR_MESSAGES[resourcesError.type]) ||
+      "Failed to retrieve permissions due to an unexpected error. The resource may have been deleted, moved, or its sharing permissions changed.";
+
+    return <div className="text-sm text-warning">{errorMessage}</div>;
+  }
+
+  const tree = (
+    <Tree isLoading={isResourcesLoading} isBoxed={isRoundedBackground}>
+      {!isResourcesLoading &&
+        filteredNodes &&
+        filteredNodes.length === 0 &&
+        (emptyComponent ?? <Tree.Empty label="No documents" />)}
+
+      {filteredNodes.map((n) => {
+        const checkedState = getCheckedState(n);
+        return (
+          <Tree.Item
+            key={n.internalId}
+            id={`tree-node-${n.internalId}`}
+            type={
+              showExpand === false ? "item" : n.expandable ? "node" : "leaf"
+            }
+            label={getLabel ? getLabel(n) : n.title}
+            labelClassName={
+              n.providerVisibility === "private"
+                ? "after:content-['(private)'] after:text-warning after:ml-1"
+                : ""
+            }
+            visual={getVisualForContentNode(n)}
+            className={`whitespace-nowrap tree-depth-${depth}`}
+            defaultCollapsed={
+              !defaultExpandedIds || !defaultExpandedIds.includes(n.internalId)
+            }
+            checkbox={
+              (n.preventSelection !== true || checkedState === "partial") &&
+              selectedNodes
+                ? {
+                    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+                    disabled: parentIsSelected || !setSelectedNodes,
+                    checked: checkedState,
+                    onCheckedChange: (v) => {
+                      if (setSelectedNodes) {
+                        if (checkedState === "partial") {
+                          // Handle clicking on partial: unselect all selected children
+                          setSelectedNodes((prev) =>
+                            unselectedChildren(prev, n, sendNotification)
+                          );
+                        } else {
+                          setSelectedNodes((prev) => ({
+                            ...prev,
+                            [n.internalId]: {
+                              isSelected: v === "indeterminate" ? true : v,
+                              node: n,
+                              parents: v ? parentIds : [],
+                            },
+                          }));
+                        }
+                      }
+                    },
+                  }
+                : undefined
+            }
+            actions={
+              <div className="mr-8 flex grow flex-row justify-between gap-2">
+                {additionalActions && additionalActions(n)}
+                {n.sourceUrl && (
+                  <Button
+                    href={n.sourceUrl}
+                    icon={LinkExternal01}
+                    size="xs"
+                    variant="outline"
+                  />
+                )}
+                {onDocumentViewClick && (
+                  <IconButton
+                    size="xs"
+                    icon={Brackets}
+                    onClick={() => {
+                      if (n.type === "document") {
+                        onDocumentViewClick(n.internalId);
+                      }
+                    }}
+                    className={classNames(
+                      n.type === "document"
+                        ? ""
+                        : "pointer-events-none opacity-0"
+                    )}
+                    disabled={n.type !== "document"}
+                    variant="outline"
+                  />
+                )}
+              </div>
+            }
+            renderTreeItems={() => {
+              return (
+                <ContentNodeTreeChildren
+                  depth={depth + 1}
+                  parentId={n.internalId}
+                  parentIds={[n.internalId, ...parentIds]}
+                  parentIsSelected={getCheckedState(n) === true}
+                  additionalActions={additionalActions}
+                />
+              );
+            }}
+          />
+        );
+      })}
+    </Tree>
+  );
+
+  return (
+    <>
+      {isTitleFilterEnabled && setSelectedNodes && (
+        <>
+          <div className="flex w-full flex-row items-center">
+            <div className="flex-grow p-1">
+              <SearchInput
+                name="search"
+                placeholder="Search"
+                value={filter}
+                onChange={(v) => {
+                  setFilter(v);
+                  setSelectAllClicked(false);
+                }}
+              />
+            </div>
+
+            <Button
+              icon={CheckDone01}
+              label={selectAllClicked ? "Unselect All" : "Select All"}
+              size="sm"
+              className="m-1"
+              variant="ghost"
+              disabled={filteredNodes.length === 0}
+              onClick={() => {
+                const isSelected = !selectAllClicked;
+                setSelectAllClicked(isSelected);
+                setSelectedNodes((prev) => {
+                  const newState = { ...prev };
+                  const nodesToUpdate = isSelected
+                    ? filteredNodes.filter((n) => n.preventSelection !== true)
+                    : filteredNodes;
+                  nodesToUpdate.forEach((n) => {
+                    newState[n.internalId] = {
+                      isSelected,
+                      node: n,
+                      parents: isSelected ? parentIds : [],
+                    };
+                  });
+                  return newState;
+                });
+              }}
+            />
+          </div>
+        </>
+      )}
+      <div className="p-1">
+        {tree}
+        <ContentNodeTreeInfiniteScroll
+          loadMore={loadMore}
+          hasMore={!!nextPageCursor}
+          isLoadingMore={!!isLoadingMore}
+        />
+      </div>
+    </>
+  );
+}
+
+interface ContentNodeTreeProps {
+  /**
+   * If true, the tree will have a rounded background.
+   */
+  isRoundedBackground?: boolean;
+  /**
+   * If true, a search bar will be displayed at the top of the tree.
+   */
+  isTitleFilterEnabled?: boolean;
+  /**
+   * Whole tree will be considered selected and disabled.
+   */
+  parentIsSelected?: boolean;
+  /**
+   * Callback when the user clicks on the "view document" action
+   * If undefined, the action will not be displayed.
+   */
+  onDocumentViewClick?: (documentId: string) => void;
+  /**
+   * The current nodes selection.
+   * If undefined, no checkbox will be displayed.
+   */
+  selectedNodes?: Record<string, ContentNodeTreeItemStatus>;
+  /**
+   * This function is called when the user selects or unselects a node.
+   * If undefined, the tree will be read-only.
+   */
+  setSelectedNodes?: (updater: TreeSelectionModelUpdater) => void;
+  /**
+   * If true, the expand/collapse buttons will be displayed.
+   */
+  showExpand?: boolean;
+  /**
+   * The hook to fetch the resources under a given parent.
+   */
+  useResourcesHook: UseResourcesHook;
+  /**
+   * The component to display when an item is expanded and it has no children.
+   */
+  emptyComponent?: ReactNode;
+  /**
+   * The ids of the nodes to be expanded by default.
+   */
+  defaultExpandedIds?: string[];
+  /**
+   * Additional actions to display on for each node.
+   */
+  additionalActionsForContentNode?: (contentNode: ContentNode) => ReactNode;
+  /**
+   * Optional function to compute the display label for a node. Defaults to node.title.
+   */
+  getLabel?: (node: ContentNode) => string;
+}
+
+export function ContentNodeTree({
+  isRoundedBackground,
+  isTitleFilterEnabled,
+  onDocumentViewClick,
+  parentIsSelected,
+  selectedNodes,
+  setSelectedNodes,
+  showExpand,
+  useResourcesHook,
+  emptyComponent,
+  defaultExpandedIds,
+  additionalActionsForContentNode,
+  getLabel,
+}: ContentNodeTreeProps) {
+  return (
+    <ContentNodeTreeContextProvider
+      value={{
+        onDocumentViewClick,
+        selectedNodes,
+        setSelectedNodes,
+        showExpand,
+        useResourcesHook,
+        emptyComponent,
+        defaultExpandedIds,
+        getLabel,
+      }}
+    >
+      <ContentNodeTreeChildren
+        depth={0}
+        isRoundedBackground={isRoundedBackground}
+        isTitleFilterEnabled={isTitleFilterEnabled}
+        parentId={null}
+        parentIds={[]}
+        parentIsSelected={parentIsSelected ?? false}
+        additionalActions={additionalActionsForContentNode}
+      />
+    </ContentNodeTreeContextProvider>
+  );
+}

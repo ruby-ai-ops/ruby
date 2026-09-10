@@ -1,0 +1,119 @@
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { SkillResource } from "@app/lib/resources/skill/skill_resource";
+import logger from "@app/logger/logger";
+import { ConversationError } from "@app/types/assistant/conversation";
+import { apiErrorForConversation } from "@front-api/lib/api/assistant/conversation/helper";
+import { workspaceApp } from "@front-api/middlewares/ctx";
+import { apiError } from "@front-api/middlewares/utils";
+import { validate } from "@front-api/middlewares/validator";
+import { z } from "zod";
+
+const ParamsSchema = z.object({
+  cId: z.string(),
+});
+
+const ConversationSkillActionRequestSchema = z.object({
+  action: z.enum(["add", "delete"]),
+  skillId: z.string(),
+});
+
+// Mounted at /api/w/:wId/assistant/conversations/:cId/skills.
+const app = workspaceApp();
+
+/** @ignoreswagger */
+app.get("/", validate("param", ParamsSchema), async (ctx) => {
+  const auth = ctx.get("auth");
+  const { cId: conversationId } = ctx.req.valid("param");
+
+  const conversation = await ConversationResource.fetchById(
+    auth,
+    conversationId
+  );
+  if (!conversation) {
+    return apiErrorForConversation(
+      ctx,
+      new ConversationError("conversation_not_found")
+    );
+  }
+
+  const conversationSkills = await SkillResource.listEnabledByConversation(
+    auth,
+    { conversation: conversation.toJSON() }
+  );
+
+  return ctx.json({ skills: conversationSkills.map((s) => s.toJSON(auth)) });
+});
+
+app.post(
+  "/",
+  validate("param", ParamsSchema),
+  validate("json", ConversationSkillActionRequestSchema),
+  async (ctx) => {
+    const auth = ctx.get("auth");
+    const { cId: conversationId } = ctx.req.valid("param");
+
+    const conversationResource = await ConversationResource.fetchById(
+      auth,
+      conversationId
+    );
+    if (!conversationResource) {
+      return apiErrorForConversation(
+        ctx,
+        new ConversationError("conversation_not_found")
+      );
+    }
+
+    const conversation = conversationResource.toJSON();
+
+    const { action, skillId } = ctx.req.valid("json");
+
+    const skillRes = await SkillResource.fetchById(auth, skillId);
+
+    if (!skillRes) {
+      logger.error(
+        {
+          skillId,
+          conversationId,
+          workspaceId: auth.getNonNullableWorkspace().sId,
+        },
+        "Skill not found"
+      );
+      return apiError(ctx, {
+        status_code: 404,
+        api_error: {
+          type: "skill_not_found",
+          message: "Skill not found",
+        },
+      });
+    }
+
+    const r = await SkillResource.upsertConversationSkills(auth, {
+      conversation,
+      skills: [skillRes],
+      enabled: action === "add",
+    });
+    if (r.isErr()) {
+      logger.error(
+        {
+          error: r.error,
+          skillId,
+          conversationId,
+          action,
+          workspaceId: auth.getNonNullableWorkspace().sId,
+        },
+        "Failed to upsert skill to conversation"
+      );
+      return apiError(ctx, {
+        status_code: 500,
+        api_error: {
+          type: "internal_server_error",
+          message: "Failed to add skill to conversation",
+        },
+      });
+    }
+
+    return ctx.json({ success: true });
+  }
+);
+
+export default app;

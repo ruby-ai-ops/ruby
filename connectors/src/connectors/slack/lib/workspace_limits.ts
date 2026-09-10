@@ -1,0 +1,405 @@
+import {
+  isSlackPostingPermissionError,
+  SlackExternalUserError,
+} from "@connectors/connectors/slack/lib/errors";
+import type { SlackUserInfo } from "@connectors/connectors/slack/lib/slack_client";
+import {
+  getSlackConversationInfo,
+  reportSlackUsage,
+} from "@connectors/connectors/slack/lib/slack_client";
+import { dataSourceConfigFromConnector } from "@connectors/lib/api/data_source_config";
+import { getRubyAPI } from "@connectors/lib/api/ruby_api";
+import { makeRubyAppUrl } from "@connectors/lib/bot/conversation_utils";
+import { isActiveMemberOfWorkspace } from "@connectors/lib/bot/user_validation";
+import logger from "@connectors/logger/logger";
+import type { ConnectorResource } from "@connectors/resources/connector_resource";
+import { SlackConfigurationResource } from "@connectors/resources/slack_configuration_resource";
+import { cacheWithRedis } from "@connectors/types";
+import type { Result, WorkspaceDomainType } from "@ruby-ai/client";
+import { Err, normalizeError, Ok } from "@ruby-ai/client";
+import type { WebClient } from "@slack/web-api";
+import type {} from "@slack/web-api/dist/types/response/UsersInfoResponse";
+
+async function getVerifiedDomainsForWorkspace(
+  connector: ConnectorResource
+): Promise<WorkspaceDomainType[]> {
+  const ds = dataSourceConfigFromConnector(connector);
+
+  const rubyAPI = getRubyAPI(ds);
+
+  const workspaceVerifiedDomainsRes =
+    await rubyAPI.getWorkspaceVerifiedDomains();
+  if (workspaceVerifiedDomainsRes.isErr()) {
+    logger.error("Error getting verified domains for workspace.", {
+      error: workspaceVerifiedDomainsRes.error,
+    });
+
+    throw new Error("Error getting verified domains for workspace.");
+  }
+
+  return workspaceVerifiedDomainsRes.value;
+}
+
+export const getVerifiedDomainsForWorkspaceMemoized = cacheWithRedis(
+  getVerifiedDomainsForWorkspace,
+  (connector: ConnectorResource) => {
+    return `workspace-verified-domains-${connector.id}`;
+  },
+  // Caches data for 15 minutes to limit frequent API calls.
+  // Note: Updates (e.g., workspace verified domains) may take up to 15 minutes to be reflected.
+  {
+    ttlMs: 15 * 10 * 1000,
+  }
+);
+
+function getSlackUserEmailFromProfile(
+  slackUserInfo: SlackUserInfo | undefined
+): string | undefined {
+  return slackUserInfo?.email?.toLowerCase();
+}
+
+function getSlackUserEmailDomainFromProfile(
+  slackUserInfo: SlackUserInfo | undefined
+): string | undefined {
+  return getSlackUserEmailFromProfile(slackUserInfo)?.split("@")[1];
+}
+
+async function isAutoJoinEnabledForDomain(
+  connector: ConnectorResource,
+  slackUserInfo: SlackUserInfo
+): Promise<boolean> {
+  const userDomain = getSlackUserEmailDomainFromProfile(slackUserInfo);
+  if (!userDomain) {
+    return false;
+  }
+
+  const verifiedDomains =
+    await getVerifiedDomainsForWorkspaceMemoized(connector);
+
+  const isDomainAutoJoinEnabled = verifiedDomains.find(
+    (vd) => vd.domain === userDomain
+  );
+
+  return isDomainAutoJoinEnabled?.domainAutoJoinEnabled ?? false;
+}
+
+function makeSlackMembershipAccessBlocksForConnector(
+  connector: ConnectorResource
+) {
+  return {
+    autojoin_enabled: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "The Slack integration is accessible to members of your company's Ruby workspace. Click 'Join My Workspace' to get started. For help, contact an administrator.",
+        },
+      },
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            text: {
+              type: "plain_text",
+              text: "Join My Workspace",
+              emoji: true,
+            },
+            style: "primary",
+            value: "join_my_workspace_cta",
+            action_id: "actionId-0",
+            url: makeRubyAppUrl(
+              `/w/${connector.workspaceId}/join?wId=${connector.workspaceId}`
+            ),
+          },
+        ],
+      },
+    ],
+    autojoin_disabled: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "It looks like you're not a member of your company's Ruby workspace yet. Please reach out to an administrator to join and start using Ruby on Slack.",
+        },
+      },
+    ],
+  };
+}
+
+async function postMessageForUnauthorizedUser(
+  connector: ConnectorResource,
+  slackClient: WebClient,
+  slackUserInfo: SlackUserInfo,
+  slackInfos: SlackInfos
+): Promise<Result<undefined, Error>> {
+  const { slackChannelId, slackMessageTs } = slackInfos;
+
+  const autoJoinEnabled = await isAutoJoinEnabledForDomain(
+    connector,
+    slackUserInfo
+  );
+
+  const slackMessageBlocks =
+    makeSlackMembershipAccessBlocksForConnector(connector)[
+      autoJoinEnabled ? "autojoin_enabled" : "autojoin_disabled"
+    ];
+
+  reportSlackUsage({
+    connectorId: connector.id,
+    method: "chat.postMessage",
+    channelId: slackChannelId,
+  });
+  try {
+    await slackClient.chat.postMessage({
+      channel: slackChannelId,
+      blocks: slackMessageBlocks,
+      thread_ts: slackMessageTs,
+    });
+    return new Ok(undefined);
+  } catch (error) {
+    return new Err(normalizeError(error));
+  }
+}
+
+export async function isBotAllowed(
+  connector: ConnectorResource,
+  slackUserInfo: SlackUserInfo
+): Promise<Result<undefined, Error>> {
+  const realName = slackUserInfo.real_name;
+
+  if (!realName) {
+    throw new Error("Failed to get bot name. Should never happen.");
+  }
+
+  // Whitelisting a bot will accept any message from this bot.
+  // This means that even a non verified user of a given Slack workspace who can trigger a bot
+  // that talks to our bot (@ruby) will be able to use the Ruby bot.
+  // Make sure to be explicit about this with users as you whitelist a new bot.
+  // Example: non-verified-user -> @AnyWhitelistedBot -> @ruby -> Ruby answers with potentially private information.
+  const slackConfig = await SlackConfigurationResource.fetchByConnectorId(
+    connector.id
+  );
+  const whitelist = await slackConfig?.isBotWhitelistedToSummon(
+    realName.trim() // sometimes the user put a space at the end of the bot name
+  );
+
+  if (!whitelist) {
+    logger.info(
+      { user: slackUserInfo, connectorId: connector.id },
+      "Ignoring bot message"
+    );
+
+    return new Err(
+      new SlackExternalUserError(
+        "To enable Slack Workflows to call Ruby agents, email us at support@ruby.ad."
+      )
+    );
+  }
+
+  return new Ok(undefined);
+}
+
+interface SlackInfos {
+  slackChannelId: string;
+  slackMessageTs: string;
+  slackTeamId: string;
+}
+
+type SlackUserAuthorization = {
+  authorized: boolean;
+  groupIds: string[];
+};
+
+// Verify the Slack user is not an external guest to the workspace.
+// An exception is made for users from domains on the whitelist,
+// allowing them to interact with the bot in public channels.
+// See incident: https://ruby4ai.slack.com/archives/C05B529FHV1/p1704799263814619.
+async function isExternalUserAllowed(
+  connector: ConnectorResource,
+  slackClient: WebClient,
+  slackUserInfo: SlackUserInfo,
+  slackInfos: SlackInfos,
+  // Whitelisted domains are in the format "domain:group_id".
+  whitelistedDomains?: readonly string[]
+): Promise<{ authorized: boolean; groupIds: string[] }> {
+  // If the email is confirmed by Slack AND the user is an active Ruby workspace
+  // member, treat them like a regular member — no group restriction needed.
+  if (
+    slackUserInfo.is_email_confirmed &&
+    (await isUserAllowed(connector, slackUserInfo))
+  ) {
+    return { authorized: true, groupIds: [] };
+  }
+
+  const { slackChannelId } = slackInfos;
+
+  const userDomain = getSlackUserEmailDomainFromProfile(slackUserInfo);
+
+  if (!userDomain || !whitelistedDomains) {
+    return { authorized: false, groupIds: [] };
+  }
+
+  const authorization = whitelistedDomains.reduce(
+    (acc, domain) => {
+      const [whitelistedDomain, whitelistedGroup] = domain.split(":");
+      if (userDomain === whitelistedDomain && whitelistedGroup) {
+        acc.authorized = true;
+        acc.groupIds.push(whitelistedGroup);
+      }
+      return acc;
+    },
+    {
+      authorized: false,
+      groupIds: [],
+    } as { authorized: boolean; groupIds: string[] }
+  );
+
+  const slackConversationInfo = await getSlackConversationInfo(
+    connector.id,
+    slackClient,
+    slackChannelId
+  );
+  if (!slackConversationInfo) {
+    return { authorized: false, groupIds: [] };
+  }
+
+  const isChannelPublic = !slackConversationInfo.channel?.is_private;
+  if (!isChannelPublic) {
+    return { authorized: false, groupIds: [] };
+  }
+
+  // Matteo 2026-04-23: Log when a whitelisted user is authorized with an unverified email.
+  // This helps us understand how many external users are being let through without
+  // Slack's email confirmation guarantee, before we decide whether to tighten this.
+  if (authorization.authorized && !slackUserInfo.is_email_confirmed) {
+    logger.warn(
+      {
+        connectorId: connector.id,
+        slackUserEmail: getSlackUserEmailFromProfile(slackUserInfo),
+      },
+      "Whitelisted Slack user authorized with unverified email."
+    );
+  }
+
+  return authorization;
+}
+
+async function isUserAllowed(
+  connector: ConnectorResource,
+  slackUserInfo: SlackUserInfo
+) {
+  const isMember = await isActiveMemberOfWorkspace(
+    connector,
+    getSlackUserEmailFromProfile(slackUserInfo)
+  );
+  if (isMember) {
+    return true;
+  }
+  return false;
+}
+
+async function isSlackUserAllowed(
+  slackUserInfo: SlackUserInfo,
+  connector: ConnectorResource,
+  slackClient: WebClient,
+  slackInfos: SlackInfos
+) {
+  const { teamId } = slackUserInfo;
+
+  const isInWorkspace = teamId === slackInfos.slackTeamId;
+  if (!isInWorkspace) {
+    return false;
+  }
+
+  // Otherwise, ensure that the slack user is an active member in the workspace.
+  return isUserAllowed(connector, slackUserInfo);
+}
+
+export async function notifyIfSlackUserIsNotAllowed(
+  connector: ConnectorResource,
+  slackClient: WebClient,
+  slackUserInfo: SlackUserInfo,
+  slackInfos: SlackInfos,
+  whitelistedDomains?: readonly string[]
+): Promise<Result<SlackUserAuthorization, Error>> {
+  if (!slackUserInfo) {
+    return new Ok({ authorized: false, groupIds: [] });
+  }
+
+  // Handle Slack users that we consider external to the Slack workspace,
+  // which can be eventually whitelisted via the `whitelistedDomains` list.
+  const {
+    is_restricted,
+    is_stranger: isStranger,
+    is_ultra_restricted,
+  } = slackUserInfo;
+  const isGuest = is_restricted || is_ultra_restricted;
+  const isExternal = isGuest || isStranger;
+  let isAllowed = false;
+  let externalAuthorization: {
+    authorized: boolean;
+    groupIds: string[];
+  } | null = null;
+
+  if (isExternal) {
+    // If the external user is allowed, they are allowed with a specific group id.
+    externalAuthorization = await isExternalUserAllowed(
+      connector,
+      slackClient,
+      slackUserInfo,
+      slackInfos,
+      whitelistedDomains
+    );
+    isAllowed = externalAuthorization.authorized;
+  } else {
+    // Handle users that are not Slack external.
+    isAllowed = await isSlackUserAllowed(
+      slackUserInfo,
+      connector,
+      slackClient,
+      slackInfos
+    );
+  }
+
+  if (!isAllowed) {
+    logger.info(
+      {
+        connectorId: connector.id,
+        slackInfos,
+        slackUserEmail: getSlackUserEmailFromProfile(slackUserInfo),
+      },
+      "Unauthorized Slack user attempted to access webhook."
+    );
+
+    const postMessageRes = await postMessageForUnauthorizedUser(
+      connector,
+      slackClient,
+      slackUserInfo,
+      slackInfos
+    );
+    if (postMessageRes.isErr()) {
+      if (isSlackPostingPermissionError(postMessageRes.error)) {
+        logger.info(
+          {
+            connectorId: connector.id,
+            failureStage: "unauthorized_user_notification",
+            slackChannelId: slackInfos.slackChannelId,
+            slackErrorCode: postMessageRes.error.data.error,
+            slackTeamId: slackInfos.slackTeamId,
+          },
+          "Slack prevented Ruby from posting an unauthorized-user notification."
+        );
+      } else {
+        return postMessageRes;
+      }
+    }
+  }
+
+  // If the user is part of the Ruby workspace, they are allowed without any explicit group id.
+  if (isExternal && externalAuthorization) {
+    return new Ok(externalAuthorization);
+  }
+
+  return new Ok({ authorized: isAllowed, groupIds: [] });
+}

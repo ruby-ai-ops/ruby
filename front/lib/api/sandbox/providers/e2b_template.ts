@@ -1,0 +1,382 @@
+/**
+ * E2B-specific template building.
+ *
+ * Uses the E2B SDK to build templates from our provider-agnostic Template class.
+ * This is the only template-related file that imports from the E2B SDK.
+ */
+
+import config from "@app/lib/api/config";
+import type { SandboxImage } from "@app/lib/api/sandbox/image";
+import type {
+  ContentGenerator,
+  Operation,
+  SandboxImageId,
+  SandboxResources,
+} from "@app/lib/api/sandbox/image/types";
+import { formatSandboxImageId } from "@app/lib/api/sandbox/image/types";
+import logger from "@app/logger/logger";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { TemplateBuilder } from "e2b";
+import {
+  ApiClient,
+  ConnectionConfig,
+  defaultBuildLogger,
+  Template as E2BTemplate,
+} from "e2b";
+import * as fs from "fs";
+import * as path from "path";
+
+export type DockerRegistryFactory = (imageRef: string) => TemplateBuilder;
+
+export function createGCPRegistryFactory(
+  registry: string,
+  serviceAccountPath: string
+): DockerRegistryFactory {
+  const absolutePath = path.isAbsolute(serviceAccountPath)
+    ? serviceAccountPath
+    : path.resolve(process.cwd(), serviceAccountPath);
+  // E2B SDK uses path.join internally which breaks absolute paths.
+  // Compute relative path from this file's directory so E2B resolves correctly.
+  const relativePath = path.relative(__dirname, absolutePath);
+
+  return (imageRef: string) =>
+    E2BTemplate().fromGCPRegistry(`${registry}/${imageRef}`, {
+      serviceAccountJSON: relativePath,
+    });
+}
+
+interface E2BBuildConfig {
+  apiKey?: string;
+  domain?: string;
+  skipCache?: boolean;
+  dockerRegistryFactory?: DockerRegistryFactory;
+}
+
+class ContentMaterializer {
+  private tempDir: string | null = null;
+  private fileCount = 0;
+
+  // Writes the generator's content into a temp subdir under __dirname (E2B
+  // resolves paths from there). For single-file content, dest is treated as
+  // the file path. For multi-file content (Map), dest is treated as the
+  // destination directory.
+  materialize(
+    getContent: ContentGenerator,
+    dest: string
+  ): { tempDir: string; destDir: string } {
+    if (!this.tempDir) {
+      const uniqueId = `sandbox-build-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      this.tempDir = path.join(__dirname, uniqueId);
+      fs.mkdirSync(this.tempDir, { recursive: true });
+    }
+    const contentDir = path.join(this.tempDir, `content-${this.fileCount++}`);
+    fs.mkdirSync(contentDir, { recursive: true });
+
+    const result = getContent();
+    const tempDir = path.relative(__dirname, contentDir);
+    if (result instanceof Map) {
+      for (const [filename, content] of result) {
+        fs.writeFileSync(path.join(contentDir, filename), content);
+      }
+      return { tempDir, destDir: dest };
+    }
+    fs.writeFileSync(path.join(contentDir, path.basename(dest)), result);
+    return { tempDir, destDir: path.dirname(dest) };
+  }
+
+  cleanup(): void {
+    if (this.tempDir) {
+      fs.rmSync(this.tempDir, { recursive: true, force: true });
+    }
+  }
+}
+
+interface E2BTemplateBuildOptions {
+  apiKey: string;
+  domain?: string;
+  skipCache?: boolean;
+  resources: SandboxResources;
+}
+
+class E2BTemplateBuilder {
+  private builder: TemplateBuilder;
+  private readonly materializer = new ContentMaterializer();
+
+  private constructor(builder: TemplateBuilder) {
+    this.builder = builder;
+  }
+
+  static fromSandboxImage(
+    image: SandboxImage,
+    options: { dockerRegistryFactory: DockerRegistryFactory }
+  ): E2BTemplateBuilder {
+    const builder = options.dockerRegistryFactory(image.baseImage.imageRef);
+    const e2bBuilder = new E2BTemplateBuilder(builder);
+
+    for (const op of image.operations) {
+      e2bBuilder.applyOperation(op);
+    }
+
+    return e2bBuilder;
+  }
+
+  private applyOperation(op: Operation): void {
+    switch (op.type) {
+      case "run":
+        if (op.user) {
+          this.builder = this.builder.runCmd(op.command, { user: op.user });
+        } else {
+          this.builder = this.builder.runCmd(op.command);
+        }
+        break;
+
+      case "copy":
+        if (op.src.type === "path") {
+          this.builder = this.builder.copy(op.src.path, op.dest, {
+            user: op.user,
+          });
+        } else {
+          const { tempDir, destDir } = this.materializer.materialize(
+            op.src.getContent,
+            op.dest
+          );
+          this.builder = this.builder.copy(tempDir, destDir, { user: op.user });
+        }
+        break;
+
+      case "workdir":
+        this.builder = this.builder.setWorkdir(op.path);
+        break;
+
+      case "user":
+        this.builder = this.builder.setUser(op.user);
+        break;
+
+      case "env":
+        this.builder = this.builder.setEnvs({ ...op.vars });
+        break;
+
+      default:
+        assertNever(op);
+    }
+  }
+
+  async build(
+    imageId: SandboxImageId,
+    options: E2BTemplateBuildOptions
+  ): Promise<{ templateId: string }> {
+    try {
+      return await E2BTemplate.build(
+        this.builder,
+        formatSandboxImageId(imageId),
+        {
+          cpuCount: options.resources.vcpu,
+          memoryMB: options.resources.memoryMb,
+          apiKey: options.apiKey,
+          ...(options.domain ? { domain: options.domain } : {}),
+          ...(options.skipCache ? { skipCache: true } : {}),
+          onBuildLogs: defaultBuildLogger(),
+        }
+      );
+    } finally {
+      this.materializer.cleanup();
+    }
+  }
+}
+
+export interface E2BTemplateInfo {
+  templateId: string;
+  aliases: readonly string[];
+  // Null until a build completes. E2B registers the template and its alias when
+  // a build starts and only attaches an envd version once one finishes, so an
+  // alias carrying no envd version is the symptom of a half-baked build: it
+  // answers an existence check, but no sandbox can boot from it.
+  envdVersion: string | null;
+}
+
+function createE2BApiClient(apiKey?: string): ApiClient {
+  const e2bConfig = config.getE2BSandboxConfig();
+  const connectionConfig = new ConnectionConfig({
+    apiKey: apiKey ?? e2bConfig.apiKey,
+    ...(e2bConfig.domain ? { domain: e2bConfig.domain } : {}),
+  });
+
+  return new ApiClient(connectionConfig, { requireApiKey: true });
+}
+
+export async function listE2BTemplates(
+  apiKey?: string
+): Promise<Result<E2BTemplateInfo[], Error>> {
+  try {
+    const client = createE2BApiClient(apiKey);
+
+    const response = await client.api.GET("/templates");
+
+    if (response.error) {
+      throw new Error(`E2B API error: ${JSON.stringify(response.error)}`);
+    }
+
+    const templates = response.data ?? [];
+    return new Ok(
+      templates.map((t) => ({
+        templateId: t.templateID,
+        aliases: t.aliases ?? [],
+        envdVersion: t.envdVersion || null,
+      }))
+    );
+  } catch (err) {
+    logger.error({ err: normalizeError(err) }, "Failed to list E2B templates");
+    return new Err(normalizeError(err));
+  }
+}
+
+export async function findE2BTemplate(
+  imageId: SandboxImageId,
+  apiKey?: string
+): Promise<Result<E2BTemplateInfo | null, Error>> {
+  const templatesResult = await listE2BTemplates(apiKey);
+  if (templatesResult.isErr()) {
+    return templatesResult;
+  }
+
+  const expectedAlias = formatSandboxImageId(imageId);
+  const template = templatesResult.value.find((t) =>
+    t.aliases.includes(expectedAlias)
+  );
+
+  return new Ok(template ?? null);
+}
+
+export async function templateExists(
+  imageId: SandboxImageId,
+  apiKey?: string
+): Promise<Result<boolean, Error>> {
+  const templateResult = await findE2BTemplate(imageId, apiKey);
+  if (templateResult.isErr()) {
+    return templateResult;
+  }
+
+  return new Ok(templateResult.value !== null);
+}
+
+// Reciprocal of a failed build: E2B registers the template and its alias the
+// moment a build starts, so a failure leaves an alias that
+// `sandbox_image_check.ts` reads as "already built". A template carrying an
+// envd version completed a build and may be serving sandboxes, so it is never
+// touched here.
+export async function deleteUnbuiltE2BTemplate(
+  imageId: SandboxImageId,
+  apiKey?: string
+): Promise<Result<boolean, Error>> {
+  const templateResult = await findE2BTemplate(imageId, apiKey);
+  if (templateResult.isErr()) {
+    return templateResult;
+  }
+
+  const template = templateResult.value;
+  if (!template || template.envdVersion) {
+    return new Ok(false);
+  }
+
+  const deleteResult = await deleteE2BTemplate(template.templateId, apiKey);
+  if (deleteResult.isErr()) {
+    return deleteResult;
+  }
+
+  return new Ok(true);
+}
+
+export async function deleteE2BTemplate(
+  templateId: string,
+  apiKey?: string
+): Promise<Result<void, Error>> {
+  try {
+    const client = createE2BApiClient(apiKey);
+
+    const response = await client.api.DELETE("/templates/{templateID}", {
+      params: { path: { templateID: templateId } },
+    });
+
+    if (response.error) {
+      throw new Error(`E2B API error: ${JSON.stringify(response.error)}`);
+    }
+
+    return new Ok(undefined);
+  } catch (err) {
+    logger.error(
+      { err: normalizeError(err), templateId },
+      "Failed to delete E2B template"
+    );
+    return new Err(normalizeError(err));
+  }
+}
+
+export async function buildSandboxImage(
+  image: SandboxImage,
+  imageId: SandboxImageId,
+  buildConfig?: E2BBuildConfig
+): Promise<Result<string, Error>> {
+  const e2bConfig = config.getE2BSandboxConfig();
+
+  const apiKey = buildConfig?.apiKey ?? e2bConfig.apiKey;
+  const domain = buildConfig?.domain ?? e2bConfig.domain;
+
+  logger.info(
+    {
+      imageName: imageId.imageName,
+      tag: imageId.tag,
+      domain,
+      skipCache: buildConfig?.skipCache ?? false,
+      cpuCount: image.resources.vcpu,
+      memoryMB: image.resources.memoryMb,
+      operationCount: image.operations.length,
+      toolCount: image.tools.length,
+    },
+    "Building E2B sandbox image"
+  );
+
+  if (!buildConfig?.dockerRegistryFactory) {
+    return new Err(
+      new Error("dockerRegistryFactory is required to build sandbox images")
+    );
+  }
+
+  try {
+    const e2bBuilder = E2BTemplateBuilder.fromSandboxImage(image, {
+      dockerRegistryFactory: buildConfig.dockerRegistryFactory,
+    });
+
+    const result = await e2bBuilder.build(imageId, {
+      apiKey,
+      domain,
+      skipCache: buildConfig?.skipCache,
+      resources: image.resources,
+    });
+
+    logger.info(
+      {
+        templateId: result.templateId,
+        requestedResources: {
+          cpuCount: image.resources.vcpu,
+          memoryMB: image.resources.memoryMb,
+        },
+      },
+      "E2B sandbox image build completed"
+    );
+
+    return new Ok(result.templateId);
+  } catch (err) {
+    logger.error(
+      {
+        err: normalizeError(err),
+        imageName: imageId.imageName,
+        tag: imageId.tag,
+      },
+      "Failed to build E2B sandbox image"
+    );
+    return new Err(normalizeError(err));
+  }
+}

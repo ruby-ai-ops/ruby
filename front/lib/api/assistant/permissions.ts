@@ -1,0 +1,118 @@
+import type { ServerSideMCPServerConfigurationType } from "@app/lib/actions/mcp";
+import type { UnsavedMCPServerConfigurationType } from "@app/lib/actions/types/agent";
+import { isServerSideMCPServerConfiguration } from "@app/lib/actions/types/guards";
+import type { Authenticator } from "@app/lib/auth";
+import { AppResource } from "@app/lib/resources/app_resource";
+import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
+import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
+import type { SkillResource } from "@app/lib/resources/skill/skill_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import type { ModelId } from "@app/types/shared/model_id";
+import { removeNulls } from "@app/types/shared/utils/general";
+import uniq from "lodash/uniq";
+
+export function getDataSourceViewIdsFromActions(
+  actions: UnsavedMCPServerConfigurationType[]
+): string[] {
+  const relevantActions = actions.filter(
+    (action): action is ServerSideMCPServerConfigurationType =>
+      action.type === "mcp_server_configuration" &&
+      isServerSideMCPServerConfiguration(action)
+  );
+
+  return removeNulls(
+    relevantActions.flatMap((action) => {
+      const dataSourceViewIds = new Set<string>();
+
+      if (action.dataSources) {
+        action.dataSources.forEach((dataSource) => {
+          dataSourceViewIds.add(dataSource.dataSourceViewId);
+        });
+      }
+
+      if (action.tables) {
+        action.tables.forEach((table) => {
+          dataSourceViewIds.add(table.dataSourceViewId);
+        });
+      }
+
+      return Array.from(dataSourceViewIds);
+    })
+  );
+}
+
+export async function getAgentConfigurationRequirementsFromCapabilities(
+  auth: Authenticator,
+  {
+    actions,
+    skills,
+    ignoreSpaces,
+  }: {
+    actions: UnsavedMCPServerConfigurationType[];
+    skills: SkillResource[];
+    ignoreSpaces?: SpaceResource[];
+  }
+): Promise<{ requestedSpaceIds: ModelId[] }> {
+  const ignoreSpaceModelIds = new Set(ignoreSpaces?.map((space) => space.id));
+
+  // Collect DataSourceView permissions by space.
+  const dsViews = await DataSourceViewResource.fetchByIds(
+    auth,
+    getDataSourceViewIdsFromActions(actions)
+  );
+  const dsViewRequirements = dsViews.map((view) => view.space.id);
+
+  // Collect MCPServerView permissions by space.
+  const mcpServerViewRequirements =
+    await MCPServerViewResource.listSpaceRequirementsByIds(
+      auth,
+      actions
+        .filter(isServerSideMCPServerConfiguration)
+        .map((action) => action.mcpServerViewId)
+    );
+
+  // Collect Ruby App permissions by space.
+  const rubyAppIds = removeNulls(
+    actions
+      .filter(isServerSideMCPServerConfiguration)
+      .map((action) => action.rubyAppConfiguration?.appId)
+  );
+  let rubyAppRequirements: ModelId[] = [];
+
+  if (rubyAppIds.length > 0) {
+    const rubyApps = await AppResource.fetchByIds(auth, rubyAppIds);
+    rubyAppRequirements = rubyApps.map((app) => app.space.id);
+  }
+
+  // Collect Skill permissions by space.
+  const skillRequirements = skills.flatMap((skill) => skill.requestedSpaceIds);
+
+  const requestedSpaceIds = uniq([
+    ...dsViewRequirements,
+    ...mcpServerViewRequirements,
+    ...rubyAppRequirements,
+    ...skillRequirements,
+  ]).filter((id) => !ignoreSpaceModelIds.has(id));
+
+  return { requestedSpaceIds };
+}
+
+export async function getContentFragmentsSpaceIds(
+  auth: Authenticator,
+  nodeDataSourceViewIds: string[]
+): Promise<string[]> {
+  const dsViews = await DataSourceViewResource.fetchByIds(
+    auth,
+    nodeDataSourceViewIds
+  );
+  if (!dsViews || dsViews.length === 0) {
+    throw new Error(`Unexpected dataSourceView not found`);
+  }
+
+  return dsViews.map((dsView) =>
+    SpaceResource.modelIdToSId({
+      id: dsView.space.id,
+      workspaceId: auth.getNonNullableWorkspace().id,
+    })
+  );
+}

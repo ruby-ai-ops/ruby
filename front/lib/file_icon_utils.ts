@@ -1,0 +1,182 @@
+import {
+  frameContentType,
+  frameSlideshowContentType,
+  frameV2ContentType,
+} from "@app/types/files";
+import {
+  ActionFrame,
+  BigQueryLogo,
+  Brackets,
+  ConfluenceLogo,
+  DriveLogo,
+  RubyLogoSquare,
+  File02,
+  GithubLogo,
+  GongLogo,
+  GoogleDocLogo,
+  GooglePdfLogo,
+  GoogleSlideLogo,
+  GoogleSpreadsheetLogo,
+  Image01,
+  IntercomLogo,
+  MicrosoftExcelLogo,
+  MicrosoftLogo,
+  MicrosoftPowerpointLogo,
+  MicrosoftWordLogo,
+  NotionLogo,
+  SalesforceLogo,
+  SlackLogo,
+  SnowflakeLogo,
+  Table,
+  Type01,
+  VolumeMax,
+  ZendeskLogo,
+} from "@ruby-ai/sparkle";
+import type { ComponentType } from "react";
+
+const RUBY_MIME_PREFIX = "application/vnd.ruby.";
+const VND_MIME_PREFIX = "application/vnd.";
+
+/** Map provider segment from Ruby internal MIME (e.g. "notion", "googledrive") to colored logo. */
+const INTERNAL_PROVIDER_ICONS: Record<string, ComponentType> = {
+  notion: NotionLogo,
+  bigquery: BigQueryLogo,
+  googledrive: DriveLogo,
+  confluence: ConfluenceLogo,
+  slack: SlackLogo,
+  github: GithubLogo,
+  microsoft: MicrosoftLogo,
+  intercom: IntercomLogo,
+  zendesk: ZendeskLogo,
+  snowflake: SnowflakeLogo,
+  salesforce: SalesforceLogo,
+  gong: GongLogo,
+  rubyproject: RubyLogoSquare,
+};
+
+/**
+ * Generic map for application/vnd.{vendor}.{subtype} MIME types.
+ * Add new types under the vendor key; no need to touch the lookup logic.
+ * e.g. application/vnd.google-apps.document → vendor "google-apps", subtype "document"
+ */
+const VND_VENDOR_SUBTYPE_ICONS: Record<
+  string,
+  Record<string, ComponentType>
+> = {
+  "google-apps": {
+    document: GoogleDocLogo,
+    spreadsheet: GoogleSpreadsheetLogo,
+    presentation: GoogleSlideLogo,
+  },
+  "openxmlformats-officedocument": {
+    "wordprocessingml.document": MicrosoftWordLogo,
+    "spreadsheetml.sheet": MicrosoftExcelLogo,
+    "presentationml.presentation": MicrosoftPowerpointLogo,
+  },
+};
+
+interface FileTypeMapping {
+  icon: ComponentType;
+  mimeTypes: string[];
+  extensions: string[];
+}
+
+const FILE_TYPE_MAPPINGS: FileTypeMapping[] = [
+  {
+    icon: GooglePdfLogo,
+    mimeTypes: ["application/pdf"],
+    extensions: ["pdf"],
+  },
+  {
+    icon: MicrosoftWordLogo,
+    mimeTypes: ["application/msword"],
+    extensions: ["doc", "docx"],
+  },
+  {
+    icon: MicrosoftExcelLogo,
+    mimeTypes: ["application/vnd.ms-excel"],
+    extensions: ["xls", "xlsx"],
+  },
+  {
+    icon: Table,
+    mimeTypes: ["text/csv", "text/tab-separated-values"],
+    extensions: ["csv", "tsv"],
+  },
+  {
+    icon: Type01,
+    mimeTypes: ["text/plain"],
+    extensions: ["txt"],
+  },
+  {
+    icon: Brackets,
+    mimeTypes: ["text/markdown", "application/json"],
+    extensions: ["md", "markdown", "json"],
+  },
+  {
+    icon: ActionFrame,
+    mimeTypes: [
+      frameContentType,
+      frameSlideshowContentType,
+      frameV2ContentType,
+    ],
+    extensions: [".js", ".jsx", ".ts", ".tsx"],
+  },
+];
+
+function getExtension(fileName: string): string | undefined {
+  return fileName.split(".").pop()?.toLowerCase();
+}
+
+/**
+ * Maps file content types and extensions to appropriate icons.
+ * Uses platform-specific logos (PDF, Word, Excel) when available.
+ */
+export function getFileTypeIcon(
+  contentType: string,
+  fileName?: string
+): ComponentType {
+  // Check prefix-based content types first
+  if (contentType.startsWith("image/")) {
+    return Image01;
+  }
+  if (contentType.startsWith("audio/")) {
+    return VolumeMax;
+  }
+
+  // Internal Ruby types (Notion, BigQuery, Slack, etc.) – use colored provider logos
+  if (contentType.startsWith(RUBY_MIME_PREFIX)) {
+    const suffix = contentType.slice(RUBY_MIME_PREFIX.length);
+    const provider = suffix.split(".")[0]?.toLowerCase();
+    if (provider && provider in INTERNAL_PROVIDER_ICONS) {
+      return INTERNAL_PROVIDER_ICONS[provider];
+    }
+  }
+
+  // Generic application/vnd.{vendor}.{subtype} lookup (Google Apps, Office Open XML, etc.)
+  if (contentType.startsWith(VND_MIME_PREFIX)) {
+    const suffix = contentType.slice(VND_MIME_PREFIX.length);
+    const parts = suffix.split(".");
+    const vendor = parts[0]?.toLowerCase();
+    const subtype = parts.slice(1).join(".").toLowerCase();
+    if (vendor && subtype) {
+      const vendorMap = VND_VENDOR_SUBTYPE_ICONS[vendor];
+      if (vendorMap && subtype in vendorMap) {
+        return vendorMap[subtype];
+      }
+    }
+  }
+
+  const extension = fileName ? getExtension(fileName) : undefined;
+
+  // Check against mappings (MIME type takes priority, then extension)
+  for (const mapping of FILE_TYPE_MAPPINGS) {
+    if (mapping.mimeTypes.includes(contentType)) {
+      return mapping.icon;
+    }
+    if (extension && mapping.extensions.includes(extension)) {
+      return mapping.icon;
+    }
+  }
+
+  return File02;
+}

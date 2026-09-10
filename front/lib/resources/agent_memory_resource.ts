@@ -1,0 +1,457 @@
+import { AGENT_MEMORY_SERVER_NAME } from "@app/lib/api/actions/servers/agent_memory/metadata";
+import type { Authenticator } from "@app/lib/auth";
+import { BaseResource } from "@app/lib/resources/base_resource";
+import { AgentMemoryModel } from "@app/lib/resources/storage/models/agent_memories";
+import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
+import type { ModelStaticWorkspaceAware } from "@app/lib/resources/storage/wrappers/workspace_models";
+import { getResourceIdFromSId, makeSId } from "@app/lib/resources/string_ids";
+import type { ResourceFindOptions } from "@app/lib/resources/types";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import { withTransaction } from "@app/lib/utils/sql_utils";
+import type { LightAgentConfigurationWithoutModelType } from "@app/types/assistant/agent";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type { UserType } from "@app/types/user";
+import type {
+  Attributes,
+  CreationAttributes,
+  ModelStatic,
+  Transaction,
+} from "sequelize";
+
+// We define a memory limit of 16K characters per user and agent configuration. -> ~4000 tokens.
+// This is not perfect and could be configured according to the model's context window, but it's a good starting point.
+const AGENT_MEMORY_LIMIT = 16 * 1024;
+
+type AgentMemoryEdit = {
+  index: number;
+  content: string;
+};
+
+type AgentMemoryEntry = {
+  lastUpdated: Date;
+  content: string;
+};
+
+// Attributes are marked as read-only to reflect the stateless nature of our Resource.
+// This design will be moved up to BaseResource once we transition away from Sequelize.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface AgentMemoryResource
+  extends ReadonlyAttributesType<AgentMemoryModel> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class AgentMemoryResource extends BaseResource<AgentMemoryModel> {
+  static model: ModelStaticWorkspaceAware<AgentMemoryModel> = AgentMemoryModel;
+
+  constructor(
+    model: ModelStatic<AgentMemoryModel>,
+    blob: Attributes<AgentMemoryModel>
+  ) {
+    super(AgentMemoryModel, blob);
+  }
+
+  static async makeNew(
+    auth: Authenticator,
+    blob: CreationAttributes<AgentMemoryModel>,
+    transaction?: Transaction
+  ) {
+    const memory = await AgentMemoryModel.create(
+      {
+        ...blob,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      { transaction }
+    );
+
+    return new this(AgentMemoryModel, memory.get());
+  }
+
+  private static async baseFetch(
+    auth: Authenticator,
+    options?: ResourceFindOptions<AgentMemoryModel>,
+    transaction?: Transaction
+  ) {
+    const { where, ...otherOptions } = options ?? {};
+
+    const memories = await AgentMemoryModel.findAll({
+      where: {
+        ...where,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      ...otherOptions,
+      transaction,
+    });
+
+    return memories.map((m) => new this(AgentMemoryModel, m.get()));
+  }
+
+  static async fetchByModelIds(auth: Authenticator, ids: ModelId[]) {
+    return this.baseFetch(auth, {
+      where: {
+        id: ids,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+  }
+
+  static async fetchByIds(auth: Authenticator, ids: string[]) {
+    return AgentMemoryResource.fetchByModelIds(
+      auth,
+      removeNulls(ids.map(getResourceIdFromSId))
+    );
+  }
+
+  static async fetchByIdForUser(
+    auth: Authenticator,
+    { user, memoryId }: { user: UserType | null; memoryId: string }
+  ): Promise<AgentMemoryResource | null> {
+    const id = getResourceIdFromSId(memoryId);
+    if (!id) {
+      return null;
+    }
+
+    const [memory] = await this.baseFetch(auth, {
+      where: {
+        id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+        userId: user?.id ?? null,
+      },
+    });
+    return memory ?? null;
+  }
+
+  static async findByAgentConfigurationAndUser(
+    auth: Authenticator,
+    {
+      agentConfiguration,
+      user,
+    }: {
+      agentConfiguration: LightAgentConfigurationWithoutModelType;
+      user: UserType | null;
+    },
+    transaction?: Transaction
+  ): Promise<AgentMemoryResource[]> {
+    return this.baseFetch(
+      auth,
+      {
+        where: {
+          agentConfigurationId: agentConfiguration.sId,
+          userId: user?.id ?? null,
+        },
+        order: [["updatedAt", "DESC"]],
+      },
+      transaction
+    );
+  }
+
+  static async findByAgentConfigurationIdAndUser(
+    auth: Authenticator,
+    {
+      agentConfigurationId,
+    }: {
+      agentConfigurationId: string;
+    },
+    transaction?: Transaction
+  ): Promise<AgentMemoryResource[]> {
+    const userId = auth.user()?.id ?? null;
+    if (!userId) {
+      return [];
+    }
+
+    return this.baseFetch(
+      auth,
+      {
+        where: {
+          workspaceId: auth.getNonNullableWorkspace().id,
+          agentConfigurationId,
+          userId,
+        },
+        order: [["updatedAt", "DESC"]],
+      },
+      transaction
+    );
+  }
+
+  async updateContent(auth: Authenticator, content: string) {
+    return this.update({ content });
+  }
+
+  /**
+   * API used by the agent memory MCP server
+   */
+
+  static async retrieveMemory(
+    auth: Authenticator,
+    {
+      agentConfiguration,
+      user,
+    }: {
+      agentConfiguration: LightAgentConfigurationWithoutModelType;
+      user: UserType | null;
+    }
+  ): Promise<AgentMemoryEntry[]> {
+    return (
+      await this.findByAgentConfigurationAndUser(auth, {
+        agentConfiguration,
+        user,
+      })
+    )
+      .map((m) => ({
+        lastUpdated: m.updatedAt,
+        content: m.content,
+      }))
+      .sort((a, b) => b.lastUpdated.getTime() - a.lastUpdated.getTime());
+  }
+
+  static async recordEntries(
+    auth: Authenticator,
+    {
+      agentConfiguration,
+      user,
+      entries,
+    }: {
+      agentConfiguration: LightAgentConfigurationWithoutModelType;
+      user: UserType | null;
+      entries: string[];
+    }
+  ): Promise<Result<{ lastUpdated: Date; content: string }[], string>> {
+    const existingMemories = await this.retrieveMemory(auth, {
+      agentConfiguration,
+      user,
+    });
+
+    const validation = this.validateRecordEntries(existingMemories, entries);
+    if (validation.isErr()) {
+      return new Err(validation.error);
+    }
+
+    await concurrentExecutor(
+      entries,
+      async (content) => {
+        await this.makeNew(auth, {
+          agentConfigurationId: agentConfiguration.sId,
+          content: content,
+          userId: user?.id ?? null,
+        });
+      },
+      { concurrency: 4 }
+    );
+
+    const memories = await AgentMemoryResource.retrieveMemory(auth, {
+      agentConfiguration,
+      user,
+    });
+    return new Ok(memories);
+  }
+
+  private static validateRecordEntries(
+    existingMemories: AgentMemoryEntry[],
+    newEntries: string[]
+  ): Result<void, string> {
+    const existingCharacterCount = existingMemories.reduce(
+      (acc, entry) => acc + entry.content.length,
+      0
+    );
+    const newEntriesCharacterCount = newEntries.reduce(
+      (acc, entry) => acc + entry.length,
+      0
+    );
+
+    if (
+      existingCharacterCount + newEntriesCharacterCount >
+      AGENT_MEMORY_LIMIT
+    ) {
+      return new Err(
+        `Cannot add new memory entries. Current memory size (${existingCharacterCount} characters) + new entries size (${newEntriesCharacterCount} characters) exceeds the memory limit of ${AGENT_MEMORY_LIMIT} characters. Please compact or erase some entries before adding new ones.`
+      );
+    }
+
+    return new Ok(undefined);
+  }
+
+  static async eraseEntries(
+    auth: Authenticator,
+    {
+      agentConfiguration,
+      user,
+      indexes,
+    }: {
+      agentConfiguration: LightAgentConfigurationWithoutModelType;
+      user: UserType | null;
+      indexes: number[];
+    }
+  ): Promise<AgentMemoryEntry[]> {
+    await withTransaction(async (t) => {
+      const memories = (
+        await this.findByAgentConfigurationAndUser(
+          auth,
+          {
+            agentConfiguration,
+            user,
+          },
+          t
+        )
+      ).sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+
+      await concurrentExecutor(
+        indexes,
+        async (i) => {
+          await memories[i]?.delete(auth, { transaction: t });
+        },
+        { concurrency: 4 }
+      );
+    });
+
+    return AgentMemoryResource.retrieveMemory(auth, {
+      agentConfiguration,
+      user,
+    });
+  }
+
+  static async editEntries(
+    auth: Authenticator,
+    {
+      agentConfiguration,
+      user,
+      edits,
+    }: {
+      agentConfiguration: LightAgentConfigurationWithoutModelType;
+      user: UserType | null;
+      edits: AgentMemoryEdit[];
+    }
+  ): Promise<Result<AgentMemoryEntry[], string>> {
+    const existingMemories = await this.retrieveMemory(auth, {
+      agentConfiguration,
+      user,
+    });
+
+    const validation = this.validateEditEntries(existingMemories, edits);
+    if (validation.isErr()) {
+      return new Err(validation.error);
+    }
+
+    await withTransaction(async (t) => {
+      const memories = (
+        await this.findByAgentConfigurationAndUser(
+          auth,
+          {
+            agentConfiguration,
+            user,
+          },
+          t
+        )
+      ).sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+
+      await concurrentExecutor(
+        edits,
+        async ({ index, content }) => {
+          const m = memories[index];
+          if (m) {
+            await m.update({ content }, t);
+          } else {
+            // If the index does not exist we create a new memory.
+            await this.makeNew(
+              auth,
+              {
+                agentConfigurationId: agentConfiguration.sId,
+                content: content,
+                userId: user?.id ?? null,
+              },
+              t
+            );
+          }
+        },
+        { concurrency: 4 }
+      );
+    });
+
+    const memories = await AgentMemoryResource.retrieveMemory(auth, {
+      agentConfiguration,
+      user,
+    });
+    return new Ok(memories);
+  }
+
+  private static validateEditEntries(
+    existingMemories: AgentMemoryEntry[],
+    edits: AgentMemoryEdit[]
+  ): Result<void, string> {
+    // We want to calculate the total memory length after applying the edits.
+    // For each edit, we will subtract the old length and add the new length based on the index.
+    let newTotalLength = existingMemories.reduce(
+      (acc, entry) => acc + entry.content.length,
+      0
+    );
+    for (const edit of edits) {
+      if (edit.index >= 0 && edit.index < existingMemories.length) {
+        newTotalLength -= existingMemories[edit.index].content.length;
+        newTotalLength += edit.content.length;
+      }
+    }
+
+    if (newTotalLength > AGENT_MEMORY_LIMIT) {
+      return new Err(
+        `Total memory size after edits (${newTotalLength} characters) exceeds the memory limit of ${AGENT_MEMORY_LIMIT} characters. Please compact or erase some entries before editing.`
+      );
+    }
+
+    return new Ok(undefined);
+  }
+
+  async delete(
+    auth: Authenticator,
+    { transaction }: { transaction?: Transaction }
+  ): Promise<Result<undefined, Error>> {
+    try {
+      await this.model.destroy({
+        where: {
+          workspaceId: auth.getNonNullableWorkspace().id,
+          id: this.id,
+        },
+        transaction,
+      });
+
+      return new Ok(undefined);
+    } catch (err) {
+      return new Err(normalizeError(err));
+    }
+  }
+
+  static async deleteAllForWorkspace(auth: Authenticator): Promise<undefined> {
+    await this.model.destroy({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+  }
+
+  get sId(): string {
+    return AgentMemoryResource.modelIdToSId({
+      id: this.id,
+      workspaceId: this.workspaceId,
+    });
+  }
+
+  static modelIdToSId({
+    id,
+    workspaceId,
+  }: {
+    id: ModelId;
+    workspaceId: ModelId;
+  }): string {
+    return makeSId(AGENT_MEMORY_SERVER_NAME, {
+      id,
+      workspaceId,
+    });
+  }
+
+  toJSON() {
+    return {
+      sId: this.sId,
+      lastUpdated: this.updatedAt,
+      content: this.content,
+    };
+  }
+}

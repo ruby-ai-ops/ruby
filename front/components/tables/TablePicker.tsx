@@ -1,0 +1,245 @@
+import { InfiniteScroll } from "@app/components/InfiniteScroll";
+import { useCursorPagination } from "@app/hooks/useCursorPagination";
+import { useDebounce } from "@app/hooks/useDebounce";
+import {
+  useDataSourceViewTable,
+  useDataSourceViewTables,
+} from "@app/lib/swr/data_source_view_tables";
+import { useSpaceDataSourceViews } from "@app/lib/swr/spaces";
+import { classNames } from "@app/lib/utils";
+import type { CoreAPITable } from "@app/types/core/core_api";
+import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/utils";
+import type { DataSourceViewContentNode } from "@app/types/data_source_view";
+import type { SpaceType } from "@app/types/space";
+import type { LightWorkspaceType } from "@app/types/user";
+import {
+  Button,
+  PopoverContent,
+  PopoverRoot,
+  PopoverTrigger,
+  ScrollArea,
+  ScrollBar,
+  SearchInput,
+  Spinner,
+} from "@ruby-ai/sparkle";
+import { ChevronDownIcon } from "@heroicons/react/20/solid";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React, { useEffect, useState } from "react";
+
+interface TablePickerProps {
+  owner: LightWorkspaceType;
+  dataSource: {
+    workspace_id: string;
+    data_source_id: string;
+  };
+  currentTableId?: string;
+  readOnly: boolean;
+  space: SpaceType;
+  onTableUpdate: (table: DataSourceViewContentNode) => void;
+  excludeTables?: Array<{ dataSourceId: string; tableId: string }>;
+}
+
+const PAGE_SIZE = 25;
+
+export default function TablePicker({
+  owner,
+  dataSource,
+  currentTableId,
+  readOnly,
+  space,
+  onTableUpdate,
+  excludeTables,
+}: TablePickerProps) {
+  void dataSource;
+  const [open, setOpen] = useState(false);
+  const [allTablesMap, setallTablesMap] = useState<
+    Map<string, DataSourceViewContentNode>
+  >(new Map());
+
+  const {
+    inputValue: searchFilter,
+    debouncedValue: debouncedSearch,
+    isDebouncing,
+    setValue: setSearchFilter,
+  } = useDebounce("", {
+    delay: 300,
+    minLength: MIN_SEARCH_QUERY_SIZE,
+  });
+
+  const [currentTable, setCurrentTable] = useState<CoreAPITable>();
+  const {
+    cursorPagination,
+    reset: resetPagination,
+    handleLoadNext,
+    pageIndex,
+  } = useCursorPagination(PAGE_SIZE);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
+  useEffect(() => {
+    resetPagination();
+  }, [debouncedSearch, resetPagination]);
+
+  const { spaceDataSourceViews } = useSpaceDataSourceViews({
+    spaceId: space.sId,
+    workspaceId: owner.sId,
+  });
+
+  const selectedDataSourceView = spaceDataSourceViews.find(
+    (dsv) =>
+      dsv.sId === dataSource.data_source_id ||
+      dsv.dataSource.name === dataSource.data_source_id
+  );
+
+  const { tables, nextPageCursor, isTablesLoading } = useDataSourceViewTables({
+    owner,
+    dataSourceView: selectedDataSourceView ?? null,
+    searchQuery: debouncedSearch,
+    pagination: cursorPagination,
+    disabled: !debouncedSearch,
+  });
+
+  const { table, isTableLoading, isTableError } = useDataSourceViewTable({
+    owner: owner,
+    dataSourceView: selectedDataSourceView ?? null,
+    tableId: currentTableId ?? null,
+    disabled: !currentTableId,
+  });
+
+  useEffect(() => {
+    if (tables && !isTablesLoading) {
+      setallTablesMap((prevTablesMap) => {
+        if (pageIndex === 0) {
+          return new Map(tables.map((table) => [table.internalId, table]));
+        } else {
+          // Create a new Map to avoid mutating the previous state
+          const newTablesMap = new Map(prevTablesMap);
+
+          tables.forEach((table) => {
+            newTablesMap.set(table.internalId, table);
+          });
+
+          return newTablesMap;
+        }
+      });
+    }
+  }, [tables, isTablesLoading, pageIndex]);
+
+  useEffect(() => {
+    if (!isTableLoading && !isTableError) {
+      setCurrentTable(table);
+    }
+  }, [isTableError, isTableLoading, table]);
+
+  const showTableLoaders = isTablesLoading || isDebouncing;
+
+  return (
+    <div className="flex items-center">
+      <div className="flex items-center">
+        {readOnly ? (
+          currentTable ? (
+            <div className="copy-sm mr-1 max-w-20 truncate font-semibold text-highlight-500">
+              {currentTable.title}
+            </div>
+          ) : (
+            "No Table"
+          )
+        ) : (
+          <PopoverRoot open={open} onOpenChange={setOpen}>
+            <PopoverTrigger asChild>
+              {currentTable ? (
+                <div
+                  className={classNames(
+                    "copy-sm inline-flex items-center rounded-md py-1 font-normal",
+                    readOnly ? "text-primary-400" : "text-muted-foreground",
+                    "focus:outline-hidden focus:ring-0"
+                  )}
+                >
+                  <div className="copy-sm mr-1 max-w-xs truncate font-semibold text-highlight-500">
+                    {currentTable.title}
+                  </div>
+                  <ChevronDownIcon className="mt-0.5 h-4 w-4 hover:text-muted-foreground" />
+                </div>
+              ) : allTablesMap.size > 0 ? (
+                <Button
+                  variant="outline"
+                  label="Select Table"
+                  isSelect
+                  size="xs"
+                />
+              ) : (
+                <span
+                  className={classNames(
+                    "copy-sm",
+                    readOnly ? "text-primary-400" : "text-muted-foreground"
+                  )}
+                >
+                  No Tables
+                </span>
+              )}
+            </PopoverTrigger>
+
+            <PopoverContent className="mr-2">
+              <SearchInput
+                name="search"
+                placeholder="Search for tables"
+                value={searchFilter}
+                onChange={setSearchFilter}
+              />
+              <ScrollArea hideScrollBar className="mt-2 flex max-h-72 flex-col">
+                <div className="w-full space-y-1">
+                  {Array.from(allTablesMap.values())
+                    .filter(
+                      (t) =>
+                        !excludeTables?.some(
+                          (et) =>
+                            et.dataSourceId === dataSource.data_source_id &&
+                            et.tableId === t.internalId
+                        )
+                    )
+                    .map((t) => (
+                      <div
+                        key={t.internalId}
+                        className="flex cursor-pointer flex-col items-start px-2 hover:opacity-80"
+                        onClick={() => {
+                          onTableUpdate(t);
+                          setSearchFilter("");
+                          setOpen(false);
+                        }}
+                      >
+                        <div className="my-1">
+                          <div className="copy-sm text-foreground">
+                            {t.title}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  {debouncedSearch &&
+                    allTablesMap.size === 0 &&
+                    !showTableLoaders && (
+                      <span className="copy-sm mt-2 block px-2 text-muted-foreground">
+                        No tables found
+                      </span>
+                    )}
+                </div>
+                <InfiniteScroll
+                  nextPage={() => {
+                    handleLoadNext(nextPageCursor);
+                  }}
+                  hasMore={!!nextPageCursor}
+                  showLoader={showTableLoaders}
+                  loader={
+                    <div className="copy-sm mt-2 flex items-center gap-2 px-2 text-center text-muted-foreground">
+                      <Spinner size="xs" />
+                      <span>Loading more data...</span>
+                    </div>
+                  }
+                />
+                <ScrollBar className="py-0" />
+              </ScrollArea>
+            </PopoverContent>
+          </PopoverRoot>
+        )}
+      </div>
+    </div>
+  );
+}

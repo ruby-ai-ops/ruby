@@ -1,0 +1,116 @@
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+
+// Thresholds for offloading MCP tool output items to files.
+// When a single content block exceeds these sizes, it gets stored as a file and replaced with a
+// snippet + file reference.
+export const FILE_OFFLOAD_TEXT_SIZE_BYTES = 20 * 1024; // 20KB.
+export const FILE_OFFLOAD_IMAGE_SIZE_BYTES = 2 * 1024 * 1024; // 2MB.
+export const FILE_OFFLOAD_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20MB for non-image file uploads.
+
+export const FILE_OFFLOAD_SNIPPET_LENGTH = 8_000; // Approximately 2K tokens.
+
+// Key of the machine-readable offload descriptor in a content block's `_meta`. Attached to every
+// block whose full text was offloaded to the run context's file system, so code consumers
+// (function code via `@ruby-ai/pod`, future SDKs) can read the full content back without parsing the
+// human-facing "[Full content archived at ...]" sentence. Reverse-domain prefixed per the MCP
+// `_meta` naming convention.
+export const TOOL_OUTPUT_OFFLOAD_META_KEY = "tt.ruby/offload";
+
+// The descriptor stored under TOOL_OUTPUT_OFFLOAD_META_KEY. This is a wire contract consumed
+// in-sandbox (`@ruby-ai/pod` carries its own copy of the shape): fields are append-only.
+export interface ToolOutputOffloadDescriptor {
+  // Scoped path of the archived full content (e.g. "pod-{pId}/.tool_outputs/{slug}/{file}"),
+  // resolvable in-sandbox under the /files gcsfuse mount.
+  fullContentPath: string;
+  totalBytes: number;
+  contentType: string;
+}
+
+// Hard limits for remote MCP server tool results.
+// When any content block exceeds these sizes, the entire tool result is rejected.
+const REMOTE_MAX_TEXT_SIZE_BYTES = 2 * 1024 * 1024; // 2MB.
+const REMOTE_MAX_IMAGE_SIZE_BYTES = 2 * 1024 * 1024; // 2MB.
+// Resource-with-text blocks above FILE_OFFLOAD_TEXT_SIZE_BYTES are offloaded to a file in
+// processToolResults, so this hard limit only needs to guard against absurd payloads.
+const REMOTE_MAX_RESOURCE_SIZE_BYTES = 20 * 1024 * 1024; // 20MB.
+// Hard limit on the entire array of tool outputs.
+const REMOTE_MAX_TOOL_RESULT_SIZE_BYTES = 50 * 1024 * 1024; // 50MB.
+
+// Hard limit on the `structuredContent` payload of remote MCP tool results. Oversized payloads
+// are dropped (the model-facing content is unaffected) rather than failing the tool call, since
+// they used to be discarded entirely.
+export const REMOTE_MAX_STRUCTURED_CONTENT_SIZE_BYTES = 2 * 1024 * 1024; // 2MB.
+
+export function computeTextByteSize(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
+
+function computeBase64ByteSize(base64: string): number {
+  return Math.ceil((base64.length * 3) / 4);
+}
+
+export function getRemoteContentMaxSize(
+  item: CallToolResult["content"][number]
+) {
+  switch (item.type) {
+    case "text":
+      return REMOTE_MAX_TEXT_SIZE_BYTES;
+
+    case "image":
+      return REMOTE_MAX_IMAGE_SIZE_BYTES;
+
+    case "resource":
+      return REMOTE_MAX_RESOURCE_SIZE_BYTES;
+
+    default:
+      return 1 * 1024 * 1024; // 1MB default
+  }
+}
+
+export function computeContentSize(
+  item: CallToolResult["content"][number]
+): number {
+  switch (item.type) {
+    case "text":
+      return computeTextByteSize(item.text);
+
+    case "image":
+      return computeBase64ByteSize(item.data);
+
+    case "resource":
+      if (
+        "blob" in item.resource &&
+        item.resource.blob &&
+        typeof item.resource.blob === "string"
+      ) {
+        return computeBase64ByteSize(item.resource.blob);
+      }
+      if ("text" in item.resource && typeof item.resource.text === "string") {
+        return computeTextByteSize(item.resource.text);
+      }
+      return 0;
+
+    case "audio":
+      return item.data.length;
+
+    default:
+      return 0;
+  }
+}
+
+export function isWithinRemoteContentLimit(
+  content: CallToolResult["content"]
+): boolean {
+  let totalOutputSize = 0;
+  for (const item of content) {
+    const itemSize = computeContentSize(item);
+    if (itemSize > getRemoteContentMaxSize(item)) {
+      return false;
+    }
+    totalOutputSize += itemSize;
+    if (totalOutputSize > REMOTE_MAX_TOOL_RESULT_SIZE_BYTES) {
+      return false;
+    }
+  }
+  return true;
+}

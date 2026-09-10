@@ -1,0 +1,436 @@
+import { Readable } from "node:stream";
+import { FILE_OFFLOAD_TEXT_SIZE_BYTES } from "@app/lib/actions/action_output_limits";
+import { MCPError } from "@app/lib/actions/mcp_errors";
+import { getDataSourceURI } from "@app/lib/actions/mcp_internal_actions/input_configuration";
+import type { ToolHandlers } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { buildTools } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { isAgentLoopRunContext } from "@app/lib/actions/types";
+import {
+  CONVERSATION_CAT_FILE_ACTION_NAME,
+  CONVERSATION_FILES_TOOLS_METADATA,
+  CONVERSATION_FILES_TOOLS_METADATA_WITH_FILESYSTEM,
+  CONVERSATION_LIST_CONTENT_NODES_AND_TABLES_ACTION_NAME,
+  CONVERSATION_LIST_FILES_ACTION_NAME,
+  CONVERSATION_SEARCH_FILES_ACTION_NAME,
+} from "@app/lib/api/actions/servers/conversation_files/metadata";
+import {
+  collectGrepMatches,
+  compileGrepPattern,
+} from "@app/lib/api/actions/servers/files/tools/grep_regex";
+import { searchFunction } from "@app/lib/api/actions/servers/search/tools";
+import type { DataSourceConfiguration } from "@app/lib/api/assistant/configuration/types";
+import { getAttachmentCapabilityContext } from "@app/lib/api/assistant/conversation/attachment_capabilities";
+import type { AttachmentUsageHints } from "@app/lib/api/assistant/conversation/attachments";
+import {
+  attachmentUsageHintsFor,
+  conversationAttachmentId,
+  isContentNodeAttachmentType,
+  renderAttachmentXml,
+} from "@app/lib/api/assistant/conversation/attachments";
+import { getConversationDataSourceViews } from "@app/lib/api/assistant/jit/utils";
+import { listAttachments } from "@app/lib/api/assistant/jit_utils";
+import type { Authenticator } from "@app/lib/auth";
+import {
+  CONTENT_OUTDATED_MSG,
+  getContentFragmentFromAttachmentFile,
+} from "@app/lib/resources/content_fragment_resource";
+import type {
+  ContentNodeAttachmentType,
+  ConversationAttachmentType,
+} from "@app/types/api/assistant/conversation/attachments";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import type {
+  ImageContent,
+  TextContent,
+} from "@app/types/assistant/generation";
+import { isImageContent, isTextContent } from "@app/types/assistant/generation";
+import type { ModelConfigurationType } from "@app/types/assistant/models/types";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { INTERNAL_MIME_TYPES } from "@ruby-ai/client";
+import assert from "assert";
+
+const MAX_CONTENT_SIZE_FOR_LIST_FILES = 1024 * 256; // 256KB.
+
+export const contentFromAttachments = (
+  attachments: ConversationAttachmentType[],
+  {
+    usage,
+    snippetContent,
+  }: { usage: AttachmentUsageHints; snippetContent?: string }
+) => {
+  let content = "";
+
+  // Directly attached files.
+  attachments
+    .filter((a) => !a.isInProjectContext)
+    .forEach((attachment, i) => {
+      if (i === 0) {
+        content +=
+          "The following files are currently attached to the conversation directly:\n";
+      } else {
+        content += "\n";
+      }
+      content += renderAttachmentXml({
+        attachment,
+        content: snippetContent,
+        usage,
+      });
+    });
+
+  // Project context attached files.
+  attachments
+    .filter((a) => a.isInProjectContext)
+    .forEach((attachment, i) => {
+      if (i === 0) {
+        content +=
+          "The following files are currently attached to the conversation via the pod context:\n";
+      } else {
+        content += "\n";
+      }
+      content += renderAttachmentXml({
+        attachment,
+        content: snippetContent,
+        usage,
+      });
+    });
+  return content;
+};
+
+// Shared list handler used under two action names: the legacy `list` (all attachments) and the
+// file-system-mode `list_content_nodes` (narrowed). Filtering is driven by the conversation's
+// `useFileSystem` flag so the same handler is correct under either name.
+const listAttachmentsHandler: ToolHandlers<
+  typeof CONVERSATION_FILES_TOOLS_METADATA
+>[typeof CONVERSATION_LIST_FILES_ACTION_NAME] = async (
+  _,
+  { auth, runContext }
+) => {
+  assert(isAgentLoopRunContext(runContext), "AgentLoopRunContext expected");
+
+  const conversation = runContext.conversation;
+  const capabilities = await getAttachmentCapabilityContext(auth, conversation);
+  const allAttachments = await listAttachments(auth, { conversation });
+
+  // When the conversation uses the new file system, regular files are surfaced via the `files`
+  // server, so only content nodes remain listable here.
+  const attachments = capabilities.isNewFileExplorer
+    ? allAttachments.filter(isContentNodeAttachmentType)
+    : allAttachments;
+
+  if (attachments.length === 0) {
+    return new Ok([
+      {
+        type: "text",
+        text: "No files are currently attached to the conversation.",
+      },
+    ]);
+  }
+
+  const usage = attachmentUsageHintsFor(capabilities);
+  let content = contentFromAttachments(attachments, { usage });
+
+  if (content.length > MAX_CONTENT_SIZE_FOR_LIST_FILES) {
+    content = contentFromAttachments(attachments, {
+      usage,
+      snippetContent: "Snippet content too large.",
+    });
+  }
+
+  return new Ok([
+    {
+      type: "text",
+      text: content,
+    },
+  ]);
+};
+
+const handlers: ToolHandlers<typeof CONVERSATION_FILES_TOOLS_METADATA> = {
+  [CONVERSATION_LIST_FILES_ACTION_NAME]: listAttachmentsHandler,
+
+  [CONVERSATION_CAT_FILE_ACTION_NAME]: async (
+    { fileId, offset, limit, grep },
+    { auth, runContext }
+  ) => {
+    assert(isAgentLoopRunContext(runContext), "AgentLoopRunContext expected");
+
+    const conversation = runContext.conversation;
+    const modelConfig = runContext.modelInfo.endpoint.modelConfig;
+
+    const fileRes = await getFileFromConversation(
+      auth,
+      fileId,
+      conversation,
+      modelConfig
+    );
+
+    if (fileRes.isErr()) {
+      return new Err(new MCPError(fileRes.error));
+    }
+
+    const { content, title } = fileRes.value;
+
+    // Only process text content.
+    if (!isTextContent(content)) {
+      return new Err(
+        new MCPError(
+          `File ${title} does not have text content that can be read with offset/limit`,
+          {
+            tracked: false,
+          }
+        )
+      );
+    }
+
+    const fullText = content.text;
+    const totalLength = fullText.length;
+
+    // Returning early with a custom message if the text is empty.
+    if (totalLength === 0) {
+      return new Ok([
+        {
+          type: "text",
+          text: `No content retrieved for file ${title}.`,
+        },
+      ]);
+    }
+
+    // Apply offset and limit.
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+    const start = offset || 0;
+
+    if (start > totalLength) {
+      return new Err(
+        new MCPError(
+          `Offset ${start} is out of bounds for file ${title} (total length: ${totalLength}).`,
+          {
+            tracked: false,
+          }
+        )
+      );
+    }
+    if (limit === 0) {
+      return new Err(
+        new MCPError(`Limit cannot be equal to 0.`, {
+          tracked: false,
+        })
+      );
+    }
+
+    // Cap to FILE_OFFLOAD_TEXT_SIZE_BYTES to avoid storing oversized content in the DB.
+    // For ASCII-dominant text, 1 char ≈ 1 byte, so we use FILE_OFFLOAD_TEXT_SIZE_BYTES directly.
+    const maxCharacters = FILE_OFFLOAD_TEXT_SIZE_BYTES;
+    const effectiveLimit =
+      limit !== undefined ? Math.min(limit, maxCharacters) : maxCharacters;
+    const end = start + effectiveLimit;
+
+    let text = fullText.slice(start, end);
+
+    // Apply grep filter if provided.
+    if (grep) {
+      const regexResult = compileGrepPattern(grep);
+      if (regexResult.isErr()) {
+        return new Err(
+          new MCPError(
+            `Unsupported or invalid regular expression. Error: ${regexResult.error.message}`,
+            { tracked: false }
+          )
+        );
+      }
+
+      const grepResult = await collectGrepMatches(
+        Readable.from([text]),
+        regexResult.value,
+        {
+          formatMatch: (line) => line,
+          maxMatches: Number.MAX_SAFE_INTEGER,
+        }
+      );
+      if (grepResult.isErr()) {
+        return new Err(
+          new MCPError(
+            `Failed to search file ${title}: ${grepResult.error.message}`,
+            { tracked: false }
+          )
+        );
+      }
+      text = grepResult.value.matches.join("\n");
+      if (grepResult.value.capped) {
+        text += "\n\n[Results truncated to the grep output limit.]";
+      }
+      if (text.length === 0) {
+        return new Err(
+          new MCPError(`No lines matched the grep pattern.`, {
+            tracked: false,
+          })
+        );
+      }
+    }
+
+    const hasMore = end < totalLength;
+
+    return new Ok([
+      {
+        type: "text",
+        text: hasMore
+          ? `${text}\n\n[Showing characters ${start}-${end} of ${totalLength} total. Use offset=${end} to read more.]`
+          : text,
+      },
+    ]);
+  },
+
+  [CONVERSATION_SEARCH_FILES_ACTION_NAME]: async (
+    { query },
+    { auth, runContext }
+  ) => {
+    assert(isAgentLoopRunContext(runContext), "AgentLoopRunContext expected");
+
+    const conversation = runContext.conversation;
+    const attachments = await listAttachments(auth, { conversation });
+    const filesUsableAsRetrievalQuery = attachments.filter(
+      (f) => f.isSearchable
+    );
+
+    if (filesUsableAsRetrievalQuery.length === 0) {
+      return new Ok([
+        {
+          type: "text",
+          text: "No searchable files are attached to the conversation.",
+        },
+      ]);
+    }
+
+    // Get datasource views for child conversations.
+    const fileIdToDataSourceViewMap = await getConversationDataSourceViews(
+      auth,
+      conversation,
+      attachments
+    );
+
+    const contentNodeAttachments: ContentNodeAttachmentType[] = [];
+    for (const f of filesUsableAsRetrievalQuery) {
+      if (isContentNodeAttachmentType(f)) {
+        contentNodeAttachments.push(f);
+      }
+    }
+
+    const dataSources: DataSourceConfiguration[] = contentNodeAttachments.map(
+      (f) => ({
+        workspaceId: auth.getNonNullableWorkspace().sId,
+        dataSourceViewId: f.nodeDataSourceViewId,
+        filter: {
+          parents: {
+            in: [f.nodeId],
+            not: [],
+          },
+          tags: null,
+        },
+      })
+    );
+
+    const dataSourceIds = new Set(
+      [...fileIdToDataSourceViewMap.values()].map(
+        (dataSourceView) => dataSourceView.sId
+      )
+    );
+
+    for (const dataSourceViewId of dataSourceIds.values()) {
+      dataSources.push({
+        workspaceId: auth.getNonNullableWorkspace().sId,
+        dataSourceViewId,
+        filter: { parents: null, tags: null },
+      });
+    }
+
+    const searchResults = await searchFunction(auth, {
+      query,
+      relativeTimeFrame: "all",
+      dataSources: dataSources.map((dataSource) => ({
+        uri: getDataSourceURI(dataSource),
+        mimeType: INTERNAL_MIME_TYPES.TOOL_INPUT.DATA_SOURCE,
+      })),
+      toolContext: { runContext },
+    });
+
+    return searchResults;
+  },
+};
+
+async function getFileFromConversation(
+  auth: Authenticator,
+  fileId: string,
+  conversation: ConversationWithoutContentType,
+  model: ModelConfigurationType
+): Promise<
+  Result<
+    { fileId: string; title: string; content: ImageContent | TextContent },
+    string
+  >
+> {
+  // Note on `contentFragmentVersion`: two content fragment versions are created with different
+  // fileIds. So we accept here rendering content fragments that are superseded. This will mean
+  // that past actions on a previous version of a content fragment will correctly render the
+  // content as being superseded, showing the model that a new version is available. The fileId of
+  // this new version will be different, but the title will likely be the same and the model should
+  // be able to understand the state of affairs. We use content.flat() to consider all versions of
+  // messages here (to support rendering a file that was part of an old version of a previous
+  // message).
+  const attachments = await listAttachments(auth, { conversation });
+  const attachment = attachments.find(
+    (a) => conversationAttachmentId(a) === fileId
+  );
+  // In file system mode only content nodes stay includable: regular files are read by path through
+  // the `files` server.
+  if (!attachment || !attachment.isIncludable) {
+    return new Err(`File \`${fileId}\` not found in conversation`);
+  }
+
+  if (attachment.contentFragmentVersion === "superseded") {
+    return new Ok({
+      fileId,
+      title: attachment.title,
+      content: {
+        type: "text",
+        text: CONTENT_OUTDATED_MSG,
+      },
+    });
+  }
+  const r = await getContentFragmentFromAttachmentFile(auth, {
+    attachment,
+    excludeImages: false,
+    model,
+  });
+
+  if (r.isErr()) {
+    return new Err(`Error including conversation file: ${r.error}`);
+  }
+
+  if (
+    !isTextContent(r.value.content[0]) &&
+    !isImageContent(r.value.content[0])
+  ) {
+    return new Err(`File \`${fileId}\` has no text or image content`);
+  }
+
+  return new Ok({
+    fileId,
+    title: attachment.title,
+    content: r.value.content[0],
+  });
+}
+
+export const TOOLS = buildTools(CONVERSATION_FILES_TOOLS_METADATA, handlers);
+
+const handlersWithFilesystem: ToolHandlers<
+  typeof CONVERSATION_FILES_TOOLS_METADATA_WITH_FILESYSTEM
+> = {
+  [CONVERSATION_LIST_CONTENT_NODES_AND_TABLES_ACTION_NAME]:
+    listAttachmentsHandler,
+  [CONVERSATION_CAT_FILE_ACTION_NAME]:
+    handlers[CONVERSATION_CAT_FILE_ACTION_NAME],
+};
+
+export const TOOLS_WITH_FILESYSTEM = buildTools(
+  CONVERSATION_FILES_TOOLS_METADATA_WITH_FILESYSTEM,
+  handlersWithFilesystem
+);

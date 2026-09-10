@@ -1,0 +1,661 @@
+import { isRubyLikeAgent } from "@app/lib/api/assistant/global_agents/prompt_context";
+import type { CacheDiagnosticsKey } from "@app/lib/api/llm/cache_diagnostics";
+import {
+  getPreviousMessageId,
+  setPreviousMessageId,
+} from "@app/lib/api/llm/cache_diagnostics";
+import type { LLM } from "@app/lib/api/llm/llm";
+import { parseResponseFormatSchema } from "@app/lib/api/llm/utils";
+import { config as regionsConfig } from "@app/lib/api/regions/config";
+import type { Authenticator } from "@app/lib/auth";
+import { getShutdownSignal } from "@app/lib/shutdown_signal";
+import { classifyTemporalAbortReason } from "@app/lib/temporal/cancellation";
+import { statsDMetrics } from "@app/lib/utils/statsd";
+import logger from "@app/logger/logger";
+import { makeModelInterruptionError } from "@app/temporal/agent_loop/lib/run_model_errors";
+import type {
+  GetOutputRequestParams,
+  GetOutputResponse,
+  Output,
+} from "@app/temporal/agent_loop/lib/types";
+import type { ModelIdType } from "@app/types/assistant/models/types";
+import { Err, Ok } from "@app/types/shared/result";
+import { safeParseJSON } from "@app/types/shared/utils/json_utils";
+import { CancelledFailure, heartbeat, sleep } from "@temporalio/activity";
+
+const LLM_HEARTBEAT_INTERVAL_MS = 10_000;
+// Log heartbeat status periodically to track long-waiting LLM calls.
+const HEARTBEAT_LOG_INTERVAL = 6; // Every minute (6 * 10s)
+// Timeout for waiting on a single LLM event (first or subsequent).
+const LLM_EVENT_TIMEOUT_MINUTES = 2;
+const LLM_EVENT_TIMEOUT_MS = LLM_EVENT_TIMEOUT_MINUTES * 60 * 1000;
+// Bound on waiting for the stream to close on early exit: exit paths that must report quickly
+// (worker shutdown has ~10s before SIGKILL) cannot wait on a stalled provider read.
+const STREAM_CLEANUP_TIMEOUT_MS = 2_000;
+type LLMStreamTimeoutKind = "activity" | "event";
+
+export function resolveStableToolCallName(
+  specifications: GetOutputRequestParams["specifications"],
+  streamedToolName: string
+): string | null {
+  const exactMatch = specifications.find(
+    (specification) => specification.name === streamedToolName
+  );
+
+  return exactMatch?.name ?? null;
+}
+
+export function getToolCallStartDeduplicationKeys({
+  stableToolName,
+  toolCallId,
+  toolCallIndex,
+}: {
+  stableToolName: string;
+  toolCallId?: string;
+  toolCallIndex?: number;
+}): string[] {
+  const keys: string[] = [];
+
+  if (toolCallId) {
+    keys.push(`id:${toolCallId}`);
+  }
+  if (toolCallIndex !== undefined) {
+    keys.push(`index:${toolCallIndex}`);
+  }
+  if (keys.length === 0) {
+    keys.push(`name:${stableToolName}`);
+  }
+
+  return keys;
+}
+
+class LLMStreamTimeoutError extends Error {
+  constructor(
+    public readonly kind: LLMStreamTimeoutKind,
+    public readonly elapsedMs: number,
+    public readonly context?: { conversationId: string; step: number }
+  ) {
+    super(
+      kind === "activity"
+        ? `LLM stream exceeded the activity time budget after ${Math.round(elapsedMs / 1000)}s`
+        : `LLM stream timeout after ${Math.round(elapsedMs / 1000)}s waiting for event`
+    );
+    this.name = "LLMStreamTimeoutError";
+  }
+}
+
+function makeLLMTimeoutResponse(kind: LLMStreamTimeoutKind): GetOutputResponse {
+  return new Err({
+    type: "shouldRetryMessage",
+    content: {
+      type: "llm_timeout_error",
+      message:
+        kind === "activity"
+          ? "The agent step hit its time budget before the model response completed"
+          : `LLM stream timeout after ${LLM_EVENT_TIMEOUT_MINUTES} minutes waiting for event`,
+      isRetryable: true,
+      errorSource: "ruby",
+    },
+  });
+}
+
+// Wraps an async iterator and ensures heartbeat() is called at regular intervals
+// even when the source is slow to yield values.
+// Exported for tests.
+export async function* withPeriodicHeartbeat<T>(
+  stream: AsyncIterator<T>,
+  activityTimeoutDeadlineMs: number,
+  logContext?: {
+    workspaceId: string;
+    conversationId: string;
+    step: number;
+    modelId: ModelIdType;
+  }
+): AsyncGenerator<T> {
+  let nextPromise = stream.next();
+  let streamExhausted = false;
+  let heartbeatCount = 0;
+  const streamStartTimeMs = Date.now();
+  let lastEventTimeMs = Date.now();
+
+  let heartbeatTimer: NodeJS.Timeout | undefined;
+
+  // The pod shutdown signal aborts 10s before the termination grace period ends, while
+  // Temporal's own WORKER_SHUTDOWN cancellation only fires at grace expiry, together with
+  // SIGKILL, too late to report anything. Raced against the stream below so a shutdown is
+  // detected immediately, not at the next event or heartbeat tick, and the retryable failure
+  // can be reported while the pod can still talk to Temporal.
+  const shutdownSignal = getShutdownSignal();
+  let onShutdownAbort: (() => void) | undefined;
+  const shutdownPromise = new Promise<{ type: "shutdown" }>((resolve) => {
+    onShutdownAbort = () => resolve({ type: "shutdown" as const });
+    shutdownSignal.addEventListener("abort", onShutdownAbort, { once: true });
+  });
+
+  try {
+    while (!streamExhausted) {
+      // The abort listener above never fires for a signal that aborted before this generator
+      // started: cover it here.
+      if (shutdownSignal.aborted) {
+        throw makeModelInterruptionError();
+      }
+
+      const remainingActivityTimeMs = activityTimeoutDeadlineMs - Date.now();
+
+      if (remainingActivityTimeMs <= 0) {
+        logger.error(
+          {
+            ...logContext,
+            totalElapsedMs: Date.now() - streamStartTimeMs,
+          },
+          "[LLM stream] timeout - activity time budget exceeded"
+        );
+        throw new LLMStreamTimeoutError(
+          "activity",
+          Date.now() - streamStartTimeMs,
+          logContext
+        );
+      }
+
+      heartbeatTimer = undefined;
+      const result = await Promise.race([
+        nextPromise
+          .then((value) => ({ type: "stream" as const, value }))
+          .catch((error) => {
+            // Rethrow to ensure errors are not swallowed
+            throw error;
+          }),
+        new Promise<{ type: "heartbeat" }>((resolve) => {
+          heartbeatTimer = setTimeout(
+            () => resolve({ type: "heartbeat" }),
+            Math.min(LLM_HEARTBEAT_INTERVAL_MS, remainingActivityTimeMs)
+          );
+        }),
+        shutdownPromise,
+      ]);
+
+      // Clear the heartbeat timer if the stream event won the race.
+      clearTimeout(heartbeatTimer);
+
+      if (result.type === "shutdown") {
+        throw makeModelInterruptionError();
+      }
+
+      heartbeat();
+
+      if (result.type === "heartbeat") {
+        heartbeatCount++;
+        const now = Date.now();
+        const elapsedMs = now - lastEventTimeMs;
+
+        if (now >= activityTimeoutDeadlineMs) {
+          logger.error(
+            {
+              ...logContext,
+              heartbeatCount,
+              totalElapsedMs: now - streamStartTimeMs,
+            },
+            "[LLM stream] timeout - activity time budget exceeded"
+          );
+          throw new LLMStreamTimeoutError(
+            "activity",
+            now - streamStartTimeMs,
+            logContext
+          );
+        }
+
+        // Check for timeout waiting on event.
+        if (elapsedMs >= LLM_EVENT_TIMEOUT_MS) {
+          logger.error(
+            {
+              ...logContext,
+              heartbeatCount,
+              elapsedMs,
+              timeoutMinutes: LLM_EVENT_TIMEOUT_MINUTES,
+            },
+            "[LLM stream] timeout - no event received"
+          );
+          throw new LLMStreamTimeoutError("event", elapsedMs, logContext);
+        }
+
+        // Log every minute to track long-waiting LLM calls.
+        if (heartbeatCount % HEARTBEAT_LOG_INTERVAL === 0) {
+          logger.info(
+            {
+              ...logContext,
+              heartbeatCount,
+              elapsedMs,
+            },
+            "[LLM stream] heartbeat - still waiting for event"
+          );
+        }
+        // Heartbeat won the race, but nextPromise is still pending
+        // Continue racing with the same nextPromise
+        continue;
+      }
+
+      // Stream value arrived
+      const streamResult = result.value;
+
+      if (streamResult.done) {
+        streamExhausted = true;
+        break;
+      }
+
+      yield streamResult.value;
+      nextPromise = stream.next();
+      // Reset for next event.
+      heartbeatCount = 0;
+      lastEventTimeMs = Date.now();
+    }
+  } finally {
+    // Clear any pending heartbeat timer to prevent leaked closures.
+    clearTimeout(heartbeatTimer);
+
+    if (onShutdownAbort) {
+      shutdownSignal.removeEventListener("abort", onShutdownAbort);
+    }
+
+    // Ensure the underlying stream is closed on early exit (timeout, error, worker shutdown, or
+    // break). This aborts the HTTP connection to the LLM provider. An async generator's return()
+    // queues behind an in-flight next(), so a stalled provider read would block this await
+    // indefinitely: bound it and abandon the stream if it does not settle. The pending read
+    // keeps the connection until it settles or the process exits.
+    const cleanupPromise = stream.return?.()?.catch((cleanupError) => {
+      logger.warn(
+        { err: cleanupError, ...logContext },
+        "[LLM stream] cleanup error"
+      );
+    });
+    if (cleanupPromise) {
+      let cleanupTimer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        cleanupPromise,
+        new Promise<void>((resolve) => {
+          cleanupTimer = setTimeout(resolve, STREAM_CLEANUP_TIMEOUT_MS);
+        }),
+      ]);
+      clearTimeout(cleanupTimer);
+    }
+  }
+}
+
+export async function getOutputFromLLMStream(
+  auth: Authenticator,
+  {
+    modelConversationRes,
+    conversation,
+    toolSearchEnabled,
+    disableToolUse,
+    specifications,
+    flushParserTokens,
+    contentParser,
+    step,
+    agentConfiguration,
+    agentMessage,
+    model,
+    activityTimeoutDeadlineMs,
+    prompt,
+    llm,
+    updateResourceAndPublishEvent,
+  }: GetOutputRequestParams & { llm: LLM }
+): Promise<GetOutputResponse> {
+  const start = Date.now();
+  let timeToFirstEvent: number | undefined = undefined;
+  const logContext = {
+    workspaceId: conversation.owner.sId,
+    conversationId: conversation.sId,
+    step,
+    modelId: model.modelId,
+  };
+  // Unique ID for this LLM call; changes on Temporal retries so the client
+  // can detect retry boundaries and reset its CoT accumulator.
+  const traceId = llm.getTraceId();
+
+  if (start >= activityTimeoutDeadlineMs) {
+    logger.error(
+      logContext,
+      "[LLM stream] skipped - activity time budget exhausted"
+    );
+    return makeLLMTimeoutResponse("activity");
+  }
+
+  // Prompt-cache diagnostics: thread the previous step's response id so Anthropic
+  // can report why the cache prefix diverged. Keyed by conversation and agent in
+  // Redis so the chain survives across steps and user turns. `null` (no prior, or
+  // expired) is still a valid value.
+  const cacheDiagnosticsKey: CacheDiagnosticsKey = {
+    conversationId: conversation.sId,
+    agentConfigurationId: agentConfiguration.sId,
+    providerId: model.providerId,
+  };
+
+  const previousMessageId = await getPreviousMessageId(cacheDiagnosticsKey);
+
+  const events = llm.stream(
+    {
+      conversation: modelConversationRes.value.modelConversation,
+      toolSearchEnabled,
+      disableToolUse,
+      prompt,
+      specifications,
+      previousMessageId,
+    },
+    {
+      workspaceId: conversation.owner.sId,
+      agentConfigurationId: agentConfiguration.sId,
+    }
+  );
+
+  const contents: Output["contents"] = [];
+  const actions: Output["actions"] = [];
+  let generation = "";
+  let nativeChainOfThought = "";
+  let stopReason: string | undefined = undefined;
+  const publishedToolCallStartKeys = new Set<string>();
+
+  try {
+    for await (const event of withPeriodicHeartbeat(
+      events,
+      activityTimeoutDeadlineMs,
+      logContext
+    )) {
+      timeToFirstEvent ??= Date.now() - start;
+      if (event.type === "error") {
+        await flushParserTokens();
+        return new Err({
+          type: "shouldRetryMessage",
+          content: event.content,
+        });
+      }
+
+      // Sleep allows the activity to be cancelled, e.g. on a "Stop agent" request.
+      try {
+        await sleep(1);
+      } catch (err) {
+        if (err instanceof CancelledFailure) {
+          // Worker shutdown also cancels in-flight activities. Surface a retryable failure so
+          // Temporal reruns the step on another worker, instead of finalizing the message as
+          // successful mid-answer like a user stop would.
+          if (classifyTemporalAbortReason(err) === "worker_shutdown") {
+            throw makeModelInterruptionError();
+          }
+          logger.info("Activity cancelled, stopping");
+          return new Err({ type: "shouldReturnNull" });
+        }
+        throw err;
+      }
+
+      switch (event.type) {
+        case "text_delta": {
+          for await (const tokenEvent of contentParser.emitTokens(
+            event.content.delta
+          )) {
+            await updateResourceAndPublishEvent(auth, {
+              event: { ...tokenEvent, traceId },
+              agentMessage,
+              conversation,
+              step,
+            });
+          }
+          continue;
+        }
+        case "reasoning_delta": {
+          await updateResourceAndPublishEvent(auth, {
+            event: {
+              type: "generation_tokens",
+              classification: "chain_of_thought",
+              created: Date.now(),
+              configurationId: agentConfiguration.sId,
+              messageId: agentMessage.sId,
+              text: event.content.delta,
+              traceId,
+            },
+            agentMessage,
+            conversation,
+            step,
+          });
+
+          nativeChainOfThought += event.content.delta;
+          continue;
+        }
+        case "tool_call_started": {
+          const stableToolName = resolveStableToolCallName(
+            specifications,
+            event.content.name
+          );
+
+          if (!stableToolName) {
+            continue;
+          }
+
+          const deduplicationKeys = getToolCallStartDeduplicationKeys({
+            stableToolName,
+            toolCallId: event.content.id,
+            toolCallIndex: event.content.index,
+          });
+
+          if (
+            deduplicationKeys.some((key) => publishedToolCallStartKeys.has(key))
+          ) {
+            continue;
+          }
+
+          await updateResourceAndPublishEvent(auth, {
+            event: {
+              type: "tool_call_started",
+              created: Date.now(),
+              configurationId: agentConfiguration.sId,
+              messageId: agentMessage.sId,
+              ...(event.content.id ? { toolCallId: event.content.id } : {}),
+              ...(event.content.index !== undefined
+                ? { toolCallIndex: event.content.index }
+                : {}),
+              toolName: stableToolName,
+            },
+            agentMessage,
+            conversation,
+            step,
+          });
+
+          for (const key of deduplicationKeys) {
+            publishedToolCallStartKeys.add(key);
+          }
+          continue;
+        }
+        case "tool_call_delta":
+          // tool_call_delta events act as heartbeat signals during tool call
+          // streaming, preventing the LLM stream timeout when the model is
+          // generating tool call arguments.
+          continue;
+        case "reasoning_generated": {
+          await updateResourceAndPublishEvent(auth, {
+            event: {
+              type: "generation_tokens",
+              classification: "chain_of_thought",
+              created: Date.now(),
+              configurationId: agentConfiguration.sId,
+              messageId: agentMessage.sId,
+              text: "\n\n",
+              traceId,
+            },
+            agentMessage,
+            conversation,
+            step,
+          });
+
+          const currentRegion = regionsConfig.getCurrentRegion();
+          let region: "us" | "eu";
+          switch (currentRegion) {
+            case "europe-west1":
+              region = "eu";
+              break;
+            case "us-central1":
+              region = "us";
+              break;
+            default:
+              throw new Error(`Unexpected region: ${currentRegion}`);
+          }
+
+          // Add reasoning content to contents array
+          contents.push({
+            type: "reasoning",
+            value: {
+              reasoning: event.content.text,
+              metadata: JSON.stringify(event.metadata),
+              tokens: 0, // Will be updated later from token_usage event
+              provider: model.providerId,
+              region: region,
+            },
+          });
+
+          nativeChainOfThought += "\n\n";
+          continue;
+        }
+        case "provider_passthrough": {
+          // Opaque provider block stored in stream order so the producing
+          // provider can replay it verbatim.
+          contents.push({
+            type: "provider_passthrough",
+            value: {
+              provider: event.content.provider,
+              block: event.content.block,
+            },
+          });
+          continue;
+        }
+        default:
+          break;
+      }
+
+      if (event.type === "tool_call") {
+        const {
+          content: { name, id, arguments: args, namespace },
+          metadata: { thoughtSignature },
+        } = event;
+        actions.push({
+          name,
+          functionCallId: id,
+        });
+
+        // Arguments are already fixed by parseToolArguments in the LLM client
+        const stringifiedArgs = JSON.stringify(args);
+        contents.push({
+          type: "function_call",
+          value: {
+            id,
+            name,
+            arguments: stringifiedArgs,
+            namespace,
+            metadata: thoughtSignature ? { thoughtSignature } : undefined,
+          },
+        });
+      }
+
+      if (event.type === "text_generated") {
+        contents.push({
+          type: "text_content",
+          value: event.content.text,
+          metadata: event.metadata,
+        });
+        generation += event.content.text;
+      }
+
+      if (event.type === "interaction_id") {
+        const { modelInteractionId, cacheMissReason } = event.content;
+
+        // Store this response id so the next step/turn can compare against it.
+        await setPreviousMessageId(cacheDiagnosticsKey, modelInteractionId);
+
+        if (cacheMissReason) {
+          logger.info(
+            {
+              ...logContext,
+              agentConfigurationId: agentConfiguration.sId,
+              modelInteractionId,
+              previousMessageId,
+              cacheMissReasonType: cacheMissReason.type,
+              cacheMissedInputTokens: cacheMissReason.cacheMissedInputTokens,
+            },
+            "[LLM stream] prompt cache miss"
+          );
+          const reasonTags = [
+            `model_id:${model.modelId}`,
+            `reason:${cacheMissReason.type}`,
+            `is_ruby_like_agent:${isRubyLikeAgent(agentConfiguration.sId)}`,
+          ];
+          // Count: how often each reason occurs.
+          statsDMetrics.increment("llm.cache_miss_reason.count", 1, reasonTags);
+          // Weighted by lost-cache tokens: which reason actually costs the most,
+          // not just which happens most. Only the `*_changed` reasons carry this
+          // (the inconclusive ones have no diverged prefix to measure).
+          if (cacheMissReason.cacheMissedInputTokens !== undefined) {
+            statsDMetrics.distribution(
+              "llm.cache_miss_reason.missed_input_tokens",
+              cacheMissReason.cacheMissedInputTokens,
+              reasonTags
+            );
+          }
+        }
+        continue;
+      }
+
+      if (event.type === "success") {
+        stopReason = event.stopReason;
+      }
+
+      if (event.type === "token_usage") {
+        // Update reasoning token count on the last reasoning item
+        const reasoningTokens = event.content.reasoningTokens ?? 0;
+        if (reasoningTokens > 0) {
+          for (let i = contents.length - 1; i >= 0; i--) {
+            const content = contents[i];
+            if (content.type === "reasoning") {
+              content.value.tokens = reasoningTokens;
+              break;
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof LLMStreamTimeoutError) {
+      await flushParserTokens();
+      // Watchdog timeouts abort after llm_interaction.count is already emitted
+      // and never become a terminal LLM error, so they do not increment
+      // llm_error.count.
+      return makeLLMTimeoutResponse(err.kind);
+    }
+    throw err;
+  }
+
+  await flushParserTokens();
+
+  // Validate structured output against the JSON schema when response format is set.
+  const responseFormat = parseResponseFormatSchema(llm.getResponseFormat());
+  if (responseFormat && generation) {
+    const parsed = safeParseJSON(generation);
+    if (parsed.isErr()) {
+      logger.warn(
+        {
+          ...logContext,
+          responseFormatName: responseFormat.json_schema.name,
+          error: parsed.error.message,
+        },
+        "Structured output JSON parsing failed: response from LLM may be invalid."
+      );
+    }
+  }
+
+  return new Ok({
+    output: {
+      actions,
+      generation,
+      contents,
+    },
+    nativeChainOfThought,
+    rubyRunId: llm.getTraceId(),
+    timeToFirstEvent,
+    stopReason,
+  });
+}

@@ -1,0 +1,284 @@
+import config from "@app/lib/api/config";
+import type { Authenticator } from "@app/lib/auth";
+import type { DataSourceResource } from "@app/lib/resources/data_source_resource";
+import { FileResource } from "@app/lib/resources/file_resource";
+import { cleanTimestamp } from "@app/lib/utils/timestamps";
+import logger from "@app/logger/logger";
+import tracer from "@app/logger/tracer";
+import type { CoreAPIError, CoreAPITable } from "@app/types/core/core_api";
+import { CoreAPI } from "@app/types/core/core_api";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import type { WorkspaceType } from "@app/types/user";
+
+type NotFoundError = {
+  type: "table_not_found" | "file_not_found";
+  message: string;
+};
+
+type TableOperationError =
+  | {
+      type: "internal_server_error";
+      coreAPIError: CoreAPIError;
+      message: string;
+    }
+  | {
+      type: "invalid_request_error";
+      message: string;
+    }
+  | {
+      type: "not_found_error";
+      notFoundError: NotFoundError;
+    };
+
+export async function deleteTable({
+  owner,
+  dataSource,
+  tableId,
+}: {
+  owner: WorkspaceType;
+  dataSource: DataSourceResource;
+  tableId: string;
+}): Promise<Result<null, TableOperationError>> {
+  return tracer.trace(
+    "tables.delete_table",
+    { resource: dataSource.connectorProvider ?? "managed-none" },
+    async (span) => {
+      span?.setTag("workspace.id", owner.sId);
+      span?.setTag("data_source.s_id", dataSource.sId);
+      span?.setTag("table.id", tableId);
+      span?.setTag("core.project_id", dataSource.rubyAPIProjectId);
+      span?.setTag("core.data_source_id", dataSource.rubyAPIDataSourceId);
+      return _deleteTable({ owner, dataSource, tableId });
+    }
+  );
+}
+
+async function _deleteTable({
+  owner,
+  dataSource,
+  tableId,
+}: {
+  owner: WorkspaceType;
+  dataSource: DataSourceResource;
+  tableId: string;
+}): Promise<Result<null, TableOperationError>> {
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+  const deleteRes = await coreAPI.deleteTable({
+    projectId: dataSource.rubyAPIProjectId,
+    dataSourceId: dataSource.rubyAPIDataSourceId,
+    tableId,
+    caller: "tables-api-delete-table",
+  });
+  if (deleteRes.isErr()) {
+    logger.error(
+      {
+        projectId: dataSource.rubyAPIProjectId,
+        dataSourceId: dataSource.rubyAPIDataSourceId,
+        dataSourceName: dataSource.name,
+        workspaceId: owner.sId,
+        error: deleteRes.error,
+      },
+      "Failed to delete table."
+    );
+    if (deleteRes.error.code === "table_not_found") {
+      return new Err({
+        type: "not_found_error",
+        notFoundError: {
+          type: "table_not_found",
+          message: "The table you requested was not found.",
+        },
+      });
+    }
+    return new Err({
+      type: "internal_server_error",
+      coreAPIError: deleteRes.error,
+      message: "Failed to delete table.",
+    });
+  }
+  // We do not delete the related AgentTablesQueryConfigurationTable entry if any.
+  // This is because the table might be created again with the same name and we want to keep the configuration.
+  // The agent Builder displays an error on the action card if it misses a table.
+
+  return new Ok(null);
+}
+
+export async function upsertTableFromCsv({
+  auth,
+  dataSource,
+  tableName,
+  tableDescription,
+  tableId,
+  tableTimestamp,
+  tableTags,
+  tableParentId,
+  tableParents,
+  fileId,
+  truncate,
+  title,
+  mimeType,
+  sourceUrl,
+}: {
+  auth: Authenticator;
+  dataSource: DataSourceResource;
+  tableName: string;
+  tableDescription: string;
+  tableId: string;
+  tableTimestamp: number | null;
+  tableTags: string[];
+  tableParentId: string | null;
+  tableParents: string[];
+  fileId: string | null;
+  truncate: boolean;
+  title: string;
+  mimeType: string;
+  sourceUrl: string | null;
+}): Promise<Result<{ table: CoreAPITable }, TableOperationError>> {
+  const owner = auth.getNonNullableWorkspace();
+  const file: FileResource | null = fileId
+    ? await FileResource.fetchById(auth, fileId)
+    : null;
+  if (fileId && !file) {
+    return new Err({
+      type: "not_found_error",
+      notFoundError: {
+        type: "file_not_found",
+        message:
+          "The file associated with the fileId you provided was not found",
+      },
+    });
+  }
+
+  if (file) {
+    if (file.status !== "ready") {
+      return new Err({
+        type: "invalid_request_error",
+        message: "The file provided is not ready",
+      });
+    }
+
+    const VALID_USE_CASES = [
+      "upsert_table",
+      "conversation",
+      "tool_output",
+      "project_context",
+    ];
+    if (!VALID_USE_CASES.includes(file.useCase)) {
+      return new Err({
+        type: "invalid_request_error",
+        message: `The file provided has not the expected use-case. Expected one of: ${VALID_USE_CASES.join(
+          ", "
+        )}`,
+      });
+    }
+  }
+
+  if (tableParentId && tableParents && tableParents[1] !== tableParentId) {
+    return new Err({
+      type: "invalid_request_error",
+      message: "Invalid request body, parents[1] and parent_id should be equal",
+    });
+  }
+
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+  const tableRes = await coreAPI.upsertTable({
+    projectId: dataSource.rubyAPIProjectId,
+    dataSourceId: dataSource.rubyAPIDataSourceId,
+    tableId,
+    name: tableName,
+    description: tableDescription,
+    timestamp: cleanTimestamp(tableTimestamp),
+    tags: tableTags,
+    parentId: tableParentId,
+    parents: tableParents,
+    title,
+    mimeType,
+    sourceUrl,
+  });
+
+  if (tableRes.isErr()) {
+    const errorDetails = {
+      type: "internal_server_error" as const,
+      coreAPIError: tableRes.error,
+      message: "Failed to upsert table.",
+    };
+    logger.error(
+      {
+        ...errorDetails,
+        projectId: dataSource.rubyAPIProjectId,
+        dataSourceId: dataSource.rubyAPIDataSourceId,
+        dataSourceName: dataSource.name,
+        workspaceId: owner.sId,
+        tableId,
+        tableName,
+      },
+      "Error upserting table in CoreAPI."
+    );
+    return new Err(errorDetails);
+  }
+
+  if (file) {
+    const { bucket, path } = file.getContentBucketAndPath(auth);
+    const csvRes = await coreAPI.tableUpsertCSVContent({
+      projectId: dataSource.rubyAPIProjectId,
+      dataSourceId: dataSource.rubyAPIDataSourceId,
+      tableId,
+      bucket,
+      bucketCSVPath: path,
+      truncate,
+    });
+
+    if (csvRes.isErr()) {
+      const errorDetails = {
+        type: "internal_server_error" as const,
+        coreAPIError: csvRes.error,
+        truncate,
+        message: `Failed to upsert CSV.`,
+      };
+      logger.error(
+        {
+          ...errorDetails,
+          projectId: dataSource.rubyAPIProjectId,
+          dataSourceId: dataSource.rubyAPIDataSourceId,
+          dataSourceName: dataSource.name,
+          workspaceId: owner.sId,
+          tableId,
+          tableName,
+        },
+        "Error upserting CSV in CoreAPI."
+      );
+
+      // Only delete the table if we are truncating.
+      // Otherwise, we will delete the whole previous data while we just failed an upsert.
+      if (truncate) {
+        const delRes = await coreAPI.deleteTable({
+          projectId: dataSource.rubyAPIProjectId,
+          dataSourceId: dataSource.rubyAPIDataSourceId,
+          tableId,
+          caller: "tables-api-truncate-on-upsert-fail",
+        });
+
+        if (delRes.isErr()) {
+          logger.error(
+            {
+              type: "internal_server_error",
+              coreAPIError: delRes.error,
+              projectId: dataSource.rubyAPIProjectId,
+              dataSourceId: dataSource.rubyAPIDataSourceId,
+              dataSourceName: dataSource.name,
+              workspaceId: owner.sId,
+              tableId,
+              tableName,
+            },
+            "Failed to delete table after failed CSV upsert."
+          );
+        }
+      }
+      return new Err(errorDetails);
+    }
+  }
+
+  return tableRes;
+}

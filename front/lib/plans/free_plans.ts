@@ -1,0 +1,189 @@
+import { PlanModel } from "@app/lib/models/plan";
+import {
+  FREE_NO_PLAN_CODE,
+  FREE_TEST_PLAN_CODE,
+  FREE_TRIAL_PHONE_PLAN_CODE,
+  FREE_UPGRADED_PLAN_CODE,
+} from "@app/lib/plans/plan_codes";
+import type { Attributes } from "sequelize";
+
+export type PlanAttributes = Omit<
+  Attributes<PlanModel>,
+  "id" | "createdAt" | "updatedAt"
+>;
+
+/**
+ * We have 3 categories of plans:
+ * - Free: plans with no paid subscription.
+ * - Pro: plans with a paid subscription, not tailored. -> i.e. the same plan is used by all Pro
+ *        workspaces.
+ * - Entreprise: plans with a paid subscription, tailored to the needs of the entreprise.
+ *               -> i.e. we will have one plan per "Entreprise".
+ *
+ * This file about Free plans.
+ */
+
+/**
+ * FREE_NO_PLAN is the plan used for workspaces that are being created and have not yet subscribed
+ * to a plan (card has not been entered yet for free trial). It prevents using the product entirely.
+ */
+export const FREE_NO_PLAN_DATA: PlanAttributes = {
+  code: FREE_NO_PLAN_CODE,
+  name: "No Plan",
+  maxMessages: 0,
+  maxMessagesTimeframe: "lifetime",
+  maxAwuCredits: 0,
+  maxAwuCreditsTimeframe: "lifetime",
+  isDeepDiveAllowed: false,
+  maxImagesPerWeek: 0,
+  maxUsersInWorkspace: 1,
+  maxFreeUsersInWorkspace: -1,
+  maxLifetimeFreeUsersInWorkspace: -1,
+  maxVaultsInWorkspace: 1,
+  isSlackbotAllowed: false,
+  isManagedConfluenceAllowed: false,
+  isManagedSlackAllowed: false,
+  isManagedNotionAllowed: false,
+  isManagedGoogleDriveAllowed: false,
+  isManagedGithubAllowed: false,
+  isManagedIntercomAllowed: false,
+  isManagedWebCrawlerAllowed: false,
+  isManagedSalesforceAllowed: false,
+  isSSOAllowed: false,
+  isSCIMAllowed: false,
+  isAuditLogsAllowed: false,
+  maxConnectionsCount: 0,
+  maxDataSourcesCount: 0,
+  maxDataSourcesDocumentsCount: 0,
+  maxDataSourcesDocumentsSizeMb: 0,
+  trialPeriodDays: 0,
+  canUseProduct: false,
+  isByok: false,
+  hasAdvancedModelAccess: false,
+};
+
+/**
+ * FREE plans are stored in the database.
+ * We can update existing plans or add new one but never remove anything from this list.
+ */
+const FREE_PLANS_DATA: PlanAttributes[] = [
+  {
+    code: FREE_TEST_PLAN_CODE,
+    name: "Free",
+    maxMessages: 50,
+    maxMessagesTimeframe: "lifetime",
+    maxAwuCredits: -1,
+    maxAwuCreditsTimeframe: "lifetime",
+    isDeepDiveAllowed: false,
+    maxUsersInWorkspace: 1,
+    maxFreeUsersInWorkspace: -1,
+    maxLifetimeFreeUsersInWorkspace: -1,
+    maxVaultsInWorkspace: 1,
+    maxImagesPerWeek: 0,
+    isSlackbotAllowed: false,
+    isManagedConfluenceAllowed: false,
+    isManagedSlackAllowed: false,
+    isManagedNotionAllowed: false,
+    isManagedGoogleDriveAllowed: false,
+    isManagedGithubAllowed: false,
+    isManagedIntercomAllowed: false,
+    isManagedWebCrawlerAllowed: false,
+    isManagedSalesforceAllowed: false,
+    isSSOAllowed: false,
+    isSCIMAllowed: false,
+    isAuditLogsAllowed: false,
+    maxConnectionsCount: -1,
+    maxDataSourcesCount: 5,
+    maxDataSourcesDocumentsCount: 10,
+    maxDataSourcesDocumentsSizeMb: 2,
+    trialPeriodDays: 0,
+    canUseProduct: false,
+    isByok: false,
+    hasAdvancedModelAccess: false,
+  },
+  {
+    code: FREE_UPGRADED_PLAN_CODE,
+    name: "Free Trial",
+    maxMessages: -1,
+    maxMessagesTimeframe: "lifetime",
+    maxAwuCredits: -1,
+    maxAwuCreditsTimeframe: "lifetime",
+    maxUsersInWorkspace: -1,
+    maxFreeUsersInWorkspace: -1,
+    maxLifetimeFreeUsersInWorkspace: -1,
+    maxVaultsInWorkspace: -1,
+    maxImagesPerWeek: 50,
+    isDeepDiveAllowed: true,
+    isSlackbotAllowed: true,
+    isManagedConfluenceAllowed: true,
+    isManagedSlackAllowed: true,
+    isManagedNotionAllowed: true,
+    isManagedGoogleDriveAllowed: true,
+    isManagedGithubAllowed: true,
+    isManagedIntercomAllowed: true,
+    isManagedWebCrawlerAllowed: true,
+    isManagedSalesforceAllowed: true,
+    isSSOAllowed: true,
+    isSCIMAllowed: false,
+    isAuditLogsAllowed: false,
+    maxConnectionsCount: -1,
+    maxDataSourcesCount: -1,
+    maxDataSourcesDocumentsCount: -1,
+    maxDataSourcesDocumentsSizeMb: 2,
+    trialPeriodDays: 0,
+    canUseProduct: true,
+    isByok: false,
+    hasAdvancedModelAccess: false,
+  },
+  {
+    code: FREE_TRIAL_PHONE_PLAN_CODE,
+    name: "Free Trial",
+    maxMessages: 100,
+    maxMessagesTimeframe: "lifetime",
+    maxAwuCredits: -1,
+    maxAwuCreditsTimeframe: "lifetime",
+    isDeepDiveAllowed: false,
+    maxUsersInWorkspace: 3,
+    maxFreeUsersInWorkspace: -1,
+    maxLifetimeFreeUsersInWorkspace: -1,
+    maxVaultsInWorkspace: 5,
+    maxImagesPerWeek: 10,
+    isSlackbotAllowed: true,
+    isManagedConfluenceAllowed: true,
+    isManagedSlackAllowed: true,
+    isManagedNotionAllowed: true,
+    isManagedGoogleDriveAllowed: true,
+    isManagedGithubAllowed: true,
+    isManagedIntercomAllowed: true,
+    isManagedWebCrawlerAllowed: true,
+    isManagedSalesforceAllowed: false,
+    isSSOAllowed: false,
+    isSCIMAllowed: false,
+    isAuditLogsAllowed: false,
+    maxConnectionsCount: -1,
+    maxDataSourcesCount: -1,
+    maxDataSourcesDocumentsCount: -1,
+    maxDataSourcesDocumentsSizeMb: 2,
+    trialPeriodDays: 0,
+    canUseProduct: true,
+    isByok: false,
+    hasAdvancedModelAccess: false,
+  },
+];
+
+/**
+ * Function to call when we edit something in FREE_PLANS_DATA to update the database. It will create or update the plans.
+ * Uses atomic upsert to avoid race conditions when called concurrently (e.g., in parallel tests).
+ * @param planCode - Optional plan code to upsert. If not provided, all plans are upserted.
+ */
+export const upsertFreePlans = async (planCode?: string) => {
+  const plansToUpsert = planCode
+    ? FREE_PLANS_DATA.filter((p) => p.code === planCode)
+    : FREE_PLANS_DATA;
+
+  for (const planData of plansToUpsert) {
+    await PlanModel.upsert(planData, {
+      conflictFields: ["code"],
+    });
+  }
+};

@@ -1,0 +1,1669 @@
+import {
+  createConversation,
+  postNewContentFragment,
+} from "@app/lib/api/assistant/conversation";
+import {
+  isContentNodeAttachmentType,
+  isFileAttachmentType,
+} from "@app/lib/api/assistant/conversation/attachments";
+import * as contentFragmentModule from "@app/lib/api/assistant/conversation/content_fragment";
+import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
+import { createConversationFork } from "@app/lib/api/assistant/conversation/forks";
+import { listAttachments } from "@app/lib/api/assistant/jit_utils";
+import * as fileUtilsModule from "@app/lib/api/files/utils";
+import * as uploadFrameContentModule from "@app/lib/api/viz/upload_frame_content";
+import { Authenticator } from "@app/lib/auth";
+import { USAGE_TYPE_USER } from "@app/lib/metronome/constants";
+import { AgentStepContentToolExecutionModel } from "@app/lib/models/agent/actions/agent_step_content_tool_execution";
+import {
+  AgentMCPActionModel,
+  AgentMCPActionOutputItemModel,
+} from "@app/lib/models/agent/actions/mcp";
+import { AgentStepContentModel } from "@app/lib/models/agent/agent_step_content";
+import {
+  AgentMessageModel,
+  ConversationModel,
+  MessageModel,
+  UserMessageModel,
+} from "@app/lib/models/agent/conversation";
+import { ConversationForkModel } from "@app/lib/models/agent/conversation_fork";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { FileResource } from "@app/lib/resources/file_resource";
+import { RunResource } from "@app/lib/resources/run_resource";
+import { SkillResource } from "@app/lib/resources/skill/skill_resource";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import { launchCompactionWorkflow } from "@app/temporal/agent_loop/client";
+import { DataSourceViewFactory } from "@app/tests/utils/DataSourceViewFactory";
+import { FileFactory } from "@app/tests/utils/FileFactory";
+import { createPrivateApiMockRequest } from "@app/tests/utils/generic_private_api_tests";
+import { MCPServerViewFactory } from "@app/tests/utils/MCPServerViewFactory";
+import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
+import { RemoteMCPServerFactory } from "@app/tests/utils/RemoteMCPServerFactory";
+import { SkillFactory } from "@app/tests/utils/SkillFactory";
+import { SpaceFactory } from "@app/tests/utils/SpaceFactory";
+import { UserFactory } from "@app/tests/utils/UserFactory";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
+import type {
+  ConversationType,
+  ConversationWithoutContentType,
+} from "@app/types/assistant/conversation";
+import { isCompactionMessageType } from "@app/types/assistant/conversation";
+import { CLAUDE_4_5_HAIKU_DEFAULT_MODEL_CONFIG } from "@app/types/assistant/models/anthropic";
+import { GPT_5_MINI_MODEL_CONFIG } from "@app/types/assistant/models/openai";
+import type { SupportedModel } from "@app/types/assistant/models/types";
+import {
+  isContentFragmentType,
+  isContentNodeContentFragment,
+} from "@app/types/content_fragment";
+import { frameContentType } from "@app/types/files";
+import type { ModelId } from "@app/types/shared/model_id";
+import { Ok } from "@app/types/shared/result";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@app/temporal/agent_loop/client", () => ({
+  launchAgentLoopWorkflow: vi.fn(),
+  launchCompactionWorkflow: vi.fn(),
+}));
+
+async function createUserMessage(
+  auth: Authenticator,
+  {
+    conversation,
+    rank,
+    content,
+  }: {
+    conversation: ConversationWithoutContentType | ConversationResource;
+    rank: number;
+    content: string;
+  }
+): Promise<MessageModel> {
+  const workspace = auth.getNonNullableWorkspace();
+  const user = auth.getNonNullableUser();
+
+  const userMessage = await UserMessageModel.create({
+    userId: user.id,
+    conversationId: conversation.id,
+    workspaceId: workspace.id,
+    content,
+    userContextUsername: user.username,
+    userContextTimezone: "UTC",
+    userContextFullName: user.fullName(),
+    userContextEmail: user.email,
+    userContextProfilePictureUrl: user.imageUrl,
+    userContextOrigin: "web",
+    clientSideMCPServerIds: [],
+  });
+
+  return MessageModel.create({
+    workspaceId: workspace.id,
+    sId: generateRandomModelSId(),
+    rank,
+    conversationId: conversation.id,
+    parentId: null,
+    userMessageId: userMessage.id,
+  });
+}
+
+async function createAgentMessage(
+  auth: Authenticator,
+  {
+    conversation,
+    rank,
+    parentId,
+    status,
+    generatedFileId = null,
+  }: {
+    conversation: ConversationWithoutContentType | ConversationResource;
+    rank: number;
+    parentId: ModelId;
+    status: "created" | "succeeded";
+    generatedFileId?: ModelId | null;
+  }
+): Promise<MessageModel> {
+  const workspace = auth.getNonNullableWorkspace();
+
+  const agentMessage = await AgentMessageModel.create({
+    conversationId: conversation.id,
+    workspaceId: workspace.id,
+    status,
+    agentConfigurationId: GLOBAL_AGENTS_SID.RUBY,
+    agentConfigurationVersion: 0,
+    skipToolsValidation: false,
+    completedAt: status === "created" ? null : new Date(),
+  });
+
+  const message = await MessageModel.create({
+    workspaceId: workspace.id,
+    sId: generateRandomModelSId(),
+    rank,
+    conversationId: conversation.id,
+    parentId,
+    agentMessageId: agentMessage.id,
+  });
+
+  if (!generatedFileId) {
+    return message;
+  }
+
+  const stepContent = await AgentStepContentModel.create({
+    workspaceId: workspace.id,
+    agentMessageId: agentMessage.id,
+    step: 1,
+    index: 0,
+    version: 0,
+    type: "function_call",
+    value: {
+      type: "function_call",
+      value: {
+        id: generateRandomModelSId(),
+        name: "test_tool",
+        arguments: "{}",
+      },
+    },
+  });
+
+  const action = await AgentMCPActionModel.create({
+    workspaceId: workspace.id,
+    agentMessageId: agentMessage.id,
+    stepContentId: stepContent.id,
+    mcpServerConfigurationId: generateRandomModelSId(),
+    status: "succeeded",
+    citationsAllocated: 0,
+    augmentedInputs: {},
+    toolConfiguration: {
+      id: 1,
+      sId: generateRandomModelSId(),
+      type: "mcp_configuration",
+      name: "test_tool",
+      dataSources: null,
+      tables: null,
+      childAgentId: null,
+      timeFrame: null,
+      jsonSchema: null,
+      additionalConfiguration: {},
+      mcpServerViewId: "test-server-view",
+      rubyAppConfiguration: null,
+      secretName: null,
+      rubyProject: null,
+      internalMCPServerId: null,
+      availability: "auto",
+      permission: "low",
+      toolServerId: "test-server",
+      retryPolicy: "no_retry",
+      originalName: "test_tool",
+      mcpServerName: "test_server",
+    },
+    stepContext: {
+      citationsCount: 0,
+      citationsOffset: 0,
+      resumeState: null,
+      retrievalTopK: 10,
+      websearchResultCount: 0,
+    },
+  });
+
+  await AgentStepContentToolExecutionModel.create({
+    workspaceId: workspace.id,
+    conversationId: conversation.id,
+    agentMessageId: agentMessage.id,
+    agentMCPActionId: action.id,
+    stepContentId: stepContent.id,
+  });
+
+  await AgentMCPActionOutputItemModel.create({
+    workspaceId: workspace.id,
+    agentMCPActionId: action.id,
+    content: { type: "text", text: "Tool output" },
+    contentGcsPath: null,
+    fileId: generatedFileId,
+    citations: null,
+  });
+
+  return message;
+}
+
+async function createConversationFile(
+  auth: Authenticator,
+  {
+    conversationId,
+    fileName,
+    snippet = null,
+    contentType = "text/plain",
+  }: {
+    conversationId: string;
+    fileName: string;
+    snippet?: string | null;
+    contentType?: "text/plain" | "text/csv";
+  }
+): Promise<FileResource> {
+  return FileFactory.create(auth, auth.getNonNullableUser(), {
+    contentType,
+    fileName,
+    fileSize: 16,
+    status: "ready",
+    useCase: "conversation",
+    useCaseMetadata: {
+      conversationId,
+    },
+    snippet,
+  });
+}
+
+async function attachRunToAgentMessage(
+  auth: Authenticator,
+  {
+    message,
+    model,
+    promptTokens = 100,
+  }: {
+    message: MessageModel;
+    model: SupportedModel;
+    promptTokens?: number;
+  }
+): Promise<void> {
+  if (!message.agentMessageId) {
+    throw new Error("Expected an agent message.");
+  }
+
+  const run = await RunResource.makeNew({
+    appId: null,
+    rubyRunId: generateRandomModelSId(),
+    runType: "deploy",
+    useWorkspaceCredentials: false,
+    workspaceId: auth.getNonNullableWorkspace().id,
+  });
+
+  await run.recordTokenUsage(
+    auth,
+    {
+      inputTokens: promptTokens,
+      totalOutputTokens: 20,
+      totalTokens: promptTokens + 20,
+    },
+    model.modelId,
+    { usageType: USAGE_TYPE_USER }
+  );
+
+  const [updatedCount] = await AgentMessageModel.update(
+    { runIds: [run.rubyRunId] },
+    {
+      where: {
+        id: message.agentMessageId,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    }
+  );
+
+  if (updatedCount !== 1) {
+    throw new Error(`Missing agent message ${message.agentMessageId}.`);
+  }
+}
+
+async function createToolOutputFile(
+  auth: Authenticator,
+  {
+    conversationId,
+    fileName,
+    snippet = null,
+    hideFromUser = false,
+  }: {
+    conversationId: string;
+    fileName: string;
+    snippet?: string | null;
+    hideFromUser?: boolean;
+  }
+): Promise<FileResource> {
+  return FileFactory.create(auth, auth.getNonNullableUser(), {
+    contentType: "text/plain",
+    fileName,
+    fileSize: 16,
+    status: "ready",
+    useCase: "tool_output",
+    useCaseMetadata: {
+      conversationId,
+      ...(hideFromUser ? { hideFromUser: true } : {}),
+    },
+    snippet,
+  });
+}
+
+async function fetchConversationOrThrow(
+  auth: Authenticator,
+  conversationId: string
+): Promise<ConversationType> {
+  const result = await getConversation(auth, conversationId);
+  if (result.isErr()) {
+    throw result.error;
+  }
+
+  return result.value;
+}
+
+function getLatestContentNodeContentFragmentId(
+  conversation: ConversationType,
+  nodeId: string
+): string {
+  for (const versions of conversation.content) {
+    const latestVersion = versions[versions.length - 1];
+
+    if (
+      latestVersion &&
+      isContentFragmentType(latestVersion) &&
+      isContentNodeContentFragment(latestVersion) &&
+      latestVersion.nodeId === nodeId
+    ) {
+      return latestVersion.contentFragmentId;
+    }
+  }
+
+  throw new Error(`Missing content node content fragment for node ${nodeId}.`);
+}
+
+function mockCopyToConversation({
+  copyContent = false,
+}: {
+  copyContent?: boolean;
+} = {}) {
+  return vi
+    .spyOn(FileResource, "copyToConversation")
+    .mockImplementation(async (auth, { sourceId, conversationId }) => {
+      const sourceFile = await FileResource.fetchById(auth, sourceId);
+      if (!sourceFile) {
+        throw new Error(`Missing source file in test: ${sourceId}`);
+      }
+
+      const copiedFile = await FileFactory.create(auth, auth.user(), {
+        contentType: sourceFile.contentType,
+        fileName: sourceFile.fileName,
+        fileSize: sourceFile.fileSize,
+        status: "ready",
+        useCase: sourceFile.useCase,
+        useCaseMetadata: {
+          ...(sourceFile.useCaseMetadata ?? {}),
+          conversationId,
+        },
+        snippet: sourceFile.snippet,
+      });
+
+      if (copyContent) {
+        const sourceContent = await fileUtilsModule.getFileContent(
+          auth,
+          sourceFile,
+          "original"
+        );
+        if (sourceContent !== null) {
+          await copiedFile.uploadContent(auth, sourceContent);
+        }
+      }
+
+      return new Ok(copiedFile);
+    });
+}
+
+function mockFileContentStorage() {
+  const fileContents = new Map<string, string>();
+  const getFileContentSpy = vi
+    .spyOn(fileUtilsModule, "getFileContent")
+    .mockImplementation(
+      async (_auth, file) => fileContents.get(file.sId) ?? null
+    );
+  const uploadContentSpy = vi
+    .spyOn(FileResource.prototype, "uploadContent")
+    .mockImplementation(async function (this: FileResource, _auth, content) {
+      fileContents.set(this.sId, content);
+      await this.update({
+        fileSize: Buffer.byteLength(content, "utf8"),
+      });
+    });
+
+  return {
+    getFileContentSpy,
+    uploadContentSpy,
+  };
+}
+
+function mockUploadFrameContent() {
+  return vi
+    .spyOn(uploadFrameContentModule, "uploadFrameContent")
+    .mockImplementation(async (auth, file, content) => {
+      await file.uploadContent(auth, content);
+      return new Ok(undefined);
+    });
+}
+
+function mockContentNodeAttachments(nodeDataSourceViewId: number) {
+  return vi
+    .spyOn(contentFragmentModule, "getContentFragmentBlob")
+    .mockImplementation(async (_auth, cf) => {
+      if (!("nodeId" in cf)) {
+        throw new Error(
+          "Unexpected file content fragment input in content node mock."
+        );
+      }
+
+      return new Ok({
+        contentType: "text/plain",
+        fileId: null,
+        nodeId: cf.nodeId,
+        nodeDataSourceViewId,
+        nodeType: "document",
+        sourceUrl: null,
+        textBytes: null,
+        title: cf.title,
+      });
+    });
+}
+
+describe("createConversationFork", () => {
+  it("creates the child conversation, sole participant, and lineage row", async () => {
+    const { auth, user } = await createPrivateApiMockRequest();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      depth: 1,
+      spaceId: null,
+    });
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "How should I continue this?",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    expect(childConversation.title).toBeNull();
+    expect(childConversation.spaceId).toBe(null);
+    // Forks are root conversations even when created from a sub-agent conversation.
+    expect(childConversation.depth).toBe(0);
+    expect(childConversation.forkingData).toEqual({
+      forkedFrom: {
+        parentConversationId: parentConversation.sId,
+        parentConversationTitle: "Parent conversation",
+        sourceMessageId: sourceMessage.sId,
+        branchedAt: expect.any(Number),
+        user: user.toJSON(),
+        fileCopyStatus: "pending",
+      },
+    });
+    expect(childConversation.content).toHaveLength(1);
+    expect(isCompactionMessageType(childConversation.content[0]![0]!)).toBe(
+      true
+    );
+    expect(
+      isCompactionMessageType(childConversation.content[0]![0]!)
+        ? childConversation.content[0]![0]!.status
+        : null
+    ).toBe("created");
+    expect(vi.mocked(launchCompactionWorkflow)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth,
+        conversationId: childConversation.sId,
+        sourceConversation: {
+          conversationId: parentConversation.sId,
+          messageRank: sourceMessage.rank,
+        },
+      })
+    );
+
+    const forkRow = await ConversationForkModel.findOne({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        childConversationId: childConversation.id,
+      },
+    });
+
+    expect(forkRow).not.toBeNull();
+    expect(forkRow?.parentConversationId).toBe(parentConversation.id);
+    expect(forkRow?.sourceMessageId).toBe(sourceMessage.id);
+    expect(forkRow?.createdByUserId).toBe(user.id);
+
+    const participants = await ConversationResource.listParticipantDetails(
+      auth,
+      childConversation
+    );
+    expect(participants).toEqual([
+      {
+        userId: user.id,
+        action: "subscribed",
+      },
+    ]);
+  });
+
+  it("uses the source agent message model for fork compaction", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const firstUserMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "First turn",
+    });
+    const firstAgentMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: firstUserMessage.id,
+      status: "succeeded",
+    });
+    await attachRunToAgentMessage(auth, {
+      message: firstAgentMessage,
+      model: {
+        providerId: CLAUDE_4_5_HAIKU_DEFAULT_MODEL_CONFIG.providerId,
+        modelId: CLAUDE_4_5_HAIKU_DEFAULT_MODEL_CONFIG.modelId,
+      },
+      promptTokens: 300,
+    });
+
+    const secondUserMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 2,
+      content: "Second turn",
+    });
+    const secondAgentMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 3,
+      parentId: secondUserMessage.id,
+      status: "succeeded",
+    });
+    await attachRunToAgentMessage(auth, {
+      message: secondAgentMessage,
+      model: {
+        providerId: GPT_5_MINI_MODEL_CONFIG.providerId,
+        modelId: GPT_5_MINI_MODEL_CONFIG.modelId,
+      },
+      promptTokens: 150,
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: firstAgentMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    expect(vi.mocked(launchCompactionWorkflow)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth,
+        conversationId: expect.any(String),
+        model: {
+          providerId: CLAUDE_4_5_HAIKU_DEFAULT_MODEL_CONFIG.providerId,
+          modelId: CLAUDE_4_5_HAIKU_DEFAULT_MODEL_CONFIG.modelId,
+        },
+        sourceConversation: {
+          conversationId: parentConversation.sId,
+          messageRank: firstAgentMessage.rank,
+        },
+      })
+    );
+  });
+
+  it("resolves the latest completed main-thread agent message when no source is provided", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const firstUserMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "First turn",
+    });
+    const firstAgentMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: firstUserMessage.id,
+      status: "succeeded",
+    });
+
+    const secondUserMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 2,
+      content: "Second turn",
+    });
+    await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 3,
+      parentId: secondUserMessage.id,
+      status: "created",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    expect(childConversation.forkingData?.forkedFrom?.sourceMessageId).toBe(
+      firstAgentMessage.sId
+    );
+  });
+
+  it("returns invalid_request_error when the source message is not forkable", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "Still waiting for the model",
+    });
+    const pendingAgentMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: userMessage.id,
+      status: "created",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: pendingAgentMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(true);
+    expect(result.isErr() ? result.error.code : "").toBe(
+      "invalid_request_error"
+    );
+  });
+
+  it("copies enabled conversation MCP server views into the child conversation", async () => {
+    const { auth, globalSpace, workspace } =
+      await createPrivateApiMockRequest();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const enabledRemoteServer = await RemoteMCPServerFactory.create(workspace);
+    const enabledMCPServerView = await MCPServerViewFactory.create(
+      workspace,
+      enabledRemoteServer.sId,
+      globalSpace
+    );
+    const disabledRemoteServer = await RemoteMCPServerFactory.create(workspace);
+    const disabledMCPServerView = await MCPServerViewFactory.create(
+      workspace,
+      disabledRemoteServer.sId,
+      globalSpace
+    );
+
+    const enabledUpsertResult = await ConversationResource.upsertMCPServerViews(
+      auth,
+      {
+        conversation: parentConversation,
+        mcpServerViews: [enabledMCPServerView],
+        enabled: true,
+        source: "conversation",
+        agentConfigurationId: null,
+      }
+    );
+    expect(enabledUpsertResult.isOk()).toBe(true);
+
+    const disabledUpsertResult =
+      await ConversationResource.upsertMCPServerViews(auth, {
+        conversation: parentConversation,
+        mcpServerViews: [disabledMCPServerView],
+        enabled: false,
+        source: "conversation",
+        agentConfigurationId: null,
+      });
+    expect(disabledUpsertResult.isOk()).toBe(true);
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "Continue with the same tools.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    const childMCPServerViews = await ConversationResource.fetchMCPServerViews(
+      auth,
+      childConversation
+    );
+
+    expect(childMCPServerViews).toHaveLength(1);
+    expect(childMCPServerViews[0].mcpServerViewId).toBe(
+      enabledMCPServerView.id
+    );
+    expect(childMCPServerViews[0].enabled).toBe(true);
+    expect(childMCPServerViews[0].source).toBe("conversation");
+  });
+
+  it("copies enabled conversation skills into the child conversation", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const enabledSkill = await SkillFactory.create(auth, {
+      name: "Enabled skill",
+    });
+    await SkillFactory.create(auth, {
+      name: "Disabled skill",
+    });
+
+    const upsertResult = await SkillResource.upsertConversationSkills(auth, {
+      conversation: parentConversation.toJSON(),
+      skills: [enabledSkill],
+      enabled: true,
+    });
+    expect(upsertResult.isOk()).toBe(true);
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "Continue with the same skills.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    const childSkills = await SkillResource.listEnabledByConversation(auth, {
+      conversation: childConversation,
+    });
+
+    expect(childSkills).toHaveLength(1);
+    expect(childSkills[0].sId).toBe(enabledSkill.sId);
+  });
+
+  it("copies direct conversation file attachments into the child conversation", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+    const copyToConversationSpy = mockCopyToConversation();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const sourceFile = await createConversationFile(auth, {
+      conversationId: parentConversation.sId,
+      fileName: "notes.csv",
+      snippet: "fork me",
+      contentType: "text/csv",
+    });
+
+    let parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const attachmentResult = await postNewContentFragment(
+      auth,
+      parentConversationWithContent,
+      {
+        title: "Notes",
+        fileId: sourceFile.sId,
+      },
+      null
+    );
+    expect(attachmentResult.isOk()).toBe(true);
+    if (attachmentResult.isErr()) {
+      throw attachmentResult.error;
+    }
+
+    parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversationWithContent,
+      rank: 1,
+      content: "Please branch this.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversationWithContent,
+      rank: 2,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    const childAttachments = await listAttachments(auth, {
+      conversation: childConversation,
+    });
+    const childFileAttachments = childAttachments.filter(isFileAttachmentType);
+
+    expect(childFileAttachments).toHaveLength(1);
+    expect(childFileAttachments[0]?.title).toBe("notes.csv");
+    expect(childFileAttachments[0]?.fileId).not.toBe(sourceFile.sId);
+
+    const copiedFiles = await FileResource.fetchByIds(auth, [
+      childFileAttachments[0]!.fileId,
+    ]);
+    expect(copiedFiles).toHaveLength(1);
+    expect(copiedFiles[0]?.useCaseMetadata?.conversationId).toBe(
+      childConversation.sId
+    );
+    expect(copiedFiles[0]?.snippet).toBe(sourceFile.snippet);
+    expect(vi.mocked(launchCompactionWorkflow)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth,
+        conversationId: childConversation.sId,
+        sourceConversation: expect.objectContaining({
+          conversationId: parentConversation.sId,
+          messageRank: sourceMessage.rank,
+          attachmentIdReplacements: {
+            [sourceFile.sId]: childFileAttachments[0]!.fileId,
+          },
+        }),
+      })
+    );
+
+    copyToConversationSpy.mockRestore();
+  }, 15_000);
+
+  it("rewrites copied frame file ids to the child attachment ids", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+    const copyToConversationSpy = mockCopyToConversation({ copyContent: true });
+    const { getFileContentSpy, uploadContentSpy } = mockFileContentStorage();
+    const uploadFrameContentSpy = mockUploadFrameContent();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const referencedFile = await createConversationFile(auth, {
+      conversationId: parentConversation.sId,
+      fileName: "data.csv",
+      snippet: "data",
+      contentType: "text/csv",
+    });
+    const frameFile = await FileFactory.create(
+      auth,
+      auth.getNonNullableUser(),
+      {
+        contentType: frameContentType,
+        fileName: "dashboard.tsx",
+        fileSize: 16,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: {
+          conversationId: parentConversation.sId,
+        },
+      }
+    );
+    await frameFile.uploadContent(
+      auth,
+      `const referencedFileId = "${referencedFile.sId}";
+const frameFileId = "${frameFile.sId}";
+const untouched = "prefix${referencedFile.sId}suffix";`
+    );
+
+    let parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const attachmentResult = await postNewContentFragment(
+      auth,
+      parentConversationWithContent,
+      {
+        title: "Data",
+        fileId: referencedFile.sId,
+      },
+      null
+    );
+    expect(attachmentResult.isOk()).toBe(true);
+    if (attachmentResult.isErr()) {
+      throw attachmentResult.error;
+    }
+
+    parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversationWithContent,
+      rank: 1,
+      content: "Please branch this.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversationWithContent,
+      rank: 2,
+      parentId: userMessage.id,
+      status: "succeeded",
+      generatedFileId: frameFile.id,
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    const childAttachments = await listAttachments(auth, {
+      conversation: childConversation,
+    });
+    const childFileAttachments = childAttachments.filter(isFileAttachmentType);
+
+    expect(childFileAttachments).toHaveLength(2);
+
+    const copiedDataAttachment = childFileAttachments.find(
+      (attachment) => attachment.title === "data.csv"
+    );
+    const copiedFrameAttachment = childFileAttachments.find(
+      (attachment) => attachment.title === "dashboard.tsx"
+    );
+
+    expect(copiedDataAttachment?.fileId).toBeDefined();
+    expect(copiedFrameAttachment?.fileId).toBeDefined();
+
+    const copiedFrameFile = await FileResource.fetchById(
+      auth,
+      copiedFrameAttachment!.fileId
+    );
+    expect(copiedFrameFile).not.toBeNull();
+    if (!copiedFrameFile) {
+      throw new Error("Missing copied frame file.");
+    }
+
+    const copiedFrameContent = await fileUtilsModule.getFileContent(
+      auth,
+      copiedFrameFile,
+      "original"
+    );
+    expect(copiedFrameContent).toBe(
+      `const referencedFileId = "${copiedDataAttachment!.fileId}";
+const frameFileId = "${copiedFrameAttachment!.fileId}";
+const untouched = "prefix${referencedFile.sId}suffix";`
+    );
+    expect(vi.mocked(launchCompactionWorkflow)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth,
+        conversationId: childConversation.sId,
+        sourceConversation: expect.objectContaining({
+          conversationId: parentConversation.sId,
+          messageRank: sourceMessage.rank,
+          attachmentIdReplacements: expect.objectContaining({
+            [referencedFile.sId]: copiedDataAttachment!.fileId,
+            [frameFile.sId]: copiedFrameAttachment!.fileId,
+          }),
+        }),
+      })
+    );
+
+    copyToConversationSpy.mockRestore();
+    getFileContentSpy.mockRestore();
+    uploadContentSpy.mockRestore();
+    uploadFrameContentSpy.mockRestore();
+  }, 15_000);
+
+  it("only copies attachments that existed at the selected source message", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+    const copyToConversationSpy = mockCopyToConversation();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const firstFile = await createConversationFile(auth, {
+      conversationId: parentConversation.sId,
+      fileName: "first.txt",
+      snippet: "first",
+    });
+    const secondFile = await createConversationFile(auth, {
+      conversationId: parentConversation.sId,
+      fileName: "second.txt",
+      snippet: "second",
+    });
+
+    let parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const firstAttachmentResult = await postNewContentFragment(
+      auth,
+      parentConversationWithContent,
+      {
+        title: "First attachment",
+        fileId: firstFile.sId,
+      },
+      null
+    );
+    expect(firstAttachmentResult.isOk()).toBe(true);
+
+    parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversationWithContent,
+      rank: 1,
+      content: "Fork from here.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversationWithContent,
+      rank: 2,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const secondAttachmentResult = await postNewContentFragment(
+      auth,
+      parentConversationWithContent,
+      {
+        title: "Second attachment",
+        fileId: secondFile.sId,
+      },
+      null
+    );
+    expect(secondAttachmentResult.isOk()).toBe(true);
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    const childAttachments = await listAttachments(auth, {
+      conversation: childConversation,
+    });
+    const childFileAttachments = childAttachments.filter(isFileAttachmentType);
+
+    expect(childFileAttachments).toHaveLength(1);
+    expect(childFileAttachments[0]?.title).toBe("first.txt");
+
+    copyToConversationSpy.mockRestore();
+  }, 15_000);
+
+  it("carries over tool output attachments from the selected source message", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+    const copyToConversationSpy = mockCopyToConversation();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const sourceToolOutput = await createToolOutputFile(auth, {
+      conversationId: parentConversation.sId,
+      fileName: "before-fork.txt",
+      snippet: "before",
+    });
+    const laterToolOutput = await createToolOutputFile(auth, {
+      conversationId: parentConversation.sId,
+      fileName: "after-fork.txt",
+      snippet: "after",
+    });
+
+    const firstUserMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      content: "Fork from the next answer.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 2,
+      parentId: firstUserMessage.id,
+      status: "succeeded",
+      generatedFileId: sourceToolOutput.id,
+    });
+    const secondUserMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 3,
+      content: "Too late for the fork.",
+    });
+    await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 4,
+      parentId: secondUserMessage.id,
+      status: "succeeded",
+      generatedFileId: laterToolOutput.id,
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    const childAttachments = await listAttachments(auth, {
+      conversation: childConversation,
+    });
+    const childFileAttachments = childAttachments.filter(isFileAttachmentType);
+
+    expect(childFileAttachments).toHaveLength(1);
+    expect(childFileAttachments[0]?.title).toBe("before-fork.txt");
+    expect(childFileAttachments[0]?.fileId).not.toBe(sourceToolOutput.sId);
+
+    const copiedFiles = await FileResource.fetchByIds(auth, [
+      childFileAttachments[0]!.fileId,
+    ]);
+    expect(copiedFiles).toHaveLength(1);
+    expect(copiedFiles[0]?.useCase).toBe("tool_output");
+    expect(copiedFiles[0]?.useCaseMetadata?.conversationId).toBe(
+      childConversation.sId
+    );
+    expect(copiedFiles[0]?.snippet).toBe(sourceToolOutput.snippet);
+    expect(vi.mocked(launchCompactionWorkflow)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth,
+        conversationId: childConversation.sId,
+        sourceConversation: expect.objectContaining({
+          conversationId: parentConversation.sId,
+          messageRank: sourceMessage.rank,
+          attachmentIdReplacements: expect.objectContaining({
+            [sourceToolOutput.sId]: childFileAttachments[0]!.fileId,
+          }),
+        }),
+      })
+    );
+
+    copyToConversationSpy.mockRestore();
+  }, 15_000);
+
+  it("preserves hidden tool output attachments in the forked conversation", async () => {
+    const { auth } = await createPrivateApiMockRequest();
+    const copyToConversationSpy = mockCopyToConversation();
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    const hiddenToolOutput = await createToolOutputFile(auth, {
+      conversationId: parentConversation.sId,
+      fileName: "hidden-output.txt",
+      hideFromUser: true,
+    });
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      content: "Fork from the next answer.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 2,
+      parentId: userMessage.id,
+      status: "succeeded",
+      generatedFileId: hiddenToolOutput.id,
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    const childAttachments = await listAttachments(auth, {
+      conversation: childConversation,
+    });
+    const childFileAttachments = childAttachments.filter(isFileAttachmentType);
+
+    expect(childFileAttachments).toHaveLength(1);
+    expect(childFileAttachments[0]?.hidden).toBe(true);
+
+    const copiedFiles = await FileResource.fetchByIds(auth, [
+      childFileAttachments[0]!.fileId,
+    ]);
+    expect(copiedFiles).toHaveLength(1);
+    expect(copiedFiles[0]?.useCaseMetadata?.hideFromUser).toBe(true);
+
+    copyToConversationSpy.mockRestore();
+  }, 15_000);
+
+  it("reattaches content node attachments that existed at the selected source message", async () => {
+    const { auth, workspace, globalSpace } =
+      await createPrivateApiMockRequest();
+
+    const dataSourceView = await DataSourceViewFactory.folder(
+      workspace,
+      globalSpace,
+      auth.user() ?? null
+    );
+    const getContentFragmentBlobSpy = mockContentNodeAttachments(
+      dataSourceView.id
+    );
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+
+    let parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const firstAttachmentResult = await postNewContentFragment(
+      auth,
+      parentConversationWithContent,
+      {
+        title: "First note",
+        nodeId: "node_before_fork",
+        nodeDataSourceViewId: dataSourceView.sId,
+      },
+      null
+    );
+    expect(firstAttachmentResult.isOk()).toBe(true);
+    if (firstAttachmentResult.isErr()) {
+      throw firstAttachmentResult.error;
+    }
+
+    parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversationWithContent,
+      rank: 1,
+      content: "Fork from here.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversationWithContent,
+      rank: 2,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    parentConversationWithContent = await fetchConversationOrThrow(
+      auth,
+      parentConversation.sId
+    );
+    const secondAttachmentResult = await postNewContentFragment(
+      auth,
+      parentConversationWithContent,
+      {
+        title: "Second note",
+        nodeId: "node_after_fork",
+        nodeDataSourceViewId: dataSourceView.sId,
+      },
+      null
+    );
+    expect(secondAttachmentResult.isOk()).toBe(true);
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    const childAttachments = await listAttachments(auth, {
+      conversation: childConversation,
+    });
+    const childContentNodeAttachments = childAttachments.filter(
+      isContentNodeAttachmentType
+    );
+
+    expect(childContentNodeAttachments).toHaveLength(1);
+    expect(childContentNodeAttachments[0]?.title).toBe("First note");
+    expect(childContentNodeAttachments[0]?.nodeId).toBe("node_before_fork");
+    expect(childContentNodeAttachments[0]?.nodeDataSourceViewId).toBe(
+      dataSourceView.sId
+    );
+    const childContentNodeFragmentId = getLatestContentNodeContentFragmentId(
+      childConversation,
+      "node_before_fork"
+    );
+    expect(vi.mocked(launchCompactionWorkflow)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth,
+        conversationId: childConversation.sId,
+        sourceConversation: expect.objectContaining({
+          conversationId: parentConversation.sId,
+          messageRank: sourceMessage.rank,
+          attachmentIdReplacements: {
+            [firstAttachmentResult.value.contentFragmentId]:
+              childContentNodeFragmentId,
+          },
+        }),
+      })
+    );
+
+    getContentFragmentBlobSpy.mockRestore();
+  });
+
+  it("lists the fork of a project conversation in the project's conversation list", async () => {
+    const {
+      auth: initialAuth,
+      user,
+      workspace,
+    } = await createPrivateApiMockRequest({ role: "admin" });
+
+    const project = await SpaceFactory.project(workspace);
+    const addMembersRes = await project.addMembers(initialAuth, {
+      userIds: [user.sId],
+    });
+    expect(addMembersRes.isOk()).toBe(true);
+
+    // Refresh auth after adding the user to the project (permissions are cached).
+    const auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: project.id,
+    });
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "How should I continue this?",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const { conversations } =
+      await ConversationResource.listConversationsInSpacePaginated(auth, {
+        spaceId: project.sId,
+        pagination: { limit: 10 },
+      });
+
+    const conversationIds = conversations.map((c) => c.sId);
+    expect(conversationIds).toContain(parentConversation.sId);
+    expect(conversationIds).toContain(result.value.conversationId);
+  });
+
+  it("surfaces the fork of a project conversation in unread lists for project members", async () => {
+    const {
+      auth: initialAuth,
+      user,
+      workspace,
+    } = await createPrivateApiMockRequest({ role: "admin" });
+
+    const otherUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, otherUser, { role: "user" });
+
+    const project = await SpaceFactory.project(workspace);
+    const addMembersRes = await project.addMembers(initialAuth, {
+      userIds: [user.sId, otherUser.sId],
+    });
+    expect(addMembersRes.isOk()).toBe(true);
+
+    // Refresh auths after adding the users to the project (permissions are cached).
+    const auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+    const otherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      otherUser.sId,
+      workspace.sId
+    );
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: project.id,
+    });
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "How should I continue this?",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    // The other project member never opened the fork: it must show up in
+    // their non-participant unread list (the sidebar activity badge path).
+    const { nonParticipantUnreadConversations } =
+      await ConversationResource.listSpaceUnreadConversationsAndActivityForUser(
+        otherAuth,
+        [project.id]
+      );
+
+    const unreadIds = nonParticipantUnreadConversations.map((c) => c.sId);
+    expect(unreadIds).toContain(result.value.conversationId);
+  });
+
+  it("inherits the parent's requested spaces so the fork does not broaden visibility", async () => {
+    const {
+      auth: initialAuth,
+      globalSpace,
+      user,
+      workspace,
+    } = await createPrivateApiMockRequest({ role: "admin" });
+
+    const restrictedSpace = await SpaceFactory.regular(workspace);
+    const addMembersRes = await restrictedSpace.addMembers(initialAuth, {
+      userIds: [user.sId],
+    });
+    expect(addMembersRes.isOk()).toBe(true);
+
+    const auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+    const otherUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, otherUser, { role: "user" });
+    const otherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      otherUser.sId,
+      workspace.sId
+    );
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: null,
+    });
+    await ConversationModel.update(
+      { requestedSpaceIds: [globalSpace.id, restrictedSpace.id] },
+      {
+        where: {
+          id: parentConversation.id,
+          workspaceId: workspace.id,
+        },
+      }
+    );
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "Continue from the restricted state.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    const result = await createConversationFork(auth, {
+      conversationId: parentConversation.sId,
+      sourceMessageId: sourceMessage.sId,
+    });
+
+    expect(result.isErr()).toBe(false);
+    if (result.isErr()) {
+      throw result.error;
+    }
+
+    const childConversation = await fetchConversationOrThrow(
+      auth,
+      result.value.conversationId
+    );
+
+    expect(childConversation.requestedSpaceIds).toEqual([
+      globalSpace.sId,
+      restrictedSpace.sId,
+    ]);
+
+    const childConversationForOtherUser = await ConversationResource.fetchById(
+      otherAuth,
+      childConversation.sId
+    );
+    expect(childConversationForOtherUser).toBeNull();
+  });
+});

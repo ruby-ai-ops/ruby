@@ -1,0 +1,190 @@
+import { AuthContext, type AuthContextValue } from "@app/lib/auth/AuthContext";
+import { emptyWorkspacePermissions } from "@app/types/group_permissions";
+import type { SubscriptionType } from "@app/types/plan";
+import type { UserTypeWithWorkspaces, WorkspaceType } from "@app/types/user";
+import { isAdmin, isManager } from "@app/types/user";
+import type { AuthError } from "@extension/shared/services/auth";
+import { useAuthHook } from "@extension/ui/components/auth/useAuth";
+import type { ReactNode } from "react";
+import { createContext, useContext, useMemo } from "react";
+
+// Extension-specific auth context (bearer token, login/logout, etc.)
+type ExtensionAuthContextType = {
+  token: string | null;
+  isAuthenticated: boolean;
+  authError: AuthError | null;
+  setAuthError: (error: AuthError | null) => void;
+  redirectToSSOLogin: (workspace: WorkspaceType) => void;
+  user: UserTypeWithWorkspaces | null;
+  workspace: WorkspaceType | undefined;
+  isUserSetup: boolean;
+  isLoading: boolean;
+  handleLogin: (args?: { organizationId?: string }) => void;
+  handleLogout: () => void;
+  handleSelectOrganization: (organizationId: string) => void;
+};
+
+const ExtensionAuthContext = createContext<ExtensionAuthContextType | null>(
+  null
+);
+
+export const useExtensionAuth = () => {
+  const context = useContext(ExtensionAuthContext);
+  if (!context) {
+    throw new Error(
+      "useExtensionAuth must be used within an ExtensionAuthProvider"
+    );
+  }
+  return context;
+};
+
+// Stub subscription for shared front components — none of them use subscription
+// in the extension context.
+const EXTENSION_SUBSCRIPTION: SubscriptionType = {
+  sId: null,
+  status: "active",
+  trialing: false,
+  stripeSubscriptionId: null,
+  metronomeContractId: null,
+  startDate: null,
+  endDate: null,
+  paymentFailingSince: null,
+  plan: {
+    code: "EXTENSION",
+    name: "Extension",
+    limits: {
+      assistant: {
+        isSlackBotAllowed: false,
+        maxMessages: -1,
+        maxMessagesTimeframe: "lifetime",
+        maxAwuCredits: -1,
+        maxAwuCreditsTimeframe: "lifetime",
+        isDeepDiveAllowed: false,
+      },
+      connections: {
+        count: -1,
+        isConfluenceAllowed: false,
+        isSlackAllowed: false,
+        isNotionAllowed: false,
+        isGoogleDriveAllowed: false,
+        isGithubAllowed: false,
+        isIntercomAllowed: false,
+        isWebCrawlerAllowed: false,
+        isSalesforceAllowed: false,
+      },
+      dataSources: {
+        count: -1,
+        documents: { count: -1, sizeMb: -1 },
+      },
+      users: {
+        maxUsers: -1,
+        maxFreeUsers: -1,
+        maxLifetimeFreeUsers: -1,
+        isSSOAllowed: false,
+        isSCIMAllowed: false,
+      },
+      vaults: { maxVaults: -1 },
+      capabilities: { images: { maxImagesPerWeek: -1 } },
+      canUseProduct: true,
+    },
+    trialPeriodDays: 0,
+    isByok: false,
+    isAuditLogsAllowed: false,
+    hasAdvancedModelAccess: false,
+  },
+  requestCancelAt: null,
+};
+
+interface ExtensionAuthProviderProps {
+  children: ReactNode;
+}
+
+/**
+ * Single auth provider for the extension. It:
+ * - Manages extension-specific auth state (bearer token, login/logout flows) via
+ *   ExtensionAuthContext — consumed with useExtensionAuth().
+ * - Bridges to the front's AuthContext so that shared front components (e.g.
+ *   ConversationViewer sub-components) can call useAuth() without error.
+ * - Uses CellContext for URL resolution (rubyDomain).
+ *
+ * Mirrors the ExtensionFetcherProvider / FetcherProvider pattern.
+ */
+export function ExtensionAuthProvider({
+  children,
+}: ExtensionAuthProviderProps) {
+  const {
+    token,
+    isAuthenticated,
+    authError,
+    setAuthError,
+    redirectToSSOLogin,
+    user,
+    workspace,
+    isUserSetup,
+    isLoading,
+    handleLogin,
+    handleLogout,
+    handleSelectOrganization,
+    featureFlags,
+  } = useAuthHook();
+
+  const extensionAuthValue = useMemo(
+    () => ({
+      token,
+      isAuthenticated,
+      authError,
+      setAuthError,
+      redirectToSSOLogin,
+      user,
+      workspace,
+      isUserSetup,
+      isLoading,
+      handleLogin,
+      handleLogout,
+      handleSelectOrganization,
+    }),
+    [
+      token,
+      isAuthenticated,
+      authError,
+      setAuthError,
+      redirectToSSOLogin,
+      user,
+      workspace,
+      isUserSetup,
+      isLoading,
+      handleLogin,
+      handleLogout,
+      handleSelectOrganization,
+    ]
+  );
+
+  const frontAuthValue: AuthContextValue | null = useMemo(() => {
+    if (!user || !workspace) {
+      return null;
+    }
+    return {
+      user,
+      workspace,
+      subscription: EXTENSION_SUBSCRIPTION,
+      isAdmin: isAdmin(workspace),
+      isManager: isManager(workspace),
+      featureFlags,
+      vizUrl: process.env.VIZ_PUBLIC_URL ?? "",
+      providersHealth: null,
+      workspacePermissions: emptyWorkspacePermissions(),
+    };
+  }, [user, workspace, featureFlags]);
+
+  return (
+    <ExtensionAuthContext.Provider value={extensionAuthValue}>
+      {frontAuthValue ? (
+        <AuthContext.Provider value={frontAuthValue}>
+          {children}
+        </AuthContext.Provider>
+      ) : (
+        children
+      )}
+    </ExtensionAuthContext.Provider>
+  );
+}

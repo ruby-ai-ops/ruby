@@ -1,0 +1,36 @@
+FROM node:24.16.0 AS base
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y vim redis-tools postgresql-client htop curl libpq-dev build-essential cmake tmux screen
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Set the working directory to /ruby
+WORKDIR /ruby
+
+RUN npm install -g npm@11.11.0
+
+COPY . .
+
+# Install dependencies, including devDependencies (e.g. tsx, needed to run
+# scripts/db/run-migrate.cjs against uncompiled TypeScript).
+RUN --mount=type=cache,id=npm-cache,target=/root/.npm npm ci --include=dev
+
+RUN cd sdks/js && npm run build
+
+RUN cd sparkle && npm run build
+
+RUN cd connectors && npm run build
+
+# Set the default start directory to /ruby when SSH into the container
+WORKDIR /ruby
+
+# Wraning and prompt
+RUN echo "echo -e \"\033[0;31mWARNING: This is a PRODUCTION system!\033[0m\"" >> /root/.bashrc
+
+ENV GIT_SSH_COMMAND="ssh -i ~/.ssh/github-deploykey-deploybox"
+
+# Set a default command
+CMD ["/ruby/prodbox/init.sh"]

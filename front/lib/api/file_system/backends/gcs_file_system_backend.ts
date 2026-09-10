@@ -1,0 +1,755 @@
+import type { GCSMountTarget } from "@app/lib/api/file_system/sandbox/gcs_sandbox_mount_adapter";
+import { GCSSandboxMountAdapter } from "@app/lib/api/file_system/sandbox/gcs_sandbox_mount_adapter";
+import type { SandboxMountAdapter } from "@app/lib/api/file_system/sandbox/sandbox_mount_adapter";
+import { getPrivateUploadBucket } from "@app/lib/file_storage";
+import fileStorageConfig from "@app/lib/file_storage/config";
+import { getCachedPrivateUploadSignedUrl } from "@app/lib/file_storage/signed_url_cache";
+import logger from "@app/logger/logger";
+import type {
+  FileSystemDirectoryEntry,
+  FileSystemEntry,
+} from "@app/types/api/file_system/types";
+import { getFrameDatabaseReplicasBasePath } from "@app/types/api/frame_storage";
+import type { FileSystemMount, SandboxOnlyMount } from "@app/types/file_system";
+import {
+  RubyFileSystemError,
+  SCOPED_PREFIX_CONVERSATION,
+  SCOPED_PREFIX_POD,
+  SCOPED_PREFIX_USER,
+} from "@app/types/file_system";
+import { stripMimeParameters } from "@app/types/files";
+import { TOOL_OUTPUTS_FOLDER_NAME } from "@app/types/mount_path";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { isString } from "@app/types/shared/utils/general";
+import type { Readable } from "stream";
+import { pipeline } from "stream/promises";
+
+import type {
+  FileSystemBackend,
+  FileSystemNodeIdentity,
+} from "./file_system_backend";
+
+// ---------------------------------------------------------------------------
+// Scoped-path helpers
+// ---------------------------------------------------------------------------
+
+type ParsedScopedPath = {
+  kind: "conversation" | "pod" | "user";
+  id: string;
+  /** Path component after `<kind>-<id>/`, empty string for a root listing. */
+  rel: string;
+};
+
+/**
+ * Parse the scoped prefix from a scoped path.
+ *
+ * `"conversation-{cId}/report.pdf"` -> `{ kind: "conversation", id: "{cId}", rel: "report.pdf" }`
+ * `"pod-{pId}/data/"`               -> `{ kind: "pod", id: "{pId}", rel: "data/" }`
+ *
+ * Returns `null` for unrecognised prefixes.
+ */
+function parseScopedPath(scopedPath: string): ParsedScopedPath | null {
+  const slashIdx = scopedPath.indexOf("/");
+  const prefix = slashIdx >= 0 ? scopedPath.slice(0, slashIdx) : scopedPath;
+  const rel = slashIdx >= 0 ? scopedPath.slice(slashIdx + 1) : "";
+
+  if (prefix.startsWith(SCOPED_PREFIX_CONVERSATION)) {
+    const id = prefix.slice(SCOPED_PREFIX_CONVERSATION.length);
+    return id ? { kind: "conversation", id, rel } : null;
+  }
+
+  if (prefix.startsWith(SCOPED_PREFIX_POD)) {
+    const id = prefix.slice(SCOPED_PREFIX_POD.length);
+    return id ? { kind: "pod", id, rel } : null;
+  }
+
+  if (prefix.startsWith(SCOPED_PREFIX_USER)) {
+    const id = prefix.slice(SCOPED_PREFIX_USER.length);
+    return id ? { kind: "user", id, rel } : null;
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// GCSFileSystemBackend
+// ---------------------------------------------------------------------------
+
+/** Number of GCS objects fetched per list page. Warn when more than one page is needed. */
+const GCS_LIST_PAGE_SIZE = 200;
+
+/**
+ * GCS-backed FileSystemBackend.
+ *
+ * Path translation (internal, never exposed):
+ *   `conversation-{cId}/{rel}` -> `w/{wId}/conversations/{cId}/files/{rel}`
+ *   `pod-{pId}/{rel}`          -> `w/{wId}/pods/{pId}/files/{rel}`
+ */
+export class GCSFileSystemBackend implements FileSystemBackend {
+  constructor(
+    private readonly workspaceId: string,
+    private readonly bucketName: string
+  ) {}
+
+  private toGCSPath(scopedPath: string): string | null {
+    const p = parseScopedPath(scopedPath);
+    if (!p) {
+      return null;
+    }
+
+    switch (p.kind) {
+      case "conversation":
+        return `w/${this.workspaceId}/conversations/${p.id}/files/${p.rel}`;
+
+      case "pod":
+        return `w/${this.workspaceId}/pods/${p.id}/files/${p.rel}`;
+
+      case "user":
+        return `w/${this.workspaceId}/users/${p.id}/files/${p.rel}`;
+
+      default:
+        assertNever(p.kind);
+    }
+  }
+
+  private fromGCSPath(gcsPath: string): string | null {
+    const base = `w/${this.workspaceId}/`;
+    if (!gcsPath.startsWith(base)) {
+      return null;
+    }
+
+    const rest = gcsPath.slice(base.length);
+    const conv = rest.match(/^conversations\/([^/]+)\/files\/(.*)$/);
+    if (conv) {
+      return `${SCOPED_PREFIX_CONVERSATION}${conv[1]}/${conv[2]}`;
+    }
+
+    const pod = rest.match(/^pods\/([^/]+)\/files\/(.*)$/);
+    if (pod) {
+      return `${SCOPED_PREFIX_POD}${pod[1]}/${pod[2]}`;
+    }
+
+    const user = rest.match(/^users\/([^/]+)\/files\/(.*)$/);
+    if (user) {
+      return `${SCOPED_PREFIX_USER}${user[1]}/${user[2]}`;
+    }
+
+    return null;
+  }
+
+  /** GCS prefix for a mount's root, no trailing slash. Used in CAB and gcsfuse --only-dir. */
+  private mountRootGCSPrefix(mount: FileSystemMount): string {
+    switch (mount.kind) {
+      case "conversation":
+        return `w/${this.workspaceId}/conversations/${mount.id}/files`;
+
+      case "pod":
+        return `w/${this.workspaceId}/pods/${mount.id}/files`;
+
+      case "user":
+        return `w/${this.workspaceId}/users/${mount.id}/files`;
+
+      default:
+        assertNever(mount.kind);
+    }
+  }
+
+  async list(
+    scopedPath: string,
+    {
+      maxFiles,
+      includeProcessed = false,
+    }: { maxFiles?: number; includeProcessed?: boolean } = {}
+  ): Promise<Result<FileSystemEntry[], RubyFileSystemError>> {
+    const normalised = scopedPath.endsWith("/") ? scopedPath : `${scopedPath}/`;
+    const gcsPrefix = this.toGCSPath(normalised);
+
+    if (!gcsPrefix) {
+      logger.warn(
+        { scopedPath, workspaceId: this.workspaceId },
+        "GCSFileSystemBackend.list: unrecognised scoped path"
+      );
+
+      return new Ok([]);
+    }
+
+    const bucket = getPrivateUploadBucket();
+    let rawFiles: { name: string; metadata: Record<string, unknown> }[];
+
+    try {
+      if (maxFiles !== undefined) {
+        rawFiles = await bucket.getFiles({
+          prefix: gcsPrefix,
+          maxResults: maxFiles,
+        });
+      } else {
+        const result = await bucket.getAllFilesByPrefix({
+          prefix: gcsPrefix,
+          pageSize: GCS_LIST_PAGE_SIZE,
+        });
+
+        if (result.pageFetchCount > 1) {
+          logger.warn(
+            {
+              workspaceId: this.workspaceId,
+              prefix: gcsPrefix,
+              pageFetchCount: result.pageFetchCount,
+              objectCount: result.files.length,
+            },
+            "GCSFileSystemBackend.list: multiple GCS list requests, prefix has many objects"
+          );
+        }
+
+        rawFiles = result.files;
+      }
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+
+    const folderPlaceholders = rawFiles.filter((f) => f.name.endsWith("/"));
+    const regularFiles = rawFiles.filter((f) => {
+      if (f.name.endsWith("/")) {
+        return false;
+      }
+
+      // Hide files inside a hidden ("."-prefixed, non-tool-outputs) directory
+      // below the listed prefix. Listing is recursive, so the folder filter
+      // below (which only hides the dot-directory *entry*) is not enough on its
+      // own — without this, e.g. pptx/docx QA renders under .pptx_render/ /
+      // .docx_render/ would still surface. Computed relative to the listed
+      // prefix, so listing a hidden directory directly still returns its files.
+      const relDirs = f.name.slice(gcsPrefix.length).split("/").slice(0, -1);
+      if (
+        relDirs.some(
+          (seg) => seg.startsWith(".") && seg !== TOOL_OUTPUTS_FOLDER_NAME
+        )
+      ) {
+        return false;
+      }
+
+      if (includeProcessed) {
+        return true;
+      }
+
+      const name = f.name.split("/").pop() ?? "";
+      return !name.includes(".processed.");
+    });
+
+    const folderEntries: FileSystemEntry[] = folderPlaceholders.flatMap((f) => {
+      const trimmed = f.name.replace(/\/$/, "");
+      const name = trimmed.split("/").pop() ?? "";
+      if (
+        !name ||
+        (name.startsWith(".") && name !== TOOL_OUTPUTS_FOLDER_NAME)
+      ) {
+        return [];
+      }
+
+      const scopedFilePath = this.fromGCSPath(trimmed);
+      if (!scopedFilePath) {
+        return [];
+      }
+
+      return [
+        {
+          isDirectory: true as const,
+          fileName: name,
+          path: scopedFilePath,
+          sizeBytes: 0,
+          lastModifiedMs: isString(f.metadata["updated"])
+            ? new Date(f.metadata["updated"] as string).getTime()
+            : 0,
+        },
+      ];
+    });
+
+    const fileEntries: FileSystemEntry[] = regularFiles.map((gcsFile) => {
+      const meta = gcsFile.metadata;
+      const rawCT = isString(meta["contentType"])
+        ? (meta["contentType"] as string)
+        : "application/octet-stream";
+      const contentType = stripMimeParameters(rawCT);
+      const scopedFilePath = this.fromGCSPath(gcsFile.name) ?? gcsFile.name;
+
+      return {
+        isDirectory: false as const,
+        fileName: gcsFile.name.split("/").pop() ?? gcsFile.name,
+        path: scopedFilePath,
+        sizeBytes: Number(meta["size"] ?? 0),
+        contentType,
+        lastModifiedMs: isString(meta["updated"])
+          ? new Date(meta["updated"] as string).getTime()
+          : 0,
+        fileId: null,
+        // Thumbnail URLs are application-layer concerns (they point to our API).
+        // RubyFileSystem.list() populates this after receiving entries from the backend.
+        thumbnailUrl: null,
+      };
+    });
+
+    return new Ok([...folderEntries, ...fileEntries]);
+  }
+
+  async read(
+    scopedPath: string
+  ): Promise<Result<Readable | null, RubyFileSystemError>> {
+    const gcsPath = this.toGCSPath(scopedPath);
+    if (!gcsPath) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.read: unrecognised scoped path: ${scopedPath}`
+        )
+      );
+    }
+
+    const bucket = getPrivateUploadBucket();
+    try {
+      const [exists] = await bucket.file(gcsPath).exists();
+      if (!exists) {
+        return new Ok(null);
+      }
+
+      return new Ok(bucket.file(gcsPath).createReadStream());
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+  }
+
+  async stat(
+    scopedPath: string
+  ): Promise<
+    Result<
+      { contentType: string; sizeBytes: number } | null,
+      RubyFileSystemError
+    >
+  > {
+    const gcsPath = this.toGCSPath(scopedPath);
+    if (!gcsPath) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.stat: unrecognised scoped path: ${scopedPath}`
+        )
+      );
+    }
+
+    const bucket = getPrivateUploadBucket();
+    try {
+      const [exists] = await bucket.file(gcsPath).exists();
+      if (!exists) {
+        return new Ok(null);
+      }
+
+      const [metadata] = await bucket.file(gcsPath).getMetadata();
+      const rawCT = isString(metadata.contentType)
+        ? metadata.contentType
+        : "application/octet-stream";
+
+      return new Ok({
+        contentType: stripMimeParameters(rawCT),
+        sizeBytes: Number(metadata.size ?? 0),
+      });
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+  }
+
+  async exists(
+    scopedPath: string
+  ): Promise<Result<boolean, RubyFileSystemError>> {
+    const gcsPath = this.toGCSPath(scopedPath);
+    if (!gcsPath) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.exists: unrecognised scoped path: ${scopedPath}`
+        )
+      );
+    }
+
+    try {
+      const [exists] = await getPrivateUploadBucket().file(gcsPath).exists();
+      return new Ok(exists);
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+  }
+
+  async write(
+    scopedPath: string,
+    content: Buffer | string | Readable,
+    contentType: string
+  ): Promise<Result<FileSystemNodeIdentity, RubyFileSystemError>> {
+    const gcsPath = this.toGCSPath(scopedPath);
+    if (!gcsPath) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.write: unrecognised scoped path: ${scopedPath}`
+        )
+      );
+    }
+
+    try {
+      const file = getPrivateUploadBucket().file(gcsPath);
+
+      if (isString(content) || Buffer.isBuffer(content)) {
+        const buf = isString(content) ? Buffer.from(content) : content;
+        await file.save(buf, { contentType });
+      } else {
+        await pipeline(
+          content,
+          file.createWriteStream({ contentType, resumable: false })
+        );
+      }
+
+      return new Ok({ nodeId: null });
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+  }
+
+  async mkdir(
+    scopedPath: string
+  ): Promise<
+    Result<
+      { entry: FileSystemDirectoryEntry } & FileSystemNodeIdentity,
+      RubyFileSystemError
+    >
+  > {
+    const gcsPath = this.toGCSPath(scopedPath);
+    if (!gcsPath) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.mkdir: unrecognised scoped path: ${scopedPath}`
+        )
+      );
+    }
+
+    const dirGcsPath = `${gcsPath}/`;
+    try {
+      const bucket = getPrivateUploadBucket();
+      const [exists] = await bucket.file(dirGcsPath).exists();
+      if (exists) {
+        return new Err(
+          new RubyFileSystemError(
+            "already_exists",
+            "A directory already exists at this path."
+          )
+        );
+      }
+
+      await bucket.file(dirGcsPath).save(Buffer.alloc(0), {
+        contentType: "application/x-directory",
+      });
+
+      const fileName = gcsPath.split("/").pop() ?? "";
+      return new Ok({
+        entry: {
+          isDirectory: true as const,
+          fileName,
+          path: scopedPath,
+          sizeBytes: 0,
+          lastModifiedMs: Date.now(),
+        },
+        nodeId: null,
+      });
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+  }
+
+  async delete(
+    scopedPath: string,
+    { ignoreNotFound = false }: { ignoreNotFound?: boolean } = {}
+  ): Promise<Result<void, RubyFileSystemError>> {
+    const gcsPath = this.toGCSPath(scopedPath);
+    if (!gcsPath) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.delete: unrecognised scoped path: ${scopedPath}`
+        )
+      );
+    }
+
+    try {
+      const bucket = getPrivateUploadBucket();
+      const [fileExists] = await bucket.file(gcsPath).exists();
+      if (fileExists) {
+        await bucket.delete(gcsPath, { ignoreNotFound });
+
+        return new Ok(undefined);
+      }
+
+      const dirPrefix = gcsPath.endsWith("/") ? gcsPath : `${gcsPath}/`;
+      const [dirExists] = await bucket.file(dirPrefix).exists();
+      const { files: sample } = await bucket.getAllFilesByPrefix({
+        prefix: dirPrefix,
+        pageSize: 1,
+      });
+
+      if (dirExists || sample.length > 0) {
+        await bucket.deleteByPrefix(dirPrefix);
+        return new Ok(undefined);
+      }
+
+      if (!ignoreNotFound) {
+        return new Err(
+          new RubyFileSystemError("not_found", `Path not found: ${scopedPath}`)
+        );
+      }
+
+      return new Ok(undefined);
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+  }
+
+  /**
+   * Copy every GCS object whose name starts with `srcPrefix` to the corresponding name under
+   * `destPrefix`.  GCS has no native directory rename, so this is the only way to move a "folder".
+   */
+  private async copyDir({
+    destPrefix,
+    srcPrefix,
+  }: {
+    destPrefix: string;
+    srcPrefix: string;
+  }): Promise<Result<void, RubyFileSystemError>> {
+    const bucket = getPrivateUploadBucket();
+    const { files } = await bucket.getAllFilesByPrefix({ prefix: srcPrefix });
+
+    if (files.length === 0) {
+      return new Err(
+        new RubyFileSystemError(
+          "not_found",
+          `Directory not found or empty: ${srcPrefix}`
+        )
+      );
+    }
+
+    for (const file of files) {
+      const relative = file.name.slice(srcPrefix.length);
+      await bucket.copyFile(file.name, `${destPrefix}${relative}`);
+    }
+
+    return new Ok(undefined);
+  }
+
+  async copy({
+    src,
+    dest,
+  }: {
+    src: string;
+    dest: string;
+  }): Promise<Result<void, RubyFileSystemError>> {
+    const srcGCS = this.toGCSPath(src);
+    const destGCS = this.toGCSPath(dest);
+    if (!srcGCS) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.copy: unrecognised source path: ${src}`
+        )
+      );
+    }
+
+    if (!destGCS) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.copy: unrecognised destination path: ${dest}`
+        )
+      );
+    }
+
+    try {
+      const bucket = getPrivateUploadBucket();
+
+      // Try as a regular file first.
+      const [fileExists] = await bucket.file(srcGCS).exists();
+      if (fileExists) {
+        await bucket.copyFile(srcGCS, destGCS);
+        return new Ok(undefined);
+      }
+
+      // Fall back to directory copy.
+      return this.copyDir({
+        srcPrefix: `${srcGCS}/`,
+        destPrefix: `${destGCS}/`,
+      });
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+  }
+
+  async move({
+    src,
+    dest,
+  }: {
+    src: string;
+    dest: string;
+  }): Promise<Result<{ sourceDeletionFailed: boolean }, RubyFileSystemError>> {
+    const destExists = await this.exists(dest);
+    if (destExists.isErr()) {
+      return destExists;
+    }
+    if (destExists.value) {
+      return new Err(
+        new RubyFileSystemError(
+          "already_exists",
+          "File name already exists in the destination directory."
+        )
+      );
+    }
+
+    const copyResult = await this.copy({ src, dest });
+    if (copyResult.isErr()) {
+      return copyResult;
+    }
+
+    const deleteResult = await this.delete(src);
+    if (deleteResult.isErr()) {
+      logger.error(
+        { err: deleteResult.error, src, dest },
+        "GCS move left the source after copying the destination"
+      );
+      return new Ok({ sourceDeletionFailed: true });
+    }
+
+    return new Ok({ sourceDeletionFailed: false });
+  }
+
+  async getDownloadUrl(
+    scopedPath: string,
+    opts?: { expiresInMs?: number; fileName?: string }
+  ): Promise<Result<string, RubyFileSystemError>> {
+    const gcsPath = this.toGCSPath(scopedPath);
+    if (!gcsPath) {
+      return new Err(
+        new RubyFileSystemError(
+          "invalid_path",
+          `GCSFileSystemBackend.getDownloadUrl: unrecognised scoped path: ${scopedPath}`
+        )
+      );
+    }
+
+    try {
+      const [exists] = await getPrivateUploadBucket().file(gcsPath).exists();
+      if (!exists) {
+        return new Err(
+          new RubyFileSystemError("not_found", `Path not found: ${scopedPath}`)
+        );
+      }
+
+      const url = await getCachedPrivateUploadSignedUrl(gcsPath, {
+        expirationDelayMs: opts?.expiresInMs,
+      });
+
+      return new Ok(url);
+    } catch (err) {
+      return new Err(
+        new RubyFileSystemError("internal", normalizeError(err).message)
+      );
+    }
+  }
+
+  createSandboxAdapter(
+    mounts: ReadonlyArray<FileSystemMount>,
+    sandboxOnlyMounts: ReadonlyArray<SandboxOnlyMount> = []
+  ): SandboxMountAdapter {
+    const bucket = fileStorageConfig.getGcsPrivateUploadsBucket();
+    const targets: GCSMountTarget[] = [
+      ...mounts
+        .filter(
+          (mount): mount is FileSystemMount & { sandboxMountPoint: string } =>
+            mount.sandboxMountPoint !== null
+        )
+        .map(
+          (mount): GCSMountTarget => ({
+            gcsPrefix: this.mountRootGCSPrefix(mount),
+            sandboxMountPoint: mount.sandboxMountPoint,
+            legacySandboxMountPoint: mount.legacySandboxMountPoint,
+            readOnly: false,
+            mountProfile: "workload",
+          })
+        ),
+      ...sandboxOnlyMounts.map(
+        (mount): GCSMountTarget => ({
+          gcsPrefix: this.sandboxOnlyMountGCSPrefix(mount),
+          sandboxMountPoint: mount.sandboxMountPoint,
+          legacySandboxMountPoint: null,
+          readOnly: mount.readOnly,
+          mountProfile: this.sandboxOnlyMountProfile(mount),
+        })
+      ),
+    ];
+
+    return new GCSSandboxMountAdapter(bucket, targets);
+  }
+
+  private sandboxOnlyMountGCSPrefix(mount: SandboxOnlyMount): string {
+    switch (mount.kind) {
+      case "frame_publications":
+        return `w/${this.workspaceId}/frames/${mount.frameId}/publications`;
+
+      case "frame_state":
+        return getFrameDatabaseReplicasBasePath({
+          workspaceId: this.workspaceId,
+          frameId: mount.frameId,
+        }).replace(/\/$/, "");
+
+      case "pod_sandbox_functions":
+        return `w/${this.workspaceId}/pods/${mount.podId}/sandbox-functions`;
+
+      case "pod_state":
+        return `w/${this.workspaceId}/pods/${mount.podId}/state`;
+
+      default:
+        assertNever(mount);
+    }
+  }
+
+  private sandboxOnlyMountProfile(
+    mount: SandboxOnlyMount
+  ): GCSMountTarget["mountProfile"] {
+    switch (mount.kind) {
+      case "frame_publications":
+        return "frame_publications";
+
+      case "frame_state":
+        return "sandbox_state_replica";
+
+      case "pod_sandbox_functions":
+        return "pod_sandbox_functions";
+
+      case "pod_state":
+        return "sandbox_state_replica";
+
+      default:
+        assertNever(mount);
+    }
+  }
+}

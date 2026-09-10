@@ -1,0 +1,318 @@
+import { formatUserQuestionAnswer } from "@app/lib/actions/user_question";
+import { ONE_DAY_MS, ONE_HOUR_MS } from "@app/tests/sidekick-evals/lib/config";
+import type { MockAgentState } from "@app/tests/sidekick-evals/lib/types";
+import { INSTRUCTIONS_ROOT_TARGET_BLOCK_ID } from "@app/types/suggestions/agent_suggestion";
+
+function instructionsToHtml(instructions: string): string {
+  if (!instructions.trim()) {
+    return `<div data-type="${INSTRUCTIONS_ROOT_TARGET_BLOCK_ID}" data-block-id="${INSTRUCTIONS_ROOT_TARGET_BLOCK_ID}"><p></p></div>`;
+  }
+  const paragraphs = instructions.split("\n").map((line) => line.trim());
+  const blocks = paragraphs
+    .map((p, i) => `<p data-block-id="mock-${i}">${p}</p>`)
+    .join("");
+  return `<div data-type="${INSTRUCTIONS_ROOT_TARGET_BLOCK_ID}" data-block-id="${INSTRUCTIONS_ROOT_TARGET_BLOCK_ID}">${blocks}</div>`;
+}
+
+let mockSuggestionCounter = 0;
+
+function getSuggestionsArray(
+  toolArguments: Record<string, unknown> | undefined
+): unknown[] {
+  const raw = toolArguments?.suggestions;
+  return Array.isArray(raw) ? raw : [null];
+}
+
+export function getMockToolResponse(
+  toolName: string,
+  agentState: MockAgentState,
+  toolArguments?: Record<string, unknown>
+): string {
+  const mockResponses: Record<string, () => object | string> = {
+    // There is no user to answer during an eval, so every question gets the same
+    // free-text answer. It hands the decision back to the sidekick instead of
+    // steering it, and lets the run continue so the work after the clarifying
+    // question is what gets judged.
+    ask_user_question: () =>
+      formatUserQuestionAnswer(
+        typeof toolArguments?.question === "string"
+          ? toolArguments.question
+          : "",
+        ["Other: do whatever is the most intuitive for you"]
+      ),
+
+    get_agent_info: () => agentState,
+
+    get_agent_config: () => ({
+      name: agentState.name,
+      description: agentState.description,
+      instructionsHtml: instructionsToHtml(agentState.instructions),
+      scope: agentState.scope ?? "private",
+      model: {
+        modelId: agentState.model.modelId,
+        providerId: "anthropic",
+        temperature: agentState.model.temperature ?? 0.7,
+        reasoningEffort: agentState.model.reasoningEffort ?? null,
+      },
+      tools: agentState.tools,
+      skills: agentState.skills,
+      maxStepsPerRun: agentState.maxStepsPerRun ?? 8,
+      pendingSuggestions: [],
+    }),
+
+    get_available_models: () =>
+      [
+        "<available_models>",
+        '<provider id="openai">',
+        "- **GPT-4 Turbo** (modelId: gpt-4-turbo): GPT-4 Turbo (no vision)",
+        "- **GPT-5 Mini** (modelId: gpt-5-mini): GPT-5 Mini (no vision)",
+        "</provider>",
+        "",
+        '<provider id="anthropic">',
+        "- **Claude Sonnet 4.5** (modelId: claude-sonnet-4-5-20250929): Claude Sonnet 4.5 (no vision)",
+        "- **Claude Opus 4** (modelId: claude-opus-4-20250514): Claude Opus 4 (no vision)",
+        "</provider>",
+        "</available_models>",
+      ].join("\n"),
+
+    get_available_skills: () =>
+      [
+        "<available_skills>",
+        '<skill ID="skill_web_search" name="Web Search">',
+        "  Search the web for information",
+        "</skill>",
+        '<skill ID="skill_data_analysis" name="Data Analysis">',
+        "  Analyze data and generate insights",
+        "</skill>",
+        "</available_skills>",
+      ].join("\n"),
+
+    get_available_tools: () =>
+      [
+        "<available_tools>",
+        '<tool ID="mcp_slack" name="Slack">Read and send Slack messages</tool>',
+        '<tool ID="mcp_notion" name="Notion">Search Notion workspace</tool>',
+        '<tool ID="mcp_github" name="GitHub">Access GitHub repositories</tool>',
+        '<tool ID="mcp_datadog" name="Datadog">Search and query Datadog logs and metrics</tool>',
+        '<tool ID="mcp_jira" name="JIRA">Search and manage JIRA issues and projects</tool>',
+        "</available_tools>",
+      ].join("\n"),
+
+    search_knowledge: () => ({
+      dataSourceViews: [
+        {
+          dataSourceView: {
+            sId: "dsv_notion_1",
+            name: "Notion",
+            connectorProvider: "notion",
+            category: "managed",
+          },
+          spaceId: "space_1",
+        },
+        {
+          dataSourceView: {
+            sId: "dsv_slack_1",
+            name: "Slack",
+            connectorProvider: "slack",
+            category: "managed",
+          },
+          spaceId: "space_1",
+        },
+        {
+          dataSourceView: {
+            sId: "dsv_folder_1",
+            name: "Product Requirements",
+            connectorProvider: null,
+            category: "folder",
+          },
+          spaceId: "space_1",
+        },
+        {
+          dataSourceView: {
+            sId: "dsv_website_1",
+            name: "Company Blog",
+            connectorProvider: "webcrawler",
+            category: "website",
+          },
+          spaceId: "space_2",
+        },
+        {
+          dataSourceView: {
+            sId: "dsv_snowflake_1",
+            name: "Snowflake",
+            connectorProvider: "snowflake",
+            category: "managed",
+          },
+          spaceId: "space_3",
+        },
+        {
+          dataSourceView: {
+            sId: "dsv_github_1",
+            name: "GitHub",
+            connectorProvider: "github",
+            category: "managed",
+          },
+          spaceId: "space_3",
+        },
+      ],
+      nodes: [],
+    }),
+
+    get_agent_feedback: () => ({
+      feedback: [
+        {
+          id: "fb1",
+          thumbDirection: "down",
+          content: "The agent's responses are too formal and robotic",
+          createdAt: Date.now() - ONE_DAY_MS,
+        },
+        {
+          id: "fb2",
+          thumbDirection: "up",
+          content: "Great at finding relevant information quickly",
+          createdAt: Date.now() - ONE_DAY_MS * 2,
+        },
+        {
+          id: "fb3",
+          thumbDirection: "down",
+          content: "Sometimes misses important context from previous messages",
+          createdAt: Date.now() - ONE_DAY_MS * 3,
+        },
+      ],
+      total: 3,
+    }),
+
+    get_agent_insights: () => ({
+      activeUsers: 15,
+      conversations: 48,
+      messages: 320,
+      feedbackStats: {
+        thumbsUp: 12,
+        thumbsDown: 8,
+        thumbsUpRate: 0.6,
+      },
+      topUsers: [
+        { userId: "user1", name: "Alice Smith", conversations: 12 },
+        { userId: "user2", name: "Bob Johnson", conversations: 8 },
+      ],
+    }),
+
+    suggest_prompt_edits: () =>
+      getSuggestionsArray(toolArguments)
+        .map(() => {
+          const sId = `mock_sId_${++mockSuggestionCounter}`;
+          return `:agent_suggestion[]{sId=${sId} kind=instructions}`;
+        })
+        .join("\n\n"),
+
+    suggest_tools: () =>
+      getSuggestionsArray(toolArguments)
+        .map(() => {
+          const sId = `mock_sId_${++mockSuggestionCounter}`;
+          return `:agent_suggestion[]{sId=${sId} kind=tools}`;
+        })
+        .join("\n\n"),
+
+    suggest_skills: () =>
+      getSuggestionsArray(toolArguments)
+        .map(() => {
+          const sId = `mock_sId_${++mockSuggestionCounter}`;
+          return `:agent_suggestion[]{sId=${sId} kind=skills}`;
+        })
+        .join("\n\n"),
+
+    suggest_model: () =>
+      `:agent_suggestion[]{sId=mock_sId_${++mockSuggestionCounter} kind=model}`,
+
+    suggest_knowledge: () =>
+      `:agent_suggestion[]{sId=mock_sId_${++mockSuggestionCounter} kind=knowledge}`,
+
+    suggest_sub_agent: () =>
+      `:agent_suggestion[]{sId=mock_sId_${++mockSuggestionCounter} kind=sub_agent}`,
+
+    search_agent_templates: () => ({
+      templates: [
+        {
+          sId: "template_support",
+          handle: "customer-support",
+          description: "A customer support agent template",
+          tags: ["support"],
+          sidekickInstructions: "Help users set up a customer support agent.",
+        },
+      ],
+    }),
+
+    get_agent_template: () => ({
+      sId: "template_support",
+      handle: "customer-support",
+      description: "A customer support agent template",
+      sidekickInstructions: "Help users set up a customer support agent.",
+    }),
+
+    get_available_agents: () => ({
+      agents: [
+        {
+          sId: "agent_1",
+          name: "Research Assistant",
+          description: "Helps with research tasks",
+        },
+      ],
+    }),
+
+    inspect_available_agent: () => ({
+      sId: "agent_1",
+      name: "Research Assistant",
+      description: "Helps with research tasks",
+      instructions: "You are a research assistant.",
+      tools: [],
+      skills: [],
+    }),
+
+    update_suggestions_state: () => ({
+      status: "success",
+      message: "Suggestions updated successfully",
+    }),
+
+    inspect_conversation: () => ({
+      title: "Mock conversation",
+      messages: [],
+    }),
+
+    inspect_message: () => ({
+      id: "msg_1",
+      role: "user",
+      content: "Mock message content",
+    }),
+
+    list_suggestions: () => ({
+      suggestions: [
+        {
+          id: "sug1",
+          kind: "instructions",
+          status: "pending",
+          createdAt: Date.now() - ONE_HOUR_MS,
+          analysis: "Make tone more friendly based on user feedback",
+        },
+      ],
+      total: 1,
+    }),
+  };
+
+  const responseFactory = mockResponses[toolName];
+  if (!responseFactory) {
+    // Models sometimes call a tool that is not in the specs. Returning the error
+    // to the model instead of throwing lets it recover, so the scenario is
+    // scored on its final answer rather than dropping out of the run entirely.
+    // The bogus call stays visible to the judge in the tool call list.
+    return `Error: no tool named "${toolName}" is available. Use one of the tools provided in the specifications.`;
+  }
+
+  const result = responseFactory();
+
+  // Suggestion tools return plain-text directives, not JSON objects.
+  if (typeof result === "string") {
+    return result;
+  }
+
+  return JSON.stringify(result, null, 2);
+}

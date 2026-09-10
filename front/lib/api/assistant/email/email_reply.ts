@@ -1,0 +1,328 @@
+import { getAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
+import type {
+  EmailReplyContext,
+  InboundEmail,
+} from "@app/lib/api/assistant/email/email_trigger";
+import {
+  deleteEmailReplyContext,
+  getEmailReplyContext,
+  replyToEmail,
+  sendToolValidationEmail,
+  storeEmailReplyContext,
+} from "@app/lib/api/assistant/email/email_trigger";
+import config from "@app/lib/api/config";
+import type { Authenticator } from "@app/lib/auth";
+import { AgentMCPActionResource } from "@app/lib/resources/agent_mcp_action_resource";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { getConversationRoute } from "@app/lib/utils/router";
+import logger from "@app/logger/logger";
+import type { AgentLoopArgs } from "@app/types/assistant/agent_run";
+import { getAgentLoopRuntimeDataWithAuth } from "@app/types/assistant/agent_run";
+import { marked } from "marked";
+import sanitizeHtml from "sanitize-html";
+
+/**
+ * Reconstructs a minimal InboundEmail from the stored context.
+ * Only includes fields needed for replyToEmail.
+ */
+function reconstructEmailFromContext(context: EmailReplyContext): InboundEmail {
+  return {
+    subject: context.subject,
+    text: context.originalText,
+    auth: { SPF: "", dkim: [], dkimRaw: "" },
+    threadingHeaders: {
+      messageId: context.threadingMessageId,
+      inReplyTo: context.threadingInReplyTo,
+      references: context.threadingReferences,
+    },
+    sender: {
+      email: context.fromEmail,
+      full: context.fromFull,
+    },
+    envelope: {
+      to: [],
+      cc: [],
+      bcc: [],
+      from: context.fromEmail,
+    },
+    attachments: [],
+  };
+}
+
+/**
+ * Defense-in-depth: check the workspace toggle before sending email replies.
+ * Duplicates the webhook handler check in case Redis data is manipulated or
+ * context is stored incorrectly.
+ */
+async function isEmailAgentsEnabled(auth: Authenticator): Promise<boolean> {
+  const workspace = auth.getNonNullableWorkspace();
+  if (workspace.metadata?.allowEmailAgents !== true) {
+    logger.info(
+      { workspaceId: workspace.sId },
+      "[email] allowEmailAgents not enabled in workspace metadata, skipping reply"
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Check if the agent is blocked on tool validation.
+ * If so, send a validation email and re-store the context with fresh TTL.
+ * Returns true if blocked (validation email sent), false otherwise.
+ */
+async function handleBlockedValidation(
+  auth: Authenticator,
+  agentMessageId: string,
+  context: EmailReplyContext
+): Promise<boolean> {
+  const conversationResource = await ConversationResource.fetchById(
+    auth,
+    context.conversationId
+  );
+  if (!conversationResource) {
+    logger.warn(
+      {
+        agentMessageId,
+        conversationId: context.conversationId,
+      },
+      "[email] Conversation not found for blocked validation check"
+    );
+    return false;
+  }
+
+  const blockedActions =
+    await AgentMCPActionResource.listBlockedActionsForConversation(
+      auth,
+      conversationResource
+    );
+
+  const validationRequiredActions = blockedActions.filter(
+    (action) =>
+      action.status === "blocked_validation_required" &&
+      action.messageId === agentMessageId
+  );
+
+  if (validationRequiredActions.length === 0) {
+    return false;
+  }
+
+  const agentConfiguration = await getAgentConfiguration(auth, {
+    agentId: context.agentConfigurationId,
+    variant: "light",
+  });
+  if (!agentConfiguration) {
+    logger.warn(
+      {
+        agentMessageId,
+        agentConfigurationId: context.agentConfigurationId,
+      },
+      "[email] Agent configuration not found for blocked validation check"
+    );
+    return false;
+  }
+
+  const email = reconstructEmailFromContext(context);
+
+  await sendToolValidationEmail({
+    email,
+    agentConfiguration,
+    blockedActions: validationRequiredActions,
+    conversation: { sId: context.conversationId },
+    workspace: auth.getNonNullableWorkspace(),
+  });
+
+  // Re-store context with fresh TTL so it's available when agent resumes.
+  await storeEmailReplyContext(agentMessageId, context);
+
+  logger.info(
+    {
+      agentMessageId,
+      conversationId: context.conversationId,
+      blockedActionsCount: validationRequiredActions.length,
+    },
+    "[email] Agent blocked on tool validation, sent approval email"
+  );
+
+  return true;
+}
+
+/**
+ * Send an email reply after agent message completion.
+ * If the agent is blocked on tool validation, sends a validation email instead.
+ * Fire-and-forget: failures are logged but don't throw.
+ */
+export async function sendEmailReplyOnCompletion(
+  auth: Authenticator,
+  agentLoopArgs: AgentLoopArgs
+): Promise<void> {
+  const workspaceId = auth.getNonNullableWorkspace().sId;
+
+  // Only process email-originated messages.
+  if (agentLoopArgs.userMessageOrigin !== "email") {
+    return;
+  }
+
+  // Read without deleting — only delete after actually sending the final reply.
+  const context = await getEmailReplyContext(
+    workspaceId,
+    agentLoopArgs.agentMessageId
+  );
+  if (!context) {
+    logger.info(
+      { agentMessageId: agentLoopArgs.agentMessageId },
+      "[email] No email reply context found, skipping reply"
+    );
+    return;
+  }
+
+  // Get the completed agent message data.
+  const dataRes = await getAgentLoopRuntimeDataWithAuth(auth, agentLoopArgs);
+  if (dataRes.isErr()) {
+    logger.warn(
+      {
+        agentMessageId: agentLoopArgs.agentMessageId,
+        error: dataRes.error,
+      },
+      "[email] Failed to get agent loop data for email reply"
+    );
+    return;
+  }
+
+  const { agentMessage, conversation } = dataRes.value;
+
+  const isEnabled = await isEmailAgentsEnabled(auth);
+  if (!isEnabled) {
+    await deleteEmailReplyContext(workspaceId, agentLoopArgs.agentMessageId);
+    return;
+  }
+
+  if (agentMessage.status === "failed") {
+    await sendEmailReplyOnError(
+      auth,
+      agentLoopArgs,
+      agentMessage.error?.message ?? "Agent execution failed."
+    );
+    return;
+  }
+
+  // Check if blocked on tool validation — send validation email instead.
+  const blocked = await handleBlockedValidation(
+    auth,
+    agentMessage.sId,
+    context
+  );
+  if (blocked) {
+    return;
+  }
+
+  // No blocked actions — send the normal reply and delete the context.
+  await deleteEmailReplyContext(workspaceId, agentLoopArgs.agentMessageId);
+
+  // Get agent configuration for the reply sender name.
+  const agentConfiguration = await getAgentConfiguration(auth, {
+    agentId: context.agentConfigurationId,
+    variant: "light",
+  });
+
+  // Render the agent message content as HTML.
+  const htmlContent = sanitizeHtml(
+    await marked.parse(agentMessage.content ?? ""),
+    {
+      allowedTags: sanitizeHtml.defaults.allowedTags.concat(["img"]),
+    }
+  );
+
+  // Build the full HTML with conversation link.
+  const conversationLink = getConversationRoute(
+    context.workspaceId,
+    conversation.sId,
+    undefined,
+    config.getAppUrl()
+  );
+  const agentName = agentConfiguration
+    ? sanitizeHtml(agentConfiguration.name, {
+        allowedTags: [],
+        allowedAttributes: {},
+      })
+    : null;
+  const attribution = agentName
+    ? `Answered by <strong>${agentName}</strong>`
+    : "Answered";
+  const fullHtmlContent =
+    `<div><div>${htmlContent}</div>` +
+    `<p style="color: #666; font-size: 13px; margin-top: 16px;">${attribution} · <a href="${conversationLink}" style="color: #2563eb;">View full conversation</a></p>` +
+    `</div>`;
+
+  // Reconstruct the email and send reply.
+  const email = reconstructEmailFromContext(context);
+  await replyToEmail({
+    email,
+    agentConfiguration: agentConfiguration ?? undefined,
+    htmlContent: fullHtmlContent,
+    recipient: context.fromEmail,
+  });
+
+  logger.info(
+    {
+      agentMessageId: agentLoopArgs.agentMessageId,
+      conversationId: conversation.sId,
+      to: context.fromEmail,
+    },
+    "[email] Sent email reply on agent completion"
+  );
+}
+
+/**
+ * Send an error email on agent error/cancellation.
+ * Fire-and-forget: failures are logged but don't throw.
+ */
+export async function sendEmailReplyOnError(
+  auth: Authenticator,
+  agentLoopArgs: AgentLoopArgs,
+  errorMessage: string
+): Promise<void> {
+  const workspaceId = auth.getNonNullableWorkspace().sId;
+  if (agentLoopArgs.userMessageOrigin !== "email") {
+    return;
+  }
+
+  const context = await getEmailReplyContext(
+    workspaceId,
+    agentLoopArgs.agentMessageId
+  );
+  if (!context) {
+    logger.info(
+      { agentMessageId: agentLoopArgs.agentMessageId },
+      "[email] No email reply context found for error reply, skipping"
+    );
+    return;
+  }
+
+  await deleteEmailReplyContext(workspaceId, agentLoopArgs.agentMessageId);
+
+  const isEnabled = await isEmailAgentsEnabled(auth);
+  if (!isEnabled) {
+    return;
+  }
+
+  const email = reconstructEmailFromContext(context);
+  const htmlContent =
+    `<p>Error running agent:</p>\n` +
+    `<p>${sanitizeHtml(errorMessage, { allowedTags: [], allowedAttributes: {} })}</p>\n`;
+
+  await replyToEmail({
+    email,
+    htmlContent,
+    recipient: context.fromEmail,
+  });
+
+  logger.info(
+    {
+      agentMessageId: agentLoopArgs.agentMessageId,
+      to: context.fromEmail,
+      errorMessage,
+    },
+    "[email] Sent error email reply"
+  );
+}

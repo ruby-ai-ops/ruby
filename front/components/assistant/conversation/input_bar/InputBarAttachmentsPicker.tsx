@@ -1,0 +1,805 @@
+import { DropdownAnchorTrigger } from "@app/components/assistant/conversation/input_bar/DropdownAnchorTrigger";
+import { getSingularFileCategoryLabelForContentType } from "@app/components/file_explorer/utils";
+import { InfiniteScroll } from "@app/components/InfiniteScroll";
+import { NodePathTooltip } from "@app/components/NodePathTooltip";
+import { getIcon } from "@app/components/resources/resources_icons";
+import { useDebounce } from "@app/hooks/useDebounce";
+import type { FileUploaderService } from "@app/hooks/useFileUploaderService";
+import { useToolFileUpload } from "@app/hooks/useToolFileUpload";
+import { getConnectorProviderLogoWithFallback } from "@app/lib/connector_providers_ui";
+import {
+  getLocationForDataSourceViewContentNodeWithSpace,
+  getVisualForContentNodeType,
+  getVisualForDataSourceViewContentNode,
+} from "@app/lib/content_nodes";
+import {
+  getDisplayNameForDataSource,
+  isFolder,
+  isWebsite,
+} from "@app/lib/data_sources";
+import { getFileTypeIcon } from "@app/lib/file_icon_utils";
+import type {
+  ToolSearchResult,
+  ToolSearchServerResult,
+} from "@app/lib/search/tools/types";
+import { useUnifiedSearch } from "@app/lib/swr/search";
+import { useSpaces } from "@app/lib/swr/spaces";
+import { useIsMobile } from "@app/lib/swr/useIsMobile";
+import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/utils";
+import type { DataSourceType } from "@app/types/data_source";
+import type { DataSourceViewContentNode } from "@app/types/data_source_view";
+import type { FileUseCaseMetadata } from "@app/types/files";
+import { removeNulls } from "@app/types/shared/utils/general";
+import { asDisplayToolName } from "@app/types/shared/utils/string_utils";
+import type { SpaceType } from "@app/types/space";
+import type { LightWorkspaceType } from "@app/types/user";
+import type { DropdownMenuFilterOption } from "@ruby-ai/sparkle";
+import {
+  Attachment01,
+  Button,
+  DoubleIcon,
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuFilters,
+  DropdownMenuSearchbar,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+  Icon,
+  Input,
+  LoadingBlock,
+  SearchMd,
+  Spinner,
+  UploadCloud02,
+} from "@ruby-ai/sparkle";
+import type { ButtonVariantType } from "@ruby-ai/sparkle/dist/esm/components/Button";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+const SEARCH_RESULTS_PLACEHOLDER_COUNT = 5;
+
+const getKeyForConnectorProvider = ({
+  connectorProvider,
+  dataSourceSId,
+}: {
+  connectorProvider: DataSourceType["connectorProvider"];
+  dataSourceSId: string;
+}) => {
+  if (connectorProvider === "webcrawler") {
+    return `ds-webcrawler`;
+  } else if (!connectorProvider) {
+    return `ds-folder`;
+  } else if (connectorProvider === "ruby_project") {
+    return `ds-project`;
+  } else {
+    return `ds-${dataSourceSId}`;
+  }
+};
+
+const getKeyForDataSource = (dataSource: DataSourceType) => {
+  return getKeyForConnectorProvider({
+    connectorProvider: dataSource.connectorProvider,
+    dataSourceSId: dataSource.sId,
+  });
+};
+
+interface InputBarAttachmentsPickerProps {
+  owner: LightWorkspaceType;
+  fileUploaderService: FileUploaderService;
+  onNodeSelect: (node: DataSourceViewContentNode) => void;
+  onNodeUnselect: (node: DataSourceViewContentNode) => void;
+  attachedNodes: DataSourceViewContentNode[];
+  type: "dropdown" | "subdropdown";
+  isLoading?: boolean;
+  buttonLabel?: string;
+  buttonVariant?: ButtonVariantType;
+  disabled?: boolean;
+  buttonSize?: "xs" | "sm" | "md";
+  // Will be used to upload files found via tools and not the connected datasources.
+  toolFileUpload: {
+    useCase: "conversation" | "project_context";
+    useCaseMetadata: FileUseCaseMetadata;
+  };
+  spaceId?: string;
+  onFileChange?: () => void;
+  externalOpen?: boolean;
+  onExternalOpenChange?: (open: boolean) => void;
+  onOpenChange?: (open: boolean) => void;
+  anchorRef?: React.RefObject<HTMLElement | null>;
+  prefetch?: boolean;
+}
+
+const PAGE_SIZE = 25;
+const PROJECT_FILTER_KEY = getKeyForConnectorProvider({
+  connectorProvider: "ruby_project",
+  dataSourceSId: "project",
+});
+
+interface KnowledgeNodeCheckboxItemProps {
+  item: DataSourceViewContentNode;
+  owner: LightWorkspaceType;
+  attachedNodes: DataSourceViewContentNode[];
+  onNodeSelect: (node: DataSourceViewContentNode) => void;
+  onNodeUnselect: (node: DataSourceViewContentNode) => void;
+  spacesMap?: Record<string, SpaceType>;
+}
+
+const KnowledgeNodeCheckboxItem = ({
+  item,
+  owner,
+  attachedNodes,
+  onNodeSelect,
+  onNodeUnselect,
+  spacesMap,
+}: KnowledgeNodeCheckboxItemProps) => {
+  return (
+    <NodePathTooltip node={item} owner={owner}>
+      <DropdownMenuCheckboxItem
+        label={item.title}
+        icon={
+          isWebsite(item.dataSourceView.dataSource) ||
+          isFolder(item.dataSourceView.dataSource) ? (
+            <Icon
+              visual={getVisualForDataSourceViewContentNode(item)}
+              size="md"
+            />
+          ) : (
+            <DoubleIcon
+              size="md"
+              mainIcon={getVisualForDataSourceViewContentNode(item)}
+              secondaryIcon={getConnectorProviderLogoWithFallback({
+                provider: item.dataSourceView.dataSource.connectorProvider,
+              })}
+            />
+          )
+        }
+        description={getLocationForDataSourceViewContentNodeWithSpace(
+          item,
+          spacesMap
+        )}
+        checked={attachedNodes.some(
+          (attachedNode) =>
+            attachedNode.internalId === item.internalId &&
+            attachedNode.dataSourceView.dataSource.sId ===
+              item.dataSourceView.dataSource.sId
+        )}
+        onCheckedChange={(checked) => {
+          if (checked) {
+            onNodeSelect(item);
+          } else {
+            onNodeUnselect(item);
+          }
+        }}
+        truncateText
+      />
+    </NodePathTooltip>
+  );
+};
+
+interface ToolFileCheckboxItemProps {
+  item: ToolSearchResult;
+  isLoading: boolean;
+  isToolFileAttached: (item: ToolSearchResult) => boolean;
+  isToolFileUploading: (item: ToolSearchResult) => boolean;
+  uploadToolFile: (item: ToolSearchResult) => void;
+  removeToolFile: (item: ToolSearchResult) => void;
+}
+
+const ToolFileCheckboxItem = ({
+  item,
+  isLoading,
+  isToolFileAttached,
+  isToolFileUploading,
+  uploadToolFile,
+  removeToolFile,
+}: ToolFileCheckboxItemProps) => {
+  const isAttached = isToolFileAttached(item);
+  const isUploading = isToolFileUploading(item);
+
+  return (
+    <DropdownMenuCheckboxItem
+      label={item.title}
+      icon={
+        isUploading ? (
+          <Spinner size="sm" />
+        ) : (
+          <DoubleIcon
+            size="md"
+            mainIcon={getVisualForContentNodeType(item.type)}
+            secondaryIcon={getIcon(item.serverIcon)}
+          />
+        )
+      }
+      description={asDisplayToolName(item.serverName)}
+      checked={isAttached}
+      disabled={isLoading || isUploading}
+      onCheckedChange={(checked) => {
+        if (checked && !isAttached && !isUploading) {
+          void uploadToolFile(item);
+        } else if (!checked && isAttached) {
+          removeToolFile(item);
+        }
+      }}
+      truncateText
+    />
+  );
+};
+
+interface ProjectFileItemProps {
+  item: { fileId: string; title: string; contentType: string };
+  projectName: string;
+  isAttached: boolean;
+  isDisabled: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}
+
+const ProjectFileItem = ({
+  item,
+  projectName,
+  isAttached,
+  isDisabled,
+  onCheckedChange,
+}: ProjectFileItemProps) => {
+  const FileIcon = getFileTypeIcon(item.contentType, item.title);
+  const fileKind = getSingularFileCategoryLabelForContentType(item.contentType);
+  const description = projectName
+    ? `${fileKind} in "${projectName}" knowledge`
+    : `${fileKind} in Pod knowledge`;
+  return (
+    <DropdownMenuCheckboxItem
+      label={item.title}
+      icon={<Icon visual={FileIcon} size="md" />}
+      description={description}
+      checked={isAttached}
+      disabled={isDisabled}
+      onCheckedChange={onCheckedChange}
+      truncateText
+    />
+  );
+};
+
+export const InputBarAttachmentsPicker = ({
+  owner,
+  fileUploaderService,
+  onNodeSelect,
+  onNodeUnselect,
+  attachedNodes,
+  isLoading = false,
+  disabled = false,
+  buttonSize = "xs",
+  buttonLabel = undefined,
+  buttonVariant = "ghost-secondary",
+  toolFileUpload,
+  spaceId,
+  type,
+  onFileChange,
+  externalOpen,
+  onExternalOpenChange,
+  onOpenChange,
+  anchorRef,
+  prefetch = false,
+}: InputBarAttachmentsPickerProps) => {
+  const isMobile = useIsMobile();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const itemsContainerRef = useRef<HTMLDivElement>(null);
+  const [internalOpen, setInternalOpen] = useState(false);
+
+  const isExternallyControlled = externalOpen !== undefined;
+  const isOpen = isExternallyControlled ? externalOpen : internalOpen;
+  const setIsOpen = isExternallyControlled
+    ? (open: boolean) => onExternalOpenChange?.(open)
+    : setInternalOpen;
+  const [selectedDataSourcesAndTools, setSelectedDataSourcesAndTools] =
+    useState<Record<string, boolean>>({});
+  const {
+    inputValue: search,
+    debouncedValue: searchQuery,
+    isDebouncing,
+    setValue: setSearch,
+  } = useDebounce("", {
+    delay: 300,
+    minLength: MIN_SEARCH_QUERY_SIZE,
+  });
+
+  const { spaces, isSpacesLoading } = useSpaces({
+    workspaceId: owner.sId,
+    kinds: ["global", "regular", "project"],
+    disabled: !isOpen && !prefetch,
+  });
+
+  const spacesMap = useMemo(
+    () => Object.fromEntries(spaces.map((space) => [space.sId, space])),
+    [spaces]
+  );
+
+  const spaceIds = useMemo(() => {
+    // We are having a conversation within a specific space, so we only allow datasources/tools from that space and the global space.
+    // This is a project v1 limitation.
+    if (spaceId) {
+      return spaces
+        .filter((s) => s.sId === spaceId || s.kind === "global")
+        .map((s) => s.sId);
+    } else {
+      return spaces.map((s) => s.sId);
+    }
+  }, [spaces, spaceId]);
+
+  const projectId =
+    spaceId && spacesMap?.[spaceId]?.kind === "project" ? spaceId : undefined;
+  const projectName =
+    projectId && spacesMap[projectId]?.name ? spacesMap[projectId].name : "";
+
+  const {
+    knowledgeResults: searchResultNodes,
+    toolResults: toolFileResults,
+    projectContextFiles,
+    isProjectContextFilesLoading,
+    isSearchLoading,
+    isLoadingNextPage,
+    isSearchValidating,
+    hasMore,
+    nextPage,
+  } = useUnifiedSearch({
+    owner,
+    query: searchQuery,
+    pageSize: PAGE_SIZE,
+    disabled: isSpacesLoading || !searchQuery,
+    spaceIds,
+    projectId,
+    viewType: "all",
+    includeDataSources: true,
+    searchSourceUrls: true,
+    includeTools: true,
+    prioritizeSpaceAccess: true,
+  });
+
+  const attachedFileIds = useMemo(() => {
+    return new Set(fileUploaderService.fileBlobs.map((b) => b.fileId ?? b.id));
+  }, [fileUploaderService.fileBlobs]);
+
+  const projectFilesWithResults = useMemo(() => {
+    if (!projectId) {
+      return [];
+    }
+    return projectContextFiles;
+  }, [projectContextFiles, projectId]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
+  useEffect(() => {
+    if (isOpen) {
+      setSelectedDataSourcesAndTools({});
+    }
+  }, [isOpen, searchQuery]);
+
+  const dataSourcesNodes = useMemo(
+    () =>
+      removeNulls(
+        searchResultNodes.map((node) => {
+          const { dataSourceViews, ...rest } = node;
+
+          const dataSourceView = dataSourceViews.find(
+            (view) => spacesMap[view.spaceId]
+          );
+
+          if (!dataSourceView) {
+            return null;
+          }
+
+          return {
+            ...rest,
+            dataSourceView,
+          };
+        })
+      ),
+    [searchResultNodes, spacesMap]
+  );
+
+  const dataSourcesWithResults: Record<
+    string,
+    { dataSource: DataSourceType; results: DataSourceViewContentNode[] }
+  > = useMemo(() => {
+    return dataSourcesNodes.reduce<
+      Record<
+        string,
+        { dataSource: DataSourceType; results: DataSourceViewContentNode[] }
+      >
+    >((acc, item) => {
+      const key = getKeyForDataSource(item.dataSource);
+      acc[key] = acc[key] ?? {
+        dataSource: item.dataSource,
+        results: [],
+      };
+      acc[key].results.push(item);
+      return acc;
+    }, {});
+  }, [dataSourcesNodes]);
+
+  const serversWithResults = useMemo(
+    () =>
+      toolFileResults.reduce<
+        Record<
+          string,
+          { server: ToolSearchServerResult; results: ToolSearchResult[] }
+        >
+      >((acc, item) => {
+        acc[`tools-${item.serverName}`] = acc[`tools-${item.serverName}`] ?? {
+          server: {
+            serverIcon: item.serverIcon,
+            serverName: item.serverName,
+            serverViewId: item.serverViewId,
+          },
+          results: [],
+        };
+        acc[`tools-${item.serverName}`].results.push(item);
+        return acc;
+      }, {}),
+    [toolFileResults]
+  );
+
+  // Auto-select new datasources/tools as they appear
+  useEffect(() => {
+    const allKeys = [
+      ...(projectFilesWithResults.length > 0 ? [PROJECT_FILTER_KEY] : []),
+      ...Object.keys(dataSourcesWithResults),
+      ...Object.keys(serversWithResults),
+    ];
+    if (allKeys.length > 0) {
+      setSelectedDataSourcesAndTools((prev) => {
+        const updated = { ...prev };
+        let hasChanges = false;
+
+        allKeys.forEach((key) => {
+          if (!(key in updated)) {
+            updated[key] = false; // Auto-add as unselected (false = shown when allUnselected)
+            hasChanges = true;
+          }
+        });
+
+        return hasChanges ? updated : prev;
+      });
+    }
+  }, [
+    dataSourcesWithResults,
+    serversWithResults,
+    projectFilesWithResults.length,
+  ]);
+
+  const handleFilterClick = (key: string) => {
+    setSelectedDataSourcesAndTools((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
+  const {
+    getToolFileKey,
+    isToolFileAttached,
+    isToolFileUploading,
+    isAnyToolFileUploading,
+    uploadToolFile,
+    removeToolFile,
+  } = useToolFileUpload({
+    owner,
+    fileUploaderService,
+    useCase: toolFileUpload.useCase,
+    useCaseMetadata: toolFileUpload.useCaseMetadata,
+    onUploadSuccess: () => {
+      onFileChange?.();
+    },
+  });
+
+  const showLoader =
+    isSearchLoading ||
+    isLoadingNextPage ||
+    isSearchValidating ||
+    isDebouncing ||
+    isProjectContextFilesLoading;
+
+  const availableSources: DropdownMenuFilterOption[] = useMemo(() => {
+    const options = new Map<string, DropdownMenuFilterOption>();
+
+    for (const [key, r] of Object.entries(dataSourcesWithResults)) {
+      options.set(key, {
+        value: key,
+        label:
+          key === PROJECT_FILTER_KEY
+            ? "Pods"
+            : getDisplayNameForDataSource(r.dataSource, true),
+      });
+    }
+
+    for (const [key, s] of Object.entries(serversWithResults)) {
+      options.set(key, {
+        value: key,
+        label: asDisplayToolName(s.server.serverName),
+      });
+    }
+
+    // Ensure project files share the same filter chip as project knowledge.
+    if (projectFilesWithResults.length > 0) {
+      options.set(PROJECT_FILTER_KEY, {
+        value: PROJECT_FILTER_KEY,
+        label: "Pods",
+      });
+    }
+
+    return Array.from(options.values());
+  }, [
+    dataSourcesWithResults,
+    serversWithResults,
+    projectFilesWithResults.length,
+  ]);
+
+  // Chips only exist once at least one source has hits; paired with showLoader = still fetching.
+  const showSearchResultPlaceholders =
+    showLoader && availableSources.length === 0;
+
+  const selectedFilterKeys = useMemo(
+    () =>
+      Object.entries(selectedDataSourcesAndTools)
+        .filter(([, value]) => value)
+        .map(([key]) => key),
+    [selectedDataSourcesAndTools]
+  );
+
+  const allUnselected = selectedFilterKeys.length === 0;
+
+  const Wrapper = type === "dropdown" ? DropdownMenu : DropdownMenuSub;
+  const ContentWrapper =
+    type === "dropdown" ? DropdownMenuContent : DropdownMenuSubContent;
+
+  return (
+    <Wrapper
+      open={isOpen}
+      onOpenChange={(open) => {
+        setIsOpen(open);
+        onOpenChange?.(open);
+        if (open) {
+          setSearch("");
+        }
+      }}
+    >
+      {type === "dropdown" && !isExternallyControlled ? (
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant={buttonVariant}
+            icon={Attachment01}
+            size={buttonSize}
+            disabled={disabled || isLoading || isAnyToolFileUploading}
+            isLoading={isLoading || isAnyToolFileUploading}
+            label={buttonLabel}
+            onClick={() => setIsOpen(!isOpen)}
+          />
+        </DropdownMenuTrigger>
+      ) : type === "dropdown" && isExternallyControlled ? (
+        <DropdownAnchorTrigger anchorRef={anchorRef} />
+      ) : (
+        <DropdownMenuSubTrigger
+          label="Attach knowledge"
+          icon={
+            <Icon
+              size="xs"
+              visual={Attachment01}
+              className="text-muted-foreground"
+            />
+          }
+          disabled={disabled || isLoading || isAnyToolFileUploading}
+          onClick={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            setIsOpen(true);
+          }}
+        />
+      )}
+      <ContentWrapper
+        // Radix ScrollArea wraps content in a content-height `display:table` div. Force it to fill
+        // the viewport so the empty-state's `h-full` centering resolves against the full height.
+        className="h-80 w-80 xs:h-96 xs:w-96 [&_[data-radix-scroll-area-viewport]>div]:h-full"
+        collisionPadding={15}
+        onEscapeKeyDown={() => setIsOpen(false)}
+        {...(type === "subdropdown"
+          ? {
+              onClick: (e) => e.stopPropagation(),
+            }
+          : {
+              align: isExternallyControlled ? "end" : "start",
+              onInteractOutside: () => setIsOpen(false),
+            })}
+        dropdownHeaders={
+          <>
+            <Input
+              type="file"
+              ref={fileInputRef}
+              containerClassName="hidden"
+              onChange={async (e) => {
+                setIsOpen(false);
+                await fileUploaderService.handleFileChange(e);
+                onFileChange?.();
+                if (fileInputRef.current) {
+                  fileInputRef.current.value = "";
+                }
+              }}
+              multiple={true}
+            />
+            <DropdownMenuSearchbar
+              autoFocus={!isMobile}
+              name="search-files"
+              placeholder="Search"
+              value={search}
+              onChange={setSearch}
+              disabled={false}
+              isLoading={showLoader}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  const firstMenuItem =
+                    itemsContainerRef.current?.querySelector(
+                      '[role="menuitemcheckbox"]'
+                    );
+                  (firstMenuItem as HTMLElement)?.focus();
+                }
+              }}
+              button={
+                <Button
+                  icon={UploadCloud02}
+                  label="Upload File"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="ml-4"
+                />
+              }
+            />
+            <DropdownMenuSeparator />
+          </>
+        }
+      >
+        {searchQuery ? (
+          <div ref={itemsContainerRef}>
+            <div className="flex flex-wrap items-center">
+              <DropdownMenuFilters
+                filters={availableSources}
+                selectedValues={selectedFilterKeys}
+                onSelectFilter={handleFilterClick}
+              />
+
+              {availableSources.length === 0 && showLoader && (
+                <LoadingBlock
+                  // LoadingBlock defaults to, same as the menu
+                  // surface, so skeletons read as invisible; match menu row hover contrast.
+
+                  className="h-7 w-20 bg-muted-background p-2 mt-2"
+                />
+              )}
+            </div>
+
+            {showSearchResultPlaceholders ? (
+              <div className="flex flex-col gap-2 px-2 py-2">
+                {Array.from(
+                  { length: SEARCH_RESULTS_PLACEHOLDER_COUNT },
+                  (_, i) => (
+                    <LoadingBlock
+                      key={i}
+                      // LoadingBlock defaults to, same as the menu
+                      // surface, so skeletons read as invisible; match menu row hover contrast.
+
+                      className="h-11 w-full bg-muted-background"
+                    />
+                  )
+                )}
+              </div>
+            ) : (
+              <>
+                {(allUnselected ||
+                  selectedDataSourcesAndTools[PROJECT_FILTER_KEY]) &&
+                  projectFilesWithResults.map((f) => (
+                    <ProjectFileItem
+                      key={`project-file-${f.fileId}`}
+                      item={f}
+                      projectName={projectName}
+                      isAttached={attachedFileIds.has(f.fileId)}
+                      isDisabled={isLoading || disabled}
+                      onCheckedChange={(checked) => {
+                        if (checked) {
+                          fileUploaderService.addUploadedFile({
+                            fileId: f.fileId,
+                            filename: f.title,
+                            // We only fetch `type=file` from the project context endpoint.
+                            contentType: f.contentType as any,
+                            size: 0,
+                            id: f.fileId,
+                          });
+                        } else {
+                          fileUploaderService.removeFile(f.fileId);
+                        }
+                        onFileChange?.();
+                      }}
+                    />
+                  ))}
+                {Object.keys(serversWithResults).length === 0 ? (
+                  // No tools results, show knowledge nodes as returned by the search.
+                  dataSourcesNodes
+                    .filter(
+                      (item) =>
+                        allUnselected ||
+                        selectedDataSourcesAndTools[
+                          getKeyForDataSource(item.dataSource)
+                        ]
+                    )
+                    .map((item) => (
+                      <KnowledgeNodeCheckboxItem
+                        key={`knowledge-${item.dataSourceView.dataSource.sId}-${item.internalId}`}
+                        item={item}
+                        owner={owner}
+                        attachedNodes={attachedNodes}
+                        onNodeSelect={onNodeSelect}
+                        onNodeUnselect={onNodeUnselect}
+                        spacesMap={spacesMap}
+                      />
+                    ))
+                ) : (
+                  // Show grouped knowledge nodes, then tools (project files are rendered above).
+                  <>
+                    {Object.entries(dataSourcesWithResults).map(([key, r]) => {
+                      const isSelected =
+                        allUnselected || selectedDataSourcesAndTools[key];
+                      return isSelected
+                        ? r.results.map((item) => (
+                            <KnowledgeNodeCheckboxItem
+                              key={`knowledge-${item.dataSourceView.dataSource.sId}-${item.internalId}`}
+                              item={item}
+                              owner={owner}
+                              attachedNodes={attachedNodes}
+                              onNodeSelect={onNodeSelect}
+                              onNodeUnselect={onNodeUnselect}
+                              spacesMap={spacesMap}
+                            />
+                          ))
+                        : null;
+                    })}
+                    {Object.entries(serversWithResults).map(([key, r]) => {
+                      const isSelected =
+                        allUnselected || selectedDataSourcesAndTools[key];
+                      return isSelected
+                        ? r.results.map((item) => (
+                            <ToolFileCheckboxItem
+                              key={`tool-${getToolFileKey(item)}`}
+                              item={item}
+                              isLoading={isLoading}
+                              isToolFileAttached={isToolFileAttached}
+                              isToolFileUploading={isToolFileUploading}
+                              uploadToolFile={uploadToolFile}
+                              removeToolFile={removeToolFile}
+                            />
+                          ))
+                        : null;
+                    })}
+                  </>
+                )}
+              </>
+            )}
+            {availableSources.length === 0 && !showLoader && (
+              <div className="flex items-center justify-center py-4 text-sm text-muted-foreground">
+                No results found
+              </div>
+            )}
+
+            <InfiniteScroll
+              nextPage={nextPage}
+              hasMore={hasMore}
+              showLoader={showLoader}
+              loader={<div />}
+            />
+          </div>
+        ) : (
+          <div className="flex h-full w-full items-center justify-center">
+            <div className="flex flex-col items-center justify-center gap-0 text-center text-base font-semibold text-primary-400">
+              <Icon visual={SearchMd} size="sm" />
+              Search knowledge
+            </div>
+          </div>
+        )}
+      </ContentWrapper>
+    </Wrapper>
+  );
+};

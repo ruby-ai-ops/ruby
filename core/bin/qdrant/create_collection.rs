@@ -1,0 +1,248 @@
+use std::sync::Arc;
+
+use anyhow::{anyhow, Result};
+use clap::Parser;
+use qdrant_client::{
+    qdrant::{
+        self, quantization_config::Quantization, CreateCollectionBuilder,
+        CreateFieldIndexCollectionBuilder, CreateShardKeyBuilder, CreateShardKeyRequestBuilder,
+        HnswConfigDiffBuilder, OptimizersConfigDiffBuilder, VectorParamsBuilder,
+    },
+    Qdrant,
+};
+use ruby::{
+    data_sources::qdrant::{QdrantClients, QdrantCluster, LEGACY_SHARD_KEY_COUNT},
+    providers::{
+        embedder::{EmbedderProvidersModelMap, SupportedEmbedderModels},
+        provider::{provider, ProviderID},
+    },
+    utils,
+};
+use tokio;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Name of the provider.
+    #[arg(short, long)]
+    provider: ProviderID,
+
+    /// Name of the model.
+    #[arg(short, long)]
+    model: SupportedEmbedderModels,
+
+    /// Name of the cluster.
+    #[arg(short, long)]
+    cluster: QdrantCluster,
+
+    /// Number of shard keys. Data sources hash into them, one key per data source.
+    #[arg(long, default_value_t = LEGACY_SHARD_KEY_COUNT)]
+    shard_key_count: u64,
+
+    /// Number of shards behind each shard key, spread across the nodes.
+    #[arg(long, default_value_t = 2)]
+    shards_per_key: u32,
+
+    /// Number of copies of each shard.
+    #[arg(long, default_value_t = 2)]
+    replication_factor: u32,
+}
+
+async fn create_indexes_for_collection(
+    raw_client: &Arc<Qdrant>,
+    cluster: &QdrantCluster,
+    collection_name: &String,
+) -> Result<()> {
+    let _ = raw_client
+        .create_field_index(CreateFieldIndexCollectionBuilder::new(
+            collection_name,
+            "document_id_hash",
+            qdrant::FieldType::Keyword,
+        ))
+        .await?;
+
+    let _ = raw_client
+        .create_field_index(CreateFieldIndexCollectionBuilder::new(
+            collection_name,
+            "data_source_internal_id",
+            qdrant::FieldType::Keyword,
+        ))
+        .await?;
+
+    let _ = raw_client
+        .create_field_index(CreateFieldIndexCollectionBuilder::new(
+            collection_name,
+            "tags",
+            qdrant::FieldType::Keyword,
+        ))
+        .await?;
+
+    let _ = raw_client
+        .create_field_index(CreateFieldIndexCollectionBuilder::new(
+            collection_name,
+            "parents",
+            qdrant::FieldType::Keyword,
+        ))
+        .await?;
+
+    let _ = raw_client
+        .create_field_index(CreateFieldIndexCollectionBuilder::new(
+            collection_name,
+            "timestamp",
+            qdrant::FieldType::Integer,
+        ))
+        .await?;
+
+    println!(
+        "Done creating indexes for collection {} on cluster {}",
+        collection_name, cluster
+    );
+
+    Ok(())
+}
+
+async fn create_qdrant_collection(args: &Args) -> Result<()> {
+    let cluster = args.cluster;
+    let provider_id = args.provider;
+    let model_id = args.model.clone();
+    let qdrant_clients = QdrantClients::build().await?;
+    let client = qdrant_clients.client(cluster);
+    let raw_client = client.raw_client();
+
+    let embedder = provider(provider_id).embedder(model_id.to_string());
+
+    let collection_name = format!(
+        "{}_{}_{}",
+        client.collection_prefix(),
+        provider_id,
+        model_id
+    );
+
+    println!(
+        "About to create collection {} on cluster {}",
+        collection_name, cluster
+    );
+
+    match utils::confirm(&format!(
+        "Are you sure you want to create collection {} on cluster {}?",
+        collection_name, cluster
+    ))? {
+        true => (),
+        false => Err(anyhow!("Aborted"))?,
+    }
+
+    // Check if sharding is enabled (defaults to true for production)
+    let use_sharding = std::env::var("QDRANT_USE_SHARDING")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+
+    if !use_sharding {
+        println!("QDRANT_USE_SHARDING=false, creating collection without distributed features");
+    }
+
+    // See https://app.notion.com/p/ruby-ai/Design-Doc-Qdrant-re-arch-d0ebdd6ae8244ff593cdf10f08988c27.
+
+    // First, we create the collection.
+    let mut builder = CreateCollectionBuilder::new(collection_name.clone())
+        .vectors_config(
+            VectorParamsBuilder::new(embedder.embedding_size() as u64, qdrant::Distance::Cosine)
+                .distance(qdrant::Distance::Cosine)
+                .on_disk(true),
+        )
+        .hnsw_config(HnswConfigDiffBuilder::default().payload_m(16).m(0))
+        .optimizers_config(OptimizersConfigDiffBuilder::default().memmap_threshold(16384))
+        .quantization_config(Quantization::Scalar(qdrant::ScalarQuantization {
+            r#type: qdrant::QuantizationType::Int8.into(),
+            quantile: Some(0.99),
+            always_ram: Some(true),
+        }))
+        .on_disk_payload(true);
+
+    // Only use distributed features when sharding is enabled
+    if use_sharding {
+        builder = builder
+            .sharding_method(qdrant::ShardingMethod::Custom.into())
+            .shard_number(args.shards_per_key)
+            .replication_factor(args.replication_factor)
+            .write_consistency_factor(1);
+    }
+
+    let res = raw_client.create_collection(builder).await?;
+
+    match res.result {
+        true => {
+            println!(
+                "Done creating collection {} on cluster {}",
+                collection_name, cluster
+            );
+
+            Ok(())
+        }
+        false => Err(anyhow!("Collection not created!")),
+    }?;
+
+    // Only create shard keys when sharding is enabled
+    if use_sharding {
+        // Then, we create the shard keys.
+        for i in 0..args.shard_key_count {
+            let shard_key = format!("{}_{}", client.shard_key_prefix(), i);
+
+            let operation_result = raw_client
+                .create_shard_key(
+                    CreateShardKeyRequestBuilder::new(collection_name.clone()).request(
+                        CreateShardKeyBuilder::default()
+                            .shard_key(qdrant::shard_key::Key::Keyword(shard_key.clone())),
+                    ),
+                )
+                .await
+                .map_err(|e| anyhow!("Error creating shard key: {}", e))?;
+
+            match operation_result.result {
+                true => {
+                    println!(
+                        "Done creating shard key [{}] for collection {} on cluster {}",
+                        shard_key, collection_name, cluster
+                    );
+
+                    Ok(())
+                }
+                false => Err(anyhow!("Collection not created!")),
+            }?;
+        }
+    } else {
+        println!("Skipping shard key creation (QDRANT_USE_SHARDING=false)");
+    }
+
+    create_indexes_for_collection(&raw_client, &cluster, &collection_name)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Error creating indexes for collection {}: {}",
+                collection_name,
+                e
+            )
+        })?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    let args = Args::parse();
+
+    // Validate the model for the given provider
+    if !EmbedderProvidersModelMap::is_model_supported(&args.provider, &args.model) {
+        eprintln!(
+            "Error: Model {} is not available for provider {}.",
+            args.model, args.provider
+        );
+        std::process::exit(1);
+    }
+
+    create_qdrant_collection(&args).await.map_err(|e| {
+        eprintln!("Error creating collection: {}", e);
+        e
+    })?;
+
+    Ok(())
+}

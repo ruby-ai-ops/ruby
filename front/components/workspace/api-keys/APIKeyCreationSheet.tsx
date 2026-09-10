@@ -1,0 +1,128 @@
+import config from "@app/lib/api/config";
+import type { KeyType } from "@app/types/key";
+import type { WorkspaceType } from "@app/types/user";
+import {
+  Clipboard,
+  ClipboardCheck,
+  IconButton,
+  Page,
+  Sheet,
+  SheetContainer,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  useCopyToClipboard,
+} from "@ruby-ai/sparkle";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React from "react";
+
+type APIKeyCreationSheetProps = {
+  isOpen: boolean;
+  onOpenChange: (open: boolean) => void;
+  latestKey?: KeyType;
+  workspace: WorkspaceType;
+};
+
+export const APIKeyCreationSheet = ({
+  isOpen,
+  onOpenChange,
+  latestKey,
+  workspace,
+}: APIKeyCreationSheetProps) => {
+  const [isCopiedWorkspaceId, copyWorkspaceId] = useCopyToClipboard();
+  const [isCopiedName, copyName] = useCopyToClipboard();
+  const [isCopiedDomain, copyDomain] = useCopyToClipboard();
+  const [isCopiedApiKey, copyApiKey] = useCopyToClipboard();
+
+  const domain = config.getApiBaseUrl();
+
+  return (
+    <Sheet
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) {
+          onOpenChange(open);
+        }
+      }}
+    >
+      <SheetContent>
+        <SheetHeader>
+          <SheetTitle>API Key Created</SheetTitle>
+        </SheetHeader>
+        <SheetContainer>
+          <div className="mt-4">
+            <p className="text-sm text-muted-foreground">
+              Your API key will remain visible for 10 minutes only. You can use
+              it to authenticate with the Ruby API.
+            </p>
+            <br />
+            <div className="mt-4">
+              <Page.H variant="h5">Name</Page.H>
+              <Page.Horizontal align="center">
+                <pre className="dd-privacy-mask flex-grow overflow-x-auto rounded bg-muted-background p-2 font-mono">
+                  {latestKey?.name}
+                </pre>
+                <IconButton
+                  tooltip="Copy to clipboard"
+                  icon={isCopiedName ? ClipboardCheck : Clipboard}
+                  onClick={async () => {
+                    if (latestKey?.name) {
+                      await copyName(latestKey.name);
+                    }
+                  }}
+                />
+              </Page.Horizontal>
+            </div>
+            <div className="mt-4">
+              <Page.H variant="h5">Domain</Page.H>
+              <Page.Horizontal align="center">
+                <pre className="dd-privacy-mask flex-grow overflow-x-auto rounded bg-muted-background p-2 font-mono">
+                  {domain}
+                </pre>
+                <IconButton
+                  tooltip="Copy to clipboard"
+                  icon={isCopiedDomain ? ClipboardCheck : Clipboard}
+                  onClick={async () => {
+                    await copyDomain(domain);
+                  }}
+                />
+              </Page.Horizontal>
+            </div>
+            <div className="mt-4">
+              <Page.H variant="h5">Workspace ID</Page.H>
+              <Page.Horizontal align="center">
+                <pre className="dd-privacy-mask flex-grow overflow-x-auto rounded bg-muted-background p-2 font-mono">
+                  {workspace.sId}
+                </pre>
+                <IconButton
+                  tooltip="Copy to clipboard"
+                  icon={isCopiedWorkspaceId ? ClipboardCheck : Clipboard}
+                  onClick={async () => {
+                    await copyWorkspaceId(workspace.sId);
+                  }}
+                />
+              </Page.Horizontal>
+            </div>
+            <div className="mt-4">
+              <Page.H variant="h5">API Key</Page.H>
+              <Page.Horizontal align="center">
+                <pre className="dd-privacy-mask flex-grow overflow-x-auto rounded bg-muted-background p-2 font-mono">
+                  {latestKey?.secret}
+                </pre>
+                <IconButton
+                  tooltip="Copy to clipboard"
+                  icon={isCopiedApiKey ? ClipboardCheck : Clipboard}
+                  onClick={async () => {
+                    if (latestKey?.secret) {
+                      await copyApiKey(latestKey.secret);
+                    }
+                  }}
+                />
+              </Page.Horizontal>
+            </div>
+          </div>
+        </SheetContainer>
+      </SheetContent>
+    </Sheet>
+  );
+};

@@ -1,0 +1,142 @@
+import config from "@app/lib/api/config";
+import { getWorkspaceOAuthConnectionIdForMCPServer } from "@app/lib/api/oauth/mcp_server_connection_auth";
+import type { BaseOAuthStrategyProvider } from "@app/lib/api/oauth/providers/base_oauth_stragegy_provider";
+import {
+  finalizeUriForProvider,
+  getStringFromQuery,
+} from "@app/lib/api/oauth/utils";
+import type { Authenticator } from "@app/lib/auth";
+import logger from "@app/logger/logger";
+import type {
+  ExtraConfigType,
+  OAuthConnectionType,
+  OAuthUseCase,
+} from "@app/types/oauth/lib";
+import { OAuthAPI } from "@app/types/oauth/oauth_api";
+import type { ParsedUrlQuery } from "querystring";
+
+export class HubspotOAuthProvider implements BaseOAuthStrategyProvider {
+  requiresWorkspaceConnectionForPersonalAuth = true;
+
+  setupUri({
+    connection,
+    extraConfig,
+  }: {
+    connection: OAuthConnectionType;
+    useCase: OAuthUseCase;
+    extraConfig?: ExtraConfigType;
+  }) {
+    const requiredScopes = ["oauth"];
+
+    // Optional scopes - user can still install app without these
+    const optionalScopes = [
+      "crm.objects.contacts.read",
+      "crm.objects.contacts.write",
+      "crm.schemas.contacts.read",
+      "crm.objects.companies.read",
+      "crm.objects.companies.write",
+      "crm.schemas.companies.read",
+      "crm.objects.deals.read",
+      "crm.objects.deals.write",
+      "crm.schemas.deals.read",
+      "crm.objects.leads.read",
+      "crm.objects.leads.write",
+      "crm.objects.owners.read",
+      "crm.schemas.custom.read",
+      "crm.objects.custom.read",
+      "crm.objects.custom.write",
+      "crm.objects.quotes.read",
+      "crm.objects.line_items.read",
+      "files",
+      "sales-email-read",
+      "timeline",
+      "crm.lists.read",
+      "crm.lists.write",
+      "marketing-email",
+      "content",
+      "tickets",
+      "crm.objects.products.read",
+    ];
+
+    const workspaceGrantedScopes = extraConfig?.workspace_granted_scopes;
+    const grantedSet =
+      workspaceGrantedScopes && workspaceGrantedScopes.length > 0
+        ? new Set(workspaceGrantedScopes.split(" "))
+        : null;
+    const filteredOptionalScopes = grantedSet
+      ? optionalScopes.filter((s) => grantedSet.has(s))
+      : optionalScopes;
+
+    return (
+      `https://app.hubspot.com/oauth/authorize` +
+      `?client_id=${config.getOAuthHubspotClientId()}` +
+      `&redirect_uri=${encodeURIComponent(finalizeUriForProvider("hubspot"))}` +
+      `&scope=${encodeURIComponent(requiredScopes.join(" "))}` +
+      `&optional_scope=${encodeURIComponent(filteredOptionalScopes.join(" "))}` +
+      `&state=${connection.connection_id}`
+    );
+  }
+
+  codeFromQuery(query: ParsedUrlQuery) {
+    return getStringFromQuery(query, "code");
+  }
+
+  connectionIdFromQuery(query: ParsedUrlQuery) {
+    return getStringFromQuery(query, "state");
+  }
+
+  isExtraConfigValid(extraConfig: ExtraConfigType, useCase: OAuthUseCase) {
+    if (useCase === "personal_actions") {
+      if (extraConfig.mcp_server_id) {
+        return true;
+      }
+    }
+    return Object.keys(extraConfig).length === 0;
+  }
+
+  async getUpdatedExtraConfig(
+    auth: Authenticator,
+    {
+      extraConfig,
+      useCase,
+    }: {
+      extraConfig: ExtraConfigType;
+      useCase: OAuthUseCase;
+    }
+  ): Promise<ExtraConfigType> {
+    if (useCase !== "personal_actions" || !extraConfig.mcp_server_id) {
+      return extraConfig;
+    }
+
+    const oauthConnectionIdRes =
+      await getWorkspaceOAuthConnectionIdForMCPServer(
+        auth,
+        extraConfig.mcp_server_id
+      );
+    if (oauthConnectionIdRes.isErr()) {
+      throw new Error(oauthConnectionIdRes.error.message);
+    }
+
+    const oauthApi = new OAuthAPI(config.getOAuthAPIConfig(), logger);
+    const metadataRes = await oauthApi.getConnectionMetadata({
+      connectionId: oauthConnectionIdRes.value,
+    });
+    if (metadataRes.isErr()) {
+      throw new Error(
+        "Failed to get workspace connection metadata: " +
+          metadataRes.error.message
+      );
+    }
+
+    const { scope } = metadataRes.value.connection.metadata;
+
+    if (!scope) {
+      return extraConfig;
+    }
+
+    return {
+      ...extraConfig,
+      workspace_granted_scopes: scope,
+    };
+  }
+}

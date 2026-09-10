@@ -1,0 +1,234 @@
+import type { AgentLoopBlockedToolExecution } from "@app/lib/actions/mcp";
+import type { LightWorkspaceType } from "@app/types/user";
+import { act, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type React from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { MCPServerPersonalAuthenticationRequired } from "./MCPServerPersonalAuthenticationRequired";
+
+const createPersonalConnectionMock = vi.fn();
+const resolveAuthenticationMock = vi.fn();
+const refreshBlockedActionsMock = vi.fn();
+const removeCompletedActionMock = vi.fn();
+
+vi.mock("@app/lib/auth/AuthContext", () => ({
+  useAuth: () => ({ user: { sId: "user_1" } }),
+}));
+
+vi.mock(
+  "@app/components/assistant/conversation/BlockedActionsProvider",
+  () => ({
+    useBlockedActionsContext: () => ({
+      refreshBlockedActions: refreshBlockedActionsMock,
+      removeCompletedAction: removeCompletedActionMock,
+    }),
+  })
+);
+
+vi.mock("@app/lib/swr/mcp_servers", () => ({
+  useCreatePersonalConnection: () => ({
+    createPersonalConnection: createPersonalConnectionMock,
+  }),
+  useMCPServer: () => ({
+    server: {
+      sId: "mcp_1",
+      name: "GitHub",
+      icon: undefined,
+      authorization: {
+        provider: "github",
+        supported_use_cases: ["personal_actions"],
+      },
+    },
+  }),
+}));
+
+vi.mock("@app/lib/swr/tool_actions", () => ({
+  useResolveAuthentication: () => ({
+    resolveAuthentication: resolveAuthenticationMock,
+    isResolving: false,
+  }),
+}));
+
+vi.mock("@app/lib/actions/mcp_helper", () => ({
+  getMcpServerDisplayName: (server: { name: string }) => server.name,
+}));
+
+vi.mock("@app/lib/api/assistant/conversation/can_current_user_respond", () => ({
+  canCurrentUserRespondToParentUserMessage: () => true,
+}));
+
+vi.mock("@app/components/resources/resources_icons", () => ({
+  getIcon: () => null,
+}));
+
+vi.mock("@app/components/oauth/PersonalAuthCredentialOverrides", () => ({
+  areCredentialOverridesValid: () => true,
+  PersonalAuthCredentialOverrides: () => null,
+}));
+
+vi.mock("@app/types/oauth/lib", () => ({
+  getOverridablePersonalAuthInputs: () => null,
+}));
+
+vi.mock("@ruby-ai/sparkle", () => ({
+  Avatar: () => null,
+  Card: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
+  Button: ({
+    label,
+    onClick,
+    disabled,
+  }: {
+    label: string;
+    onClick?: () => void;
+    disabled?: boolean;
+  }) => (
+    <button type="button" onClick={onClick} disabled={disabled}>
+      {label}
+    </button>
+  ),
+  Check: () => null,
+  Key01: () => null,
+  XClose: () => null,
+}));
+
+const owner: LightWorkspaceType = {
+  id: 1,
+  sId: "w_1",
+  name: "Workspace",
+  role: "user",
+  segmentation: null,
+  whiteListedProviders: null,
+  defaultEmbeddingProvider: null,
+  regionalModelsOnly: false,
+  sharingPolicy: "workspace_only",
+  metronomeCustomerId: null,
+};
+
+function makeBlockedAction(): AgentLoopBlockedToolExecution & {
+  status: "blocked_authentication_required";
+} {
+  return {
+    conversationId: "conv_1",
+    messageId: "msg_1",
+    actionId: "action_1",
+    userId: "user_1",
+    configurationId: "config_1",
+    created: 1,
+    inputs: {},
+    metadata: {
+      toolName: "tool",
+      mcpServerName: "server",
+      agentName: "agent",
+      mcpServerId: "mcp_1",
+      mcpServerDisplayName: "GitHub",
+    },
+    status: "blocked_authentication_required",
+    authorizationInfo: {
+      provider: "github",
+      supported_use_cases: ["personal_actions"],
+    },
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+function renderCard() {
+  return render(
+    <MCPServerPersonalAuthenticationRequired
+      blockedAction={makeBlockedAction()}
+      triggeringUser={null}
+      owner={owner}
+      mcpServerId="mcp_1"
+      provider="github"
+    />
+  );
+}
+
+function outcomesPassedToResolve(): Array<string> {
+  return resolveAuthenticationMock.mock.calls.map((call) => call[0].outcome);
+}
+
+describe("MCPServerPersonalAuthenticationRequired", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    createPersonalConnectionMock.mockResolvedValue({ success: true });
+    resolveAuthenticationMock.mockResolvedValue({ success: true });
+    refreshBlockedActionsMock.mockResolvedValue(undefined);
+  });
+
+  it("explains why access is needed and that the account remains connected", () => {
+    renderCard();
+
+    expect(
+      screen.getByText("Ruby needs access to GitHub to complete this action.")
+    ).toBeDefined();
+    expect(
+      screen.getByText(
+        "Once connected, GitHub will remain connected for future requests."
+      )
+    ).toBeDefined();
+  });
+
+  it("removes the completed action before refreshing blocked actions", async () => {
+    const user = userEvent.setup();
+    renderCard();
+
+    await user.click(screen.getByRole("button", { name: /Connect/i }));
+
+    expect(outcomesPassedToResolve()).toContain("completed");
+    expect(removeCompletedActionMock).toHaveBeenCalledWith("action_1");
+    expect(refreshBlockedActionsMock).toHaveBeenCalledTimes(1);
+    expect(resolveAuthenticationMock.mock.invocationCallOrder[0]).toBeLessThan(
+      removeCompletedActionMock.mock.invocationCallOrder[0]
+    );
+    expect(removeCompletedActionMock.mock.invocationCallOrder[0]).toBeLessThan(
+      refreshBlockedActionsMock.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("keeps Decline enabled while a connection attempt is in flight", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<{ success: boolean }>();
+    createPersonalConnectionMock.mockReturnValue(pending.promise);
+
+    renderCard();
+
+    await user.click(screen.getByRole("button", { name: /Connect/i }));
+
+    // The connection promise is still pending, but Decline must remain clickable.
+    expect(screen.getByRole("button", { name: /Decline/i })).not.toBeDisabled();
+
+    await act(async () => {
+      pending.resolve({ success: true });
+      await pending.promise;
+    });
+  });
+
+  it("does not resolve completed when the user declines mid-connection", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<{ success: boolean }>();
+    createPersonalConnectionMock.mockReturnValue(pending.promise);
+
+    renderCard();
+
+    await user.click(screen.getByRole("button", { name: /Connect/i }));
+    await user.click(screen.getByRole("button", { name: /Decline/i }));
+
+    // Connection finishes *after* the user already declined.
+    await act(async () => {
+      pending.resolve({ success: true });
+      await pending.promise;
+    });
+
+    const outcomes = outcomesPassedToResolve();
+    expect(outcomes).toContain("denied");
+    expect(outcomes).not.toContain("completed");
+  });
+});

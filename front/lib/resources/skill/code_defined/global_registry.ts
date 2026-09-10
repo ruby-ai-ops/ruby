@@ -1,0 +1,61 @@
+import type { Authenticator } from "@app/lib/auth";
+import { GLOBAL_SKILLS_ARRAY } from "@app/lib/resources/skill/code_defined/global";
+import type { GlobalSkillDefinition } from "@app/lib/resources/skill/code_defined/shared";
+import { filterSkillDefinitions } from "@app/lib/resources/skill/code_defined/shared";
+import type { AllSkillConfigurationFindOptions } from "@app/lib/resources/skill/types";
+import { serializeSkillTag } from "@app/lib/skills/format";
+
+// Build lookup map for direct access by sId.
+const GLOBAL_SKILLS_BY_ID: Map<string, GlobalSkillDefinition> = new Map(
+  GLOBAL_SKILLS_ARRAY.map((skill) => [skill.sId, skill])
+);
+
+// Type derived from the actual array.
+export type GlobalSkillId = (typeof GLOBAL_SKILLS_ARRAY)[number]["sId"];
+
+export class GlobalSkillsRegistry {
+  // Internal sync lookup that does not check restrictions.
+  // Use for methods that operate on already-fetched skills.
+  private static getByIdInternal(
+    sId: string
+  ): GlobalSkillDefinition | undefined {
+    return GLOBAL_SKILLS_BY_ID.get(sId);
+  }
+
+  static async getById(
+    auth: Authenticator,
+    sId: string
+  ): Promise<GlobalSkillDefinition | null> {
+    const skills = await this.findAll(auth, { sId });
+
+    return skills[0] ?? null;
+  }
+
+  static async findAll(
+    auth: Authenticator,
+    where: AllSkillConfigurationFindOptions["where"] = {}
+  ): Promise<GlobalSkillDefinition[]> {
+    return filterSkillDefinitions(auth, GLOBAL_SKILLS_ARRAY, where, {
+      availability: "users_and_agents",
+    });
+  }
+
+  static serializeSkillTag(sId: GlobalSkillId): string {
+    const skill = this.getByIdInternal(sId);
+    if (!skill) {
+      throw new Error(`Unknown global skill: ${sId}`);
+    }
+
+    return serializeSkillTag({
+      id: skill.sId,
+      icon: skill.icon,
+      name: skill.name,
+    });
+  }
+
+  static doesSkillInheritAgentConfigurationDataSources(sId: string): boolean {
+    return (
+      this.getByIdInternal(sId)?.inheritAgentConfigurationDataSources ?? false
+    );
+  }
+}

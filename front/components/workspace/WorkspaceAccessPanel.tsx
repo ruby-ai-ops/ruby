@@ -1,0 +1,249 @@
+import { ConfirmContext } from "@app/components/Confirm";
+import { AuditLogsSection } from "@app/components/workspace/AuditLogsSection";
+import UserProvisioning from "@app/components/workspace/DirectorySync";
+import SSOConnection from "@app/components/workspace/SSOConnection";
+import { AutoJoinToggle } from "@app/components/workspace/sso/AutoJoinToggle";
+import { useFeatureFlags, useWorkspace } from "@app/lib/auth/AuthContext";
+import { isSCIMEnabled } from "@app/lib/plans/scim";
+import {
+  useRemoveWorkspaceDomain,
+  useWorkspaceDomains,
+} from "@app/lib/swr/workos";
+import type { PlanType } from "@app/types/plan";
+import type { LightWorkspaceType } from "@app/types/user";
+import type { WorkspaceDomain } from "@app/types/workspace";
+import {
+  Button,
+  Chip,
+  DataTable,
+  EmptyCTA,
+  Globe01,
+  IconButton,
+  LoadingBlock,
+  Page,
+  Plus,
+  Separator,
+  XClose,
+} from "@ruby-ai/sparkle";
+import type { CellContext } from "@tanstack/react-table";
+import type { Organization } from "@workos-inc/node";
+import React from "react";
+
+import { WorkspaceSection } from "./WorkspaceSection";
+
+interface WorkspaceAccessPanelProps {
+  workspaceVerifiedDomains: WorkspaceDomain[];
+  owner: LightWorkspaceType;
+  plan: PlanType;
+}
+
+export default function WorkspaceAccessPanel({
+  workspaceVerifiedDomains,
+  owner,
+  plan,
+}: WorkspaceAccessPanelProps) {
+  const { addDomainLink, domains, isDomainsLoading } = useWorkspaceDomains({
+    owner,
+  });
+  const { hasFeature } = useFeatureFlags();
+  const workspace = useWorkspace();
+  const scimEnabled = isSCIMEnabled(plan);
+  const hasAuditLogsAccess =
+    plan.isAuditLogsAllowed || hasFeature("audit_logs");
+  const showAuditLogs =
+    hasAuditLogsAccess && workspace.metadata?.disableAuditLogs !== true;
+
+  return (
+    <div className="flex flex-col gap-6">
+      <DomainVerification
+        addDomainLink={addDomainLink}
+        domains={domains}
+        workspaceVerifiedDomains={workspaceVerifiedDomains}
+        isDomainsLoading={isDomainsLoading}
+        owner={owner}
+      />
+      <Separator />
+      <SSOConnection domains={domains} plan={plan} owner={owner} />
+      <AutoJoinToggle
+        domains={domains}
+        workspaceVerifiedDomains={workspaceVerifiedDomains}
+        owner={owner}
+        plan={plan}
+      />
+      {scimEnabled && <Separator />}
+      {scimEnabled && <UserProvisioning owner={owner} plan={plan} />}
+      {showAuditLogs && <Separator />}
+      {showAuditLogs && <AuditLogsSection owner={owner} />}
+    </div>
+  );
+}
+
+interface DomainVerificationProps {
+  addDomainLink?: string;
+  domains: Organization["domains"];
+  workspaceVerifiedDomains: WorkspaceDomain[];
+  isDomainsLoading: boolean;
+  owner: LightWorkspaceType;
+}
+
+function DomainVerification({
+  addDomainLink,
+  domains,
+  workspaceVerifiedDomains,
+  isDomainsLoading,
+  owner,
+}: DomainVerificationProps) {
+  return (
+    <WorkspaceSection icon={Globe01} title="Domain Verification">
+      <Page.P variant="secondary">
+        Verify your company domains to enable Single Sign-On (SSO), automatic
+        workspace enrollment for team members, and secure connections to your
+        internal MCP servers.
+      </Page.P>
+      {isDomainsLoading ? (
+        <LoadingBlock className="h-32 w-full rounded-xl" />
+      ) : domains.length === 0 ? (
+        <EmptyCTA
+          action={
+            <Button
+              label="Add Domain"
+              variant="primary"
+              icon={Plus}
+              href={addDomainLink}
+            />
+          }
+        />
+      ) : (
+        <DomainVerificationTable
+          addDomainLink={addDomainLink}
+          domains={domains}
+          workspaceVerifiedDomains={workspaceVerifiedDomains}
+          owner={owner}
+        />
+      )}
+    </WorkspaceSection>
+  );
+}
+
+interface DomainVerificationTableProps {
+  addDomainLink?: string;
+  domains: Organization["domains"];
+  workspaceVerifiedDomains: WorkspaceDomain[];
+  owner: LightWorkspaceType;
+}
+
+// Define the row data type that extends TBaseData
+interface DomainRowData {
+  domain: string;
+  workspaceVerifiedDomain?: WorkspaceDomain;
+  status: string;
+  onClick?: () => void;
+}
+
+function DomainVerificationTable({
+  addDomainLink,
+  domains,
+  workspaceVerifiedDomains,
+  owner,
+}: DomainVerificationTableProps) {
+  const confirm = React.useContext(ConfirmContext);
+  const { doRemoveWorkspaceDomain } = useRemoveWorkspaceDomain({ owner });
+
+  const handleDeleteDomain = React.useCallback(
+    async (domain: string) => {
+      const confirmed = await confirm({
+        title: "Delete Domain",
+        message: (
+          <div>
+            Are you sure you want to delete the domain "{domain}"?
+            <div className="mt-2">
+              <b>This action cannot be undone.</b>
+            </div>
+          </div>
+        ),
+        validateLabel: "Delete",
+        validateVariant: "warning",
+      });
+
+      if (confirmed) {
+        await doRemoveWorkspaceDomain(domain);
+      }
+    },
+    [confirm, doRemoveWorkspaceDomain]
+  );
+
+  const columns = React.useMemo(
+    () => [
+      {
+        header: "Domain",
+        accessorKey: "domain",
+        classname: "text-xs font-medium",
+        cell: ({ row }: CellContext<DomainRowData, string>) => {
+          return `@${row.original.domain}`;
+        },
+      },
+      {
+        header: "Status",
+        accessorKey: "status",
+        cell: ({ getValue, row }: CellContext<DomainRowData, string>) => {
+          const status = getValue();
+          const workspaceVerifiedDomain = row.original.workspaceVerifiedDomain;
+          let chipColor: "success" | "info" | "warning" = "info";
+          let label: string = "Pending";
+          if (workspaceVerifiedDomain && status === "verified") {
+            chipColor = "success";
+            label = "Verified";
+          } else if (status === "failed") {
+            chipColor = "warning";
+            label = "Failed";
+          }
+
+          return <Chip color={chipColor} label={label} size="xs" />;
+        },
+      },
+      {
+        header: "",
+        accessorKey: "actions",
+        meta: { className: "w-12" },
+        cell: ({ row }: CellContext<DomainRowData, string>) => {
+          return (
+            <IconButton
+              icon={XClose}
+              size="xs"
+              variant="ghost"
+              onClick={() => handleDeleteDomain(row.original.domain)}
+              tooltip="Delete domain"
+            />
+          );
+        },
+      },
+    ],
+    [handleDeleteDomain]
+  );
+
+  const data: DomainRowData[] = React.useMemo(() => {
+    return domains.map((domain) => ({
+      domain: domain.domain,
+      status: domain.state,
+      workspaceVerifiedDomain: workspaceVerifiedDomains.find(
+        (d) => d.domain === domain.domain
+      ),
+    }));
+  }, [domains, workspaceVerifiedDomains]);
+
+  return (
+    <div className="flex w-auto flex-col gap-6">
+      <DataTable className="pt-6" columns={columns} data={data} />
+      {addDomainLink && (
+        <div>
+          <Button
+            label="Add Domain"
+            variant="primary"
+            href={addDomainLink}
+            icon={Plus}
+          />
+        </div>
+      )}
+    </div>
+  );
+}

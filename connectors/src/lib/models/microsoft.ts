@@ -1,0 +1,197 @@
+import type { MicrosoftNodeType } from "@connectors/connectors/microsoft/lib/types";
+import { connectorsSequelize } from "@connectors/resources/storage";
+import {
+  DANGEROUSLY_UNBOUNDED_TEXT,
+  DataTypes,
+} from "@connectors/resources/storage/data_types";
+import { ConnectorBaseModel } from "@connectors/resources/storage/wrappers/model_with_connectors";
+import type { CreationOptional } from "sequelize";
+
+export type SelectedSiteMetadata = {
+  siteId: string;
+  internalId: string;
+  displayName?: string | null;
+  webUrl?: string | null;
+};
+
+export class MicrosoftConfigurationModel extends ConnectorBaseModel<MicrosoftConfigurationModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+  declare pdfEnabled: boolean;
+  declare csvEnabled: boolean;
+  declare largeFilesEnabled: boolean;
+  declare tenantId: string | null;
+  declare selectedSites: SelectedSiteMetadata[] | null;
+  declare allowedSensitivityLabels: string[] | null;
+}
+MicrosoftConfigurationModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    pdfEnabled: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    csvEnabled: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    largeFilesEnabled: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    tenantId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    selectedSites: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      defaultValue: null,
+    },
+    allowedSensitivityLabels: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      defaultValue: null,
+    },
+  },
+  {
+    sequelize: connectorsSequelize,
+    modelName: "microsoft_configurations",
+    indexes: [{ fields: ["connectorId"], unique: true }],
+    relationship: "hasOne",
+  }
+);
+
+// MicrosoftRoot stores the sites/drives selected by the user to sync.
+// In order to be able to uniquely identify each node, we store the GET path
+// to the item in the itemApiPath field (e.g. /drives/{drive-id}), except for the top-level
+// sites-root, which is stored as "sites-root".
+export class MicrosoftRootModel extends ConnectorBaseModel<MicrosoftRootModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+  declare internalId: string;
+  declare nodeType: MicrosoftNodeType;
+}
+MicrosoftRootModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    internalId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    nodeType: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+  },
+  {
+    sequelize: connectorsSequelize,
+    modelName: "microsoft_roots",
+    indexes: [
+      { fields: ["connectorId", "internalId"], unique: true },
+      { fields: ["connectorId", "nodeType"], unique: false },
+    ],
+  }
+);
+
+// MicrosftNode stores nodes (e.g. files, folder, channels, ...) synced from Microsoft.
+export class MicrosoftNodeModel extends ConnectorBaseModel<MicrosoftNodeModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+  declare lastSeenTs: Date | null;
+  declare lastUpsertedTs: Date | null;
+  declare skipReason: string | null;
+  declare internalId: string;
+  declare nodeType: MicrosoftNodeType;
+  declare name: string | null;
+  declare mimeType: string | null;
+  declare parentInternalId: string | null;
+  declare deltaLink: string | null;
+  declare webUrl: string | null;
+}
+
+MicrosoftNodeModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    lastSeenTs: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    lastUpsertedTs: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    skipReason: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    internalId: {
+      type: DataTypes.STRING(512),
+      allowNull: false,
+    },
+    nodeType: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    name: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: true,
+    },
+    mimeType: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    parentInternalId: {
+      type: DataTypes.STRING(512),
+      allowNull: true,
+    },
+    deltaLink: {
+      type: DataTypes.STRING(1024),
+      allowNull: true,
+    },
+    webUrl: {
+      type: DataTypes.STRING(1024),
+      allowNull: true,
+    },
+  },
+  {
+    sequelize: connectorsSequelize,
+    modelName: "microsoft_nodes",
+    indexes: [
+      { fields: ["internalId", "connectorId"], unique: true },
+      { fields: ["connectorId", "nodeType"], unique: false },
+      { fields: ["parentInternalId", "connectorId"], concurrently: true },
+      { fields: ["connectorId", "id"], unique: false },
+    ],
+  }
+);

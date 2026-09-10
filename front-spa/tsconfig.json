@@ -1,0 +1,44 @@
+{
+  "compilerOptions": {
+    "checkers": 1,
+    "target": "esnext",
+    "useDefineForClassFields": true,
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "module": "esnext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "paths": {
+      "@spa/*": [
+        "./src/*"
+      ],
+      "@ruby-ai/front/*": [
+        "../front/*"
+      ],
+      "@app/*": [
+        "../front/*"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "../front",
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "app"
+  ]
+}

@@ -1,0 +1,633 @@
+// biome-ignore lint/suspicious/noImportCycles: ignored using `--suppress`
+import type { RequestToolPermissionActionValueParsed } from "@connectors/api/webhooks/webhook_slack_bot_interaction";
+import {
+  ANSWER_USER_QUESTION_SKIP,
+  ANSWER_USER_QUESTION_SUBMIT,
+  APPROVE_TOOL_EXECUTION,
+  AUTHENTICATE_TOOL,
+  LEAVE_FEEDBACK_DOWN,
+  LEAVE_FEEDBACK_UP,
+  REJECT_TOOL_EXECUTION,
+  STATIC_AGENT_CONFIG,
+  USER_QUESTION_OPTIONS_ACTION_ID,
+  USER_QUESTION_OPTIONS_BLOCK_ID,
+  USER_QUESTION_TEXT_ACTION_ID,
+  USER_QUESTION_TEXT_BLOCK_ID,
+  // biome-ignore lint/suspicious/noImportCycles: ignored using `--suppress`
+} from "@connectors/api/webhooks/webhook_slack_bot_interaction";
+import type { MessageFootnotes } from "@connectors/lib/bot/citations";
+import { truncate } from "@connectors/types";
+import type {
+  LightAgentConfigurationType,
+  UserQuestionItemType,
+} from "@ruby-ai/client";
+import type { KnownBlock } from "@slack/web-api";
+import slackifyMarkdown from "slackify-markdown";
+
+/*
+ * This length threshold is set to prevent the "msg_too_long" error
+ * from the Slack API's chat.update method.
+ * According to previous incidents, the maximum length for a message is 3000 characters.
+ * We adopt a conservative approach by setting a lower threshold
+ * to accommodate ellipses and ensure buffer space.
+ */
+export const MAX_SLACK_MESSAGE_LENGTH = 2500;
+
+function makeDividerBlock() {
+  return {
+    type: "divider",
+  };
+}
+
+export function makeMarkdownBlock(text?: string, isUpload?: boolean) {
+  if (!text) {
+    return [];
+  }
+
+  // New markdown block has better support for markdown formatting,
+  // but is not supported when uploading files.
+  if (!isUpload) {
+    return [
+      {
+        type: "markdown",
+        text: truncate(text, MAX_SLACK_MESSAGE_LENGTH),
+      },
+    ];
+  }
+
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: truncate(slackifyMarkdown(text), MAX_SLACK_MESSAGE_LENGTH),
+      },
+    },
+  ];
+}
+
+function makeFootnotesBlock(footnotes: MessageFootnotes) {
+  // We are limited to 10 blocks when posting a message on Slack,
+  // so we are posting 5 footnotes at most to leave rooms for other blocks (e.g. conversation link, divier, ...).
+  const elements = footnotes.slice(0, 5).map((f) => ({
+    type: "mrkdwn",
+    text: `<${f.link}|[${f.index}] ${truncate(f.text, 20)}>`,
+  }));
+
+  if (elements.length === 0) {
+    return undefined;
+  }
+
+  return {
+    type: "context",
+    elements,
+  };
+}
+
+function makeContextSectionBlocks({
+  state,
+  assistantName,
+  conversationUrl,
+  footnotes,
+  workspaceId,
+}: {
+  state: "thinking" | "answered";
+  assistantName: string;
+  conversationUrl: string | null;
+  footnotes: MessageFootnotes | undefined;
+  workspaceId: string;
+}) {
+  const blocks = [];
+
+  if (footnotes && footnotes.length > 0) {
+    const footnotesBlock = makeFootnotesBlock(footnotes);
+    if (footnotesBlock) {
+      blocks.push(footnotesBlock);
+    }
+  }
+
+  blocks.push(
+    makeFooterBlock({
+      state,
+      assistantName,
+      conversationUrl,
+    })
+  );
+
+  return blocks.length ? [makeDividerBlock(), ...blocks] : [];
+}
+
+export function makeFeedbackSubmittedBlock() {
+  return [
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "✅ Feedback submitted",
+        },
+      ],
+    },
+  ];
+}
+
+function makeThinkingBlock({
+  isThinking,
+  thinkingText,
+}: {
+  isThinking: boolean;
+  thinkingText: string;
+}) {
+  return isThinking
+    ? [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            // -2 because we add two underscores for italic
+            text: `_${truncate(thinkingText, MAX_SLACK_MESSAGE_LENGTH - 2)}_`,
+          },
+        },
+      ]
+    : [];
+}
+
+export function makeAssistantSelectionBlock(
+  agentConfigurations: LightAgentConfigurationType[],
+  id: string,
+  feedbackParams?: {
+    conversationId: string;
+    messageId: string;
+    workspaceId: string;
+  }
+) {
+  const elements: Array<Record<string, unknown>> = [];
+
+  // Add feedback buttons if parameters are provided
+  if (feedbackParams) {
+    elements.push(
+      {
+        type: "button",
+        text: {
+          type: "plain_text",
+          text: "👍",
+          emoji: true,
+        },
+        action_id: LEAVE_FEEDBACK_UP,
+        value: JSON.stringify({
+          ...feedbackParams,
+          preselectedThumb: "up",
+        }),
+      },
+      {
+        type: "button",
+        text: {
+          type: "plain_text",
+          text: "👎",
+          emoji: true,
+        },
+        action_id: LEAVE_FEEDBACK_DOWN,
+        value: JSON.stringify({
+          ...feedbackParams,
+          preselectedThumb: "down",
+        }),
+      }
+    );
+  }
+
+  // Add agent selection dropdown if we have agent configurations
+  if (agentConfigurations.length > 0) {
+    elements.push({
+      type: "static_select",
+      placeholder: {
+        type: "plain_text",
+        text: "Ask another agent",
+        emoji: true,
+      },
+      options: agentConfigurations.map((ac) => {
+        return {
+          text: {
+            type: "plain_text",
+            text: ac.name,
+          },
+          value: ac.sId,
+        };
+      }),
+      action_id: STATIC_AGENT_CONFIG,
+    });
+  }
+
+  return [
+    {
+      type: "actions",
+      block_id: id,
+      elements: elements,
+    },
+  ];
+}
+
+export type SlackMessageUpdate = {
+  isThinking?: boolean;
+  thinkingAction?: string;
+  assistantName: string;
+  agentConfigurations: LightAgentConfigurationType[];
+  text?: string;
+  footnotes?: MessageFootnotes;
+  conversationId?: string;
+  messageId?: string;
+};
+
+export function makeFooterBlock({
+  state,
+  assistantName,
+  conversationUrl,
+}: {
+  state: "thinking" | "error" | "answered";
+  assistantName?: string;
+  conversationUrl: string | null;
+}) {
+  let attribution = "";
+  if (assistantName) {
+    if (state === "thinking") {
+      attribution = `*${assistantName}* is thinking...`;
+    } else if (state === "error") {
+      attribution = `*${assistantName}* encountered an error`;
+    } else if (state === "answered") {
+      attribution = `Answered by *${assistantName}*`;
+    }
+  } else {
+    if (state === "thinking") {
+      attribution = "Thinking...";
+    } else if (state === "error") {
+      attribution = "Error";
+    } else if (state === "answered") {
+      attribution = "Answered";
+    }
+  }
+
+  const links = [];
+  if (conversationUrl) {
+    links.push(`<${conversationUrl}|View full conversation>`);
+  }
+
+  const fullText =
+    attribution && links.length > 0
+      ? `${attribution} | ${links.join(" · ")}`
+      : attribution || links.join(" · ");
+
+  return {
+    type: "context",
+    elements: [
+      {
+        type: "mrkdwn",
+        text: fullText,
+      },
+    ],
+  };
+}
+
+export function makeMessageUpdateBlocksAndText(
+  conversationUrl: string | null,
+  workspaceId: string,
+  messageUpdate: SlackMessageUpdate,
+  { isUpload = false } = {}
+) {
+  const { isThinking, thinkingAction, assistantName, text, footnotes } =
+    messageUpdate;
+  const thinkingText = "Agent is thinking...";
+  const thinkingTextWithAction = thinkingAction
+    ? `${thinkingText}... (${thinkingAction})`
+    : thinkingText;
+
+  return {
+    blocks: [
+      ...makeThinkingBlock({
+        isThinking: isThinking ?? false,
+        thinkingText: thinkingTextWithAction,
+      }),
+      ...makeMarkdownBlock(text, isUpload),
+      ...makeContextSectionBlocks({
+        state: isThinking ? "thinking" : "answered",
+        assistantName,
+        conversationUrl,
+        footnotes,
+        workspaceId,
+      }),
+    ],
+    // TODO(2024-06-17 flav) We should not return markdown here.
+    // Provide plain text for places where the content cannot be rendered (e.g push notifications).
+    text: isThinking
+      ? thinkingText
+      : text && truncate(text, MAX_SLACK_MESSAGE_LENGTH),
+    mrkdwn: true,
+    unfurl_links: false,
+  };
+}
+
+export function makeErrorBlock(
+  conversationUrl: string | null,
+  workspaceId: string,
+  errorMessage: string
+) {
+  return {
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "plain_text",
+          text: truncate(errorMessage, MAX_SLACK_MESSAGE_LENGTH),
+        },
+      },
+      makeDividerBlock(),
+      makeFooterBlock({
+        state: "error",
+        conversationUrl,
+      }),
+    ],
+    mrkdwn: true,
+    unfurl_links: false,
+    text: truncate(errorMessage, MAX_SLACK_MESSAGE_LENGTH),
+  };
+}
+
+export type TaskCardStatus = "pending" | "in_progress" | "complete" | "error";
+
+export interface TaskCardSource {
+  url: string;
+  text: string;
+}
+
+export interface TaskCardState {
+  taskId: string;
+  title: string;
+  status: TaskCardStatus;
+  details?: string;
+  sources?: TaskCardSource[];
+}
+
+function makeRichTextBlock(text: string) {
+  return {
+    type: "rich_text",
+    elements: [
+      {
+        type: "rich_text_section",
+        elements: [{ type: "text", text }],
+      },
+    ],
+  };
+}
+
+function makeTaskCardBlock(t: TaskCardState) {
+  const card: Record<string, unknown> = {
+    type: "task_card",
+    task_id: t.taskId,
+    title: t.title,
+    status: t.status,
+  };
+  if (t.details) {
+    card.details = makeRichTextBlock(t.details);
+  }
+  if (t.sources && t.sources.length > 0) {
+    card.sources = t.sources.map((s) => ({
+      type: "url",
+      url: s.url,
+      text: s.text,
+    }));
+  }
+  return card;
+}
+
+export function makePlanMessage({
+  planTitle,
+  tasks,
+  conversationUrl,
+  assistantName,
+  workspaceId,
+}: {
+  planTitle: string;
+  tasks: TaskCardState[];
+  conversationUrl: string | null;
+  assistantName: string;
+  workspaceId: string;
+}) {
+  return {
+    blocks: [
+      {
+        type: "plan",
+        block_id: "agent-plan",
+        title: planTitle,
+        tasks: tasks.map(makeTaskCardBlock),
+      },
+      makeDividerBlock(),
+      makeFooterBlock({
+        state: "thinking",
+        assistantName,
+        conversationUrl,
+      }),
+    ],
+    text: planTitle,
+    mrkdwn: true,
+    unfurl_links: false,
+  };
+}
+
+/**
+ * Creates Slack blocks with buttons for validating a tool execution.
+ * This is used when an agent sends a tool_approve_execution event to Slack.
+ */
+export function makeToolValidationBlock({
+  toolName,
+  id,
+}: {
+  toolName: string;
+  id: string;
+}) {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `The agent is requesting permission to use tool \`${toolName}\``,
+      },
+    },
+    {
+      type: "actions",
+      block_id: id,
+      elements: [
+        {
+          type: "button",
+          text: {
+            type: "plain_text",
+            text: "Approve",
+            emoji: true,
+          },
+          style: "primary",
+          value: JSON.stringify({
+            status: "approved",
+            toolName,
+          } as RequestToolPermissionActionValueParsed),
+          action_id: APPROVE_TOOL_EXECUTION,
+        },
+        {
+          type: "button",
+          text: {
+            type: "plain_text",
+            text: "Reject",
+            emoji: true,
+          },
+          style: "danger",
+          value: JSON.stringify({
+            status: "rejected",
+            toolName,
+          } as RequestToolPermissionActionValueParsed),
+          action_id: REJECT_TOOL_EXECUTION,
+        },
+      ],
+    },
+  ];
+}
+
+export function makeToolAuthenticationBlock({
+  serverName,
+  conversationUrl,
+  value,
+}: {
+  serverName: string;
+  conversationUrl: string;
+  value: string;
+}) {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `The agent requires personal authentication for \`${serverName}\``,
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: {
+            type: "plain_text",
+            text: "Authenticate",
+            emoji: true,
+          },
+          url: conversationUrl,
+          action_id: AUTHENTICATE_TOOL,
+          value,
+          style: "primary",
+        },
+      ],
+    },
+  ];
+}
+
+/**
+ * Creates Slack blocks for an agent question to the user.
+ * Single-select: buttons per option, submits immediately on click.
+ * Multi-select: checkboxes + Submit button reads state.values.
+ */
+export function makeUserQuestionBlock({
+  question,
+  value,
+}: {
+  question: UserQuestionItemType;
+  value: string;
+}) {
+  const blocks: KnownBlock[] = [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: question.question },
+    },
+  ];
+
+  if (question.options.length > 0) {
+    blocks.push({
+      type: "actions",
+      block_id: USER_QUESTION_OPTIONS_BLOCK_ID,
+      elements: [
+        {
+          type: question.multiSelect ? "checkboxes" : "radio_buttons",
+          action_id: USER_QUESTION_OPTIONS_ACTION_ID,
+          options: question.options.map((opt, index) => ({
+            text: { type: "plain_text", text: opt.label },
+            ...(opt.description
+              ? { description: { type: "plain_text", text: opt.description } }
+              : {}),
+            value: String(index),
+          })),
+        },
+      ],
+    });
+  }
+
+  blocks.push({
+    type: "input",
+    block_id: USER_QUESTION_TEXT_BLOCK_ID,
+    label: { type: "plain_text", text: " " },
+    element: {
+      type: "plain_text_input",
+      action_id: USER_QUESTION_TEXT_ACTION_ID,
+      placeholder: { type: "plain_text", text: "Type something else…" },
+    },
+  });
+
+  blocks.push({
+    type: "actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Skip" },
+        action_id: ANSWER_USER_QUESTION_SKIP,
+        value,
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Submit" },
+        action_id: ANSWER_USER_QUESTION_SUBMIT,
+        value,
+        style: "primary",
+      },
+    ],
+  });
+
+  return blocks;
+}
+export function makeToolFileAuthorizationBlock({
+  fileName,
+  conversationUrl,
+  value,
+}: {
+  fileName: string;
+  conversationUrl: string;
+  value: string;
+}) {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `The agent requires file authorization for \`${fileName}\``,
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: {
+            type: "plain_text",
+            text: "Authorize file",
+            emoji: true,
+          },
+          url: conversationUrl,
+          action_id: AUTHENTICATE_TOOL,
+          value,
+          style: "primary",
+        },
+      ],
+    },
+  ];
+}

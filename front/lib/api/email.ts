@@ -1,0 +1,333 @@
+/**
+ * This file contains functions related to sending emails, as well as the
+ * content of emails themselves.
+ */
+
+import config from "@app/lib/api/config";
+import { FREE_TRIAL_PHONE_PLAN_CODE } from "@app/lib/plans/plan_codes";
+import logger from "@app/logger/logger";
+import { isDevelopment } from "@app/types/shared/env";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { WorkspaceType } from "@app/types/user";
+import sgMail from "@sendgrid/mail";
+import { escape } from "html-escaper";
+
+let sgMailClient: typeof sgMail | null = null;
+
+function getSgMailClient(): any {
+  if (!sgMailClient) {
+    sgMail.setApiKey(config.getSendgridApiKey());
+    sgMailClient = sgMail;
+  }
+
+  return sgMail;
+}
+
+export async function sendGitHubDeletionEmail(email: string): Promise<void> {
+  await sendEmailWithTemplate({
+    to: email,
+    from: config.getSupportEmailAddress(),
+    subject: "[Ruby] GitHub connection deleted - important information",
+    body: `<p>Your Ruby connection to GitHub was deleted, along with all the related data on Ruby servers.</p>
+    <p>You can now uninstall the Ruby app from your GitHub account to revoke authorizations initially granted to Ruby when you connected the GitHub account.</p>
+    <p>Please reply to this email if you have any questions.</p>`,
+  });
+}
+
+/** Emails for cancelling / reactivating subscription */
+
+export async function sendCancelSubscriptionEmail(
+  email: string,
+  workspaceId: string,
+  date: Date
+): Promise<void> {
+  const options: Intl.DateTimeFormatOptions = {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  };
+  const formattedDate = date.toLocaleDateString("en-US", options);
+
+  await sendEmailWithTemplate({
+    to: email,
+    from: config.getSupportEmailAddress(),
+    subject: `[Ruby] Subscription canceled - important information`,
+    body: `
+      <p>You just canceled your subscription. It will be terminated at the end of your current billing period (${formattedDate}). You can reactivate your subscription at any time before then. If you do not reactivate your subscription, you will then be switched back to our free plan:</p>
+      <ul>
+      <li>all users will be removed from the workspace except for the most tenured admin (more about this <a href="https://docs.ruby.ad/docs/subscriptions#what-happens-when-we-cancel-our-ruby-subscription">here</a>);</li>
+      <li>connections will be removed and data safety deleted from Ruby;</li>
+      <li>conversations, custom agents, and data sources will still be accessible with limitations;</li>
+      <li>your usage of Ruby will have the <a href="https://ruby.ad/w/${workspaceId}/subscription">restrictions of the free plan</a>.</li>
+      </ul>
+      <p>Also note that if you have a data source (folder) with more than 50 MB of data, it will be deleted after the end of your billing period. </p>
+      <p>More details are available on <a href="https://docs.ruby.ad/docs/subscriptions#what-happens-when-we-cancel-our-ruby-subscription">our subscription cancelling FAQ</a>.</p>
+      <p>Please reply to this email if you have any questions.`,
+  });
+}
+
+export async function sendReactivateSubscriptionEmail(
+  email: string
+): Promise<void> {
+  await sendEmailWithTemplate({
+    to: email,
+    from: config.getSupportEmailAddress(),
+    subject: `[Ruby] Your subscription has been reactivated`,
+    body: `<p>You have requested to reactivate your subscription.</p>
+      <p>Therefore, your subscription will not be canceled at the end of the billing period, no downgrade actions will take place, and you can continue using Ruby as usual.</p>
+      <p>We really appreciate you renewing your trust in us.</p>
+      <p>If you have any questions, we'll gladly answer at support@ruby.ad.</p>`,
+  });
+}
+
+export async function sendAdminSubscriptionPaymentFailedEmail(
+  email: string,
+  customerPortailUrl: string | null
+): Promise<void> {
+  await sendEmailWithTemplate({
+    to: email,
+    from: config.getSupportEmailAddress(),
+    subject: `[Ruby] Your payment has failed`,
+    body: `
+      <p>Your payment has failed. Please visit ${customerPortailUrl} to edit your payment information.</p>
+      <p>
+        Please note: your workspace will be downgraded after 3 failed payment retries. This will trigger the removal of any feature attached to the paid plan you were on, and the permanent deletion of connections and the data associated with them. Any agent that are linked to connections will also be removed.
+      </p>
+      <p>Please reply to this email if you have any questions.</p>`,
+  });
+}
+
+export async function sendAdminDataDeletionEmail({
+  email,
+  workspaceName,
+  remainingDays,
+  planCode,
+  isLast,
+}: {
+  email: string;
+  workspaceName: string;
+  remainingDays: number;
+  planCode: string | undefined;
+  isLast: boolean;
+}): Promise<void> {
+  await sendEmailWithTemplate({
+    to: email,
+    from: config.getSupportEmailAddress(),
+    subject: `${
+      isLast ? "Last Reminder: " : ""
+    }Your Ruby data will be deleted in ${remainingDays} days`,
+    body:
+      planCode === FREE_TRIAL_PHONE_PLAN_CODE
+        ? `
+      <p>You're receiving this as Admin of the Ruby workspace ${workspaceName}. Your trial period has ended.</p>
+      <p>To continue using Ruby and avoid losing your data, please subscribe within the next ${remainingDays} days. After this period, your data will be permanently deleted and you will no longer be able to access your workspace.</p>
+      <p>Subscribe now to keep all your conversations, custom agents, data sources, and continue using Ruby without interruption.</p>
+      <p>If you have any questions about Ruby, simply reply to this email.</p>
+      ${isLast ? "<p>This is our last message before data deletion.</p>" : ""}`
+        : `
+      <p>You're receiving this as Admin of the Ruby workspace ${workspaceName}. You recently canceled your Ruby subscription.</p>
+      <p>To protect your privacy and maintain the highest security standards, your data will be permanently deleted in ${remainingDays} days.</p>
+      <p>To keep your data, please resubscribe within the next ${remainingDays} days to recover your account. After this period, data recovery will not be possible.</p>
+      <p>If you have any questions about Ruby, simply reply to this email.</p>
+      ${isLast ? "<p>This is our last message before data deletion.</p>" : ""}`,
+  });
+}
+
+export async function sendProactiveTrialCancelledEmail(
+  email: string
+): Promise<void> {
+  await sendEmailWithTemplate({
+    to: email,
+    from: {
+      name: "Gabriel Hubert",
+      email: "gabriel@ruby.ad",
+    },
+    subject: "[Ruby] Your Pro plan trial has been cancelled early",
+    body: `
+      <p>I'm Gabriel, a cofounder of Ruby. Thanks for trying us out with a free trial of the Pro Plan.</p>
+
+      <p>You've not used core features of the product (adding data sources, creating custom agents) and you haven't used agent conversations in the past 7 days.
+      As a result, to avoid keeping your payment method on file while you may not intend to convert to our paid plan, we've cancelled your trial ahead of time and won't be charging you.</p>
+
+      <p>If you did intend to continue on Ruby, you can subscribe again. If you'd like to extend further, feel free to just email me.</p>
+
+      <p>Thanks again for trying Ruby out. If you have a second, please let me know if you have any thoughts about what we could do to improve Ruby for your needs!</p>`,
+  });
+}
+
+export async function sendCreditUsageAlertEmail({
+  email,
+  workspace,
+  percentUsed,
+  totalInitialMicroUsd,
+  totalConsumedMicroUsd,
+}: {
+  email: string;
+  workspace: WorkspaceType;
+  percentUsed: number;
+  totalInitialMicroUsd: number;
+  totalConsumedMicroUsd: number;
+}): Promise<void> {
+  const remainingMicroUsd = totalInitialMicroUsd - totalConsumedMicroUsd;
+  const formatCents = (microUsd: number) =>
+    `$${(microUsd / 1_000_000).toFixed(2)}`;
+
+  await sendEmailWithTemplate({
+    to: email,
+    from: config.getSupportEmailAddress(),
+    subject: `[Ruby] Credit usage alert - ${percentUsed}% of your credits consumed`,
+    body: `
+      <p>You're receiving this as Admin of the Ruby workspace <strong>${workspace.name}</strong>.</p>
+      <p>Your workspace has consumed <strong>${percentUsed}%</strong> of its available programmatic usage credits.</p>
+      <ul>
+        <li>Total credits: ${formatCents(totalInitialMicroUsd)}</li>
+        <li>Consumed: ${formatCents(totalConsumedMicroUsd)}</li>
+        <li>Remaining: ${formatCents(remainingMicroUsd)}</li>
+      </ul>
+      <p>To avoid service interruption:</p>
+      <ul>
+        <li><strong><a href="https://ruby.ad/w/${workspace.sId}/developers/credits-usage">Purchase additional credits</a></strong> in the Developers > Credits section</li>
+        <li>Learn more about <a href="https://ruby.ad/legal">programmatic usage at Ruby</a></li>
+      </ul>
+      <p>Please reply to this email if you have any questions.</p>`,
+  });
+}
+
+export async function sendMCPGlobalSharingReconfigurationEmail({
+  email,
+  workspaceName,
+  toolName,
+  agentNames,
+}: {
+  email: string;
+  workspaceName: string;
+  toolName: string;
+  agentNames: string[];
+}): Promise<Result<void, Error>> {
+  const agentsList = agentNames
+    .map((agentName) => `<li>${escape(agentName)}</li>`)
+    .join("");
+
+  return sendEmailWithTemplate({
+    to: email,
+    from: config.getSupportEmailAddress(),
+    subject: `[Ruby] Agents to reconfigure after sharing ${toolName}`,
+    body: `
+      <p>You're receiving this as Admin of the Ruby workspace <strong>${escape(workspaceName)}</strong>.</p>
+      <p>The tool <strong>${escape(toolName)}</strong> was just made available to all workspace members.</p>
+      <p>This removes older space-specific versions of the same tool. The following agents may need to be reconfigured:</p>
+      <ul>${agentsList}</ul>
+      <p>Please review these agents and re-add the tool if needed.</p>`,
+  });
+}
+
+export async function sendEmailToRecipients({
+  to,
+  cc,
+  message,
+}: {
+  to: string[];
+  cc?: string[];
+  message: any;
+}) {
+  // In dev, filter out external recipients and warn rather than blocking the send entirely.
+  let filteredTo = to;
+  let filteredCc = cc;
+  if (isDevelopment()) {
+    const isInternal = (r: string) => r.endsWith("@ruby.ad");
+    filteredTo = to.filter(isInternal);
+    filteredCc = cc?.filter(isInternal);
+    const externalRecipients = [...to, ...(cc ?? [])].filter(
+      (r) => !isInternal(r)
+    );
+    if (externalRecipients.length > 0) {
+      logger.warn(
+        { externalRecipients, subject: message.subject },
+        "Dropping external recipients in development mode."
+      );
+    }
+    if (filteredTo.length === 0) {
+      return;
+    }
+  }
+
+  const msg = {
+    ...message,
+    to: filteredTo,
+    ...(filteredCc && filteredCc.length > 0 ? { cc: filteredCc } : {}),
+  };
+
+  try {
+    await getSgMailClient().send(msg);
+    logger.info({ to, cc, subject: message.subject }, "Sending email");
+  } catch (error) {
+    logger.error(
+      { error, to, cc, subject: message.subject },
+      "Error sending email."
+    );
+  }
+}
+
+// Avoid using this function directly, use sendEmailWithTemplate instead.
+export async function sendEmail(email: string, message: any) {
+  await sendEmailToRecipients({
+    to: [email],
+    message,
+  });
+}
+
+interface sendEmailWithTemplateParams {
+  to: string;
+  from: {
+    email: string;
+    name: string;
+  };
+  replyTo?: string;
+  subject: string;
+  body: string;
+  // Optional CTA button — rendered by the SendGrid template if both are provided.
+  buttonLabel?: string;
+  buttonUrl?: string;
+}
+
+// This function sends an email using a predefined template. Note: The salutation and footer are
+// automatically included by the template, so do not add them manually to the email body.
+export async function sendEmailWithTemplate({
+  to,
+  from,
+  replyTo,
+  subject,
+  body,
+  buttonLabel,
+  buttonUrl,
+}: sendEmailWithTemplateParams): Promise<Result<void, Error>> {
+  const templateId = config.getGenericEmailTemplate();
+  const message = {
+    to,
+    from,
+    replyTo,
+    templateId,
+    dynamic_template_data: {
+      subject,
+      body,
+      ...(buttonLabel && buttonUrl ? { buttonLabel, buttonUrl } : {}),
+    },
+  };
+
+  try {
+    await sendEmail(to, message);
+    return new Ok(undefined);
+  } catch (e) {
+    logger.error(
+      {
+        error: e,
+        to,
+        subject,
+      },
+      "Error sending email."
+    );
+    return new Err(normalizeError(e));
+  }
+}

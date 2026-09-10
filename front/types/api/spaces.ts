@@ -1,0 +1,138 @@
+import type { AgentsAndSkillsUsageType } from "@app/types/data_source";
+import type { GroupKind } from "@app/types/groups";
+import type { PodFileTab } from "@app/types/pod_file_tab";
+import { PodFileTabsSchema, PodTabsOrderSchema } from "@app/types/pod_file_tab";
+import type { EnrichedSpaceType, PodType, SpaceType } from "@app/types/space";
+import type { SpaceUserType } from "@app/types/user";
+import { z } from "zod";
+
+export const ContentSchema = z.object({
+  dataSourceId: z.string(),
+  parentsIn: z.array(z.string()),
+});
+
+export const PatchSpaceRequestBodySchema = z.object({
+  name: z.string().optional(),
+  content: z.array(ContentSchema).optional(),
+});
+
+export const PostNotionSyncPayloadSchema = z.object({
+  urls: z.array(z.string()),
+  method: z.enum(["sync", "delete"]),
+});
+
+export const GetPostNotionSyncResponseBodySchema = z.object({
+  syncResults: z.array(
+    z.object({
+      url: z.string(),
+      method: z.enum(["sync", "delete"]),
+      timestamp: z.number(),
+      success: z.boolean(),
+      error_message: z.string().optional(),
+    })
+  ),
+});
+
+export type GetPostNotionSyncResponseBody = z.infer<
+  typeof GetPostNotionSyncResponseBodySchema
+>;
+
+export const PatchPodMetadataBodySchema = z.object({
+  description: z.string().optional(),
+  archive: z.boolean().optional(),
+  todoGenerationEnabled: z.boolean().optional(),
+  initialTodoAnalysisLookback: z.enum(["now", "last_24h", "max"]).optional(),
+  pinnedFramePath: z.string().nullable().optional(),
+  frameTabs: PodFileTabsSchema.optional(),
+  tabsOrder: PodTabsOrderSchema.optional(),
+  defaultAgentId: z.string().nullable().optional(),
+  defaultSkillIds: z.array(z.string()).optional(),
+});
+
+export type PatchPodMetadataBodyType = z.infer<
+  typeof PatchPodMetadataBodySchema
+>;
+
+// A new space's members: its manual member list, the groups given access to it, or both. A
+// dimension the request leaves out is simply not seeded (see
+// `PatchSpaceMembersRequestBodySchema` for the same shape on update).
+export const PostSpaceRequestBodySchema = z.object({
+  isRestricted: z.boolean(),
+  name: z.string(),
+  spaceKind: z.enum(["regular", "project"]),
+  memberIds: z.array(z.string()).optional(),
+  groupIds: z.array(z.string()).optional(),
+});
+
+export type PostSpaceRequestBodyType = z.infer<
+  typeof PostSpaceRequestBodySchema
+>;
+
+export type GetSpacesResponseBody = {
+  spaces: (EnrichedSpaceType | PodType)[];
+};
+
+export type PostSpacesResponseBody = {
+  space: SpaceType;
+};
+
+export type SpaceCategoryInfo = {
+  usage: AgentsAndSkillsUsageType;
+  count: number;
+};
+
+/**
+ * A group given access to a space: who it is, what it confers, and since when. The space's members
+ * are its individual members plus the members of these groups.
+ */
+export type SpaceGroupAccessType = {
+  sId: string;
+  name: string;
+  kind: GroupKind;
+  role: "member" | "editor";
+};
+
+export type RichSpaceType = EnrichedSpaceType & {
+  categories: { [key: string]: SpaceCategoryInfo };
+  canWrite: boolean;
+  canRead: boolean;
+  isMember: boolean;
+  members: SpaceUserType[];
+  groups: SpaceGroupAccessType[];
+  isEditor: boolean;
+  // Useful in case of projects
+  description: string | null;
+  archivedAt: number | null;
+  /** Background todo suggestions from project activity (project spaces only). */
+  todoGenerationEnabled: boolean;
+  lastTodoAnalysisAt: number | null;
+  pinnedFramePath: string | null;
+  frameTabs: PodFileTab[];
+  tabsOrder: string[];
+  isAdminControlled: false;
+};
+
+export type GetSpaceResponseBody = {
+  space: RichSpaceType;
+};
+
+export type PatchSpaceResponseBody = {
+  space: SpaceType;
+};
+
+/**
+ * For one space, the requested users that are not members of it — i.e. that
+ * cannot read the data it holds.
+ */
+export type SpaceUsersWithoutAccess = {
+  spaceId: string;
+  userIdsWithoutAccess: string[];
+};
+
+export type GetSpacesAccessCheckResponseBody = {
+  spacesAccess: SpaceUsersWithoutAccess[];
+};
+
+export type CheckNameResponseBody = {
+  available: boolean;
+};

@@ -1,0 +1,251 @@
+import type {
+  MemberRowData,
+  SearchMemberType,
+} from "@app/components/members/MemberSelectionTable";
+import { MemberSelectionTable } from "@app/components/members/MemberSelectionTable";
+import { useSendNotification } from "@app/hooks/useNotification";
+import { spaceMembershipProperties } from "@app/lib/spaces_utils";
+import { useUpdateSpace } from "@app/lib/swr/spaces";
+import type { RichSpaceType } from "@app/types/api/spaces";
+import type { LightWorkspaceType, SpaceUserType } from "@app/types/user";
+import {
+  Button,
+  Check,
+  DataTable,
+  Sheet,
+  SheetContainer,
+  SheetContent,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from "@ruby-ai/sparkle";
+import type { CellContext, ColumnDef } from "@tanstack/react-table";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+interface BaseManageUsersPanelProps {
+  isOpen: boolean;
+  setIsOpen: (isOpen: boolean) => void;
+  owner: LightWorkspaceType;
+}
+
+interface SpaceMembersMode extends BaseManageUsersPanelProps {
+  mode: "space-members";
+  space: RichSpaceType;
+  currentProjectMembers: SpaceUserType[];
+  onSuccess?: () => void | Promise<void>;
+}
+
+interface EditorsOnlyMode extends BaseManageUsersPanelProps {
+  mode: "editors-only";
+  editors: SearchMemberType[];
+  onEditorsChange: (editors: SearchMemberType[]) => void;
+  title?: string;
+}
+
+type ManageUsersPanelProps = SpaceMembersMode | EditorsOnlyMode;
+
+export function ManageUsersPanel(props: ManageUsersPanelProps) {
+  const { isOpen, setIsOpen, owner, mode } = props;
+
+  const [isSaving, setIsSaving] = useState(false);
+  const sendNotification = useSendNotification();
+  const doUpdateSpace = useUpdateSpace({ owner });
+
+  const [currentMembers, setCurrentMembers] = useState<Set<string>>(new Set());
+  const [currentEditors, setCurrentEditors] = useState<Set<string>>(new Set());
+  const [selectedUsers, setSelectedUsers] = useState<SearchMemberType[]>([]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset state when panel opens
+  useEffect(() => {
+    if (mode === "space-members") {
+      const editorIds = props.currentProjectMembers
+        .filter((m) => m.isEditor)
+        .map((m) => m.sId);
+      setCurrentMembers(new Set(props.currentProjectMembers.map((m) => m.sId)));
+      setCurrentEditors(new Set(editorIds));
+    } else if (mode === "editors-only") {
+      setCurrentMembers(new Set(props.editors.map((e) => e.sId)));
+      setSelectedUsers(props.editors);
+    }
+  }, [isOpen]);
+
+  const toggleEditor = useCallback(
+    (userId: string) => {
+      if (!currentMembers.has(userId)) {
+        return;
+      }
+      setCurrentEditors((prev) => {
+        const next = new Set(prev);
+        if (next.has(userId)) {
+          next.delete(userId);
+        } else {
+          next.add(userId);
+        }
+        return next;
+      });
+    },
+    [currentMembers]
+  );
+
+  const handleSave = async () => {
+    setIsSaving(true);
+
+    if (mode === "space-members") {
+      const memberIds = Array.from(currentMembers).filter(
+        (id) => !currentEditors.has(id)
+      );
+      const editorIds = Array.from(currentEditors);
+
+      // A Pod keeps at least one individual editor even when a group is attached to it as an
+      // editor: a group's membership can drop to zero — in its IdP, for a provisioned one —
+      // leaving the Pod with nobody able to administrate it.
+      if (editorIds.length === 0) {
+        setIsOpen(false);
+        sendNotification({
+          title: "At least one editor is required.",
+          description: "You cannot remove the last editor.",
+          type: "error",
+        });
+        setIsSaving(false);
+        return;
+      }
+
+      const updatedSpace = await doUpdateSpace(
+        props.space,
+        {
+          isRestricted: props.space.isRestricted,
+          // Only the individual members change here; the space's groups are passed through.
+          ...spaceMembershipProperties(props.space),
+          memberIds,
+          editorIds,
+          name: props.space.name,
+        },
+        {
+          title: "Successfully updated Pod members",
+          description: "Pod members were successfully updated.",
+        }
+      );
+
+      if (updatedSpace) {
+        await props.onSuccess?.();
+        setIsOpen(false);
+      }
+    } else if (mode === "editors-only") {
+      props.onEditorsChange(selectedUsers);
+      setIsOpen(false);
+    }
+
+    setIsSaving(false);
+  };
+
+  const handleClose = () => {
+    setIsOpen(false);
+  };
+
+  const handleSelectionChange = (
+    newMembers: Set<string>,
+    users: SearchMemberType[]
+  ) => {
+    setCurrentMembers(newMembers);
+    setSelectedUsers(users);
+
+    if (mode === "space-members") {
+      setCurrentEditors((prevEditors) => {
+        const nextEditors = new Set(prevEditors);
+        for (const editorId of prevEditors) {
+          if (!newMembers.has(editorId)) {
+            nextEditors.delete(editorId);
+          }
+        }
+        return nextEditors;
+      });
+    }
+  };
+
+  const editorColumn: ColumnDef<MemberRowData>[] = useMemo(() => {
+    if (mode !== "space-members") {
+      return [];
+    }
+    return [
+      {
+        id: "editor",
+        header: "",
+        meta: {
+          className: "w-28",
+        },
+        cell: (info: CellContext<MemberRowData, unknown>) => {
+          const { sId } = info.row.original;
+          const isMember = currentMembers.has(sId);
+          const isEditor = currentEditors.has(sId);
+
+          if (!isMember) {
+            return null;
+          }
+
+          return (
+            <DataTable.CellContent>
+              <Button
+                size="xs"
+                variant={isEditor ? "highlight" : "outline"}
+                label={isEditor ? "Editor" : "Set as editor"}
+                icon={isEditor ? Check : undefined}
+                onClick={(e) => {
+                  toggleEditor(sId);
+                  e.stopPropagation();
+                }}
+              />
+            </DataTable.CellContent>
+          );
+        },
+      },
+    ];
+  }, [mode, currentMembers, currentEditors, toggleEditor]);
+
+  const initialMembers =
+    mode === "editors-only" ? props.editors : props.currentProjectMembers;
+
+  const canSave =
+    !isSaving && (mode !== "space-members" || currentEditors.size > 0);
+
+  const sheetTitle =
+    mode === "space-members"
+      ? `Manage Members of ${props.space.name}`
+      : (props.title ?? "Manage Editors");
+
+  return (
+    <Sheet open={isOpen} onOpenChange={(open) => !open && handleClose()}>
+      <SheetContent size="lg" side="right">
+        <SheetHeader>
+          <SheetTitle>{sheetTitle}</SheetTitle>
+        </SheetHeader>
+        <SheetContainer>
+          <MemberSelectionTable
+            owner={owner}
+            selectedMemberIds={currentMembers}
+            onSelectionChange={handleSelectionChange}
+            extraColumns={editorColumn}
+            initialMembers={initialMembers}
+          />
+        </SheetContainer>
+        <SheetFooter
+          leftButtonProps={{
+            label: "Cancel",
+            variant: "outline",
+            onClick: handleClose,
+          }}
+          rightButtonProps={{
+            label: "Save",
+            variant: "highlight",
+            onClick: handleSave,
+            disabled: !canSave,
+            isLoading: isSaving,
+            tooltip:
+              !canSave && mode === "space-members"
+                ? "Please select at least one editor to save."
+                : undefined,
+          }}
+        />
+      </SheetContent>
+    </Sheet>
+  );
+}

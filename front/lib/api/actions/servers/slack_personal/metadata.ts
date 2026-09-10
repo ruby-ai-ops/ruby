@@ -1,0 +1,673 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { z } from "zod";
+
+export const SLACK_TOOL_LOG_NAME = "slack" as const;
+
+// Common Zod parameter schemas shared by search tools.
+const commonSearchParams = {
+  channels: z
+    .string()
+    .array()
+    .optional()
+    .describe("Narrow the search to specific channels (optional)"),
+  usersFrom: z
+    .string()
+    .array()
+    .optional()
+    .describe(
+      "Narrow the search to messages written by specific Slack user IDs (e.g., 'U01234ABCD'). Use the search_user tool to find Slack user IDs if needed (optional)"
+    ),
+  usersTo: z
+    .string()
+    .array()
+    .optional()
+    .describe(
+      "Narrow the search to direct messages sent to specific Slack user IDs (e.g., 'U01234ABCD'). Use the search_user tool to find Slack user IDs if needed (optional)"
+    ),
+  usersMentioned: z
+    .string()
+    .array()
+    .optional()
+    .describe(
+      "Narrow the search to messages mentioning specific Slack user IDs (e.g., 'U01234ABCD'). Use the search_user tool to find Slack user IDs if needed (optional)"
+    ),
+  relativeTimeFrame: z
+    .string()
+    .regex(/^(all|\d+[hdwmy])$/)
+    .describe(
+      "The time frame (relative to LOCAL_TIME) to restrict the search based" +
+        " on the user request and past conversation context." +
+        " Possible values are: `all`, `{k}h`, `{k}d`, `{k}w`, `{k}m`, `{k}y`" +
+        " where {k} is a number. Be strict, do not invent invalid values." +
+        " Also, do not pass this unless the user explicitly asks for some timeframe."
+    ),
+};
+
+const MAX_CHANNEL_SEARCH_RESULTS = 20;
+
+export const SLACK_PERSONAL_TOOLS_METADATA = [
+  {
+    name: "search_messages",
+    description:
+      "Search Slack messages by keyword across public channels, private channels, DMs, and group DMs where the current user is a member",
+    schema: {
+      keywords: z
+        .string()
+        .array()
+        .min(1)
+        .describe(
+          "Between 1 and 3 keywords to retrieve relevant messages " +
+            "based on the user request and conversation context."
+        ),
+      ...commonSearchParams,
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Searching Slack messages (keyword)",
+      done: "Search Slack messages (keyword)",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "semantic_search_messages",
+    description:
+      "Use semantic search to find Slack messages across public channels, private channels, DMs, and group DMs where the current user is a member",
+    schema: {
+      query: z
+        .string()
+        .describe(
+          "A query to retrieve relevant messages based on the user request and conversation context. For it to be treated as semantic search, make sure it begins with a question word such as what, where, how, etc, and ends with a question mark. If the user asks to limit to certain channels, don't make them part of this query. Instead, use the `channels` parameter to limit the search to specific channels. But only do this if the user explicitly asks for it, otherwise, the search will be more effective if you don't limit it to specific channels."
+        ),
+      ...commonSearchParams,
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Searching Slack messages (semantic)",
+      done: "Search Slack messages (semantic)",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "post_message",
+    description:
+      "Post a message from the user's personal Slack account to a public channel, private channel, or DM. You MUST ONLY post to channels or users that were explicitly specified by the user in their request. NEVER post to alternative channels if the requested channel is not found. If you cannot find the exact channel requested by the user, you MUST ask the user for clarification instead of choosing a different channel.",
+    schema: {
+      to: z
+        .union([z.string(), z.string().array().min(2)])
+        .describe(
+          "Use a string to post to a channel (name or ID) or a single user (Slack user ID for DM). " +
+            "Use an array of at least 2 Slack user IDs to create a group DM (e.g. ['U123', 'U456']). " +
+            "Arrays only support Slack user IDs, not channel names or IDs."
+        ),
+      message: z
+        .string()
+        .describe(
+          "The message to post, using standard Markdown formatting (e.g., [text](url) for links, **bold**, *italic*, `code`). Do NOT use Slack-specific markup like <url|text> for links. The system converts Markdown to Slack format automatically. " +
+            "To mention a user, use <@user_id> (use the user's id field, not name). " +
+            "To mention a user group, use <!subteam^user_group_id> (use the user group's id field, not handle). " +
+            "To reference a channel, use #CHANNEL or <#CHANNEL_ID>."
+        ),
+      threadTs: z
+        .string()
+        .optional()
+        .describe(
+          "The thread ts of the message to reply to. If you need to find the thread ts, you can use the `search_messages` tool, the thread ts is the id of the message you want to reply to. If you don't provide a thread ts, the message will be posted as a top-level message."
+        ),
+      fileId: z
+        .string()
+        .optional()
+        .describe(
+          "Optional file to attach to the message. Accepts a scoped file path (e.g. 'conversation/report.pdf') or a legacy file sId."
+        ),
+      unfurlLinks: z
+        .boolean()
+        .optional()
+        .describe(
+          "If false, disable link previews (unfurling) for URLs in the message. Useful when posting newsletters or curated lists where previews add clutter. Defaults to Slack's behavior."
+        ),
+      unfurlMedia: z
+        .boolean()
+        .optional()
+        .describe(
+          "If false, disable media previews (unfurling) for image/video URLs in the message. Defaults to Slack's behavior."
+        ),
+      show_sent_by_footer: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          "Include the 'Sent via [AgentName] on Ruby' footer. Set false only when explicitly asked to remove the footer, never for formatting or brevity."
+        ),
+    },
+    stake: "medium",
+    displayLabels: {
+      running: "Posting Slack message",
+      done: "Post Slack message",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "schedule_message",
+    description:
+      "Schedule a message to be posted from the user's personal Slack account to a channel at a future time. Messages can be scheduled up to 120 days in advance. Maximum of 30 scheduled messages per 5 minutes per channel. You MUST ONLY schedule messages to channels or users that were explicitly specified by the user in their request. NEVER schedule messages to alternative channels if the requested channel is not found. If you cannot find the exact channel requested by the user, you MUST ask the user for clarification instead of choosing a different channel.",
+    schema: {
+      to: z
+        .string()
+        .describe(
+          "The channel or user to schedule the message to. Accepted values are the channel name, the channel id or the user id. If you need to find the user id, you can use the `search_user` tool. " +
+            "Messages sent to a user will be sent as a direct message."
+        ),
+      message: z
+        .string()
+        .describe(
+          "The message to post, using standard Markdown formatting (e.g., [text](url) for links, **bold**, *italic*, `code`). Do NOT use Slack-specific markup like <url|text> for links. The system converts Markdown to Slack format automatically. " +
+            "To mention a user, use <@user_id> (use the user's id field, not name). " +
+            "To mention a user group, use <!subteam^user_group_id> (use the user group's id field, not handle). " +
+            "To reference a channel, use #CHANNEL or <#CHANNEL_ID>."
+        ),
+      post_at: z
+        .union([z.number().int().positive(), z.string()])
+        .describe(
+          "When to post the message. Can be either: (1) A Unix timestamp in seconds (e.g., 1730380000), or (2) An ISO 8601 datetime string (e.g., '2025-10-31T14:55:00Z' or '2025-10-31T14:55:00+01:00'). The time must be in the future and within 120 days from now."
+        ),
+      threadTs: z
+        .string()
+        .optional()
+        .describe(
+          "The thread ts of the message to reply to. If you need to find the thread ts, you can use the `search_messages` tool, the thread ts is the id of the message you want to reply to. If you don't provide a thread ts, the message will be posted as a top-level message."
+        ),
+      unfurlLinks: z
+        .boolean()
+        .optional()
+        .describe(
+          "If false, disable link previews (unfurling) for URLs in the message. Useful when posting newsletters or curated lists where previews add clutter. Defaults to Slack's behavior."
+        ),
+      unfurlMedia: z
+        .boolean()
+        .optional()
+        .describe(
+          "If false, disable media previews (unfurling) for image/video URLs in the message. Defaults to Slack's behavior."
+        ),
+      show_sent_by_footer: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          "Include the 'Sent via [AgentName] on Ruby' footer. Set false only when explicitly asked to remove the footer, never for formatting or brevity."
+        ),
+    },
+    stake: "medium",
+    displayLabels: {
+      running: "Scheduling Slack message",
+      done: "Schedule Slack message",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "search_user",
+    description: `Search for a Slack user by Slack user ID or email address.
+
+Query parameter accepts:
+- User ID (e.g., 'U01234ABCD') - instant lookup
+- Email address (e.g., 'user@company.com') - instant lookup
+
+This tool can be used to find the Slack user ID (starts with U, e.g. U01234ABCD) based on the user's email address.
+If you only have a user's first name or partial information, ask the user to provide their email address or Slack user ID instead of using search_all=true.
+
+The search_all parameter should only be set to true if the user explicitly requests to search all workspace users. This operation is slow on large workspaces and should be avoided unless specifically requested.`,
+    schema: {
+      query: z
+        .string()
+        .describe(
+          "Slack user ID (e.g., 'U01234ABCD'), email address, or user name"
+        ),
+      search_all: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Only set to true if the user explicitly requests searching all workspace users. This is slow and should be avoided. Always ask the user for email/ID first."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Searching Slack users",
+      done: "Search Slack users",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "list_user_groups",
+    description:
+      "List all Slack user groups in the workspace. User groups (e.g., @engineering, @marketing) can be mentioned in messages.",
+    schema: {},
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Slack user groups",
+      done: "List Slack user groups",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "search_channels",
+    description: `Search for Slack channels by channel ID or name.
+
+Query parameter accepts:
+- Channel ID (e.g., 'C01234ABCD') - instant lookup
+- Channel name or keywords (e.g., 'marketing') - searches channel names, topics, and descriptions, returns top ${MAX_CHANNEL_SEARCH_RESULTS} matches
+
+By default, searches only joined channels (public, private, IMs, group DMs).
+Set search_all=true only if the user explicitly requests to search all public workspace channels.`,
+    schema: {
+      query: z
+        .string()
+        .describe(
+          "Channel ID (e.g., 'C01234ABCD'), channel name, or search keywords. Channel IDs are automatically detected."
+        ),
+      search_all: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Only set to true if the user explicitly requests searching all public workspace channels. By default, searches only joined channels. Ignored when query is a channel ID."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Searching Slack channels",
+      done: "Search Slack channels",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "list_messages",
+    description:
+      "List the recent messages in a Slack channel, private channel, or direct message (DM). Returns message headers with their timestamps (ts).",
+    schema: {
+      channel: z
+        .string()
+        .describe(
+          "The channel name, channel ID, or Slack user ID to list threads for. Supports public channels, private channels, and DMs."
+        ),
+      relativeTimeFrame: z
+        .string()
+        .regex(/^(all|\d+[hdwmy])$/)
+        .describe(
+          "The time frame (relative to LOCAL_TIME) to restrict the search based" +
+            " on the user request and past conversation context." +
+            " Possible values are: `all`, `{k}h`, `{k}d`, `{k}w`, `{k}m`, `{k}y`" +
+            " where {k} is a number. Be strict, do not invent invalid values."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Slack messages",
+      done: "List Slack messages",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "read_thread_messages",
+    description:
+      "Read all messages in a Slack thread from a public channel, private channel, or direct message (DM). Use list_messages first to find the thread's timestamp (ts).",
+    schema: {
+      channel: z
+        .string()
+        .describe(
+          "Channel name, channel ID, or Slack user ID where the thread is located. Supports public channels, private channels, and DMs."
+        ),
+      threadTs: z
+        .string()
+        .describe(
+          "Thread timestamp (ts field from list_messages results, identifies the parent message)"
+        ),
+      limit: z
+        .number()
+        .optional()
+        .describe("Number of messages to retrieve (default: 20, max: 200)"),
+      cursor: z
+        .string()
+        .optional()
+        .describe("Pagination cursor from previous call to get next page"),
+      oldest: z
+        .string()
+        .optional()
+        .describe("Only messages after this timestamp (Unix timestamp)"),
+      latest: z
+        .string()
+        .optional()
+        .describe("Only messages before this timestamp (Unix timestamp)"),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Reading Slack thread messages",
+      done: "Read Slack thread messages",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "get_channel_canvases",
+    description:
+      "List all canvas IDs for a Slack channel (from the channel's tabs). " +
+      "Use when you need to edit a channel's canvas but only have the channel ID. ",
+    schema: {
+      channel_id: z
+        .string()
+        .describe("The Slack channel ID (e.g. 'C01234ABCD')."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Getting channel canvases",
+      done: "Got channel canvases",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "read_canvas",
+    description:
+      "Find sections within a Slack canvas. " +
+      "Returns section IDs that can be used with write_canvas to insert, replace, or delete specific sections.",
+    schema: {
+      canvas_id: z.string().describe("The canvas file ID (e.g. 'F01234ABCD')."),
+      section_types: z
+        .array(z.enum(["h1", "h2", "h3", "any_header"]))
+        .optional()
+        .describe(
+          "Filter by section type. Defaults to ['any_header'] to return all headings"
+        ),
+      contains_text: z
+        .string()
+        .optional()
+        .describe(
+          "Narrow results to sections containing this text. Can be combined with section_types."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Reading Slack canvas sections",
+      done: "Read Slack canvas sections",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "write_canvas",
+    description:
+      "Create or edit a Slack canvas (a shared document / doc / page pinned in a channel).\n\n" +
+      "**Creating a new canvas** (omit canvas_id):\n" +
+      "  - Optionally provide title, content (initial markdown), and channel_id to pin it to a channel tab.\n" +
+      "**Editing an existing canvas** (provide canvas_id + operation):\n" +
+      "  - insert_at_end / insert_at_start: add content at the end or beginning (requires content).\n" +
+      "  - insert_after / insert_before: insert content relative to a section (requires content + section_id from read_canvas).\n" +
+      "  - replace: replace entire canvas or a specific section (requires content, section_id optional).\n" +
+      "  - delete: remove a specific section (requires section_id).\n" +
+      "  - rename: rename the canvas (requires title).\n\n" +
+      "Content must be Markdown. Use read_canvas to get section IDs before doing relative edits.",
+    schema: {
+      canvas_id: z
+        .string()
+        .optional()
+        .describe(
+          "The canvas file ID to edit (e.g. 'F01234ABCD'). Omit to create a new canvas."
+        ),
+      operation: z
+        .enum([
+          "insert_at_end",
+          "insert_at_start",
+          "insert_after",
+          "insert_before",
+          "replace",
+          "delete",
+          "rename",
+        ])
+        .optional()
+        .describe(
+          "The edit operation to perform. Required when canvas_id is provided. " +
+            "Defaults to insert_at_end. " +
+            "insert_after/insert_before/delete require a section_id. " +
+            "rename requires a title."
+        ),
+      content: z
+        .string()
+        .optional()
+        .describe(
+          "Markdown content to insert or replace. Required for all operations except delete and rename."
+        ),
+      section_id: z
+        .string()
+        .optional()
+        .describe(
+          "Section ID from read_canvas. Required for insert_after, insert_before, and delete. " +
+            "Optional for replace (omit to replace entire canvas)."
+        ),
+      title: z
+        .string()
+        .optional()
+        .describe(
+          "Canvas title. Required for the rename operation. Optional when creating a new canvas."
+        ),
+      channel_id: z
+        .string()
+        .optional()
+        .describe(
+          "Channel ID to pin the newly created canvas to (e.g. 'C01234ABCD'). Only used when creating a new canvas."
+        ),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Writing Slack canvas",
+      done: "Write Slack canvas",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "create_channel",
+    description:
+      "Create a new Slack channel (public or private). Returns the created channel's details including its ID. Note: Slack always adds the authenticated user to a newly created channel. Use leave_after_creation=true to immediately leave after creating.",
+    schema: {
+      name: z
+        .string()
+        .describe(
+          "The name of the channel to create. Channel names must be lowercase, without spaces (use hyphens instead), and max 80 characters."
+        ),
+      is_private: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Whether to create a private channel. Defaults to false (public channel)."
+        ),
+      leave_after_creation: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "If true, the authenticated user will immediately leave the channel after creating it. Useful when creating a channel on behalf of others. Note: for private channels, leaving means losing access. Defaults to false."
+        ),
+    },
+    stake: "high",
+    displayLabels: {
+      running: "Creating Slack channel",
+      done: "Create Slack channel",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "invite_to_channel",
+    description:
+      "Invite one or more users to a Slack channel. Users must be specified by their Slack user IDs. Use the search_user tool first if you need to find user IDs.",
+    schema: {
+      channel: z
+        .string()
+        .describe(
+          "The channel name or ID to invite users to (e.g. 'general' or 'C01234ABCD')."
+        ),
+      users: z
+        .string()
+        .array()
+        .min(1)
+        .describe(
+          "Array of Slack user IDs to invite (e.g. ['U01234ABCD', 'U56789EFGH']). Use search_user to find Slack user IDs."
+        ),
+    },
+    stake: "high",
+    displayLabels: {
+      running: "Inviting users to Slack channel",
+      done: "Invite users to Slack channel",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "archive_channel",
+    description:
+      "Archive a Slack channel. Archived channels are read-only and hidden from the channel list by default. This action can be undone by unarchiving the channel.",
+    schema: {
+      channel: z
+        .string()
+        .describe(
+          "The channel name or ID to archive (e.g. 'old-project' or 'C01234ABCD')."
+        ),
+    },
+    stake: "high",
+    displayLabels: {
+      running: "Archiving Slack channel",
+      done: "Archive Slack channel",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "set_user_status",
+    description:
+      "Set the current user's Slack status (emoji + text). Pass empty strings to clear the status. " +
+      "Status expiration is optional — omit it to set a permanent status.",
+    schema: {
+      status_text: z
+        .string()
+        .max(100)
+        .describe(
+          "The status text to display (e.g. 'In a meeting'). Pass an empty string to clear."
+        ),
+      status_emoji: z
+        .string()
+        .describe(
+          "The status emoji to display (e.g. ':spiral_calendar_pad:'). Pass an empty string to clear."
+        ),
+      status_expiration: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe(
+          "Unix timestamp (seconds) when the status should expire. Omit or pass 0 for no expiration."
+        ),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Setting Slack status",
+      done: "Set Slack status",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "add_reaction",
+    description:
+      "Add a reaction emoji to a Slack message. Supports both standard emoji (e.g., 'thumbsup', 'heart') and custom workspace emoji.",
+    schema: {
+      channel: z.string().describe("The channel where the message is located"),
+      timestamp: z
+        .string()
+        .describe("The timestamp (ts) of the message to react to"),
+      name: z
+        .string()
+        .describe(
+          "The name of the emoji reaction without colons (e.g., 'thumbsup', 'heart', 'custom-emoji-name')"
+        ),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Adding Slack reaction",
+      done: "Add Slack reaction",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "remove_reaction",
+    description:
+      "Remove a reaction emoji from a Slack message. Supports both standard and custom workspace emoji.",
+    schema: {
+      channel: z.string().describe("The channel where the message is located"),
+      timestamp: z
+        .string()
+        .describe("The timestamp (ts) of the message to remove reaction from"),
+      name: z
+        .string()
+        .describe(
+          "The name of the emoji reaction to remove without colons (e.g., 'thumbsup', 'heart', 'custom-emoji-name')"
+        ),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Removing Slack reaction",
+      done: "Remove Slack reaction",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "get_reactions",
+    description:
+      "Get all emoji reactions on a Slack message, including the emoji names and the users who reacted.",
+    schema: {
+      channel: z.string().describe("The channel where the message is located"),
+      timestamp: z
+        .string()
+        .describe("The timestamp (ts) of the message to get reactions for"),
+      full: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, returns the full list of users who reacted for each emoji (may be truncated otherwise for reactions with many users)"
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Getting Slack reactions",
+      done: "Get Slack reactions",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+] as const;
+
+// Server metadata for external consumption (e.g., by SDK).
+export const SLACK_PERSONAL_SERVER = {
+  serverInfo: {
+    name: "slack",
+    version: "1.0.0",
+    description:
+      "Slack tools for searching and posting messages. Works with your personal Slack account and supports all common Slack operations.",
+    authorization: {
+      provider: "slack_tools" as const,
+      supported_use_cases: ["personal_actions"] as const,
+    },
+    icon: "SlackLogo",
+    documentationUrl: "https://docs.ruby.ad/docs/slack-mcp",
+  },
+  tools: SLACK_PERSONAL_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

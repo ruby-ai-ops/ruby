@@ -1,0 +1,118 @@
+import { getStreamLLM } from "@app/lib/api/llm";
+import { isFreeUsageBlocked } from "@app/lib/api/llm/free_usage";
+import { getStreamEndpointFromLegacyModelId } from "@app/lib/api/llm/selectPreferredEndpointForWorkspace";
+import type { LLMTraceContext } from "@app/lib/api/llm/traces/types";
+import type { LLMStreamParameters } from "@app/lib/api/llm/types/options";
+import { getLlmCredentials } from "@app/lib/api/provider_credentials";
+import type { Authenticator } from "@app/lib/auth";
+import type { ModelProviderIdType } from "@app/lib/resources/storage/models/workspace";
+import type {
+  ModelIdType,
+  ReasoningEffort,
+} from "@app/types/assistant/models/types";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { z } from "zod";
+
+export interface LLMConfig {
+  functionCall?: string | null;
+  modelId: ModelIdType;
+  providerId: ModelProviderIdType;
+  reasoningEffort?: ReasoningEffort;
+  temperature?: number;
+  useCache?: boolean;
+  useStream?: boolean;
+}
+
+interface LLMOptions {
+  tracingRecords?: Record<string, string>;
+  context?: LLMTraceContext;
+  onRunId?: (runId: string) => Promise<void> | void;
+}
+
+// Zod schema to validate runActionStreamed output.
+const _LLMOutputSchema = z.object({
+  actions: z
+    .array(
+      z.object({
+        name: z.string(),
+        functionCallId: z.string().optional(),
+        arguments: z.record(z.any()),
+      })
+    )
+    .optional(),
+  generation: z.string().nullable().optional(),
+});
+
+export type LLMOutput = z.infer<typeof _LLMOutputSchema>;
+
+/**
+ * Temporary wrapper around assistant-v2-multi-actions-agent Ruby app to consolidate LLM interactions.
+ * This provides a unified interface for calling LLMs while we transition away from individual Ruby
+ * apps. Once we have the direct LLM router ready, this wrapper will be fully removed.
+ */
+export async function runMultiActionsAgent(
+  auth: Authenticator,
+  config: LLMConfig,
+  input: LLMStreamParameters,
+  options: LLMOptions = {}
+): Promise<Result<LLMOutput, Error>> {
+  const credentials = await getLlmCredentials(auth, {
+    skipEmbeddingApiKeyRequirement: true,
+  });
+
+  const endpoint = await getStreamEndpointFromLegacyModelId(
+    auth,
+    config.modelId
+  );
+  if (!endpoint) {
+    return new Err(new Error(`Model ${config.modelId} not supported`));
+  }
+
+  // Enforce the per-user daily free-usage cost cap before running a free call.
+  if (options.context && (await isFreeUsageBlocked(auth, options.context))) {
+    return new Err(
+      new Error("The daily free-usage limit has been reached for this user.")
+    );
+  }
+
+  const llm = await getStreamLLM(auth, {
+    credentials,
+    modelInfo: {
+      endpoint,
+      reasoningEffort: config.reasoningEffort,
+      temperature: config.temperature,
+    },
+    context: options.context,
+  });
+
+  if (!llm) {
+    // Should not happen
+    return new Err(new Error(`Model ${config.modelId} not supported`));
+  }
+
+  await options.onRunId?.(llm.getTraceId());
+
+  const actions: NonNullable<LLMOutput["actions"]> = [];
+  let generation = "";
+
+  for await (const event of llm.stream(input)) {
+    if (event.type === "error") {
+      return new Err(new Error(`LLM error: ${event.content.message}`));
+    }
+
+    if (event.type === "text_generated") {
+      generation += event.content.text;
+    }
+
+    if (event.type === "tool_call") {
+      actions.push({
+        name: event.content.name,
+        functionCallId: event.content.id,
+        arguments: event.content.arguments,
+      });
+    }
+  }
+
+  return new Ok({ actions, generation });
+}

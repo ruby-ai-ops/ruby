@@ -1,0 +1,4749 @@
+import { archiveAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
+import {
+  editUserMessage,
+  isConversationEventAllowedForAuth,
+  postNewContentFragment,
+  postUserMessage,
+  retryAgentMessage,
+  softDeleteAgentMessage,
+  softDeleteUserMessageAndReplies,
+  updateAgentMessageWithFinalStatus,
+} from "@app/lib/api/assistant/conversation";
+import { compactConversation } from "@app/lib/api/assistant/conversation/compaction";
+import { getContentFragmentBlob } from "@app/lib/api/assistant/conversation/content_fragment";
+import {
+  getConversation,
+  getLightConversation,
+} from "@app/lib/api/assistant/conversation/fetch";
+import { gracefullyStopAgentLoop } from "@app/lib/api/assistant/pubsub";
+import { publishAgentMessagesEvents } from "@app/lib/api/assistant/streaming/events";
+import * as attachmentsModule from "@app/lib/api/files/attachments";
+import { fetchLatestProjectContextFileContentFragment } from "@app/lib/api/projects/context";
+import { Authenticator } from "@app/lib/auth";
+import { serializeMention } from "@app/lib/mentions/format";
+import { GlobalAgentSettingsModel } from "@app/lib/models/agent/agent";
+import {
+  AgentMessageModel,
+  CompactionMessageModel,
+  ConversationModel,
+  MentionModel,
+  MessageModel,
+} from "@app/lib/models/agent/conversation";
+import { launchAgentLoopWorkflow } from "@app/temporal/agent_loop/client";
+import { AgentConfigurationFactory } from "@app/tests/utils/AgentConfigurationFactory";
+import { ConversationFactory } from "@app/tests/utils/ConversationFactory";
+import { DataSourceViewFactory } from "@app/tests/utils/DataSourceViewFactory";
+import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
+import { KeyFactory } from "@app/tests/utils/KeyFactory";
+import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
+import { ProjectFileFactory } from "@app/tests/utils/ProjectFileFactory";
+import { SpaceFactory } from "@app/tests/utils/SpaceFactory";
+import { UserFactory } from "@app/tests/utils/UserFactory";
+import { WorkspaceFactory } from "@app/tests/utils/WorkspaceFactory";
+import type {
+  ContentFragmentInputWithContentNode,
+  ContentFragmentInputWithFileIdType,
+} from "@app/types/api/assistant";
+import { isContentFragmentInputWithContentNode } from "@app/types/api/assistant";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
+import type {
+  AgentMessageType,
+  ConversationType,
+  UserMessageNewEvent,
+  UserMessageType,
+} from "@app/types/assistant/conversation";
+import {
+  ConversationError,
+  isUserMessageType,
+} from "@app/types/assistant/conversation";
+import type { AgentMention, MentionType } from "@app/types/assistant/mentions";
+import {
+  isRichAgentMention,
+  isRichUserMention,
+} from "@app/types/assistant/mentions";
+import { Ok } from "@app/types/shared/result";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// Mock the dependencies
+vi.mock("@app/temporal/agent_loop/client", () => ({
+  launchAgentLoopWorkflow: vi.fn(),
+  launchCompactionWorkflow: vi.fn(),
+}));
+
+vi.mock("@app/lib/api/assistant/streaming/events", () => ({
+  publishAgentMessagesEvents: vi.fn(),
+  publishConversationEvent: vi.fn(),
+  publishMessageEventsOnMessagePostOrEdit: vi.fn(),
+}));
+
+vi.mock("@app/lib/api/assistant/pubsub", () => ({
+  gracefullyStopAgentLoop: vi.fn(),
+}));
+
+vi.mock("@app/lib/api/assistant/conversation/content_fragment", () => ({
+  getContentFragmentBlob: vi.fn(),
+}));
+
+import { runOnRedis } from "@app/lib/api/redis";
+import { ConversationForkResource } from "@app/lib/resources/conversation_fork_resource";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { CreditResource } from "@app/lib/resources/credit_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+// Mock rateLimiter from the utils module
+import * as rateLimiterModule from "@app/lib/utils/rate_limiter";
+
+const TEST_PROGRAMMATIC_CREDIT_AMOUNT_MICRO_USD = 100_000_000;
+const TEST_CREDIT_START_DELAY_MS = 1000;
+const TEST_CREDIT_EXPIRATION_DAYS = 365;
+const TEST_CREDIT_EXPIRATION_DELAY_MS =
+  TEST_CREDIT_EXPIRATION_DAYS * 24 * 60 * 60 * 1000;
+const TEST_DAILY_USAGE_TTL_SECONDS = 60 * 60;
+
+async function fetchConversationResource(
+  auth: Authenticator,
+  sId: string
+): Promise<ConversationResource> {
+  const resource = await ConversationResource.fetchById(auth, sId);
+  if (!resource) {
+    throw new Error(`Failed to fetch conversation resource: ${sId}`);
+  }
+  return resource;
+}
+
+async function fetchRegularAutoGroup(
+  space: SpaceResource,
+  auth: Authenticator
+) {
+  const [group] = await space.fetchRegularAutoGroups(auth);
+  return group ?? null;
+}
+
+async function createActiveProgrammaticCredit(
+  auth: Authenticator
+): Promise<void> {
+  const credit = await CreditResource.makeNew(auth, {
+    type: "free",
+    initialAmountMicroUsd: TEST_PROGRAMMATIC_CREDIT_AMOUNT_MICRO_USD,
+    consumedAmountMicroUsd: 0,
+  });
+
+  const result = await credit.start(auth, {
+    startDate: new Date(Date.now() - TEST_CREDIT_START_DELAY_MS),
+    expirationDate: new Date(Date.now() + TEST_CREDIT_EXPIRATION_DELAY_MS),
+  });
+
+  if (result.isErr()) {
+    throw result.error;
+  }
+
+  const workspace = auth.getNonNullableWorkspace();
+  await runOnRedis({ origin: "daily_usage_tracking" }, async (redis) => {
+    await redis.set(`workspace-daily-usage:${workspace.sId}`, "0", {
+      EX: TEST_DAILY_USAGE_TTL_SECONDS,
+    });
+  });
+}
+
+describe("retryAgentMessage", () => {
+  let auth: Authenticator;
+  let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
+  let globalGroup: Awaited<
+    ReturnType<typeof createResourceTest>
+  >["globalGroup"];
+  let conversation: ConversationType;
+  let conversationResource: ConversationResource;
+  let agentConfig: LightAgentConfigurationType;
+  let agentMessage: AgentMessageType;
+
+  beforeEach(async () => {
+    // Setup test resources
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+    workspace = setup.workspace;
+    globalGroup = setup.globalGroup;
+
+    // Create agent configuration
+    agentConfig = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent",
+      description: "Test Agent Description",
+    });
+
+    // Create conversation with a user message and agent message
+    const conversationWithoutContent = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig.sId,
+      messagesCreatedAt: [new Date()],
+    });
+
+    // Fetch the full conversation to get the content
+    const fetchedConversationResult = await getConversation(
+      auth,
+      conversationWithoutContent.sId
+    );
+    if (fetchedConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    conversation = fetchedConversationResult.value;
+    conversationResource = await fetchConversationResource(
+      auth,
+      conversationWithoutContent.sId
+    );
+
+    // Find the agent message in the conversation
+    const agentMessages = conversation.content
+      .flat()
+      .filter((m) => m.type === "agent_message") as AgentMessageType[];
+    if (agentMessages.length === 0) {
+      throw new Error("No agent message found in conversation");
+    }
+    agentMessage = agentMessages[0];
+
+    // Verify parentMessageId is set (factory should have set it up)
+    if (!agentMessage.parentMessageId) {
+      throw new Error("Agent message parentMessageId is not set");
+    }
+
+    // Clear mocks before each test
+    vi.clearAllMocks();
+  });
+
+  it("should call launchAgentLoopWorkflow with correct arguments", async () => {
+    const userMessage = conversation.content
+      .flat()
+      .filter(isUserMessageType)
+      .find((m) => m.sId === agentMessage.parentMessageId);
+
+    expect(userMessage).toBeDefined();
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(launchAgentLoopWorkflow).toHaveBeenCalledTimes(1);
+
+    if (result.isOk()) {
+      const newAgentMessage = result.value;
+      expect(launchAgentLoopWorkflow).toHaveBeenCalledWith({
+        auth,
+        agentLoopArgs: {
+          agentMessageId: newAgentMessage.sId,
+          agentMessageVersion: newAgentMessage.version,
+          conversationId: conversation.sId,
+          conversationTitle: conversation.title,
+          userMessageId: userMessage!.sId,
+          userMessageVersion: userMessage!.version,
+          userMessageOrigin: userMessage!.context.origin,
+        },
+        startStep: 0,
+      });
+    }
+  });
+
+  it("should call publishAgentMessagesEvents with correct arguments", async () => {
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(publishAgentMessagesEvents).toHaveBeenCalledTimes(1);
+
+    const callArgs = vi.mocked(publishAgentMessagesEvents).mock.calls[0];
+    expect(callArgs[0].sId).toBe(conversation.sId);
+    expect(callArgs[1]).toHaveLength(1);
+
+    if (result.isOk()) {
+      const newAgentMessage = result.value;
+      expect(callArgs[1][0].sId).toBe(newAgentMessage.sId);
+      expect(callArgs[1][0].type).toBe("agent_message");
+      expect(callArgs[1][0].status).toBe("created");
+      expect(callArgs[1][0].version).toBe(newAgentMessage.version);
+      expect(callArgs[1][0].configuration.sId).toBe(
+        agentMessage.configuration.sId
+      );
+    }
+  });
+
+  it("should create a new agent message version", async () => {
+    const originalVersion = agentMessage.version;
+    const originalRank = agentMessage.rank;
+    const originalModelId = agentMessage.id;
+    const originalId = agentMessage.sId;
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const newAgentMessage = result.value;
+      // Rank should stay the same
+      expect(newAgentMessage.rank).toBe(originalRank);
+      // Version should be increased
+      expect(newAgentMessage.version).toBe(originalVersion + 1);
+      // ID should be different (both database id and sId)
+      expect(newAgentMessage.id).not.toBe(originalModelId);
+      expect(newAgentMessage.sId).not.toBe(originalId);
+      // Status should be created
+      expect(newAgentMessage.status).toBe("created");
+      // Configuration should remain the same
+      expect(newAgentMessage.configuration.sId).toBe(
+        agentMessage.configuration.sId
+      );
+    }
+  });
+
+  it("should return error when message is not found", async () => {
+    const nonExistentMessage: AgentMessageType = {
+      ...agentMessage,
+      id: 999999,
+      sId: "non-existent-message-id",
+    };
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: nonExistentMessage,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(404);
+      expect(result.error.api_error.type).toBe("message_not_found");
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    expect(publishAgentMessagesEvents).not.toHaveBeenCalled();
+  });
+
+  it("should return error when message was already retried", async () => {
+    // First retry
+    const firstRetry = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+    expect(firstRetry.isOk()).toBe(true);
+
+    // Clear mocks
+    vi.clearAllMocks();
+
+    // Try to retry again with the same original message
+    const secondRetry = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(secondRetry.isErr()).toBe(true);
+    if (secondRetry.isErr()) {
+      expect(secondRetry.error.status_code).toBe(400);
+      expect(secondRetry.error.api_error.type).toBe("invalid_request_error");
+      expect(secondRetry.error.api_error.message).toContain("already retried");
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    expect(publishAgentMessagesEvents).not.toHaveBeenCalled();
+  });
+
+  it("should preserve agent message properties in the retry", async () => {
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const newAgentMessage = result.value;
+      expect(newAgentMessage.rank).toBe(agentMessage.rank);
+      expect(newAgentMessage.parentMessageId).toBe(
+        agentMessage.parentMessageId
+      );
+      expect(newAgentMessage.parentAgentMessageId).toBe(
+        agentMessage.parentAgentMessageId
+      );
+      expect(newAgentMessage.configuration.sId).toBe(
+        agentMessage.configuration.sId
+      );
+      expect(newAgentMessage.skipToolsValidation).toBe(
+        agentMessage.skipToolsValidation
+      );
+    }
+  });
+
+  it("should clear hasError flag when conversation has error", async () => {
+    // Set hasError flag on conversation directly in the database
+    await ConversationModel.update(
+      { hasError: true },
+      {
+        where: {
+          id: conversation.id,
+          workspaceId: workspace.id,
+        },
+      }
+    );
+
+    // Refresh conversation resource
+    const refreshedConversationResource = await fetchConversationResource(
+      auth,
+      conversation.sId
+    );
+    expect(refreshedConversationResource.toJSON().hasError).toBe(true);
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource: refreshedConversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+
+    // Verify hasError was cleared
+    const finalConversationResult = await getConversation(
+      auth,
+      conversation.sId
+    );
+    if (finalConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    const finalConversation = finalConversationResult.value;
+    expect(finalConversation.hasError).toBe(false);
+  });
+
+  it("should return error when message limit is reached", async () => {
+    // Mock rateLimiter to return 0 (no remaining messages)
+    const rateLimiterSpy = vi
+      .spyOn(rateLimiterModule, "rateLimiter")
+      .mockResolvedValue(0);
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(403);
+      expect(result.error.api_error.type).toBe("rate_limit_error");
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    expect(publishAgentMessagesEvents).not.toHaveBeenCalled();
+
+    // Restore the mock for other tests
+    rateLimiterSpy.mockRestore();
+  });
+
+  it("should succeed when under the message limit", async () => {
+    // Mock rateLimiter to return positive value (messages remaining)
+    const rateLimiterSpy = vi
+      .spyOn(rateLimiterModule, "rateLimiter")
+      .mockResolvedValue(100);
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(launchAgentLoopWorkflow).toHaveBeenCalledTimes(1);
+
+    // Restore the mock for other tests
+    rateLimiterSpy.mockRestore();
+  });
+
+  it("should return error when parent user message is not found", async () => {
+    // Create a message with an invalid parentMessageId
+    const messageWithInvalidParent: AgentMessageType = {
+      ...agentMessage,
+      parentMessageId: "non-existent-parent-id",
+    };
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: messageWithInvalidParent,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(400);
+      expect(result.error.api_error.type).toBe("invalid_request_error");
+      expect(result.error.api_error.message).toContain("parent user message");
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    expect(publishAgentMessagesEvents).not.toHaveBeenCalled();
+  });
+
+  it("should use the parent user message context for rate limiting", async () => {
+    // Find the parent user message to get its context
+    const parentUserMessage = conversation.content
+      .flat()
+      .filter(isUserMessageType)
+      .find((m) => m.sId === agentMessage.parentMessageId);
+
+    expect(parentUserMessage).toBeDefined();
+    expect(parentUserMessage!.context).toBeDefined();
+
+    // Spy on rateLimiter to capture the calls
+    const rateLimiterSpy = vi
+      .spyOn(rateLimiterModule, "rateLimiter")
+      .mockResolvedValue(100);
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+
+    // Verify rateLimiter was called (it's called multiple times for different checks)
+    expect(rateLimiterSpy).toHaveBeenCalled();
+
+    // The rate limiter should have been called with keys that include the workspace
+    // This verifies the context is being used for rate limiting
+    const calls = rateLimiterSpy.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+
+    // Verify the parent user message's origin is preserved in the workflow call
+    expect(launchAgentLoopWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentLoopArgs: expect.objectContaining({
+          userMessageOrigin: parentUserMessage!.context.origin,
+        }),
+      })
+    );
+
+    rateLimiterSpy.mockRestore();
+  });
+
+  it("should use the actor user key for rate limiting", async () => {
+    const userId = auth.getNonNullableUser().id;
+    const rateLimiterSpy = vi
+      .spyOn(rateLimiterModule, "rateLimiter")
+      .mockResolvedValue(100);
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(rateLimiterSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: `workspace:${workspace.sId}:user:${userId}:post_user_message`,
+      })
+    );
+
+    rateLimiterSpy.mockRestore();
+  });
+
+  it("should use the actor api key for rate limiting", async () => {
+    const systemKey = await KeyFactory.system(globalGroup);
+    const systemKeyAuth = await Authenticator.fromKey(systemKey, workspace.sId);
+
+    const rateLimiterSpy = vi
+      .spyOn(rateLimiterModule, "rateLimiter")
+      .mockResolvedValue(0);
+
+    const result = await retryAgentMessage(systemKeyAuth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(403);
+      expect(result.error.api_error.type).toBe("rate_limit_error");
+    }
+
+    expect(rateLimiterSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: `workspace:${workspace.sId}:api_key:${systemKey.id}:post_user_message`,
+      })
+    );
+
+    rateLimiterSpy.mockRestore();
+  });
+
+  it("should use the actor user key when auth has both user and api key", async () => {
+    const systemKey = await KeyFactory.system(globalGroup);
+    const mixedAuth = auth.exchangeKey(systemKey.toAuthJSON());
+    const userId = auth.getNonNullableUser().id;
+    await createActiveProgrammaticCredit(mixedAuth);
+
+    const rateLimiterSpy = vi
+      .spyOn(rateLimiterModule, "rateLimiter")
+      .mockResolvedValue(100);
+
+    const result = await retryAgentMessage(mixedAuth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(rateLimiterSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: `workspace:${workspace.sId}:user:${userId}:post_user_message`,
+      })
+    );
+
+    rateLimiterSpy.mockRestore();
+  });
+
+  it("should return error when agent is no longer available", async () => {
+    // Archive the agent configuration
+    const archived = await archiveAgentConfiguration(auth, agentConfig.sId);
+    expect(archived).toBe(true);
+
+    // Try to retry the agent message
+    const result = await retryAgentMessage(auth, {
+      conversationResource,
+      message: agentMessage,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(400);
+      expect(result.error.api_error.type).toBe("invalid_request_error");
+      expect(result.error.api_error.message).toContain(
+        "agent is no longer available"
+      );
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    expect(publishAgentMessagesEvents).not.toHaveBeenCalled();
+  });
+
+  it("should return error when the parent user message has no author", async () => {
+    // A fresh conversation, so the authorless message is not steered into the
+    // pending path by the running agent message the factory sets up.
+    const emptyConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig.sId,
+      messagesCreatedAt: [],
+    });
+    const emptyConversationResource = await fetchConversationResource(
+      auth,
+      emptyConversation.sId
+    );
+
+    const user = auth.getNonNullableUser().toJSON();
+    const postResult = await postUserMessage(auth, {
+      conversationResource: emptyConversationResource,
+      content: "Posted by Ruby on the user's behalf",
+      mentions: [{ configurationId: agentConfig.sId }],
+      context: {
+        username: user.username,
+        timezone: "UTC",
+        fullName: user.fullName,
+        email: null,
+        profilePictureUrl: null,
+        origin: "system_activation",
+      },
+      skipToolsValidation: false,
+      skipRubyAutoMention: true,
+      doNotAssociateUser: true,
+    });
+    if (postResult.isErr()) {
+      throw new Error("Failed to post the authorless message");
+    }
+    expect(postResult.value.userMessage.user).toBeNull();
+    expect(postResult.value.agentMessages).toHaveLength(1);
+
+    vi.clearAllMocks();
+
+    const result = await retryAgentMessage(auth, {
+      conversationResource: emptyConversationResource,
+      message: postResult.value.agentMessages[0],
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(403);
+      expect(result.error.api_error.type).toBe("workspace_auth_error");
+      expect(result.error.api_error.message).toContain("cannot be retried");
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    expect(publishAgentMessagesEvents).not.toHaveBeenCalled();
+  });
+
+  describe("project conversation space restrictions", () => {
+    let projectSpace: Awaited<ReturnType<typeof SpaceFactory.project>>;
+    let anotherProjectSpace: Awaited<ReturnType<typeof SpaceFactory.project>>;
+    let projectConversation: ConversationType;
+    let projectConversationResource: ConversationResource;
+    let projectAgentMessage: AgentMessageType;
+    let agentWithDifferentSpace: LightAgentConfigurationType;
+
+    beforeEach(async () => {
+      // Create two project spaces
+      projectSpace = await SpaceFactory.project(workspace);
+      anotherProjectSpace = await SpaceFactory.project(workspace);
+
+      // Add user to both project spaces
+      const internalAdminAuth = await Authenticator.internalAdminForWorkspace(
+        workspace.sId
+      );
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const projectSpaceGroup = await fetchRegularAutoGroup(
+        projectSpace,
+        internalAdminAuth
+      );
+      const anotherProjectSpaceGroup = await fetchRegularAutoGroup(
+        anotherProjectSpace,
+        internalAdminAuth
+      );
+
+      if (projectSpaceGroup) {
+        const addRes = await projectSpaceGroup.dangerouslyAddMember(
+          internalAdminAuth,
+          {
+            user: userJson,
+          }
+        );
+        if (addRes.isErr()) {
+          throw new Error(
+            `Failed to add user to project space group: ${addRes.error.message}`
+          );
+        }
+
+        const secondProjectMember = await UserFactory.basic();
+        await MembershipFactory.associate(workspace, secondProjectMember, {
+          role: "user",
+        });
+        const addSecondRes = await projectSpaceGroup.dangerouslyAddMember(
+          internalAdminAuth,
+          { user: secondProjectMember.toJSON() }
+        );
+        if (addSecondRes.isErr()) {
+          throw new Error(
+            `Failed to add second user to project space group: ${addSecondRes.error.message}`
+          );
+        }
+      }
+
+      if (anotherProjectSpaceGroup) {
+        const addRes = await anotherProjectSpaceGroup.dangerouslyAddMember(
+          internalAdminAuth,
+          {
+            user: userJson,
+          }
+        );
+        if (addRes.isErr()) {
+          throw new Error(
+            `Failed to add user to another project space group: ${addRes.error.message}`
+          );
+        }
+      }
+
+      // Refresh auth to get updated groups
+      await auth.refresh();
+
+      // Create an agent that uses the other project space
+      agentWithDifferentSpace = await AgentConfigurationFactory.createTestAgent(
+        auth,
+        {
+          name: "Agent with Different Space",
+          description: "Agent that uses a different project space",
+        }
+      );
+
+      // Update the agent to use the other project space
+      // Manually update the requestedSpaceIds in the database (using model IDs)
+      const { AgentConfigurationModel } = await import(
+        "@app/lib/models/agent/agent"
+      );
+      await AgentConfigurationModel.update(
+        { requestedSpaceIds: [anotherProjectSpace.id] },
+        {
+          where: {
+            sId: agentWithDifferentSpace.sId,
+            workspaceId: workspace.id,
+          },
+          hooks: false,
+          silent: true,
+        }
+      );
+
+      // Create a conversation in the first project space with the agent that uses a different space
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentWithDifferentSpace.sId,
+          messagesCreatedAt: [new Date()],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      // Fetch the full conversation to get the content
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      projectConversation = fetchedConversationResult.value;
+      projectConversationResource = await fetchConversationResource(
+        auth,
+        conversationWithoutContent.sId
+      );
+
+      // Find the agent message in the conversation
+      const agentMessages = projectConversation.content
+        .flat()
+        .filter((m) => m.type === "agent_message") as AgentMessageType[];
+      if (agentMessages.length === 0) {
+        throw new Error("No agent message found in conversation");
+      }
+      projectAgentMessage = agentMessages[0];
+
+      vi.clearAllMocks();
+    });
+
+    it("should succeed when retrying an agent that is restricted by space usage in a project conversation", async () => {
+      // Agent messages already present in a Pod conversation were either usable
+      // at creation time or approved via validateAgentMention; retry must work.
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      const result = await retryAgentMessage(auth, {
+        conversationResource: projectConversationResource,
+        message: projectAgentMessage,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+      expect(publishAgentMessagesEvents).toHaveBeenCalled();
+
+      rateLimiterSpy.mockRestore();
+    });
+
+    it("should succeed when agent uses the same project space", async () => {
+      // Create an agent that uses the same project space as the conversation
+      const agentWithSameSpace =
+        await AgentConfigurationFactory.createTestAgent(auth, {
+          name: "Agent with Same Space",
+          description: "Agent that uses the same project space",
+        });
+
+      // Update the agent to use the same project space
+      const { AgentConfigurationModel } = await import(
+        "@app/lib/models/agent/agent"
+      );
+      await AgentConfigurationModel.update(
+        { requestedSpaceIds: [projectSpace.id] },
+        {
+          where: {
+            sId: agentWithSameSpace.sId,
+            workspaceId: workspace.id,
+          },
+          hooks: false,
+          silent: true,
+        }
+      );
+
+      // Create a conversation in the project space with this agent
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentWithSameSpace.sId,
+          messagesCreatedAt: [new Date()],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      const sameSpaceConversation = fetchedConversationResult.value;
+      const sameSpaceConversationResource = await fetchConversationResource(
+        auth,
+        conversationWithoutContent.sId
+      );
+
+      const agentMessages = sameSpaceConversation.content
+        .flat()
+        .filter((m) => m.type === "agent_message") as AgentMessageType[];
+      if (agentMessages.length === 0) {
+        throw new Error("No agent message found in conversation");
+      }
+      const sameSpaceAgentMessage = agentMessages[0];
+
+      // Mock rateLimiter to allow the retry
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      const result = await retryAgentMessage(auth, {
+        conversationResource: sameSpaceConversationResource,
+        message: sameSpaceAgentMessage,
+      });
+
+      expect(result.isOk()).toBe(true);
+      expect(launchAgentLoopWorkflow).toHaveBeenCalledTimes(1);
+
+      rateLimiterSpy.mockRestore();
+    });
+
+    it("should succeed when agent uses global space in project conversation", async () => {
+      // Create an agent that uses the global space
+      const agentWithGlobalSpace =
+        await AgentConfigurationFactory.createTestAgent(auth, {
+          name: "Agent with Global Space",
+          description: "Agent that uses the global space",
+        });
+
+      // Update the agent to use empty requestedSpaceIds (which means global)
+      const { AgentConfigurationModel } = await import(
+        "@app/lib/models/agent/agent"
+      );
+      await AgentConfigurationModel.update(
+        { requestedSpaceIds: [] },
+        {
+          where: {
+            sId: agentWithGlobalSpace.sId,
+            workspaceId: workspace.id,
+          },
+          hooks: false,
+          silent: true,
+        }
+      );
+
+      // Create a conversation in the project space with this agent
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentWithGlobalSpace.sId,
+          messagesCreatedAt: [new Date()],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      const globalSpaceConversation = fetchedConversationResult.value;
+      const globalSpaceConversationResource = await fetchConversationResource(
+        auth,
+        conversationWithoutContent.sId
+      );
+
+      const agentMessages = globalSpaceConversation.content
+        .flat()
+        .filter((m) => m.type === "agent_message") as AgentMessageType[];
+      if (agentMessages.length === 0) {
+        throw new Error("No agent message found in conversation");
+      }
+      const globalSpaceAgentMessage = agentMessages[0];
+
+      // Mock rateLimiter to allow the retry
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      const result = await retryAgentMessage(auth, {
+        conversationResource: globalSpaceConversationResource,
+        message: globalSpaceAgentMessage,
+      });
+
+      expect(result.isOk()).toBe(true);
+      expect(launchAgentLoopWorkflow).toHaveBeenCalledTimes(1);
+
+      rateLimiterSpy.mockRestore();
+    });
+  });
+});
+
+describe("softDeleteAgentMessage", () => {
+  let auth: Authenticator;
+  let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
+  let conversation: ConversationType;
+  let agentConfig: LightAgentConfigurationType;
+  let agentMessage: AgentMessageType;
+
+  beforeEach(async () => {
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+    workspace = setup.workspace;
+
+    agentConfig = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent",
+      description: "Test Agent Description",
+    });
+
+    // Create conversation with a user message and agent message
+    const conversationWithoutContent = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig.sId,
+      messagesCreatedAt: [new Date()],
+    });
+
+    // Fetch the full conversation to get the content
+    const fetchedConversationResult = await getConversation(
+      auth,
+      conversationWithoutContent.sId
+    );
+    if (fetchedConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    conversation = fetchedConversationResult.value;
+
+    // Find the agent message in the conversation
+    const agentMessages = conversation.content
+      .flat()
+      .filter((m) => m.type === "agent_message") as AgentMessageType[];
+    if (agentMessages.length === 0) {
+      throw new Error("No agent message found in conversation");
+    }
+    agentMessage = agentMessages[0];
+  });
+
+  it("allows the user who sent the parent message to soft delete the agent message", async () => {
+    expect(agentMessage.visibility).toBe("visible");
+
+    const conversationResource = await ConversationResource.fetchById(
+      auth,
+      conversation.sId
+    );
+    if (!conversationResource) {
+      throw new Error("Failed to fetch conversation resource");
+    }
+
+    const result = await softDeleteAgentMessage(auth, {
+      message: agentMessage,
+      conversation,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      expect(result.value.success).toBe(true);
+    }
+
+    // Verify the message was deleted by fetching the conversation again
+    const updatedConversationResult = await getConversation(
+      auth,
+      conversation.sId
+    );
+    if (updatedConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    const updatedConversation = updatedConversationResult.value;
+    const updatedAgentMessages = updatedConversation.content
+      .flat()
+      .filter((m) => m.type === "agent_message") as AgentMessageType[];
+    expect(updatedAgentMessages.length).toBe(2);
+    expect(updatedAgentMessages[0].rank).toBe(1);
+    expect(updatedAgentMessages[1].version).toBe(1);
+    expect(updatedAgentMessages[1].visibility).toBe("deleted");
+  });
+
+  it("returns message_not_found when the message does not exist", async () => {
+    const nonExistentMessage: AgentMessageType = {
+      ...agentMessage,
+      id: 999999,
+      sId: "non-existent-message-id",
+      parentMessageId: "non-existent-parent-message-id",
+      visibility: "visible",
+    };
+
+    const conversationResource = await ConversationResource.fetchById(
+      auth,
+      conversation.sId
+    );
+    if (!conversationResource) {
+      throw new Error("Failed to fetch conversation resource");
+    }
+
+    const result = await softDeleteAgentMessage(auth, {
+      message: nonExistentMessage,
+      conversation,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error).toBeInstanceOf(ConversationError);
+      expect(result.error.type).toBe("message_not_found");
+    }
+  });
+
+  it("returns message_deletion_not_authorized when a different user tries to delete the agent message", async () => {
+    const otherUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, otherUser, {
+      role: "user",
+    });
+
+    const otherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      otherUser.sId,
+      workspace.sId
+    );
+
+    // Fetch the conversation with the other user's auth to get the message
+    const fetchedConversationResult = await getConversation(
+      otherAuth,
+      conversation.sId
+    );
+    if (fetchedConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    const fetchedConversation = fetchedConversationResult.value;
+    const agentMessages = fetchedConversation.content
+      .flat()
+      .filter(
+        (m) => m.type === "agent_message" && m.sId === agentMessage.sId
+      ) as AgentMessageType[];
+    if (agentMessages.length === 0) {
+      throw new Error("Agent message not found in conversation");
+    }
+    const messageToDelete = agentMessages[0];
+
+    const fetchedConversationResource = await ConversationResource.fetchById(
+      otherAuth,
+      fetchedConversation.sId
+    );
+    if (!fetchedConversationResource) {
+      throw new Error("Failed to fetch conversation resource");
+    }
+
+    const result = await softDeleteAgentMessage(otherAuth, {
+      message: messageToDelete,
+      conversation: fetchedConversation,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error).toBeInstanceOf(ConversationError);
+      expect(result.error.type).toBe("message_deletion_not_authorized");
+    }
+  });
+});
+
+describe("softDeleteUserMessageAndReplies", () => {
+  let auth: Authenticator;
+  let conversation: ConversationType;
+  let conversationResource: ConversationResource;
+  let agentConfig: LightAgentConfigurationType;
+
+  beforeEach(async () => {
+    vi.mocked(gracefullyStopAgentLoop).mockClear();
+
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+
+    agentConfig = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent",
+      description: "Test Agent Description",
+    });
+
+    // Two user/agent pairs so we can exercise the mid-conversation cascade.
+    const conversationWithoutContent = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig.sId,
+      messagesCreatedAt: [new Date(), new Date()],
+    });
+
+    const fetchedConversationResult = await getConversation(
+      auth,
+      conversationWithoutContent.sId
+    );
+    if (fetchedConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    conversation = fetchedConversationResult.value;
+    conversationResource = await fetchConversationResource(
+      auth,
+      conversationWithoutContent.sId
+    );
+  });
+
+  it("cascade-deletes the agent message that replied to the deleted user message", async () => {
+    const firstUserMessage = conversation.content
+      .flat()
+      .find((m): m is UserMessageType => isUserMessageType(m));
+    if (!firstUserMessage) {
+      throw new Error("No user message found in conversation");
+    }
+
+    const result = await softDeleteUserMessageAndReplies(auth, {
+      message: firstUserMessage,
+      conversationResource,
+    });
+
+    expect(result.isOk()).toBe(true);
+
+    const updated = await getConversation(auth, conversation.sId);
+    if (updated.isErr()) {
+      throw new Error("Failed to refetch conversation");
+    }
+
+    // Rank 0: user v1 ("deleted" placeholder).
+    const rank0Latest =
+      updated.value.content[0][updated.value.content[0].length - 1];
+    expect(rank0Latest.type).toBe("user_message");
+    expect(rank0Latest.visibility).toBe("deleted");
+
+    // Rank 1: agent v1 (cascade-deleted placeholder).
+    const rank1Latest =
+      updated.value.content[1][updated.value.content[1].length - 1];
+    expect(rank1Latest.type).toBe("agent_message");
+    expect(rank1Latest.visibility).toBe("deleted");
+    expect(rank1Latest.version).toBe(1);
+
+    // Rank 2 (next turn's user) remains untouched.
+    const rank2Latest =
+      updated.value.content[2][updated.value.content[2].length - 1];
+    expect(rank2Latest.type).toBe("user_message");
+    expect(rank2Latest.visibility).toBe("visible");
+
+    // Rank 3 (next turn's agent) remains untouched.
+    const rank3Latest =
+      updated.value.content[3][updated.value.content[3].length - 1];
+    expect(rank3Latest.type).toBe("agent_message");
+    expect(rank3Latest.visibility).toBe("visible");
+  });
+
+  it("cascades to the trailing agent when the last user message is deleted", async () => {
+    const userMessages = conversation.content
+      .flat()
+      .filter((m): m is UserMessageType => isUserMessageType(m));
+    const lastUser = userMessages[userMessages.length - 1];
+
+    const result = await softDeleteUserMessageAndReplies(auth, {
+      message: lastUser,
+      conversationResource,
+    });
+    expect(result.isOk()).toBe(true);
+
+    const updated = await getConversation(auth, conversation.sId);
+    if (updated.isErr()) {
+      throw new Error("Failed to refetch conversation");
+    }
+
+    const rank3Latest =
+      updated.value.content[3][updated.value.content[3].length - 1];
+    expect(rank3Latest.visibility).toBe("deleted");
+  });
+
+  it("does not create a duplicate placeholder when the following agent is already deleted", async () => {
+    const agentMessages = conversation.content
+      .flat()
+      .filter((m): m is AgentMessageType => m.type === "agent_message");
+    const firstAgent = agentMessages[0];
+
+    // Pre-delete the agent directly.
+    const preDelete = await softDeleteAgentMessage(auth, {
+      message: firstAgent,
+      conversation: conversationResource.toJSON(),
+    });
+    expect(preDelete.isOk()).toBe(true);
+
+    // Refetch so we have the updated conversation with the existing v1 placeholder.
+    const refetched = await getConversation(auth, conversation.sId);
+    if (refetched.isErr()) {
+      throw new Error("Failed to refetch conversation");
+    }
+    const refetchedConversation = refetched.value;
+    const refetchedConversationResource = await fetchConversationResource(
+      auth,
+      conversation.sId
+    );
+    const firstUser = refetchedConversation.content
+      .flat()
+      .find((m): m is UserMessageType => isUserMessageType(m));
+    if (!firstUser) {
+      throw new Error("No user message found");
+    }
+
+    // content[1] is the agent rank; pre-delete has given it v0 + v1 placeholder (2 versions).
+    const agentRankVersionsBefore = refetchedConversation.content[1].length;
+
+    const result = await softDeleteUserMessageAndReplies(auth, {
+      message: firstUser,
+      conversationResource: refetchedConversationResource,
+    });
+    expect(result.isOk()).toBe(true);
+
+    const updated = await getConversation(auth, conversation.sId);
+    if (updated.isErr()) {
+      throw new Error("Failed to refetch conversation");
+    }
+
+    // Cascade should not add a v2 placeholder when the orphan is already deleted.
+    expect(updated.value.content[1].length).toBe(agentRankVersionsBefore);
+  });
+
+  it("signals gracefullyStopAgentLoop when the cascaded agent reply is still running", async () => {
+    // ConversationFactory creates agent messages with status "created" by default, which
+    // simulates a mid-stream reply being orphaned by the user-message delete.
+    const firstUserMessage = conversation.content
+      .flat()
+      .find((m): m is UserMessageType => isUserMessageType(m));
+    if (!firstUserMessage) {
+      throw new Error("No user message found in conversation");
+    }
+    const firstAgentMessage = conversation.content
+      .flat()
+      .find((m): m is AgentMessageType => m.type === "agent_message");
+    if (!firstAgentMessage) {
+      throw new Error("No agent message found in conversation");
+    }
+
+    const result = await softDeleteUserMessageAndReplies(auth, {
+      message: firstUserMessage,
+      conversationResource,
+    });
+    expect(result.isOk()).toBe(true);
+
+    expect(gracefullyStopAgentLoop).toHaveBeenCalledWith(expect.anything(), {
+      messageIds: [firstAgentMessage.sId],
+      conversationId: conversation.sId,
+    });
+  });
+
+  it("starts a follow-up after deleting the previous running reply", async () => {
+    const oneTurnConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig.sId,
+      messagesCreatedAt: [new Date()],
+    });
+    const fetched = await getConversation(auth, oneTurnConversation.sId);
+    if (fetched.isErr()) {
+      throw fetched.error;
+    }
+    const userMessage = fetched.value.content
+      .flat()
+      .find((message): message is UserMessageType =>
+        isUserMessageType(message)
+      );
+    if (!userMessage) {
+      throw new Error("No user message found in conversation");
+    }
+
+    const deleted = await softDeleteUserMessageAndReplies(auth, {
+      message: userMessage,
+      conversationResource: await fetchConversationResource(
+        auth,
+        oneTurnConversation.sId
+      ),
+    });
+    expect(deleted.isOk()).toBe(true);
+
+    const afterDelete = await getConversation(auth, oneTurnConversation.sId);
+    if (afterDelete.isErr()) {
+      throw afterDelete.error;
+    }
+
+    const user = auth.getNonNullableUser().toJSON();
+    const followUp = await postUserMessage(auth, {
+      conversationResource: await fetchConversationResource(
+        auth,
+        oneTurnConversation.sId
+      ),
+      content: "Follow-up",
+      mentions: [{ configurationId: agentConfig.sId }],
+      context: {
+        username: user.username,
+        timezone: "UTC",
+        fullName: user.fullName,
+        email: user.email,
+        profilePictureUrl: user.image,
+        origin: "web",
+      },
+      skipToolsValidation: false,
+    });
+
+    expect(followUp.isOk()).toBe(true);
+    if (followUp.isOk()) {
+      expect(followUp.value.userMessage.visibility).toBe("visible");
+      expect(followUp.value.agentMessages).toHaveLength(1);
+    }
+  });
+
+  it("does not signal gracefullyStopAgentLoop when the cascaded agent reply already finished", async () => {
+    const firstUserMessage = conversation.content
+      .flat()
+      .find((m): m is UserMessageType => isUserMessageType(m));
+    if (!firstUserMessage) {
+      throw new Error("No user message found in conversation");
+    }
+
+    // Flip the first agent's status away from "created" before cascading.
+    await AgentMessageModel.update(
+      { status: "succeeded" },
+      {
+        where: {
+          id: conversation.content
+            .flat()
+            .filter((m): m is AgentMessageType => m.type === "agent_message")
+            .map((m) => m.agentMessageId),
+        },
+      }
+    );
+    const refetched = await getConversation(auth, conversation.sId);
+    if (refetched.isErr()) {
+      throw new Error("Failed to refetch conversation");
+    }
+
+    const result = await softDeleteUserMessageAndReplies(auth, {
+      message: firstUserMessage,
+      conversationResource: await fetchConversationResource(
+        auth,
+        conversation.sId
+      ),
+    });
+    expect(result.isOk()).toBe(true);
+
+    expect(gracefullyStopAgentLoop).not.toHaveBeenCalled();
+  });
+});
+
+describe("postUserMessage", () => {
+  let auth: Authenticator;
+  let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
+  let globalGroup: Awaited<
+    ReturnType<typeof createResourceTest>
+  >["globalGroup"];
+  let globalSpace: Awaited<
+    ReturnType<typeof createResourceTest>
+  >["globalSpace"];
+  let conversation: ConversationType;
+  let conversationResource: ConversationResource;
+  let agentConfig1: LightAgentConfigurationType;
+
+  beforeEach(async () => {
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+    workspace = setup.workspace;
+    globalGroup = setup.globalGroup;
+    globalSpace = setup.globalSpace;
+
+    agentConfig1 = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent 1",
+      description: "First test agent",
+    });
+    await createActiveProgrammaticCredit(auth);
+
+    const conversationWithoutContent = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig1.sId,
+      messagesCreatedAt: [],
+      visibility: "unlisted",
+    });
+
+    const fetchedConversationResult = await getConversation(
+      auth,
+      conversationWithoutContent.sId
+    );
+    if (fetchedConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    conversation = fetchedConversationResult.value;
+    conversationResource = await fetchConversationResource(
+      auth,
+      conversationWithoutContent.sId
+    );
+
+    vi.clearAllMocks();
+  });
+
+  it("should reject programmatic messages when programmatic credits are exhausted", async () => {
+    const setup = await createResourceTest({});
+    const noCreditAuth = setup.authenticator;
+    const noCreditAgent = await AgentConfigurationFactory.createTestAgent(
+      noCreditAuth,
+      {
+        name: "No Credit Test Agent",
+        description: "No Credit Test Agent Description",
+      }
+    );
+    const conversationWithoutContent = await ConversationFactory.create(
+      noCreditAuth,
+      {
+        agentConfigurationId: noCreditAgent.sId,
+        messagesCreatedAt: [],
+        visibility: "unlisted",
+      }
+    );
+    const fetchedConversationResult = await getConversation(
+      noCreditAuth,
+      conversationWithoutContent.sId
+    );
+    if (fetchedConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+
+    const noCreditWorkspace = noCreditAuth.getNonNullableWorkspace();
+    const rateLimiterSpy = vi
+      .spyOn(rateLimiterModule, "rateLimiter")
+      .mockResolvedValue(100);
+    const noCreditUser = noCreditAuth.getNonNullableUser();
+    const noCreditUserJson = noCreditUser.toJSON();
+
+    const result = await postUserMessage(noCreditAuth, {
+      conversationResource: await fetchConversationResource(
+        noCreditAuth,
+        fetchedConversationResult.value.sId
+      ),
+      content: "Programmatic message",
+      mentions: [],
+      context: {
+        username: noCreditUserJson.username,
+        timezone: "UTC",
+        fullName: noCreditUserJson.fullName,
+        email: noCreditUserJson.email,
+        profilePictureUrl: noCreditUserJson.image,
+        origin: "triggered_programmatic",
+      },
+      skipToolsValidation: false,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(403);
+      expect(result.error.api_error.type).toBe("credits_exhausted");
+      expect(result.error.api_error.message).toContain(
+        "programmatic usage credits"
+      );
+    }
+    expect(rateLimiterSpy).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: `workspace:${noCreditWorkspace.sId}:programmatic_usage_rate_limit`,
+      })
+    );
+
+    rateLimiterSpy.mockRestore();
+  });
+
+  it("should reject mentions of a retired global agent", async () => {
+    const user = auth.getNonNullableUser();
+    const userJson = user.toJSON();
+
+    const result = await postUserMessage(auth, {
+      conversationResource: await fetchConversationResource(
+        auth,
+        conversation.sId
+      ),
+      content: `Hello @claude-4-sonnet`,
+      mentions: [
+        {
+          configurationId: GLOBAL_AGENTS_SID.CLAUDE_4_SONNET,
+        } satisfies AgentMention,
+      ],
+      context: {
+        username: userJson.username,
+        timezone: "UTC",
+        fullName: userJson.fullName,
+        email: userJson.email,
+        profilePictureUrl: userJson.image,
+        origin: "zapier",
+      },
+      skipToolsValidation: false,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(400);
+      expect(result.error.api_error.type).toBe("agent_inaccessible");
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+  });
+
+  it("should preserve agent mentions in the returned userMessage", async () => {
+    const mentions: MentionType[] = [
+      {
+        configurationId: agentConfig1.sId,
+      } satisfies AgentMention,
+    ];
+
+    const user = auth.getNonNullableUser();
+    const userJson = user.toJSON();
+
+    const result = await postUserMessage(auth, {
+      conversationResource,
+      content: `Hello @${agentConfig1.name}`,
+      mentions,
+      context: {
+        username: userJson.username,
+        timezone: "UTC",
+        fullName: userJson.fullName,
+        email: userJson.email,
+        profilePictureUrl: userJson.image,
+        origin: "web",
+      },
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has mentions
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(1);
+
+      // Verify userMessage has richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(1);
+
+      // Verify all mentions are agent mentions
+      const agentMentions = userMessage.richMentions.filter(isRichAgentMention);
+      expect(agentMentions.length).toBe(1);
+
+      // Verify the agent configuration matches
+      expect(agentMentions[0].id).toBe(agentConfig1.sId);
+
+      // Verify mentions are stored in the database
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionsInDb.length).toBe(1);
+      expect(mentionsInDb[0].agentConfigurationId).toBe(agentConfig1.sId);
+
+      // Verify launchAgentLoopWorkflow was called for agent mentions
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+    }
+  });
+
+  it("should preserve user mentions in the returned userMessage", async () => {
+    const mentionedUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, mentionedUser, {
+      role: "user",
+    });
+
+    const mentions: MentionType[] = [
+      {
+        type: "user",
+        userId: mentionedUser.sId.toString(),
+      },
+    ];
+
+    const user = auth.getNonNullableUser();
+    const userJson = user.toJSON();
+
+    const result = await postUserMessage(auth, {
+      conversationResource,
+      content: `Hello @${mentionedUser.username}`,
+      mentions,
+      context: {
+        username: userJson.username,
+        timezone: "UTC",
+        fullName: userJson.fullName,
+        email: userJson.email,
+        profilePictureUrl: userJson.image,
+        origin: "web",
+      },
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has mentions
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(1);
+
+      // Verify userMessage has richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(1);
+
+      // Verify it's a user mention
+      const userMention = userMessage.richMentions[0];
+      expect(isRichUserMention(userMention)).toBe(true);
+      if (isRichUserMention(userMention)) {
+        expect(userMention.id).toBe(mentionedUser.sId);
+      }
+
+      // Verify mention is stored in the database
+      const mentionInDb = await MentionModel.findOne({
+        where: {
+          messageId: userMessage.id,
+          userId: mentionedUser.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionInDb).not.toBeNull();
+
+      // Verify launchAgentLoopWorkflow was NOT called (no agent mentions)
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    }
+  });
+
+  it("should preserve both user and agent mentions in the returned userMessage", async () => {
+    const mentionedUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, mentionedUser, {
+      role: "user",
+    });
+
+    const mentions: MentionType[] = [
+      {
+        type: "user",
+        userId: mentionedUser.sId.toString(),
+      },
+      {
+        configurationId: agentConfig1.sId,
+      } satisfies AgentMention,
+    ];
+
+    const user = auth.getNonNullableUser();
+    const userJson = user.toJSON();
+
+    const result = await postUserMessage(auth, {
+      conversationResource,
+      content: `Hello @${mentionedUser.username} and @${agentConfig1.name}`,
+      mentions,
+      context: {
+        username: userJson.username,
+        timezone: "UTC",
+        fullName: userJson.fullName,
+        email: userJson.email,
+        profilePictureUrl: userJson.image,
+        origin: "web",
+      },
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has mentions
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(2);
+
+      // Verify userMessage has richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(2);
+
+      // Verify we have both user and agent mentions
+      const userMentions = userMessage.richMentions.filter(isRichUserMention);
+      const agentMentions = userMessage.richMentions.filter(isRichAgentMention);
+      expect(userMentions.length).toBe(1);
+      expect(agentMentions.length).toBe(1);
+
+      // Verify the user mention
+      expect(userMentions[0].id).toBe(mentionedUser.sId);
+
+      // Verify the agent mention
+      expect(agentMentions[0].id).toBe(agentConfig1.sId);
+
+      // Verify mentions are stored in the database
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionsInDb.length).toBe(2);
+
+      // Verify launchAgentLoopWorkflow was called for agent mentions
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+    }
+  });
+
+  it("should preserve empty mentions array when no mentions are provided", async () => {
+    const user = auth.getNonNullableUser();
+    const userJson = user.toJSON();
+
+    const result = await postUserMessage(auth, {
+      conversationResource,
+      content: "Hello without mentions",
+      mentions: [],
+      context: {
+        username: userJson.username,
+        timezone: "UTC",
+        fullName: userJson.fullName,
+        email: userJson.email,
+        profilePictureUrl: userJson.image,
+        origin: "api",
+      },
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has empty mentions
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(0);
+
+      // Verify userMessage has empty richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(0);
+
+      // Verify launchAgentLoopWorkflow was NOT called (no agent mentions)
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    }
+  });
+
+  describe("sub-agent message authorship", () => {
+    // Posts a message and returns the sId of the agent message it spawned, which is the origin
+    // message a sub-agent run points at.
+    async function postRootMessage({
+      doNotAssociateUser,
+    }: {
+      doNotAssociateUser: boolean;
+    }): Promise<string> {
+      const userJson = auth.getNonNullableUser().toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversationResource,
+        content: `${serializeMention(agentConfig1)} root message`,
+        mentions: [{ configurationId: agentConfig1.sId }],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: doNotAssociateUser ? null : userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: doNotAssociateUser ? "system_activation" : "web",
+        },
+        skipToolsValidation: false,
+        skipRubyAutoMention: true,
+        doNotAssociateUser,
+      });
+      if (result.isErr()) {
+        throw new Error("Failed to post the root message");
+      }
+      expect(result.value.userMessage.user).toEqual(
+        doNotAssociateUser
+          ? null
+          : expect.objectContaining({ sId: userJson.sId })
+      );
+
+      return result.value.agentMessages[0].sId;
+    }
+
+    // Sub-agent runs happen in their own conversation, so the message lands there.
+    async function postSubAgentMessage(
+      originMessageId: string
+    ): Promise<UserMessageType> {
+      const childConversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agentConfig1.sId,
+        messagesCreatedAt: [],
+        visibility: "unlisted",
+      });
+
+      const result = await postUserMessage(auth, {
+        conversationResource: await fetchConversationResource(
+          auth,
+          childConversation.sId
+        ),
+        content: `${serializeMention(agentConfig1)} sub-agent query`,
+        mentions: [{ configurationId: agentConfig1.sId }],
+        context: {
+          username: agentConfig1.name,
+          timezone: "UTC",
+          fullName: `@${agentConfig1.name}`,
+          email: null,
+          profilePictureUrl: null,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+        skipRubyAutoMention: true,
+        agenticMessageData: { type: "run_agent", originMessageId },
+      });
+      if (result.isErr()) {
+        throw new Error("Failed to post the sub-agent message");
+      }
+
+      return result.value.userMessage;
+    }
+
+    it("leaves the sub-agent message without an author when the run it answers has none", async () => {
+      const originMessageId = await postRootMessage({
+        doNotAssociateUser: true,
+      });
+
+      const subAgentMessage = await postSubAgentMessage(originMessageId);
+
+      expect(subAgentMessage.user).toBeNull();
+    });
+
+    it("keeps the author on the sub-agent message of an authored run", async () => {
+      const originMessageId = await postRootMessage({
+        doNotAssociateUser: false,
+      });
+
+      const subAgentMessage = await postSubAgentMessage(originMessageId);
+
+      expect(subAgentMessage.user?.sId).toBe(
+        auth.getNonNullableUser().toJSON().sId
+      );
+    });
+  });
+
+  describe("compaction blocking", () => {
+    it("should reject posting when a compaction message is running", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      // Insert a compaction message with status "created" into the conversation.
+      const compactionMessageRow = await CompactionMessageModel.create({
+        status: "created",
+        content: null,
+        conversationId: conversation.id,
+        workspaceId: workspace.id,
+      });
+      await MessageModel.create({
+        sId: generateRandomModelSId(),
+        rank: 0,
+        conversationId: conversation.id,
+        compactionMessageId: compactionMessageRow.id,
+        workspaceId: workspace.id,
+      });
+
+      // Re-fetch the conversation so its content includes the compaction message.
+      const fetched = await getConversation(auth, conversation.sId);
+      expect(fetched.isOk()).toBe(true);
+      if (fetched.isErr()) {
+        return;
+      }
+
+      const result = await postUserMessage(auth, {
+        conversationResource: await fetchConversationResource(
+          auth,
+          fetched.value.sId
+        ),
+        content: "should be blocked",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.status_code).toBe(409);
+        expect(result.error.api_error.message).toContain("compacted");
+      }
+    });
+
+    it("should allow posting when a compaction message has succeeded", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      // Insert a completed compaction message into the conversation.
+      const compactionMessageRow = await CompactionMessageModel.create({
+        status: "succeeded",
+        content: "compacted summary",
+        conversationId: conversation.id,
+        workspaceId: workspace.id,
+      });
+      await MessageModel.create({
+        sId: generateRandomModelSId(),
+        rank: 0,
+        conversationId: conversation.id,
+        compactionMessageId: compactionMessageRow.id,
+        workspaceId: workspace.id,
+      });
+
+      // Re-fetch the conversation so its content includes the compaction message.
+      const fetched = await getConversation(auth, conversation.sId);
+      expect(fetched.isOk()).toBe(true);
+      if (fetched.isErr()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      const result = await postUserMessage(auth, {
+        conversationResource: await fetchConversationResource(
+          auth,
+          fetched.value.sId
+        ),
+        content: "should be allowed",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      rateLimiterSpy.mockRestore();
+
+      expect(result.isOk()).toBe(true);
+    });
+  });
+
+  describe("auto-mention global @ruby when posting without mentions", () => {
+    const expectedRubyMentionPrefix = serializeMention({
+      id: GLOBAL_AGENTS_SID.RUBY,
+      type: "agent",
+      label: "ruby",
+    });
+
+    it("prepends serialized @ruby and persists the mention for web origin", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversationResource,
+        content: "Hello without explicit mentions",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+
+      const { userMessage } = result.value;
+      expect(userMessage.content).toBe(
+        `${expectedRubyMentionPrefix} Hello without explicit mentions`
+      );
+
+      expect(userMessage.mentions?.length).toBe(1);
+      expect(userMessage.mentions?.[0]).toEqual({
+        configurationId: GLOBAL_AGENTS_SID.RUBY,
+      });
+
+      const agentMentions = userMessage.richMentions.filter(isRichAgentMention);
+      expect(agentMentions.some((m) => m.id === GLOBAL_AGENTS_SID.RUBY)).toBe(
+        true
+      );
+
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(
+        mentionsInDb.some(
+          (m) => m.agentConfigurationId === GLOBAL_AGENTS_SID.RUBY
+        )
+      ).toBe(true);
+
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+    });
+
+    it("auto-mentions @ruby again when only the same user already posted", async () => {
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const firstFromUser = await postUserMessage(auth, {
+        conversationResource,
+        content: "first from A",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(firstFromUser.isOk()).toBe(true);
+      if (!firstFromUser.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      expect(firstFromUser.value.userMessage.content).toBe(
+        `${expectedRubyMentionPrefix} first from A`
+      );
+      expect(firstFromUser.value.userMessage.mentions?.length ?? 0).toBe(1);
+
+      const afterFirst = await getConversation(auth, conversation.sId);
+      expect(afterFirst.isOk()).toBe(true);
+      if (!afterFirst.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      vi.clearAllMocks();
+
+      const secondFromUser = await postUserMessage(auth, {
+        conversationResource: await fetchConversationResource(
+          auth,
+          afterFirst.value.sId
+        ),
+        content: "second from A",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      rateLimiterSpy.mockRestore();
+
+      expect(secondFromUser.isOk()).toBe(true);
+      if (!secondFromUser.isOk()) {
+        return;
+      }
+
+      // With no other humans present, we should still prepend @ruby.
+      expect(secondFromUser.value.userMessage.content).toBe(
+        `${expectedRubyMentionPrefix} second from A`
+      );
+      expect(secondFromUser.value.userMessage.mentions?.length ?? 0).toBe(1);
+
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: secondFromUser.value.userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(
+        mentionsInDb.some(
+          (m) => m.agentConfigurationId === GLOBAL_AGENTS_SID.RUBY
+        )
+      ).toBe(true);
+
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+    });
+
+    it("prepends serialized @ruby for extension origin", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversationResource,
+        content: "From extension",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "extension",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+
+      expect(result.value.userMessage.content).toBe(
+        `${expectedRubyMentionPrefix} From extension`
+      );
+      expect(result.value.userMessage.mentions?.[0]).toEqual({
+        configurationId: GLOBAL_AGENTS_SID.RUBY,
+      });
+    });
+
+    it("does not auto-mention @ruby when global @ruby agent is disabled for the workspace", async () => {
+      await GlobalAgentSettingsModel.create({
+        workspaceId: workspace.id,
+        agentId: GLOBAL_AGENTS_SID.RUBY,
+        status: "disabled_by_admin",
+      });
+
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversationResource,
+        content: "Hello without explicit mentions",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+
+      expect(result.value.userMessage.content).toBe(
+        "Hello without explicit mentions"
+      );
+      expect(result.value.userMessage.mentions?.length ?? 0).toBe(0);
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: result.value.userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionsInDb).toHaveLength(0);
+
+      // Even if @ruby is disabled, we should still be able to explicitly call
+      // other active agents.
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      let resultWithOtherAgent:
+        | Awaited<ReturnType<typeof postUserMessage>>
+        | undefined;
+      try {
+        const afterFirstPostResult = await getConversation(
+          auth,
+          conversation.sId
+        );
+        expect(afterFirstPostResult.isOk()).toBe(true);
+
+        if (!afterFirstPostResult.isOk()) {
+          return;
+        }
+
+        resultWithOtherAgent = await postUserMessage(auth, {
+          conversationResource: await fetchConversationResource(
+            auth,
+            afterFirstPostResult.value.sId
+          ),
+          content: "Hello with explicit agent mention",
+          mentions: [
+            {
+              configurationId: agentConfig1.sId,
+            } satisfies AgentMention,
+          ],
+          context: {
+            username: userJson.username,
+            timezone: "UTC",
+            fullName: userJson.fullName,
+            email: userJson.email,
+            profilePictureUrl: userJson.image,
+            origin: "web",
+          },
+          skipToolsValidation: false,
+        });
+      } finally {
+        rateLimiterSpy.mockRestore();
+      }
+
+      expect(resultWithOtherAgent?.isOk()).toBe(true);
+      if (!resultWithOtherAgent || !resultWithOtherAgent.isOk()) {
+        return;
+      }
+
+      expect(resultWithOtherAgent.value.userMessage.content).toBe(
+        "Hello with explicit agent mention"
+      );
+      expect(resultWithOtherAgent.value.userMessage.mentions?.length ?? 0).toBe(
+        1
+      );
+      expect(resultWithOtherAgent.value.userMessage.mentions?.[0]).toEqual({
+        configurationId: agentConfig1.sId,
+      });
+
+      const agentMentions =
+        resultWithOtherAgent.value.userMessage.richMentions.filter(
+          isRichAgentMention
+        );
+      expect(agentMentions.some((m) => m.id === agentConfig1.sId)).toBe(true);
+      expect(agentMentions.some((m) => m.id === GLOBAL_AGENTS_SID.RUBY)).toBe(
+        false
+      );
+
+      expect(launchAgentLoopWorkflow).toHaveBeenCalledTimes(1);
+
+      const otherAgentMentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: resultWithOtherAgent.value.userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(
+        otherAgentMentionsInDb.some(
+          (m) => m.agentConfigurationId === agentConfig1.sId
+        )
+      ).toBe(true);
+      expect(
+        otherAgentMentionsInDb.some(
+          (m) => m.agentConfigurationId === GLOBAL_AGENTS_SID.RUBY
+        )
+      ).toBe(false);
+    });
+
+    it("does not auto-mention @ruby for api origin", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversationResource,
+        content: "API message",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "api",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+
+      expect(result.value.userMessage.content).toBe("API message");
+      expect(result.value.userMessage.mentions?.length ?? 0).toBe(0);
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    });
+
+    it("does not auto-mention @ruby when two distinct users already posted", async () => {
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      const userA = auth.getNonNullableUser();
+      const userAJson = userA.toJSON();
+
+      const userBModel = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, userBModel, {
+        role: "user",
+      });
+      const authB = await Authenticator.fromUserIdAndWorkspaceId(
+        userBModel.sId,
+        workspace.sId
+      );
+      const userB = authB.getNonNullableUser();
+      const userBJson = userB.toJSON();
+
+      const firstFromA = await postUserMessage(auth, {
+        conversationResource,
+        content: "first from A",
+        mentions: [],
+        context: {
+          username: userAJson.username,
+          timezone: "UTC",
+          fullName: userAJson.fullName,
+          email: userAJson.email,
+          profilePictureUrl: userAJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+      expect(firstFromA.isOk()).toBe(true);
+      if (!firstFromA.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      const afterA = await getConversation(auth, conversation.sId);
+      expect(afterA.isOk()).toBe(true);
+      if (afterA.isErr()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      const firstFromB = await postUserMessage(authB, {
+        conversationResource: await fetchConversationResource(
+          authB,
+          afterA.value.sId
+        ),
+        content: "first from B",
+        mentions: [],
+        context: {
+          username: userBJson.username,
+          timezone: "UTC",
+          fullName: userBJson.fullName,
+          email: userBJson.email,
+          profilePictureUrl: userBJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+      expect(firstFromB.isOk()).toBe(true);
+      if (!firstFromB.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      const afterB = await getConversation(auth, conversation.sId);
+      expect(afterB.isOk()).toBe(true);
+      if (afterB.isErr()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      vi.clearAllMocks();
+
+      const secondFromA = await postUserMessage(auth, {
+        conversationResource: await fetchConversationResource(
+          auth,
+          afterB.value.sId
+        ),
+        content: "second from A",
+        mentions: [],
+        context: {
+          username: userAJson.username,
+          timezone: "UTC",
+          fullName: userAJson.fullName,
+          email: userAJson.email,
+          profilePictureUrl: userAJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(secondFromA.isOk()).toBe(true);
+      if (!secondFromA.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      expect(secondFromA.value.userMessage.content).toBe("second from A");
+      expect(secondFromA.value.userMessage.mentions?.length ?? 0).toBe(0);
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+
+      rateLimiterSpy.mockRestore();
+    });
+  });
+
+  describe("project conversation member constraint", () => {
+    let projectSpace: Awaited<ReturnType<typeof SpaceFactory.project>>;
+    let nonMemberAuth: Authenticator;
+    let memberAuth: Authenticator;
+    let projectConversationResource: ConversationResource;
+
+    beforeEach(async () => {
+      // Create a project space
+      projectSpace = await SpaceFactory.project(workspace);
+
+      // Create a non-member user
+      const nonMemberUser = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, nonMemberUser, {
+        role: "user",
+      });
+      nonMemberAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        nonMemberUser.sId,
+        workspace.sId
+      );
+
+      // Create a member user (the auth user from the parent describe block)
+      const memberUser = auth.getNonNullableUser();
+      const internalAdminAuth = await Authenticator.internalAdminForWorkspace(
+        workspace.sId
+      );
+
+      // Add member user to the project space group
+      const projectSpaceGroup = await fetchRegularAutoGroup(
+        projectSpace,
+        internalAdminAuth
+      );
+      if (projectSpaceGroup) {
+        const addRes = await projectSpaceGroup.dangerouslyAddMember(
+          internalAdminAuth,
+          {
+            user: memberUser.toJSON(),
+          }
+        );
+        if (addRes.isErr()) {
+          throw new Error(
+            `Failed to add user to project space group: ${addRes.error.message}`
+          );
+        }
+      }
+
+      // Refresh auth to get updated groups
+      await auth.refresh();
+      memberAuth = auth;
+
+      // Create a conversation in the project space
+      const conversationWithoutContent = await ConversationFactory.create(
+        memberAuth,
+        {
+          agentConfigurationId: agentConfig1.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        memberAuth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      projectConversationResource = await fetchConversationResource(
+        memberAuth,
+        conversationWithoutContent.sId
+      );
+    });
+
+    it("should allow posting a message when user is a project member", async () => {
+      const user = memberAuth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(memberAuth, {
+        conversationResource: projectConversationResource,
+        content: "Hello from a project member",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "api",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.userMessage.content).toBe(
+          "Hello from a project member"
+        );
+      }
+    });
+
+    it("should reject posting a message when user is not a project member", async () => {
+      const user = nonMemberAuth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(nonMemberAuth, {
+        conversationResource: projectConversationResource,
+        content: "Hello from a non-member",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.status_code).toBe(403);
+        expect(result.error.api_error.type).toBe("workspace_auth_error");
+        expect(result.error.api_error.message).toBe(
+          "You are not a member of the Pod."
+        );
+      }
+    });
+
+    it("should reject posting a message without an auth user to a restricted Pod even when user association is disabled", async () => {
+      expect(await projectSpace.isRestricted(auth)).toBe(true);
+
+      const apiKey = await KeyFactory.regular(globalGroup);
+      const apiKeyAuth = await Authenticator.fromKey(apiKey, workspace.sId);
+
+      expect(apiKeyAuth.user()).toBeNull();
+      const restrictedPod = await SpaceResource.fetchById(
+        apiKeyAuth,
+        projectSpace.sId
+      );
+      expect(restrictedPod).not.toBeNull();
+      expect(await restrictedPod?.isRestricted(apiKeyAuth)).toBe(true);
+
+      const result = await postUserMessage(apiKeyAuth, {
+        conversationResource: projectConversationResource,
+        content: "Hello from an integration",
+        mentions: [],
+        context: {
+          username: "slack-bot",
+          timezone: "UTC",
+          fullName: null,
+          email: null,
+          profilePictureUrl: null,
+          origin: "slack",
+        },
+        doNotAssociateUser: true,
+        skipToolsValidation: false,
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.status_code).toBe(403);
+        expect(result.error.api_error.type).toBe("workspace_auth_error");
+        expect(result.error.api_error.message).toBe(
+          "You are not a member of the Pod."
+        );
+      }
+    });
+
+    it("should allow posting a message without an auth user to an open Pod when user association is disabled", async () => {
+      await SpaceFactory.attachGroup(
+        projectSpace,
+        globalGroup,
+        "project_viewer"
+      );
+
+      const apiKey = await KeyFactory.regular(globalGroup);
+      const apiKeyAuth = await Authenticator.fromKey(apiKey, workspace.sId);
+
+      expect(apiKeyAuth.user()).toBeNull();
+      const openPod = await SpaceResource.fetchById(
+        apiKeyAuth,
+        projectSpace.sId
+      );
+      expect(openPod).not.toBeNull();
+      expect(await openPod?.isRestricted(apiKeyAuth)).toBe(false);
+
+      const result = await postUserMessage(apiKeyAuth, {
+        conversationResource: projectConversationResource,
+        content: "Hello from an integration",
+        mentions: [],
+        context: {
+          username: "slack-bot",
+          timezone: "UTC",
+          fullName: null,
+          email: null,
+          profilePictureUrl: null,
+          origin: "slack",
+        },
+        doNotAssociateUser: true,
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.userMessage.content).toBe(
+          "Hello from an integration"
+        );
+        expect(result.value.userMessage.user).toBeNull();
+      }
+    });
+
+    it("should reject posting a message without an auth user to an open Pod when user association is enabled", async () => {
+      await SpaceFactory.attachGroup(
+        projectSpace,
+        globalGroup,
+        "project_viewer"
+      );
+
+      const apiKey = await KeyFactory.regular(globalGroup);
+      const apiKeyAuth = await Authenticator.fromKey(apiKey, workspace.sId);
+
+      expect(apiKeyAuth.user()).toBeNull();
+      const openPod = await SpaceResource.fetchById(
+        apiKeyAuth,
+        projectSpace.sId
+      );
+      expect(openPod).not.toBeNull();
+      expect(await openPod?.isRestricted(apiKeyAuth)).toBe(false);
+
+      const result = await postUserMessage(apiKeyAuth, {
+        conversationResource: projectConversationResource,
+        content: "Hello from an integration",
+        mentions: [],
+        context: {
+          username: "slack-bot",
+          timezone: "UTC",
+          fullName: null,
+          email: null,
+          profilePictureUrl: null,
+          origin: "slack",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.status_code).toBe(403);
+        expect(result.error.api_error.type).toBe("workspace_auth_error");
+        expect(result.error.api_error.message).toBe(
+          "You are not a member of the Pod."
+        );
+      }
+    });
+
+    it("should return 404 when project space does not exist", async () => {
+      const user = memberAuth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const fetchPodSpy = vi
+        .spyOn(SpaceResource, "fetchById")
+        .mockResolvedValue(null);
+
+      const result = await postUserMessage(memberAuth, {
+        conversationResource: projectConversationResource,
+        content: "Hello",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      fetchPodSpy.mockRestore();
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.status_code).toBe(404);
+        expect(result.error.api_error.type).toBe("space_not_found");
+        expect(result.error.api_error.message).toBe("Pod not found");
+      }
+    });
+
+    it("should allow posting to non-project conversations without member check", async () => {
+      // Create a regular (non-project) conversation
+      const regularConversationWithoutContent =
+        await ConversationFactory.create(memberAuth, {
+          agentConfigurationId: agentConfig1.sId,
+          messagesCreatedAt: [],
+          // No spaceId means it's not a project conversation
+        });
+
+      const fetchedConversationResult = await getConversation(
+        memberAuth,
+        regularConversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      const regularConversation = fetchedConversationResult.value;
+
+      // Non-member should be able to post to non-project conversations
+      const user = nonMemberAuth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(nonMemberAuth, {
+        conversationResource: await fetchConversationResource(
+          nonMemberAuth,
+          regularConversation.sId
+        ),
+        content: "Hello from a non-member to regular conversation",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "api",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.userMessage.content).toBe(
+          "Hello from a non-member to regular conversation"
+        );
+      }
+    });
+  });
+
+  describe("API key auth on workspace with privateConversationUrlsByDefault", () => {
+    it("should succeed when posting via API key on a workspace with private URLs by default", async () => {
+      // Enable private conversation URLs by default for the workspace.
+      // Testing API key auth (which has no user), even though the message was just posted.
+      const updateResult = await WorkspaceResource.updateMetadata(
+        workspace.id,
+        {
+          privateConversationUrlsByDefault: true,
+        }
+      );
+      expect(updateResult.isOk()).toBe(true);
+
+      const apiKey = await KeyFactory.regular(globalGroup);
+      const apiKeyAuth = await Authenticator.fromKey(apiKey, workspace.sId);
+
+      const result = await postUserMessage(apiKeyAuth, {
+        conversationResource,
+        content: "Hello from API key",
+        mentions: [],
+        context: {
+          username: "api-user",
+          timezone: "UTC",
+          fullName: null,
+          email: null,
+          profilePictureUrl: null,
+          origin: "api",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.userMessage.content).toBe("Hello from API key");
+      }
+    });
+  });
+
+  describe("restricted agent in project conversation", () => {
+    let projectSpace: Awaited<ReturnType<typeof SpaceFactory.project>>;
+    let anotherProjectSpace: Awaited<ReturnType<typeof SpaceFactory.project>>;
+    let projectConversation: ConversationType;
+    let projectConversationResource: ConversationResource;
+    let agentWithDifferentSpace: LightAgentConfigurationType;
+
+    async function setupProjectWithRestrictedAgent({
+      messagesCreatedAt = [new Date()],
+    }: {
+      messagesCreatedAt?: Date[];
+    } = {}) {
+      projectSpace = await SpaceFactory.project(workspace);
+      anotherProjectSpace = await SpaceFactory.project(workspace);
+
+      const internalAdminAuth = await Authenticator.internalAdminForWorkspace(
+        workspace.sId
+      );
+      const user = auth.getNonNullableUser();
+
+      const projectSpaceGroup = await fetchRegularAutoGroup(
+        projectSpace,
+        internalAdminAuth
+      );
+      const anotherProjectSpaceGroup = await fetchRegularAutoGroup(
+        anotherProjectSpace,
+        internalAdminAuth
+      );
+
+      if (projectSpaceGroup) {
+        const addRes = await projectSpaceGroup.dangerouslyAddMember(
+          internalAdminAuth,
+          { user: user.toJSON() }
+        );
+        if (addRes.isErr()) {
+          throw new Error(
+            `Failed to add user to project space: ${addRes.error.message}`
+          );
+        }
+
+        const secondProjectMember = await UserFactory.basic();
+        await MembershipFactory.associate(workspace, secondProjectMember, {
+          role: "user",
+        });
+        const addSecondRes = await projectSpaceGroup.dangerouslyAddMember(
+          internalAdminAuth,
+          { user: secondProjectMember.toJSON() }
+        );
+        if (addSecondRes.isErr()) {
+          throw new Error(
+            `Failed to add second user to project space: ${addSecondRes.error.message}`
+          );
+        }
+      }
+      if (anotherProjectSpaceGroup) {
+        const addRes = await anotherProjectSpaceGroup.dangerouslyAddMember(
+          internalAdminAuth,
+          { user: user.toJSON() }
+        );
+        if (addRes.isErr()) {
+          throw new Error(
+            `Failed to add user to another project space: ${addRes.error.message}`
+          );
+        }
+      }
+
+      await auth.refresh();
+
+      agentWithDifferentSpace = await AgentConfigurationFactory.createTestAgent(
+        auth,
+        {
+          name: "Restricted Space Agent",
+          description: "Agent that uses a different project space",
+        }
+      );
+
+      const { AgentConfigurationModel } = await import(
+        "@app/lib/models/agent/agent"
+      );
+      await AgentConfigurationModel.update(
+        { requestedSpaceIds: [anotherProjectSpace.id] },
+        {
+          where: {
+            sId: agentWithDifferentSpace.sId,
+            workspaceId: workspace.id,
+          },
+          hooks: false,
+          silent: true,
+        }
+      );
+
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentWithDifferentSpace.sId,
+          messagesCreatedAt,
+          spaceId: projectSpace.id,
+        }
+      );
+
+      // Mark factory-created agent messages as succeeded so steering doesn't
+      // treat them as a running agent loop.
+      await AgentMessageModel.update(
+        { status: "succeeded" },
+        { where: { workspaceId: workspace.id, status: "created" } }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      projectConversation = fetchedConversationResult.value;
+      projectConversationResource = await fetchConversationResource(
+        auth,
+        conversationWithoutContent.sId
+      );
+    }
+
+    describe("when posting with a restricted agent", () => {
+      beforeEach(async () => {
+        await setupProjectWithRestrictedAgent();
+      });
+
+      it("records a restricted mention without an agent message", async () => {
+        const user = auth.getNonNullableUser();
+        const userJson = user.toJSON();
+
+        const rateLimiterSpy = vi
+          .spyOn(rateLimiterModule, "rateLimiter")
+          .mockResolvedValue(100);
+
+        const result = await postUserMessage(auth, {
+          conversationResource: projectConversationResource,
+          content: `Hello @${agentWithDifferentSpace.name}`,
+          mentions: [{ configurationId: agentWithDifferentSpace.sId }],
+          context: {
+            username: userJson.username,
+            timezone: "UTC",
+            fullName: userJson.fullName,
+            email: userJson.email,
+            profilePictureUrl: userJson.image,
+            origin: "web",
+          },
+          skipToolsValidation: false,
+        });
+
+        expect(result.isOk()).toBe(true);
+        if (!result.isOk()) {
+          return;
+        }
+
+        expect(result.value.agentMessages.length).toBe(0);
+
+        const mentionRow = await MentionModel.findOne({
+          where: {
+            messageId: result.value.userMessage.id,
+            workspaceId: workspace.id,
+            agentConfigurationId: agentWithDifferentSpace.sId,
+          },
+        });
+        expect(mentionRow).not.toBeNull();
+        expect(mentionRow!.status).toBe("agent_restricted_by_space_usage");
+
+        const agentMentions =
+          result.value.userMessage.richMentions.filter(isRichAgentMention);
+        expect(agentMentions).toHaveLength(1);
+        expect(agentMentions[0].status).toBe("agent_restricted_by_space_usage");
+
+        rateLimiterSpy.mockRestore();
+      });
+    });
+
+    describe("with empty conversation", () => {
+      beforeEach(async () => {
+        await setupProjectWithRestrictedAgent({ messagesCreatedAt: [] });
+      });
+
+      it("records a restricted mention when first message mentions a restricted agent", async () => {
+        const user = auth.getNonNullableUser();
+        const userJson = user.toJSON();
+
+        const rateLimiterSpy = vi
+          .spyOn(rateLimiterModule, "rateLimiter")
+          .mockResolvedValue(100);
+
+        expect(projectConversation.content.length).toBe(0);
+
+        const result = await postUserMessage(auth, {
+          conversationResource: projectConversationResource,
+          content: `Hello @${agentWithDifferentSpace.name}`,
+          mentions: [{ configurationId: agentWithDifferentSpace.sId }],
+          context: {
+            username: userJson.username,
+            timezone: "UTC",
+            fullName: userJson.fullName,
+            email: userJson.email,
+            profilePictureUrl: userJson.image,
+            origin: "web",
+          },
+          skipToolsValidation: false,
+        });
+
+        expect(result.isOk()).toBe(true);
+        if (!result.isOk()) {
+          return;
+        }
+
+        expect(result.value.agentMessages.length).toBe(0);
+
+        const mentionRow = await MentionModel.findOne({
+          where: {
+            messageId: result.value.userMessage.id,
+            workspaceId: workspace.id,
+            agentConfigurationId: agentWithDifferentSpace.sId,
+          },
+        });
+        expect(mentionRow).not.toBeNull();
+        expect(mentionRow!.status).toBe("agent_restricted_by_space_usage");
+
+        rateLimiterSpy.mockRestore();
+      });
+
+      it("records a restricted mention when the conversation only contains content fragments", async () => {
+        const user = auth.getNonNullableUser();
+        const userJson = user.toJSON();
+        const dsViewInGlobalSpace = await DataSourceViewFactory.folder(
+          workspace,
+          globalSpace,
+          user
+        );
+
+        const blob = new Ok({
+          contentType: "text/plain" as const,
+          fileId: null,
+          nodeId: "task-instructions-node-id",
+          nodeDataSourceViewId: dsViewInGlobalSpace.id,
+          nodeType: "document" as const,
+          sourceUrl: null,
+          textBytes: null,
+          title: "How to complete the task",
+        });
+        vi.mocked(getContentFragmentBlob).mockResolvedValueOnce(blob);
+
+        expect(projectConversation.content.length).toBe(0);
+
+        const contentFragmentRes = await postNewContentFragment(
+          auth,
+          projectConversation,
+          {
+            title: "How to complete the task",
+            nodeId: "task-instructions-node-id",
+            nodeDataSourceViewId: dsViewInGlobalSpace.sId,
+          },
+          null
+        );
+        expect(contentFragmentRes.isOk()).toBe(true);
+
+        const conversationWithContentFragmentRes = await getConversation(
+          auth,
+          projectConversation.sId
+        );
+        expect(conversationWithContentFragmentRes.isOk()).toBe(true);
+        if (conversationWithContentFragmentRes.isErr()) {
+          return;
+        }
+        projectConversation = conversationWithContentFragmentRes.value;
+        expect(projectConversation.content.length).toBe(1);
+
+        const rateLimiterSpy = vi
+          .spyOn(rateLimiterModule, "rateLimiter")
+          .mockResolvedValue(100);
+
+        const result = await postUserMessage(auth, {
+          conversationResource: projectConversationResource,
+          content: `Hello @${agentWithDifferentSpace.name}`,
+          mentions: [{ configurationId: agentWithDifferentSpace.sId }],
+          context: {
+            username: userJson.username,
+            timezone: "UTC",
+            fullName: userJson.fullName,
+            email: userJson.email,
+            profilePictureUrl: userJson.image,
+            origin: "web",
+          },
+          skipToolsValidation: false,
+        });
+
+        expect(result.isOk()).toBe(true);
+        if (!result.isOk()) {
+          return;
+        }
+
+        expect(result.value.agentMessages.length).toBe(0);
+
+        const mentionRow = await MentionModel.findOne({
+          where: {
+            messageId: result.value.userMessage.id,
+            workspaceId: workspace.id,
+            agentConfigurationId: agentWithDifferentSpace.sId,
+          },
+        });
+        expect(mentionRow).not.toBeNull();
+        expect(mentionRow!.status).toBe("agent_restricted_by_space_usage");
+
+        rateLimiterSpy.mockRestore();
+      });
+    });
+  });
+});
+
+describe("compactConversation", () => {
+  let auth: Authenticator;
+  let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
+  let conversation: ConversationType;
+  let agentConfig: LightAgentConfigurationType;
+
+  beforeEach(async () => {
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+    workspace = setup.workspace;
+
+    agentConfig = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent",
+      description: "Test Agent Description",
+    });
+
+    const conversationWithoutContent = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig.sId,
+      messagesCreatedAt: [],
+    });
+
+    const fetched = await getConversation(auth, conversationWithoutContent.sId);
+    if (fetched.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    conversation = fetched.value;
+
+    vi.clearAllMocks();
+  });
+
+  it("should create a compaction message on an idle conversation", async () => {
+    const result = await compactConversation(auth, {
+      conversation,
+      model: { providerId: "anthropic", modelId: "claude-haiku-4-5-20251001" },
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isErr()) {
+      return;
+    }
+
+    const { compactionMessage } = result.value;
+    expect(compactionMessage.status).toBe("created");
+    expect(compactionMessage.content).toBeNull();
+  });
+
+  it("should reject compaction when the last message is already a compaction message", async () => {
+    const compactionMessageRow = await CompactionMessageModel.create({
+      status: "succeeded",
+      content: "compacted summary",
+      conversationId: conversation.id,
+      workspaceId: workspace.id,
+    });
+    await MessageModel.create({
+      sId: generateRandomModelSId(),
+      rank: 0,
+      conversationId: conversation.id,
+      compactionMessageId: compactionMessageRow.id,
+      workspaceId: workspace.id,
+    });
+
+    const fetched = await getConversation(auth, conversation.sId);
+    expect(fetched.isOk()).toBe(true);
+    if (fetched.isErr()) {
+      return;
+    }
+
+    const result = await compactConversation(auth, {
+      conversation: fetched.value,
+      model: { providerId: "anthropic", modelId: "claude-haiku-4-5-20251001" },
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(409);
+    }
+  });
+
+  it("should reject compaction when an agent message is running", async () => {
+    // Insert a user message then an agent message with status "created" (running).
+    const { messageRow: userMessageRow } =
+      await ConversationFactory.createUserMessage({
+        auth,
+        workspace,
+        conversation,
+        content: "hello",
+      });
+    const agentMessageRow = await AgentMessageModel.create({
+      status: "created",
+      agentConfigurationId: agentConfig.sId,
+      agentConfigurationVersion: 0,
+      conversationId: conversation.id,
+      workspaceId: workspace.id,
+      skipToolsValidation: false,
+    });
+    await MessageModel.create({
+      sId: generateRandomModelSId(),
+      rank: 1,
+      conversationId: conversation.id,
+      parentId: userMessageRow.id,
+      agentMessageId: agentMessageRow.id,
+      workspaceId: workspace.id,
+    });
+
+    // Re-fetch so the conversation content includes the running agent message.
+    const fetched = await getConversation(auth, conversation.sId);
+    expect(fetched.isOk()).toBe(true);
+    if (fetched.isErr()) {
+      return;
+    }
+
+    const result = await compactConversation(auth, {
+      conversation: fetched.value,
+      model: { providerId: "anthropic", modelId: "claude-haiku-4-5-20251001" },
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(409);
+    }
+  });
+});
+
+describe("editUserMessage", () => {
+  let auth: Authenticator;
+  let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
+  let globalGroup: Awaited<
+    ReturnType<typeof createResourceTest>
+  >["globalGroup"];
+  let conversationResource: ConversationResource;
+  let agentConfig1: LightAgentConfigurationType;
+  let agentConfig2: LightAgentConfigurationType;
+  let originalUserMessage: UserMessageType;
+
+  beforeEach(async () => {
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+    workspace = setup.workspace;
+    globalGroup = setup.globalGroup;
+
+    agentConfig1 = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent 1",
+      description: "First test agent",
+    });
+
+    agentConfig2 = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent 2",
+      description: "Second test agent",
+    });
+
+    const conversationWithoutContent = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig1.sId,
+      messagesCreatedAt: [],
+      visibility: "unlisted",
+    });
+
+    conversationResource = await fetchConversationResource(
+      auth,
+      conversationWithoutContent.sId
+    );
+
+    // Create an original user message without mentions or agent replies.
+    const user = auth.getNonNullableUser();
+    const userJson = user.toJSON();
+
+    const postResult = await postUserMessage(auth, {
+      conversationResource,
+      content: "Original message without mentions",
+      mentions: [],
+      context: {
+        username: userJson.username,
+        timezone: "UTC",
+        fullName: userJson.fullName,
+        email: userJson.email,
+        profilePictureUrl: userJson.image,
+        origin: "web",
+      },
+      skipToolsValidation: false,
+      skipRubyAutoMention: true,
+    });
+
+    if (postResult.isErr()) {
+      throw new Error("Failed to create original message");
+    }
+    originalUserMessage = postResult.value.userMessage;
+
+    vi.clearAllMocks();
+  });
+
+  it("should preserve the agent mention when editing a user message", async () => {
+    const mentions: MentionType[] = [
+      {
+        configurationId: agentConfig1.sId,
+      } satisfies AgentMention,
+    ];
+
+    const result = await editUserMessage(auth, {
+      conversationResource,
+      message: originalUserMessage,
+      content: `Edited message with @${agentConfig1.name}`,
+      mentions,
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has mentions
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(1);
+
+      // Verify userMessage has richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(1);
+
+      // Verify the mention is an agent mention for the right agent
+      const agentMentions = userMessage.richMentions.filter(isRichAgentMention);
+      expect(agentMentions.length).toBe(1);
+      expect(agentMentions[0].id).toBe(agentConfig1.sId);
+
+      // Verify the mention is stored in the database for the edited message
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionsInDb.length).toBe(1);
+      expect(mentionsInDb[0].agentConfigurationId).toBe(agentConfig1.sId);
+
+      // Verify launchAgentLoopWorkflow was called for the agent mention
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+    }
+  });
+
+  it("should create a single agent message when editing with several agents", async () => {
+    const mentions: MentionType[] = [
+      {
+        configurationId: agentConfig1.sId,
+      } satisfies AgentMention,
+      {
+        configurationId: agentConfig2.sId,
+      } satisfies AgentMention,
+    ];
+
+    const result = await editUserMessage(auth, {
+      conversationResource,
+      message: originalUserMessage,
+      content: `Edited message with @${agentConfig1.name} and @${agentConfig2.name}`,
+      mentions,
+      skipToolsValidation: false,
+    });
+
+    // The edit is still accepted, only the first mentioned agent answers.
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage, agentMessages } = result.value;
+
+      expect(agentMessages.length).toBe(1);
+
+      const agentMentions = userMessage.richMentions.filter(isRichAgentMention);
+      expect(agentMentions.length).toBe(1);
+      expect(agentMentions[0].id).toBe(agentMessages[0].configuration.sId);
+    }
+  });
+
+  it("should not create agent messages when editing a message that already has agent replies", async () => {
+    // An agent reply after the original message means the edit creates no agent messages.
+    const user = auth.getNonNullableUser();
+    const userJson = user.toJSON();
+    const postResult = await postUserMessage(auth, {
+      conversationResource,
+      content: `Hello @${agentConfig1.name}`,
+      mentions: [{ configurationId: agentConfig1.sId } satisfies AgentMention],
+      context: {
+        username: userJson.username,
+        timezone: "UTC",
+        fullName: userJson.fullName,
+        email: userJson.email,
+        profilePictureUrl: userJson.image,
+        origin: "web",
+      },
+      skipToolsValidation: false,
+      skipRubyAutoMention: true,
+    });
+    expect(postResult.isOk()).toBe(true);
+    vi.clearAllMocks();
+
+    const result = await editUserMessage(auth, {
+      conversationResource,
+      message: originalUserMessage,
+      content: `Edited message with @${agentConfig1.name} and @${agentConfig2.name}`,
+      mentions: [
+        { configurationId: agentConfig1.sId } satisfies AgentMention,
+        { configurationId: agentConfig2.sId } satisfies AgentMention,
+      ],
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      expect(result.value.agentMessages.length).toBe(0);
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+  });
+
+  it("should preserve user mentions when editing a user message", async () => {
+    const mentionedUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, mentionedUser, {
+      role: "user",
+    });
+
+    const mentions: MentionType[] = [
+      {
+        type: "user",
+        userId: mentionedUser.sId.toString(),
+      },
+    ];
+
+    const result = await editUserMessage(auth, {
+      conversationResource,
+      message: originalUserMessage,
+      content: `Edited message with @${mentionedUser.username}`,
+      mentions,
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has mentions
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(1);
+
+      // Verify userMessage has richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(1);
+
+      // Verify it's a user mention
+      const userMention = userMessage.richMentions[0];
+      expect(isRichUserMention(userMention)).toBe(true);
+      if (isRichUserMention(userMention)) {
+        expect(userMention.id).toBe(mentionedUser.sId);
+      }
+
+      // Verify mention is stored in the database
+      const mentionInDb = await MentionModel.findOne({
+        where: {
+          messageId: userMessage.id,
+          userId: mentionedUser.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionInDb).not.toBeNull();
+
+      // Verify launchAgentLoopWorkflow was NOT called (no agent mentions)
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    }
+  });
+
+  it("should preserve both user and agent mentions when editing a user message", async () => {
+    const mentionedUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, mentionedUser, {
+      role: "user",
+    });
+
+    const mentions: MentionType[] = [
+      {
+        type: "user",
+        userId: mentionedUser.sId.toString(),
+      },
+      {
+        configurationId: agentConfig2.sId,
+      } satisfies AgentMention,
+    ];
+
+    const result = await editUserMessage(auth, {
+      conversationResource,
+      message: originalUserMessage,
+      content: `Edited message with @${mentionedUser.username} and @${agentConfig2.name}`,
+      mentions,
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has mentions
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(2);
+
+      // Verify userMessage has richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(2);
+
+      // Verify we have both user and agent mentions
+      const userMentions = userMessage.richMentions.filter(isRichUserMention);
+      const agentMentions = userMessage.richMentions.filter(isRichAgentMention);
+      expect(userMentions.length).toBe(1);
+      expect(agentMentions.length).toBe(1);
+
+      // Verify the user mention
+      expect(userMentions[0].id).toBe(mentionedUser.sId);
+
+      // Verify the agent mention
+      expect(agentMentions[0].id).toBe(agentConfig2.sId);
+
+      // Verify mentions are stored in the database
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionsInDb.length).toBe(2);
+
+      // Verify launchAgentLoopWorkflow was called for agent mentions
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+    }
+  });
+
+  it("should preserve empty mentions array when editing removes all mentions", async () => {
+    const result = await editUserMessage(auth, {
+      conversationResource,
+      message: originalUserMessage,
+      content: "Edited message without mentions",
+      mentions: [],
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has empty mentions
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(0);
+
+      // Verify userMessage has empty richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(0);
+
+      // Verify no mentions are stored in the database for the edited message
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionsInDb.length).toBe(0);
+
+      // Verify launchAgentLoopWorkflow was NOT called (no agent mentions)
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    }
+  });
+
+  it("should preserve mentions when editing a message without agent mentions (only user mentions)", async () => {
+    const mentionedUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, mentionedUser, {
+      role: "user",
+    });
+
+    const mentions: MentionType[] = [
+      {
+        type: "user",
+        userId: mentionedUser.sId.toString(),
+      },
+    ];
+
+    const result = await editUserMessage(auth, {
+      conversationResource,
+      message: originalUserMessage,
+      content: `Edited message with only user mention @${mentionedUser.username}`,
+      mentions,
+      skipToolsValidation: false,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      const { userMessage } = result.value;
+
+      // Verify userMessage has mentions (this is the critical test - ensuring mentions aren't lost)
+      expect(userMessage).not.toBeNull();
+      expect(userMessage.mentions).toBeDefined();
+      expect(userMessage.mentions.length).toBe(1);
+
+      // Verify userMessage has richMentions
+      expect(userMessage.richMentions).toBeDefined();
+      expect(userMessage.richMentions.length).toBe(1);
+
+      // Verify it's a user mention
+      const userMention = userMessage.richMentions[0];
+      expect(isRichUserMention(userMention)).toBe(true);
+      if (isRichUserMention(userMention)) {
+        expect(userMention.id).toBe(mentionedUser.sId);
+      }
+
+      // Verify launchAgentLoopWorkflow was NOT called (no agent mentions)
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    }
+  });
+
+  it("should refuse to edit a message that has no author, including under API key auth", async () => {
+    const user = auth.getNonNullableUser().toJSON();
+    const postResult = await postUserMessage(auth, {
+      conversationResource,
+      content: "Posted by Ruby on the user's behalf",
+      mentions: [],
+      context: {
+        username: user.username,
+        timezone: "UTC",
+        fullName: user.fullName,
+        email: null,
+        profilePictureUrl: null,
+        origin: "system_activation",
+      },
+      skipToolsValidation: false,
+      skipRubyAutoMention: true,
+      doNotAssociateUser: true,
+    });
+    if (postResult.isErr()) {
+      throw new Error("Failed to post the authorless message");
+    }
+    const authorlessMessage = postResult.value.userMessage;
+    expect(authorlessMessage.user).toBeNull();
+
+    // A key has no `auth.user()` either, so the author check used to compare
+    // null against null and let this through.
+    const systemKey = await KeyFactory.system(globalGroup);
+    const keyAuth = await Authenticator.fromKey(systemKey, workspace.sId);
+
+    const result = await editUserMessage(keyAuth, {
+      conversationResource,
+      message: authorlessMessage,
+      content: "Edited by an API key",
+      mentions: [],
+      skipToolsValidation: false,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(403);
+      expect(result.error.api_error.type).toBe("workspace_auth_error");
+    }
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+describe("postNewContentFragment", () => {
+  let auth: Authenticator;
+  let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
+  let conversation: ConversationType;
+  let agentConfig: LightAgentConfigurationType;
+  let globalSpace: Awaited<
+    ReturnType<typeof createResourceTest>
+  >["globalSpace"];
+  let projectSpace: Awaited<ReturnType<typeof SpaceFactory.project>>;
+  let anotherProjectSpace: Awaited<ReturnType<typeof SpaceFactory.project>>;
+  let dsViewInProjectSpace: Awaited<
+    ReturnType<typeof DataSourceViewFactory.folder>
+  >;
+  let dsViewInGlobalSpace: Awaited<
+    ReturnType<typeof DataSourceViewFactory.folder>
+  >;
+  let dsViewInAnotherProjectSpace: Awaited<
+    ReturnType<typeof DataSourceViewFactory.folder>
+  >;
+
+  beforeEach(async () => {
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+    workspace = setup.workspace;
+    globalSpace = setup.globalSpace;
+
+    // Create agent configuration
+    agentConfig = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent",
+      description: "Test Agent Description",
+    });
+
+    // Create project spaces
+    projectSpace = await SpaceFactory.project(workspace);
+    anotherProjectSpace = await SpaceFactory.project(workspace);
+
+    // Add user to the groups associated with the project spaces so they can access them
+    const internalAdminAuth = await Authenticator.internalAdminForWorkspace(
+      workspace.sId
+    );
+    const user = auth.getNonNullableUser();
+    const userJson = user.toJSON();
+
+    // SpaceFactory.project creates a group and associates it with the space
+    // We need to add the user to those groups
+    const projectSpaceGroup = await fetchRegularAutoGroup(
+      projectSpace,
+      internalAdminAuth
+    );
+    const anotherProjectSpaceGroup = await fetchRegularAutoGroup(
+      anotherProjectSpace,
+      internalAdminAuth
+    );
+
+    if (projectSpaceGroup) {
+      const addRes = await projectSpaceGroup.dangerouslyAddMember(
+        internalAdminAuth,
+        {
+          user: userJson,
+        }
+      );
+      if (addRes.isErr()) {
+        throw new Error(
+          `Failed to add user to project space group: ${addRes.error.message}`
+        );
+      }
+    }
+
+    if (anotherProjectSpaceGroup) {
+      const addRes = await anotherProjectSpaceGroup.dangerouslyAddMember(
+        internalAdminAuth,
+        {
+          user: userJson,
+        }
+      );
+      if (addRes.isErr()) {
+        throw new Error(
+          `Failed to add user to another project space group: ${addRes.error.message}`
+        );
+      }
+    }
+
+    // Refresh the auth object to update the groups list after adding the user to groups
+    // This ensures that when createConversation checks permissions, it sees the updated groups
+    await auth.refresh();
+
+    // Create data source views in different spaces
+    dsViewInProjectSpace = await DataSourceViewFactory.folder(
+      workspace,
+      projectSpace,
+      auth.user() ?? null
+    );
+    dsViewInGlobalSpace = await DataSourceViewFactory.folder(
+      workspace,
+      globalSpace,
+      auth.user() ?? null
+    );
+    dsViewInAnotherProjectSpace = await DataSourceViewFactory.folder(
+      workspace,
+      anotherProjectSpace,
+      auth.user() ?? null
+    );
+
+    vi.clearAllMocks();
+  });
+
+  describe("space restrictions for content fragments with content nodes", () => {
+    beforeEach(async () => {
+      // Mock getContentFragmentBlob to return a successful result for content nodes
+      // The title will be taken from the content fragment input
+      vi.mocked(getContentFragmentBlob).mockImplementation(async (auth, cf) => {
+        const nodeDataSourceViewId = isContentFragmentInputWithContentNode(cf)
+          ? (dsViewInProjectSpace?.id ?? 1)
+          : 1;
+        return new Ok({
+          contentType: "text/plain",
+          fileId: null,
+          nodeId: "test-node-id",
+          nodeDataSourceViewId,
+          nodeType: "document",
+          sourceUrl: null,
+          textBytes: null,
+          title: cf.title,
+        });
+      });
+    });
+
+    it("should allow content fragment from the same space as the conversation", async () => {
+      // Create a conversation in a project space
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      // Create a content fragment with a node from the same space
+      const contentFragment: ContentFragmentInputWithContentNode = {
+        title: "Test Content Fragment",
+        nodeId: "test-node-id",
+        nodeDataSourceViewId: dsViewInProjectSpace.sId,
+      };
+
+      const result = await postNewContentFragment(
+        auth,
+        conversation,
+        contentFragment,
+        {
+          username: auth.getNonNullableUser().username,
+          fullName: auth.getNonNullableUser().fullName(),
+          email: auth.getNonNullableUser().email,
+          profilePictureUrl: null,
+        }
+      );
+
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.title).toBe("Test Content Fragment");
+      }
+    });
+
+    it("should allow content fragment from the global space in a project conversation", async () => {
+      // Create a conversation in a project space
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      // Create a content fragment with a node from the global space
+      const contentFragment: ContentFragmentInputWithContentNode = {
+        title: "Test Content Fragment from Global Space",
+        nodeId: "test-node-id",
+        nodeDataSourceViewId: dsViewInGlobalSpace.sId,
+      };
+
+      const result = await postNewContentFragment(
+        auth,
+        conversation,
+        contentFragment,
+        {
+          username: auth.getNonNullableUser().username,
+          fullName: auth.getNonNullableUser().fullName(),
+          email: auth.getNonNullableUser().email,
+          profilePictureUrl: null,
+        }
+      );
+
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.title).toBe(
+          "Test Content Fragment from Global Space"
+        );
+      }
+    });
+
+    it("should reject content fragment from a different project space", async () => {
+      // Create a conversation in a project space
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      // Try to create a content fragment with a node from a different project space
+      const contentFragment: ContentFragmentInputWithContentNode = {
+        title: "Test Content Fragment from Another Space",
+        nodeId: "test-node-id",
+        nodeDataSourceViewId: dsViewInAnotherProjectSpace.sId,
+      };
+
+      const result = await postNewContentFragment(
+        auth,
+        conversation,
+        contentFragment,
+        {
+          username: auth.getNonNullableUser().username,
+          fullName: auth.getNonNullableUser().fullName(),
+          email: auth.getNonNullableUser().email,
+          profilePictureUrl: null,
+        }
+      );
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toBe(
+          "Only content fragments from the project space or the global space are allowed in a project conversation"
+        );
+      }
+      // Verify getContentFragmentBlob was not called since the space check failed first
+      expect(getContentFragmentBlob).not.toHaveBeenCalled();
+    });
+
+    it("should allow content fragment from any space when conversation has no spaceId", async () => {
+      // Create a conversation without a spaceId
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: undefined,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      // Create a content fragment with a node from any space (should be allowed)
+      const contentFragment: ContentFragmentInputWithContentNode = {
+        title: "Test Content Fragment",
+        nodeId: "test-node-id",
+        nodeDataSourceViewId: dsViewInAnotherProjectSpace.sId,
+      };
+
+      const result = await postNewContentFragment(
+        auth,
+        conversation,
+        contentFragment,
+        {
+          username: auth.getNonNullableUser().username,
+          fullName: auth.getNonNullableUser().fullName(),
+          email: auth.getNonNullableUser().email,
+          profilePictureUrl: null,
+        }
+      );
+
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.title).toBe("Test Content Fragment");
+      }
+    });
+
+    it("should return error when data source view is not found", async () => {
+      // Create a conversation in a project space
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      // Try to create a content fragment with a non-existent data source view
+      const contentFragment: ContentFragmentInputWithContentNode = {
+        title: "Test Content Fragment",
+        nodeId: "test-node-id",
+        nodeDataSourceViewId: "non-existent-ds-view-id",
+      };
+
+      const result = await postNewContentFragment(
+        auth,
+        conversation,
+        contentFragment,
+        {
+          username: auth.getNonNullableUser().username,
+          fullName: auth.getNonNullableUser().fullName(),
+          email: auth.getNonNullableUser().email,
+          profilePictureUrl: null,
+        }
+      );
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toBe("Data source view not found");
+      }
+      // Verify getContentFragmentBlob was not called since the data source view check failed first
+      expect(getContentFragmentBlob).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("project-context file reuse in project conversations", () => {
+    it("reuses existing project content fragment and skips attachment upsert and blob fetch", async () => {
+      const user = auth.getNonNullableUser();
+      const projectFile = await ProjectFileFactory.create(
+        auth,
+        user,
+        projectSpace,
+        {
+          contentType: "text/plain",
+          fileName: "project-doc.txt",
+          fileSize: 12,
+          status: "ready",
+        }
+      );
+
+      const latestContext = await fetchLatestProjectContextFileContentFragment(
+        auth,
+        projectSpace,
+        projectFile.sId
+      );
+      expect(latestContext).not.toBeNull();
+
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      const maybeUpsertSpy = vi.spyOn(
+        attachmentsModule,
+        "maybeUpsertFileAttachment"
+      );
+
+      const input: ContentFragmentInputWithFileIdType = {
+        title: projectFile.fileName,
+        fileId: projectFile.sId,
+      };
+
+      const result = await postNewContentFragment(auth, conversation, input, {
+        username: user.username,
+        fullName: user.fullName(),
+        email: user.email,
+        profilePictureUrl: null,
+      });
+
+      maybeUpsertSpy.mockRestore();
+
+      expect(result.isOk()).toBe(true);
+      expect(maybeUpsertSpy).not.toHaveBeenCalled();
+      expect(getContentFragmentBlob).not.toHaveBeenCalled();
+
+      if (result.isOk()) {
+        expect(result.value.contentFragmentId).toBe(
+          latestContext!.fragment.sId
+        );
+        expect(result.value.contentFragmentType).toBe("file");
+        if (result.value.contentFragmentType === "file") {
+          expect(result.value.fileId).toBe(projectFile.sId);
+          expect(result.value.isInProjectContext).toBe(true);
+        }
+      }
+    });
+
+    it("does not create a second message row when the project fragment is already in the conversation", async () => {
+      const user = auth.getNonNullableUser();
+      const projectFile = await ProjectFileFactory.create(
+        auth,
+        user,
+        projectSpace,
+        {
+          contentType: "text/plain",
+          fileName: "project-doc-duplicate.txt",
+          fileSize: 12,
+          status: "ready",
+        }
+      );
+
+      const latestContext = await fetchLatestProjectContextFileContentFragment(
+        auth,
+        projectSpace,
+        projectFile.sId
+      );
+      expect(latestContext).not.toBeNull();
+      const fragmentModelId = latestContext!.fragment.id;
+
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      let fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      const context = {
+        username: user.username,
+        fullName: user.fullName(),
+        email: user.email,
+        profilePictureUrl: null,
+      };
+
+      const input: ContentFragmentInputWithFileIdType = {
+        title: projectFile.fileName,
+        fileId: projectFile.sId,
+      };
+
+      const first = await postNewContentFragment(
+        auth,
+        conversation,
+        input,
+        context
+      );
+      expect(first.isOk()).toBe(true);
+
+      const messageCountAfterFirst = await MessageModel.count({
+        where: {
+          conversationId: conversation.id,
+          contentFragmentId: fragmentModelId,
+        },
+      });
+      expect(messageCountAfterFirst).toBe(1);
+
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversationWithoutContent.sId
+      );
+      expect(conversationResource).not.toBeNull();
+      if (!conversationResource) {
+        throw new Error("Failed to fetch conversation metadata");
+      }
+
+      const conversationAfterFirst = conversationResource.toJSON();
+
+      const second = await postNewContentFragment(
+        auth,
+        conversationAfterFirst,
+        input,
+        context
+      );
+      expect(second.isOk()).toBe(true);
+
+      const messageCountAfterSecond = await MessageModel.count({
+        where: {
+          conversationId: conversation.id,
+          contentFragmentId: fragmentModelId,
+        },
+      });
+      expect(messageCountAfterSecond).toBe(1);
+    });
+
+    it("allows superseding a content fragment with conversation metadata only", async () => {
+      const user = auth.getNonNullableUser();
+      const blob = new Ok({
+        contentType: "text/plain" as const,
+        fileId: null,
+        nodeId: "test-node-id",
+        nodeDataSourceViewId: dsViewInGlobalSpace.id,
+        nodeType: "document" as const,
+        sourceUrl: null,
+        textBytes: null,
+        title: "Superseded fragment",
+      });
+      vi.mocked(getContentFragmentBlob)
+        .mockResolvedValueOnce(blob)
+        .mockResolvedValueOnce(blob);
+
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      const fullConversation = fetchedConversationResult.value;
+
+      const input: ContentFragmentInputWithContentNode = {
+        title: "Superseded fragment",
+        nodeId: "test-node-id",
+        nodeDataSourceViewId: dsViewInGlobalSpace.sId,
+      };
+      const context = {
+        username: user.username,
+        fullName: user.fullName(),
+        email: user.email,
+        profilePictureUrl: null,
+      };
+
+      const first = await postNewContentFragment(
+        auth,
+        fullConversation,
+        input,
+        context
+      );
+      expect(first.isOk()).toBe(true);
+
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversationWithoutContent.sId
+      );
+      expect(conversationResource).not.toBeNull();
+      if (!conversationResource) {
+        throw new Error("Failed to fetch conversation metadata");
+      }
+
+      const second = await postNewContentFragment(
+        auth,
+        conversationResource.toJSON(),
+        {
+          ...input,
+          supersededContentFragmentId: first.isOk()
+            ? first.value.contentFragmentId
+            : generateRandomModelSId("cf"),
+        },
+        context
+      );
+      expect(second.isOk()).toBe(true);
+      if (first.isOk() && second.isOk()) {
+        expect(second.value.contentFragmentId).toBe(
+          first.value.contentFragmentId
+        );
+      }
+    });
+  });
+});
+
+describe("isConversationEventAllowedForAuth", () => {
+  let auth: Authenticator;
+
+  beforeEach(async () => {
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+  });
+
+  it("returns true for agent_message_done event", async () => {
+    const event = {
+      type: "agent_message_done" as const,
+      created: Date.now(),
+      conversationId: "conv-1",
+      configurationId: "config-1",
+      messageId: "msg-1",
+      status: "success" as const,
+      costCredits: null,
+    };
+    const result = await isConversationEventAllowedForAuth(auth, { event });
+    expect(result).toBe(true);
+  });
+
+  it("returns true for agent_message_consumption_updated event", async () => {
+    const event = {
+      type: "agent_message_consumption_updated" as const,
+      created: Date.now(),
+      conversationId: "conv-1",
+      messageId: "msg-1",
+      costCredits: 12,
+    };
+    const result = await isConversationEventAllowedForAuth(auth, { event });
+    expect(result).toBe(true);
+  });
+
+  it("returns true for conversation_title event", async () => {
+    const event = {
+      type: "conversation_title" as const,
+      created: Date.now(),
+      title: "New title",
+    };
+    const result = await isConversationEventAllowedForAuth(auth, { event });
+    expect(result).toBe(true);
+  });
+
+  it("returns true for user_message_new event", async () => {
+    const event: UserMessageNewEvent = {
+      type: "user_message_new",
+      created: Date.now(),
+      messageId: "msg-1",
+      message: {
+        contentFragments: [],
+      } as unknown as UserMessageNewEvent["message"],
+    };
+    const result = await isConversationEventAllowedForAuth(auth, { event });
+    expect(result).toBe(true);
+  });
+
+  it("returns true for agent_message_new event", async () => {
+    const event = {
+      type: "agent_message_new" as const,
+      created: Date.now(),
+      configurationId: "config-1",
+      messageId: "msg-1",
+      message: {} as AgentMessageType,
+    };
+    const result = await isConversationEventAllowedForAuth(auth, { event });
+    expect(result).toBe(true);
+  });
+});
+
+describe("conversation fetch forkingData", () => {
+  it("includes forkedFrom in full and light conversation payloads", async () => {
+    const { authenticator: auth, workspace } = await createResourceTest({
+      role: "admin",
+    });
+    const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Fork Fetch Agent",
+      description: "Fork fetch agent",
+    });
+
+    const parentConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [new Date("2026-01-05T00:00:00.000Z")],
+    });
+    const parentConversationTitle = "Quarterly Review Data";
+    const updateTitleRes = await ConversationResource.updateTitle(
+      auth,
+      parentConversation.sId,
+      parentConversationTitle
+    );
+    expect(updateTitleRes.isOk()).toBe(true);
+    const childConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [],
+    });
+
+    const parentConversationResource = await ConversationResource.fetchById(
+      auth,
+      parentConversation.sId
+    );
+    const childConversationResource = await ConversationResource.fetchById(
+      auth,
+      childConversation.sId
+    );
+    expect(parentConversationResource).not.toBeNull();
+    expect(childConversationResource).not.toBeNull();
+    if (!parentConversationResource || !childConversationResource) {
+      throw new Error("Failed to fetch fork conversations");
+    }
+
+    const sourceMessage = await MessageModel.findOne({
+      where: {
+        conversationId: parentConversation.id,
+        workspaceId: workspace.id,
+        rank: 1,
+      },
+    });
+    expect(sourceMessage).not.toBeNull();
+    if (!sourceMessage) {
+      throw new Error("Failed to fetch source message");
+    }
+
+    const branchedAt = new Date("2026-01-06T00:00:00.000Z");
+    await ConversationForkResource.makeNew(auth, {
+      parentConversation: parentConversationResource,
+      childConversation: childConversationResource,
+      sourceMessageModelId: sourceMessage.id,
+      branchedAt,
+    });
+
+    const fullConversationResult = await getConversation(
+      auth,
+      childConversation.sId
+    );
+    expect(fullConversationResult.isOk()).toBe(true);
+
+    if (fullConversationResult.isOk()) {
+      expect(fullConversationResult.value.forkingData).toEqual({
+        forkedFrom: {
+          parentConversationId: parentConversation.sId,
+          parentConversationTitle,
+          sourceMessageId: sourceMessage.sId,
+          branchedAt: branchedAt.getTime(),
+          user: auth.getNonNullableUser().toJSON(),
+          fileCopyStatus: "pending",
+        },
+      });
+    }
+
+    const lightConversationResult = await getLightConversation(
+      auth,
+      childConversation.sId
+    );
+    expect(lightConversationResult.isOk()).toBe(true);
+
+    if (lightConversationResult.isOk()) {
+      expect(lightConversationResult.value.forkingData).toEqual({
+        forkedFrom: {
+          parentConversationId: parentConversation.sId,
+          parentConversationTitle,
+          sourceMessageId: sourceMessage.sId,
+          branchedAt: branchedAt.getTime(),
+          user: auth.getNonNullableUser().toJSON(),
+          fileCopyStatus: "pending",
+        },
+      });
+    }
+  });
+
+  it("includes forkedChildren in the conversation detail payload", async () => {
+    const { authenticator: auth, workspace } = await createResourceTest({
+      role: "admin",
+    });
+    const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Fork Fetch Agent",
+      description: "Fork fetch agent",
+    });
+
+    const parentConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [new Date("2026-01-05T00:00:00.000Z")],
+    });
+    const parentConversationTitle = "Parent fork source";
+    await ConversationModel.update(
+      { title: parentConversationTitle },
+      { where: { id: parentConversation.id, workspaceId: workspace.id } }
+    );
+    const firstChildConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [],
+    });
+    const secondChildConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [],
+    });
+
+    await ConversationModel.update(
+      { title: "Later fork" },
+      { where: { id: firstChildConversation.id, workspaceId: workspace.id } }
+    );
+    await ConversationModel.update(
+      { title: null },
+      { where: { id: secondChildConversation.id, workspaceId: workspace.id } }
+    );
+
+    const parentConversationResource = await ConversationResource.fetchById(
+      auth,
+      parentConversation.sId
+    );
+    const firstChildConversationResource = await ConversationResource.fetchById(
+      auth,
+      firstChildConversation.sId
+    );
+    const secondChildConversationResource =
+      await ConversationResource.fetchById(auth, secondChildConversation.sId);
+
+    expect(parentConversationResource).not.toBeNull();
+    expect(firstChildConversationResource).not.toBeNull();
+    expect(secondChildConversationResource).not.toBeNull();
+
+    if (
+      !parentConversationResource ||
+      !firstChildConversationResource ||
+      !secondChildConversationResource
+    ) {
+      throw new Error("Failed to fetch fork conversations");
+    }
+
+    const sourceMessage = await MessageModel.findOne({
+      where: {
+        conversationId: parentConversation.id,
+        workspaceId: workspace.id,
+        rank: 1,
+      },
+    });
+    expect(sourceMessage).not.toBeNull();
+    if (!sourceMessage) {
+      throw new Error("Failed to fetch source message");
+    }
+
+    const laterBranchedAt = new Date("2026-01-06T11:00:00.000Z");
+    const earlierBranchedAt = new Date("2026-01-06T10:00:00.000Z");
+
+    await ConversationForkResource.makeNew(auth, {
+      parentConversation: parentConversationResource,
+      childConversation: firstChildConversationResource,
+      sourceMessageModelId: sourceMessage.id,
+      branchedAt: laterBranchedAt,
+    });
+    await ConversationForkResource.makeNew(auth, {
+      parentConversation: parentConversationResource,
+      childConversation: secondChildConversationResource,
+      sourceMessageModelId: sourceMessage.id,
+      branchedAt: earlierBranchedAt,
+    });
+
+    const expectedForkedChildren = [
+      {
+        childConversationId: secondChildConversation.sId,
+        childConversationTitle: `Branched from '${parentConversationTitle}'`,
+        sourceMessageId: sourceMessage.sId,
+        branchedAt: earlierBranchedAt.getTime(),
+        user: auth.getNonNullableUser().toJSON(),
+      },
+      {
+        childConversationId: firstChildConversation.sId,
+        childConversationTitle: "Later fork",
+        sourceMessageId: sourceMessage.sId,
+        branchedAt: laterBranchedAt.getTime(),
+        user: auth.getNonNullableUser().toJSON(),
+      },
+    ];
+
+    const conversationResource = await ConversationResource.fetchById(
+      auth,
+      parentConversation.sId,
+      { includeForkingData: true }
+    );
+    expect(conversationResource).not.toBeNull();
+    const forkingData = await conversationResource!.fetchForkingData(auth);
+    expect(forkingData).toEqual({
+      forkedChildren: expectedForkedChildren,
+    });
+  });
+});
+
+describe("postUserMessage no-seat gate", () => {
+  it("rejects messages from a member with the `none` seat type", async () => {
+    // Credit-priced (Metronome) workspace — the seat gate only applies there.
+    const workspace = await WorkspaceFactory.creditPriced();
+    await SpaceFactory.defaults(
+      await Authenticator.internalAdminForWorkspace(workspace.sId)
+    );
+    const user = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, user, {
+      role: "user",
+      seatType: "none",
+    });
+    const auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+
+    const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Seatless Test Agent",
+      description: "Agent for the no-seat gate test",
+    });
+    const created = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [],
+      visibility: "unlisted",
+    });
+    const fetched = await getConversation(auth, created.sId);
+    if (fetched.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+
+    const userJson = user.toJSON();
+    const result = await postUserMessage(auth, {
+      conversationResource: await fetchConversationResource(
+        auth,
+        fetched.value.sId
+      ),
+      content: `Hello @${agent.name}`,
+      mentions: [{ configurationId: agent.sId } satisfies AgentMention],
+      context: {
+        username: userJson.username,
+        timezone: "UTC",
+        fullName: userJson.fullName,
+        email: userJson.email,
+        profilePictureUrl: userJson.image,
+        origin: "web",
+      },
+      skipToolsValidation: false,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(403);
+      expect(result.error.api_error.type).toBe("no_seat");
+    }
+  });
+});
+
+describe("updateAgentMessageWithFinalStatus", () => {
+  let auth: Authenticator;
+  let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
+  let conversation: ConversationType;
+  let agentMessage: AgentMessageType;
+
+  beforeEach(async () => {
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+    workspace = setup.workspace;
+
+    const agentConfig = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent",
+      description: "Test Agent Description",
+    });
+
+    const conversationWithoutContent = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig.sId,
+      messagesCreatedAt: [new Date()],
+    });
+
+    const fetchedConversationResult = await getConversation(
+      auth,
+      conversationWithoutContent.sId
+    );
+    if (fetchedConversationResult.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    conversation = fetchedConversationResult.value;
+
+    const agentMessages = conversation.content
+      .flat()
+      .filter((m): m is AgentMessageType => m.type === "agent_message");
+    if (agentMessages.length === 0) {
+      throw new Error("No agent message found in conversation");
+    }
+    agentMessage = agentMessages[0];
+
+    vi.clearAllMocks();
+  });
+
+  it("only applies the first terminal status (finalization is single-shot)", async () => {
+    const first = await updateAgentMessageWithFinalStatus(auth, {
+      conversation,
+      agentMessage,
+      status: "interrupted",
+    });
+    expect(first.status).toBe("interrupted");
+
+    // A late terminal event from an orphaned activity (e.g. an LLM call still
+    // running after an interrupt) must not overwrite the final status.
+    const second = await updateAgentMessageWithFinalStatus(auth, {
+      conversation,
+      agentMessage,
+      status: "succeeded",
+    });
+    expect(second.status).toBe("interrupted");
+
+    const agentMessageRow = await AgentMessageModel.findOne({
+      where: { id: agentMessage.agentMessageId, workspaceId: workspace.id },
+    });
+    expect(agentMessageRow?.status).toBe("interrupted");
+  });
+
+  it("does not promote pending messages nor spawn a new agent loop when already finalized", async () => {
+    await updateAgentMessageWithFinalStatus(auth, {
+      conversation,
+      agentMessage,
+      status: "interrupted",
+    });
+
+    // Queue a steering message, pending at the time the late terminal event arrives. The
+    // conversation already has messages at ranks 0 and 1.
+    const { messageRow } = await ConversationFactory.createUserMessage({
+      auth,
+      workspace,
+      conversation,
+      content: "steering message",
+      rank: 2,
+    });
+    await MessageModel.update(
+      { visibility: "pending" },
+      {
+        where: { id: messageRow.id, workspaceId: workspace.id },
+        // Bulk update constructs a dummy instance failing the beforeValidate hook; the row is
+        // already valid, we only update visibility.
+        validate: false,
+      }
+    );
+
+    vi.clearAllMocks();
+
+    const result = await updateAgentMessageWithFinalStatus(auth, {
+      conversation,
+      agentMessage,
+      status: "succeeded",
+    });
+    expect(result.status).toBe("interrupted");
+
+    // The pending steering message must remain pending: no promotion, no new agent loop.
+    const pendingMessageRow = await MessageModel.findOne({
+      where: { id: messageRow.id, workspaceId: workspace.id },
+    });
+    expect(pendingMessageRow?.visibility).toBe("pending");
+    expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+  });
+});

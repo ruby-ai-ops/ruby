@@ -1,0 +1,11 @@
+{
+  "action": "user.logout",
+  "targets": [
+    {
+      "type": "user"
+    }
+  ],
+  "metadata": {
+    "actor_type": "string"
+  }
+}

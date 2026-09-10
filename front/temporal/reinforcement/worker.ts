@@ -1,0 +1,77 @@
+import {
+  initializeOpenTelemetryInstrumentation,
+  resource,
+} from "@app/lib/api/instrumentation/init";
+import { NoopSpanExporter } from "@app/lib/api/instrumentation/noop_span_exporter";
+import {
+  getTemporalWorkerConnection,
+  TEMPORAL_MAXED_CACHED_WORKFLOWS,
+} from "@app/lib/temporal";
+import { ActivityInboundLogInterceptor } from "@app/lib/temporal_monitoring";
+import logger from "@app/logger/logger";
+import {
+  createTemporalWorker,
+  getWorkflowConfig,
+} from "@app/temporal/bundle_helper";
+import * as activities from "@app/temporal/reinforcement/activities";
+import { isDevelopment } from "@app/types/shared/env";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type { Context } from "@temporalio/activity";
+import {
+  makeWorkflowExporter,
+  OpenTelemetryActivityInboundInterceptor,
+  OpenTelemetryActivityOutboundInterceptor,
+} from "@temporalio/interceptors-opentelemetry/lib/worker";
+
+import { QUEUE_NAME } from "./config";
+
+// Must match the deployment's terminationGracePeriodSeconds minus 10s buffer.
+const SHUTDOWN_GRACE_TIME_MS = 70 * 1_000;
+
+export async function runReinforcementWorker() {
+  const { connection, namespace } = await getTemporalWorkerConnection();
+
+  initializeOpenTelemetryInstrumentation({
+    serviceName: "ruby-reinforcement",
+  });
+
+  const spanExporter = new NoopSpanExporter();
+
+  const worker = await createTemporalWorker({
+    ...getWorkflowConfig({
+      workerName: "reinforcement",
+      getWorkflowsPath: () => require.resolve("./workflows"),
+    }),
+    activities,
+    taskQueue: QUEUE_NAME,
+    maxCachedWorkflows: TEMPORAL_MAXED_CACHED_WORKFLOWS,
+    maxConcurrentActivityTaskExecutions: 8,
+    connection,
+    namespace,
+    shutdownGraceTime: SHUTDOWN_GRACE_TIME_MS,
+    interceptors: {
+      workflowModules: removeNulls([
+        !isDevelopment() || process.env.USE_TEMPORAL_BUNDLES === "true"
+          ? null
+          : require.resolve("./workflows"),
+      ]),
+      activity: [
+        (ctx: Context) => {
+          return {
+            inbound: new ActivityInboundLogInterceptor(ctx, logger),
+          };
+        },
+        (ctx) => ({
+          inbound: new OpenTelemetryActivityInboundInterceptor(ctx),
+          outbound: new OpenTelemetryActivityOutboundInterceptor(ctx),
+        }),
+      ],
+    },
+    sinks: {
+      // @ts-expect-error InMemorySpanExporter type mismatch.
+      exporter: makeWorkflowExporter(spanExporter, resource),
+    },
+  });
+
+  await worker.run();
+}

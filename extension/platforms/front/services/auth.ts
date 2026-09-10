@@ -1,0 +1,286 @@
+import type { CellInfo } from "@app/types/cell";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { RUBY_US_URL, FRONT_EXTENSION_URL } from "@extension/shared/lib/config";
+import { generatePKCE } from "@extension/shared/lib/utils";
+import type { StoredTokens } from "@extension/shared/services/auth";
+import {
+  AuthError,
+  AuthService,
+  getCellInfoFromClaims,
+} from "@extension/shared/services/auth";
+import type { StorageService } from "@extension/shared/services/storage";
+import { jwtDecode } from "jwt-decode";
+
+const POPUP_CONFIG = {
+  WIDTH: 600,
+  HEIGHT: 700,
+  CHECK_INTERVAL_MS: 100,
+} as const;
+
+interface PopupResult<T = void> {
+  data?: T;
+  error?: Error;
+}
+
+const openAndWaitForPopup = async <T>(
+  url: string,
+  title: string,
+  checkForResult: (popup: Window) => PopupResult<T> | null
+): Promise<PopupResult<T>> => {
+  const left = window.screenX + (window.outerWidth - POPUP_CONFIG.WIDTH) / 2;
+  const top = window.screenY + (window.outerHeight - POPUP_CONFIG.HEIGHT) / 2;
+
+  const popup = window.open(
+    url,
+    title,
+    `width=${POPUP_CONFIG.WIDTH},height=${POPUP_CONFIG.HEIGHT},left=${left},top=${top}`
+  );
+
+  if (!popup) {
+    return { error: new Error("Popup blocked") };
+  }
+
+  return new Promise((resolve) => {
+    const checkPopup = setInterval(() => {
+      if (popup.closed) {
+        clearInterval(checkPopup);
+        resolve({ error: new Error("Authentication cancelled") });
+      }
+
+      try {
+        const result = checkForResult(popup);
+        if (result) {
+          clearInterval(checkPopup);
+          popup.close();
+          resolve(result);
+        }
+      } catch (e) {
+        // Ignore errors accessing popup location (cross-origin)
+        console.log("[Ruby Auth] Error accessing popup location:", e);
+      }
+    }, POPUP_CONFIG.CHECK_INTERVAL_MS);
+  });
+};
+
+export class FrontAuthService extends AuthService {
+  constructor(storage: StorageService, cells?: CellInfo[]) {
+    super(storage, cells);
+  }
+
+  private async openAuthPopup(
+    options: Record<string, string>
+  ): Promise<{ code: string }> {
+    const queryString = new URLSearchParams(options).toString();
+    const authUrl = `${RUBY_US_URL}/api/workos/login?${queryString}`;
+
+    const result = await openAndWaitForPopup<{
+      code: string;
+    }>(authUrl, "Authentication", (popup) => {
+      const popupUrl = popup.location.href;
+      if (popupUrl?.includes("code=")) {
+        const popupUrlAsUrl = new URL(popupUrl);
+        const code = popupUrlAsUrl.searchParams.get("code");
+
+        return code ? { data: { code } } : null;
+      }
+      return null;
+    });
+
+    if (result.error) {
+      throw result.error;
+    }
+
+    if (!result.data?.code) {
+      throw new Error("No code received from authentication");
+    }
+
+    return result.data;
+  }
+
+  async login({
+    forcedConnection,
+    organizationId,
+  }: {
+    forcedConnection?: string;
+    organizationId?: string;
+  }) {
+    if (!this.cells) {
+      return new Err(new AuthError("not_authenticated", "No cells found."));
+    }
+
+    const { codeVerifier, codeChallenge } = await generatePKCE();
+
+    // Store code verifier for later use
+    await this.storage.set("code_verifier", codeVerifier);
+
+    try {
+      const options: Record<string, string> = {
+        redirect_uri: FRONT_EXTENSION_URL,
+        code_challenge_method: "S256",
+        code_challenge: codeChallenge,
+        connection: forcedConnection ?? "",
+        ...(organizationId ? { organizationId } : {}),
+      };
+
+      const result = await this.openAuthPopup(options);
+
+      // Get the stored code verifier
+      const storedCodeVerifier =
+        await this.storage.get<string>("code_verifier");
+      if (!storedCodeVerifier) {
+        return new Err(
+          new AuthError("not_authenticated", "No code verifier found")
+        );
+      }
+
+      const tokenParams = new URLSearchParams({
+        code_verifier: storedCodeVerifier,
+        code: result.code,
+      });
+      const response = await fetch(`${RUBY_US_URL}/api/workos/authenticate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: FRONT_EXTENSION_URL,
+        },
+        credentials: "include",
+        body: tokenParams,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        return new Err(
+          new AuthError(
+            "invalid_oauth_token_error",
+            `Token exchange failed: ${response.status} ${response.statusText}. Error: ${errorText}`
+          )
+        );
+      }
+
+      const data = await response.json();
+
+      await this.storage.delete("code_verifier");
+
+      // Store tokens
+      const tokens = await this.saveTokens({
+        success: true,
+        accessToken: data.accessToken,
+        refreshToken: data.refreshToken || "",
+        expirationDate: data.expirationDate,
+      });
+
+      const claims = jwtDecode<Record<string, string>>(data.accessToken);
+
+      const cellInfo = getCellInfoFromClaims(claims, this.cells);
+
+      await this.storage.set("cellInfo", cellInfo);
+
+      return new Ok({ tokens, cellInfo });
+    } catch (error) {
+      return new Err(new AuthError("not_authenticated", error?.toString()));
+    }
+  }
+
+  async logout(): Promise<boolean> {
+    const accessToken = await this.getAccessToken();
+    if (!accessToken) {
+      return true;
+    }
+
+    const decodedPayload = jwtDecode<Record<string, string>>(accessToken);
+    const sessionId = decodedPayload?.sid;
+    if (!sessionId) {
+      return true;
+    }
+
+    const cellInfo = await this.getCellInfoFromStorage();
+    if (!cellInfo) {
+      return true;
+    }
+
+    const response = await fetch(`${cellInfo.url}/api/workos/revoke-session`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      credentials: "omit",
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Revoke session failed: ${response.status}`);
+    }
+
+    return true;
+  }
+
+  async getAccessToken(forceRefresh?: boolean): Promise<string | null> {
+    let tokens = await this.getStoredTokens();
+    if (
+      !tokens ||
+      !tokens.accessToken ||
+      tokens.expiresAt < Date.now() ||
+      forceRefresh
+    ) {
+      const refreshRes = await this.refreshToken(tokens);
+      if (refreshRes.isOk()) {
+        tokens = refreshRes.value;
+      } else {
+        tokens = null;
+      }
+    }
+
+    return tokens?.accessToken ?? null;
+  }
+
+  async refreshToken(
+    tokens: StoredTokens | null
+  ): Promise<Result<StoredTokens, AuthError>> {
+    try {
+      tokens = tokens ?? (await this.getStoredTokens());
+      if (!tokens) {
+        return new Err(new AuthError("not_authenticated", "No tokens found."));
+      }
+
+      const tokenParams: Record<string, string> = {
+        grant_type: "refresh_token",
+        refresh_token: tokens.refreshToken ?? "",
+      };
+
+      const cellInfo = await this.getCellInfoFromStorage();
+      if (!cellInfo) {
+        return new Err(
+          new AuthError("invalid_oauth_token_error", "No cell info found")
+        );
+      }
+
+      const response = await fetch(`${cellInfo.url}/api/workos/authenticate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(tokenParams),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(
+          `Token refresh failed: ${data.error} - ${data.error_description}`
+        );
+      }
+
+      const data = await response.json();
+      const storedTokens = await this.saveTokens({
+        success: true,
+        accessToken: data.accessToken,
+        refreshToken: data.refreshToken || "",
+        expirationDate: data.expirationDate,
+      });
+      return new Ok(storedTokens);
+    } catch (error) {
+      return new Err(
+        new AuthError("invalid_oauth_token_error", error?.toString())
+      );
+    }
+  }
+}

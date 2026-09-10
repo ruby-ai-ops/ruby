@@ -1,0 +1,69 @@
+import config from "@app/lib/api/config";
+import { Html } from "@react-email/html";
+import type React from "react";
+
+export const EmailLayout = ({
+  workspace,
+  children,
+}: {
+  workspace: { id: string; name: string };
+  children: React.ReactNode;
+}) => {
+  return (
+    <Html>
+      <head>
+        <title>An email from Ruby about {workspace.name}</title>
+      </head>
+      <body
+        style={{
+          fontFamily: "Open Sans, Helvetica Neue, Helvetica, Arial, sans-serif",
+          fontSize: "14px",
+          backgroundColor: "#ffffff",
+          padding: "20px",
+        }}
+      >
+        <div
+          style={{
+            maxWidth: "600px",
+            backgroundColor: "#ffffff",
+          }}
+        >
+          {children}
+        </div>
+        <div style={{ width: "100%", textAlign: "left", marginTop: "20px" }}>
+          <a href={config.getStaticWebsiteUrl()} target="_new">
+            <img
+              alt="Ruby Logo"
+              style={{ margin: "0 auto", border: "0px" }}
+              width={96}
+              height={24}
+              src="https://ruby.ad/static/landing/logos/ruby/Ruby_Logo.png"
+            />
+          </a>
+        </div>
+        <div
+          style={{
+            width: "100%",
+            textAlign: "left",
+            marginTop: "20px",
+            fontSize: "12px",
+            color: "#969CA5",
+          }}
+        >
+          <div>This is an automated email. Please do not reply.</div>
+          <div>
+            You can manage your notification preferences from{" "}
+            <a
+              href={`${config.getAppUrl()}/w/${workspace.id}`}
+              target="_blank"
+              style={{ color: "#1C91FF" }}
+            >
+              your workspace
+            </a>
+            .
+          </div>
+        </div>
+      </body>
+    </Html>
+  );
+};

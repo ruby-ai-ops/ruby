@@ -1,0 +1,451 @@
+import {
+  AddToolsButton,
+  AddToolsDialog,
+} from "@app/components/actions/mcp/AddToolsDialog";
+import { CreateMCPServerDialog } from "@app/components/actions/mcp/create/CreateMCPServerDialog";
+import { AgentDetailsSheet } from "@app/components/assistant/details/AgentDetailsSheet";
+import { SkillDetailsSheetById } from "@app/components/command_palette/SkillDetailsSheetById";
+import { ACTION_BUTTONS_CONTAINER_ID } from "@app/components/spaces/SpacePageHeaders";
+import { UsedByButton } from "@app/components/spaces/UsedByButton";
+import { useActionButtonsPortal } from "@app/hooks/useActionButtonsPortal";
+import {
+  getMcpServerDisplayName,
+  getMcpServerViewDescription,
+  getMcpServerViewDisplayName,
+  mcpServersSortingFn,
+  requiresBearerTokenConfiguration,
+} from "@app/lib/actions/mcp_helper";
+import { getAvatar } from "@app/lib/actions/mcp_icons";
+import type { DefaultRemoteMCPServerConfig } from "@app/lib/actions/mcp_internal_actions/remote_servers";
+import type { MCPServerType, MCPServerViewType } from "@app/lib/api/mcp";
+import { filterMCPServer } from "@app/lib/mcp";
+import {
+  useCreateInternalMCPServer,
+  useMCPServerConnections,
+  useMCPServers,
+  useMCPServersUsage,
+} from "@app/lib/swr/mcp_servers";
+import { useSpacesAsAdmin } from "@app/lib/swr/spaces";
+import { formatTimestampToFriendlyDate } from "@app/lib/utils";
+import type {
+  AgentsAndSkillsUsageType,
+  AgentsUsageType,
+} from "@app/types/data_source";
+import type { SpaceType } from "@app/types/space";
+import type { LightWorkspaceType, UserType } from "@app/types/user";
+import { ANONYMOUS_USER_IMAGE_URL } from "@app/types/user";
+import { Chip, cn, DataTable, EmptyCTA, Spinner } from "@ruby-ai/sparkle";
+import type { CellContext, ColumnDef } from "@tanstack/react-table";
+import { useMemo, useState } from "react";
+
+type RowData = {
+  mcpServer: MCPServerType;
+  mcpServerView?: MCPServerViewType;
+  usage: AgentsUsageType | AgentsAndSkillsUsageType | null;
+  isConnected: boolean;
+  account: string;
+  spaces: SpaceType[];
+  onClick: () => void;
+};
+
+const NameCell = ({ row }: { row: RowData }) => {
+  const { mcpServer, mcpServerView, isConnected } = row;
+
+  return (
+    <DataTable.CellContent grow>
+      <div
+        className={cn(
+          "flex flex-row items-center gap-3 py-3",
+          mcpServerView ? "" : "opacity-50"
+        )}
+      >
+        {getAvatar(mcpServer)}
+        <div className="flex flex-grow flex-col gap-0 overflow-hidden truncate">
+          <div className="truncate text-sm font-semibold text-foreground">
+            {mcpServerView
+              ? getMcpServerViewDisplayName(mcpServerView)
+              : getMcpServerDisplayName(mcpServer)}
+          </div>
+          <div className="truncate text-sm text-muted-foreground">
+            {mcpServerView
+              ? getMcpServerViewDescription(mcpServerView)
+              : mcpServer.description}
+          </div>
+        </div>
+
+        {mcpServerView && !isConnected && mcpServer.authorization && (
+          <Chip color="warning" size="xs">
+            Disconnected
+          </Chip>
+        )}
+      </div>
+    </DataTable.CellContent>
+  );
+};
+
+type AdminActionsListProps = {
+  owner: LightWorkspaceType;
+  user: UserType;
+  filter: string;
+  systemSpace: SpaceType;
+  setMcpServerToShow: (mcpServer: MCPServerType) => void;
+};
+
+export const AdminActionsList = ({
+  owner,
+  user,
+  filter,
+  systemSpace,
+  setMcpServerToShow,
+}: AdminActionsListProps) => {
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [isAddToolsOpen, setIsAddToolsOpen] = useState(false);
+  const [internalMCPServerToCreate, setInternalMCPServerToCreate] = useState<
+    MCPServerType | undefined
+  >();
+  const [defaultServerConfig, setDefaultServerConfig] = useState<
+    DefaultRemoteMCPServerConfig | undefined
+  >();
+  const { spaces } = useSpacesAsAdmin({
+    workspaceId: owner.sId,
+    disabled: false,
+  });
+
+  const { mcpServers, isMCPServersLoading } = useMCPServers({
+    owner,
+  });
+
+  const [agentId, setAgentId] = useState<string | null>(null);
+  const [skillId, setSkillId] = useState<string | null>(null);
+
+  const { usage } = useMCPServersUsage({
+    owner,
+  });
+
+  const [isLoading, setIsLoading] = useState(false);
+
+  const showLoader = isMCPServersLoading || isLoading;
+
+  const { connections } = useMCPServerConnections({
+    owner,
+    connectionType: "workspace",
+  });
+
+  const { createInternalMCPServer } = useCreateInternalMCPServer(owner);
+
+  const { portalToHeader } = useActionButtonsPortal({
+    containerId: ACTION_BUTTONS_CONTAINER_ID,
+  });
+
+  const onCreateRemoteMCPServer = (
+    defaultServerConfig?: DefaultRemoteMCPServerConfig
+  ) => {
+    setInternalMCPServerToCreate(undefined);
+    setDefaultServerConfig(defaultServerConfig);
+    setIsCreateOpen(true);
+  };
+
+  const existingViewNames = useMemo(
+    () =>
+      mcpServers.flatMap((s) =>
+        (s.views ?? []).map((v) => v.name ?? v.server.name)
+      ),
+    [mcpServers]
+  );
+
+  const onCreateInternalMCPServer = async (mcpServer: MCPServerType) => {
+    // Open the dialog when OAuth/bearer token is required, OR when a
+    // multi-instance server already has an instance with the same name
+    // (so the user can pick a custom name).
+    const hasNameConflict =
+      mcpServer.allowMultipleInstances &&
+      existingViewNames.includes(mcpServer.name);
+
+    if (
+      mcpServer.authorization ??
+      requiresBearerTokenConfiguration(mcpServer) ??
+      hasNameConflict
+    ) {
+      setInternalMCPServerToCreate(mcpServer);
+      setDefaultServerConfig(undefined);
+      setIsCreateOpen(true);
+    } else {
+      setIsLoading(true);
+      await createInternalMCPServer({
+        name: mcpServer.name,
+        includeGlobal: true,
+      });
+      setIsLoading(false);
+    }
+  };
+
+  const rows: RowData[] = useMemo(
+    () =>
+      mcpServers
+        .filter((mcpServer) => mcpServer.availability === "manual")
+        .map((mcpServerWithViews) => {
+          const mcpServerView = mcpServerWithViews?.views.find(
+            (v) => v.spaceId === systemSpace?.sId
+          );
+          const spaceIds =
+            mcpServerWithViews?.views.map((v) => v.spaceId) ?? [];
+          const serverUsage =
+            usage && mcpServerView ? usage[mcpServerView.server.sId] : null;
+
+          const account =
+            mcpServerView?.oAuthUseCase === "personal_actions"
+              ? "Personal"
+              : mcpServerView?.oAuthUseCase === "platform_actions"
+                ? "Shared"
+                : "";
+
+          return {
+            mcpServer: mcpServerWithViews,
+            mcpServerView,
+            account,
+            spaces: spaces.filter((s) => spaceIds?.includes(s.sId)),
+            usage: serverUsage,
+            isConnected: !!connections.find(
+              (c) =>
+                c.internalMCPServerId === mcpServerWithViews.sId ||
+                c.remoteMCPServerId === mcpServerWithViews.sId
+            ),
+            onClick: () => {
+              if (mcpServerView && mcpServerWithViews) {
+                setMcpServerToShow(mcpServerWithViews);
+              }
+            },
+          };
+        })
+        .sort((a, b) =>
+          mcpServersSortingFn(
+            { mcpServer: a.mcpServer, mcpServerView: a.mcpServerView },
+            { mcpServer: b.mcpServer, mcpServerView: b.mcpServerView }
+          )
+        ),
+    [
+      connections,
+      mcpServers,
+      setMcpServerToShow,
+      spaces,
+      systemSpace?.sId,
+      usage,
+    ]
+  );
+  const columns = useMemo((): ColumnDef<RowData>[] => {
+    const columns: ColumnDef<RowData, any>[] = [];
+
+    columns.push(
+      {
+        id: "name",
+        accessorKey: "name",
+        header: "Name",
+        cell: (info: CellContext<RowData, string>) => (
+          <NameCell row={info.row.original} />
+        ),
+        filterFn: (row, _, filterValue) => {
+          const { mcpServer, mcpServerView } = row.original;
+          const filterLower = filterValue.toLowerCase();
+
+          // Check base server properties (name, description, tools).
+          if (filterMCPServer(mcpServer, filterValue)) {
+            return true;
+          }
+          // Check display name (may differ from server name due to custom view name or formatting).
+          const displayName = mcpServerView
+            ? getMcpServerViewDisplayName(mcpServerView)
+            : getMcpServerDisplayName(mcpServer);
+          return displayName.toLowerCase().includes(filterLower);
+        },
+        sortingFn: (rowA, rowB) => {
+          return mcpServersSortingFn(
+            {
+              mcpServer: rowA.original.mcpServer,
+              mcpServerView: rowA.original.mcpServerView,
+            },
+            {
+              mcpServer: rowB.original.mcpServer,
+              mcpServerView: rowB.original.mcpServerView,
+            }
+          );
+        },
+        meta: {
+          className: "w-28 @2xl:w-32",
+        },
+      },
+      {
+        id: "usedBy",
+        header: () => <div className="flex w-full justify-center">Used by</div>,
+        accessorFn: (row: RowData) => row.usage?.count ?? 0,
+        cell: (info) => (
+          <div className="flex h-12 w-full items-center justify-center">
+            <UsedByButton
+              usage={info.row.original.usage}
+              onItemClick={setAgentId}
+              onSkillClick={setSkillId}
+            />
+          </div>
+        ),
+        meta: {
+          className: "hidden px-0 @sm:w-32 @sm:table-cell",
+        },
+      },
+      {
+        id: "access",
+        accessorKey: "spaces",
+        header: "Availability",
+        cell: (info: CellContext<RowData, SpaceType[]>) => {
+          const globalSpace = info.getValue().find((s) => s.kind === "global");
+
+          return (
+            <DataTable.CellContent>
+              <div className="flex items-center gap-2">
+                {globalSpace
+                  ? "Workspace"
+                  : info
+                      .getValue()
+                      .filter((s) => s.kind === "regular")
+                      .map((s) => s.name)
+                      .join(", ")}
+              </div>
+            </DataTable.CellContent>
+          );
+        },
+        sortingFn: (rowA, rowB) => {
+          return rowA.original.mcpServer.name.localeCompare(
+            rowB.original.mcpServer.name
+          );
+        },
+        meta: {
+          className: "hidden w-28 @2xl:w-10 @sm:table-cell",
+        },
+      },
+      {
+        id: "account",
+        accessorKey: "account",
+        header: "Account",
+        cell: (info: CellContext<RowData, string>) => {
+          const account = info.getValue();
+
+          return (
+            <DataTable.CellContent>
+              <div className="flex items-center gap-2">{account}</div>
+            </DataTable.CellContent>
+          );
+        },
+        sortingFn: (rowA, rowB) => {
+          const accountA = rowA.original.account;
+          const accountB = rowB.original.account;
+          return accountA.localeCompare(accountB);
+        },
+        meta: {
+          className: "hidden @sm:w-5 @sm:table-cell",
+        },
+      },
+      {
+        id: "by",
+        accessorKey: "mcpServerView.editedByUser",
+        header: "By",
+        cell: (info) => {
+          const editedByUser = info.row.original.mcpServerView?.editedByUser;
+
+          return (
+            <DataTable.CellContent
+              avatarUrl={editedByUser?.imageUrl ?? ANONYMOUS_USER_IMAGE_URL}
+              avatarTooltipLabel={editedByUser?.fullName ?? undefined}
+              roundedAvatar
+            />
+          );
+        },
+        meta: {
+          className: "hidden @sm:w-2 @sm:table-cell",
+        },
+      },
+      {
+        id: "lastUpdated",
+        accessorKey: "mcpServerView.editedByUser.editedAt",
+        header: "Last updated",
+        cell: (info: CellContext<RowData, number>) => (
+          <DataTable.BasicCellContent
+            label={
+              info.getValue()
+                ? formatTimestampToFriendlyDate(info.getValue(), "compact")
+                : "-"
+            }
+          />
+        ),
+        meta: {
+          className: "hidden @sm:w-5 @sm:table-cell @2xl:w-5",
+        },
+      }
+    );
+
+    return columns;
+  }, []);
+
+  return (
+    <>
+      <AgentDetailsSheet
+        owner={owner}
+        user={user}
+        agentId={agentId}
+        onClose={() => setAgentId(null)}
+      />
+      <SkillDetailsSheetById
+        owner={owner}
+        user={user}
+        skillId={skillId}
+        onClose={() => setSkillId(null)}
+      />
+      <CreateMCPServerDialog
+        isOpen={isCreateOpen}
+        internalMCPServer={internalMCPServerToCreate}
+        setIsOpen={setIsCreateOpen}
+        setIsLoading={setIsLoading}
+        owner={owner}
+        setMCPServerToShow={setMcpServerToShow}
+        defaultServerConfig={defaultServerConfig}
+        existingViewNames={existingViewNames}
+      />
+      <AddToolsDialog
+        owner={owner}
+        isOpen={isAddToolsOpen}
+        setIsOpen={setIsAddToolsOpen}
+        enabledMCPServers={mcpServers}
+        createRemoteMCPServer={onCreateRemoteMCPServer}
+        createInternalMCPServer={onCreateInternalMCPServer}
+      />
+      {rows.length > 0 &&
+        portalToHeader(
+          <AddToolsButton onClick={() => setIsAddToolsOpen(true)} />
+        )}
+
+      {showLoader && (
+        <div className="mt-16 flex justify-center">
+          <Spinner />
+        </div>
+      )}
+
+      {!showLoader &&
+        (rows.length === 0 ? (
+          <EmptyCTA
+            message="You don’t have any tools yet."
+            action={
+              <AddToolsButton
+                variant="outline"
+                onClick={() => setIsAddToolsOpen(true)}
+              />
+            }
+          />
+        ) : (
+          <DataTable
+            data={rows}
+            columns={columns}
+            className="pb-4"
+            filter={filter}
+            filterColumn="name"
+          />
+        ))}
+    </>
+  );
+};

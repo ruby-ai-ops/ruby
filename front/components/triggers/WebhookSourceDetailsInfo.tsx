@@ -1,0 +1,294 @@
+import { getIcon } from "@app/components/resources/resources_icons";
+import type { WebhookSourceFormValues } from "@app/components/triggers/forms/webhookSourceFormSchema";
+import { WebhookEndpointUsageInfo } from "@app/components/triggers/WebhookEndpointUsageInfo";
+import { useSendNotification } from "@app/hooks/useNotification";
+import config from "@app/lib/api/config";
+import { buildWebhookUrl, normalizeWebhookIcon } from "@app/lib/webhook_source";
+import type { WebhookSourceViewForAdminType } from "@app/types/triggers/webhooks";
+import { WEBHOOK_PRESETS } from "@app/types/triggers/webhooks";
+import { CLIENT_SIDE_WEBHOOK_PRESETS } from "@app/types/triggers/webhooks_client_side";
+import type { LightWorkspaceType } from "@app/types/user";
+import {
+  ActionIcons,
+  Button,
+  Chip,
+  Clipboard,
+  cn,
+  Eye,
+  EyeOff,
+  IconButton,
+  IconPicker,
+  Input,
+  Label,
+  Page,
+  PopoverContent,
+  PopoverRoot,
+  PopoverTrigger,
+  Separator,
+  TextArea,
+  useCopyToClipboard,
+} from "@ruby-ai/sparkle";
+import { useMemo, useState } from "react";
+import { useController, useFormContext } from "react-hook-form";
+
+type WebhookSourceDetailsInfoProps = {
+  webhookSourceView: WebhookSourceViewForAdminType;
+  owner: LightWorkspaceType;
+};
+
+const getEditedLabel = (webhookSourceView: WebhookSourceViewForAdminType) => {
+  if (
+    webhookSourceView.editedByUser === null ||
+    (webhookSourceView.editedByUser.editedAt === null &&
+      webhookSourceView.editedByUser.fullName === null)
+  ) {
+    return null;
+  }
+  if (webhookSourceView.editedByUser.editedAt === null) {
+    return `Edited by ${webhookSourceView.editedByUser.fullName}`;
+  }
+  const editedAtDateString = new Date(
+    webhookSourceView.editedByUser.editedAt
+  ).toLocaleDateString();
+  if (webhookSourceView.editedByUser.fullName === null) {
+    return `Edited on ${editedAtDateString}`;
+  }
+
+  return `Edited by ${webhookSourceView.editedByUser.fullName}, ${editedAtDateString}`;
+};
+
+export function WebhookSourceDetailsInfo({
+  webhookSourceView,
+  owner,
+}: WebhookSourceDetailsInfoProps) {
+  const [isSecretVisible, setIsSecretVisible] = useState(false);
+  const [isPopoverOpen, setIsPopoverOpen] = useState(false);
+  const sendNotification = useSendNotification();
+  const form = useFormContext<WebhookSourceFormValues>();
+
+  const { field: nameField, fieldState: nameFieldState } = useController({
+    control: form.control,
+    name: "name",
+  });
+
+  const { field: descriptionField } = useController({
+    control: form.control,
+    name: "description",
+  });
+
+  const editedLabel = useMemo(
+    () => getEditedLabel(webhookSourceView),
+    [webhookSourceView]
+  );
+
+  const [, copy] = useCopyToClipboard();
+
+  const selectedIcon = form.watch("icon");
+  const IconComponent = getIcon(normalizeWebhookIcon(selectedIcon));
+
+  const webhookUrl = useMemo(() => {
+    return buildWebhookUrl({
+      apiBaseUrl: config.getApiBaseUrl(),
+      workspaceId: owner.sId,
+      webhookSource: webhookSourceView.webhookSource,
+    });
+  }, [owner.sId, webhookSourceView.webhookSource]);
+
+  const handleCopy = async (text: string, label: string) => {
+    const ok = await copy(text);
+    if (ok) {
+      sendNotification({
+        type: "success",
+        title: `${label} copied to clipboard`,
+      });
+    }
+  };
+
+  const { provider } = webhookSourceView.webhookSource;
+
+  return (
+    <div className="flex flex-col gap-2">
+      {editedLabel !== null && (
+        <div className="flex w-full justify-end text-sm text-muted-foreground">
+          {editedLabel}
+        </div>
+      )}
+
+      <div className="space-y-5 text-foreground">
+        <div className="space-y-2">
+          <Label htmlFor="trigger-name-icon">
+            {provider ? "Name" : "Name & Icon"}
+          </Label>
+          <div className="flex items-end space-x-2">
+            <div className="flex-grow">
+              <Input
+                {...nameField}
+                id="trigger-name-icon"
+                isError={!!nameFieldState.error}
+                message={nameFieldState.error?.message}
+                placeholder={webhookSourceView.webhookSource.name}
+              />
+            </div>
+            {!provider && (
+              <PopoverRoot open={isPopoverOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    icon={IconComponent}
+                    onClick={() => setIsPopoverOpen(true)}
+                    isSelect
+                  />
+                </PopoverTrigger>
+                <PopoverContent
+                  className="w-fit p-0"
+                  onInteractOutside={() => setIsPopoverOpen(false)}
+                  onEscapeKeyDown={() => setIsPopoverOpen(false)}
+                >
+                  <IconPicker
+                    icons={ActionIcons}
+                    selectedIcon={normalizeWebhookIcon(selectedIcon)}
+                    onIconSelect={(iconName: string) => {
+                      form.setValue("icon", iconName, { shouldDirty: true });
+                      setIsPopoverOpen(false);
+                    }}
+                  />
+                </PopoverContent>
+              </PopoverRoot>
+            )}
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="trigger-description">Description</Label>
+          <TextArea
+            {...descriptionField}
+            id="trigger-description"
+            rows={3}
+            placeholder="Help your team understand when to use this trigger."
+          />
+        </div>
+      </div>
+
+      <Separator className="mb-4 mt-4" />
+      <Page.H variant="h4">Webhook Source Details</Page.H>
+
+      <div className="space-y-6">
+        <div>
+          <Page.H variant="h6">Webhook URL</Page.H>
+          <div className="flex items-center space-x-2">
+            <p className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+              {webhookUrl}
+            </p>
+            <IconButton
+              icon={Clipboard}
+              onClick={() => handleCopy(webhookUrl, "Webhook URL")}
+              size="xs"
+            />
+          </div>
+        </div>
+
+        {provider &&
+          (() => {
+            const DetailsComponent =
+              CLIENT_SIDE_WEBHOOK_PRESETS[provider].components.detailsComponent;
+            return (
+              <DetailsComponent
+                webhookSource={webhookSourceView.webhookSource}
+              />
+            );
+          })()}
+        {provider && WEBHOOK_PRESETS[provider].events.length > 0 && (
+          <div className="space-y-3">
+            <Page.H variant="h6">Subscribed events</Page.H>
+            <div>
+              {webhookSourceView.webhookSource.subscribedEvents
+                .map((eventValue) => {
+                  const event = WEBHOOK_PRESETS[provider].events.find(
+                    (e) => e.value === eventValue
+                  );
+                  return event ? event.name : eventValue;
+                })
+                .map((event) => {
+                  return (
+                    <Chip
+                      key={event}
+                      size="xs"
+                      color="primary"
+                      className="m-0.5"
+                    >
+                      {event}
+                    </Chip>
+                  );
+                })}
+            </div>
+          </div>
+        )}
+        {webhookSourceView.webhookSource.secret && (
+          <div>
+            <Page.H variant="h6">Secret</Page.H>
+            <div className="flex items-center space-x-2">
+              <p
+                className={cn(
+                  "min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono",
+                  {
+                    "select-none blur-sm": !isSecretVisible,
+                  }
+                )}
+              >
+                {webhookSourceView.webhookSource.secret}
+              </p>
+              <div>
+                <IconButton
+                  icon={isSecretVisible ? EyeOff : Eye}
+                  onClick={() => setIsSecretVisible((prev) => !prev)}
+                  size="xs"
+                />
+                <IconButton
+                  icon={Clipboard}
+                  onClick={() =>
+                    handleCopy(
+                      webhookSourceView.webhookSource.secret ?? "",
+                      "Secret"
+                    )
+                  }
+                  size="xs"
+                />
+              </div>
+            </div>
+          </div>
+        )}
+        {webhookSourceView.webhookSource.signatureHeader && (
+          <>
+            <div>
+              <Page.H variant="h6">Signature Header</Page.H>
+              <Page.P>{webhookSourceView.webhookSource.signatureHeader}</Page.P>
+            </div>
+
+            <div>
+              <Page.H variant="h6">Signature Algorithm</Page.H>
+              <Page.P>
+                {webhookSourceView.webhookSource.signatureAlgorithm}
+              </Page.P>
+            </div>
+          </>
+        )}
+        {webhookSourceView.webhookSource.secret &&
+          webhookSourceView.webhookSource.signatureHeader &&
+          webhookSourceView.webhookSource.signatureAlgorithm && (
+            <>
+              <Separator className="mb-4 mt-4" />
+              <WebhookEndpointUsageInfo
+                signatureAlgorithm={
+                  webhookSourceView.webhookSource.signatureAlgorithm
+                }
+                signatureHeader={
+                  webhookSourceView.webhookSource.signatureHeader
+                }
+              />
+            </>
+          )}
+      </div>
+    </div>
+  );
+}

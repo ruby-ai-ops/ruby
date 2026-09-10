@@ -1,0 +1,563 @@
+import { isAgentLoopToolEvent } from "@app/lib/actions/mcp";
+import type { ToolContext } from "@app/lib/actions/types";
+import { isSandboxChildActionInfo } from "@app/lib/actions/types";
+import { isLightClientSideMCPToolConfiguration } from "@app/lib/actions/types/guards";
+import {
+  buildAuditLogTarget,
+  emitAuditLogEventDirect,
+} from "@app/lib/api/audit/workos_audit";
+import { runToolWithStreaming } from "@app/lib/api/mcp/run_tool";
+import type { AuthenticatorType } from "@app/lib/auth";
+import { Authenticator } from "@app/lib/auth";
+import { notifyManualActionRequired } from "@app/lib/notifications/workflows/manual-action-required";
+import { AgentMCPActionResource } from "@app/lib/resources/agent_mcp_action_resource";
+import { AgentStepContentResource } from "@app/lib/resources/agent_step_content_resource";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { getShutdownSignal } from "@app/lib/shutdown_signal";
+import { withPeriodicHeartbeat } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import { updateResourceAndPublishEvent } from "@app/temporal/agent_loop/activities/common";
+import { TOOL_SETUP_HEARTBEAT_INTERVAL_MS } from "@app/temporal/agent_loop/config";
+import type { ToolExecutionResult } from "@app/temporal/agent_loop/lib/deferred_events";
+import { sliceConversationForAgentMessage } from "@app/temporal/agent_loop/lib/loop_utils";
+import type {
+  AgentLoopArgsWithTiming,
+  AgentLoopExecutionData,
+} from "@app/types/assistant/agent_run";
+import {
+  getFullAgentLoopDataWithAuth,
+  isAgentLoopDataSoftDeleteError,
+} from "@app/types/assistant/agent_run";
+import type { ModelId } from "@app/types/shared/model_id";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { isString } from "@app/types/shared/utils/general";
+import {
+  startActiveObservation,
+  updateActiveObservation,
+} from "@langfuse/tracing";
+import { Context, heartbeat } from "@temporalio/activity";
+import assert from "assert";
+
+const CONVERSATION_CACHE_TTL_MS = 5000;
+
+// Extracts sIds of accessed datasources/tables from tool augmentedInputs.
+// Ruby-internal MCP servers receive { uri } objects whose last path segment is
+// the configuration sId. External MCP servers (e.g. Airtable) bypass that
+// augmentation and may send entries like { tableId, fieldIds } with no uri, so
+// uri access must be guarded and we fall back to tableId when available.
+// Cap the per-field ID list for the tool.executed audit event so tools that
+// touch dozens of data sources don't blow the WorkOS payload limit. A sample
+// of 30 IDs preserves forensic cross-reference (~25 chars * 30 IDs = ~750
+// chars, well under the 1000-char per-value metadata cap), and the
+// "+N more" suffix preserves the total count without joining every ID.
+const TOOL_EXECUTED_MAX_SAMPLE_IDS = 30;
+
+function formatAccessedIdsSample(ids: string[]): string {
+  if (ids.length <= TOOL_EXECUTED_MAX_SAMPLE_IDS) {
+    return ids.join(",");
+  }
+  const sample = ids.slice(0, TOOL_EXECUTED_MAX_SAMPLE_IDS).join(",");
+  return `${sample},+${ids.length - TOOL_EXECUTED_MAX_SAMPLE_IDS} more`;
+}
+
+function extractDataSourceIds(
+  inputs: Record<string, unknown>
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  const ds = inputs.dataSources;
+  const tables = inputs.tables;
+  const lastUriSegment = (v: unknown): string | undefined =>
+    isString(v) ? v.split("/").pop() : undefined;
+  if (Array.isArray(ds) && ds.length > 0) {
+    const ids = ds
+      .map((d: { uri?: unknown }) => lastUriSegment(d.uri) ?? "")
+      .filter(Boolean);
+    result.accessed_data_source_ids = formatAccessedIdsSample(ids);
+  }
+  if (Array.isArray(tables) && tables.length > 0) {
+    const ids = tables
+      .map((t: { uri?: unknown; tableId?: unknown }) => {
+        const segment = lastUriSegment(t.uri);
+        if (segment) {
+          return segment;
+        }
+        return isString(t.tableId) ? t.tableId : "";
+      })
+      .filter(Boolean);
+    result.accessed_table_ids = formatAccessedIdsSample(ids);
+  }
+  return result;
+}
+
+export async function runToolActivity(
+  authType: AuthenticatorType,
+  {
+    actionId,
+    runAgentArgs,
+    step,
+    runIds,
+  }: {
+    actionId: ModelId;
+    runAgentArgs: AgentLoopArgsWithTiming;
+    step: number;
+    runIds?: string[];
+  }
+): Promise<ToolExecutionResult> {
+  // The setup phase below is DB-bound and can stall past the heartbeat timeout under
+  // connection-pool contention. Tool activities are not retried, so a missed first heartbeat
+  // kills the whole run: heartbeat immediately and periodically until setup completes.
+  heartbeat();
+
+  const deferredEvents: ToolExecutionResult["deferredEvents"] = [];
+
+  const { auth, runAgentDataRes, action } = await withPeriodicHeartbeat(
+    async () => {
+      const auth = await Authenticator.fromJsonWithRefrehedGroups(authType);
+
+      const [runAgentDataRes, action] = await startActiveObservation(
+        "get-agent-loop-data",
+        () =>
+          Promise.all([
+            // Cache conversation fetches to reduce DB load when multiple tool activities run in parallel
+            // during the same step. Each tool would otherwise fetch the same conversation independently.
+            getFullAgentLoopDataWithAuth(auth, {
+              ...runAgentArgs,
+              caching: {
+                useCachedGetConversation: true,
+                unicitySuffix: `${runAgentArgs.agentMessageId}:${runAgentArgs.agentMessageVersion}:${step}`,
+                ttlMs: CONVERSATION_CACHE_TTL_MS,
+              },
+            }),
+            AgentMCPActionResource.fetchByModelIdWithAuth(auth, actionId),
+          ])
+      );
+
+      return { auth, runAgentDataRes, action };
+    },
+    {
+      intervalMs: TOOL_SETUP_HEARTBEAT_INTERVAL_MS,
+      heartbeatFn: () => {
+        heartbeat();
+        logger.info(
+          {
+            actionId,
+            conversationId: runAgentArgs.conversationId,
+            agentMessageId: runAgentArgs.agentMessageId,
+            step,
+            workspaceId: authType.workspaceId,
+          },
+          "MCP tool setup heartbeat"
+        );
+      },
+    }
+  );
+  if (runAgentDataRes.isErr()) {
+    if (isAgentLoopDataSoftDeleteError(runAgentDataRes.error)) {
+      logger.info(
+        {
+          actionId,
+          runIds,
+        },
+        "Message or conversation was deleted, exiting"
+      );
+      return { deferredEvents };
+    }
+    throw runAgentDataRes.error;
+  }
+  assert(action, "Action not found");
+
+  // Heartbeating here as retrieving the agent loop data takes some time.
+  heartbeat();
+
+  // Identify the tool as early as possible: activities that die past this point (worker killed,
+  // stall in the pre-execution phases) leave no tool-level log otherwise, making heartbeat
+  // timeout failures unattributable to a tool.
+  logger.info(
+    {
+      actionId,
+      attempt: Context.current().info.attempt,
+      conversationId: runAgentArgs.conversationId,
+      agentMessageId: runAgentArgs.agentMessageId,
+      step,
+      workspaceId: authType.workspaceId,
+      toolName: action.toolConfiguration.name,
+      mcpServerName: action.toolConfiguration.mcpServerName,
+    },
+    "Tool activity starting execution"
+  );
+
+  const {
+    agentConfiguration,
+    modelInfo: model,
+    conversation: originalConversation,
+    agentMessage: originalAgentMessage,
+    userMessage,
+  } = runAgentDataRes.value;
+
+  const { slicedConversation: conversation, slicedAgentMessage: agentMessage } =
+    sliceConversationForAgentMessage(originalConversation, {
+      agentMessageId: originalAgentMessage.sId,
+      agentMessageVersion: originalAgentMessage.version,
+      // Include the current step output.
+      //
+      // TODO(DURABLE-AGENTS 2025-07-27): Change this as part of the
+      // retryOnlyBlockedTools effort (the whole step should not be included,
+      // tools successfully ran should be removed, this should be an arg to
+      // sliceConversationForAgentMessage)
+      step: step + 1,
+    });
+
+  return startActiveObservation(
+    `${action.toolConfiguration.mcpServerName}/${action.toolConfiguration.name}`,
+    () => {
+      updateActiveObservation(
+        {
+          input: {
+            actionId,
+            toolName: action.toolConfiguration.name,
+            mcpServerName: action.toolConfiguration.mcpServerName,
+          },
+        },
+        { asType: "tool" }
+      );
+
+      return executeToolStreaming(auth, {
+        action,
+        agentConfiguration,
+        model,
+        agentMessage,
+        conversation,
+        deferredEvents,
+        runIds,
+        step,
+        userMessage,
+      });
+    },
+    { asType: "tool" }
+  );
+}
+
+async function executeToolStreaming(
+  auth: Authenticator,
+  {
+    action,
+    agentConfiguration,
+    model: modelInfo,
+    agentMessage,
+    conversation,
+    deferredEvents,
+    runIds,
+    step,
+    userMessage,
+  }: {
+    action: AgentMCPActionResource;
+    agentConfiguration: AgentLoopExecutionData["agentConfiguration"];
+    model: AgentLoopExecutionData["modelInfo"];
+    agentMessage: AgentLoopExecutionData["agentMessage"];
+    conversation: AgentLoopExecutionData["conversation"];
+    deferredEvents: ToolExecutionResult["deferredEvents"];
+    runIds?: string[];
+    step: number;
+    userMessage: AgentLoopExecutionData["userMessage"];
+  }
+): Promise<ToolExecutionResult> {
+  const abortSignal = AbortSignal.any([
+    Context.current().cancellationSignal,
+    getShutdownSignal(),
+  ]);
+
+  // Sandbox-child actions are observed by the CLI through polling; they must
+  // not surface in the conversation timeline, so progress events are dropped.
+  const isSandboxChildAction = isSandboxChildActionInfo(
+    action.stepContext.sandboxChildActionInfo
+  );
+
+  const handleNonDeferredEvents = !isSandboxChildAction
+    ? updateResourceAndPublishEvent
+    : () => {};
+
+  const toolContext: ToolContext = {
+    runContext: {
+      contextType: "agent_loop",
+      action,
+      agentConfiguration,
+      modelInfo,
+      agentMessage,
+      conversation,
+      stepContext: action.stepContext,
+      toolConfiguration: action.toolConfiguration,
+      userMessage,
+    },
+  };
+
+  const eventStream = runToolWithStreaming(
+    auth,
+    { toolContext },
+    { signal: abortSignal }
+  );
+
+  for await (const event of eventStream) {
+    switch (event.type) {
+      case "tool_error":
+        updateActiveObservation(
+          {
+            output: { status: "error", errorCode: event.error.code },
+            level: "ERROR",
+            statusMessage: event.error.message,
+          },
+          { asType: "tool" }
+        );
+
+        // For tool errors, send immediately.
+        await handleNonDeferredEvents(auth, {
+          event: {
+            type: "tool_error",
+            created: event.created,
+            configurationId: agentConfiguration.sId,
+            messageId: agentMessage.sId,
+            conversationId: conversation.sId,
+            error: {
+              code: event.error.code,
+              message: event.error.message,
+              metadata: event.error.metadata,
+            },
+            isLastBlockingEventForStep: true,
+          },
+          agentMessage,
+          conversation,
+          step,
+        });
+
+        return { deferredEvents };
+
+      case "tool_early_exit":
+        updateActiveObservation(
+          {
+            output: { status: "early_exit", isError: event.isError },
+            level: event.isError ? "ERROR" : "WARNING",
+            statusMessage: event.text ?? "Early exit",
+          },
+          { asType: "tool" }
+        );
+
+        if (event.reason === "user_cancellation") {
+          return { deferredEvents, shouldPauseAgentLoop: true };
+        }
+
+        let updatedAgentMessage = agentMessage;
+        if (
+          !event.isError &&
+          event.text &&
+          !agentMessage.content &&
+          !isSandboxChildAction
+        ) {
+          // Save and post the tool's text content only if the execution stopped
+          // before any text was generated.
+          await AgentStepContentResource.createNewVersion({
+            workspaceId: conversation.owner.id,
+            agentMessageId: agentMessage.agentMessageId,
+            step: step + 1,
+            index: 0,
+            type: "text_content",
+            value: {
+              type: "text_content",
+              value: event.text,
+            },
+          });
+
+          // Include the newly created step content in the agentMessage.contents array
+          // to ensure it's included in the agent_message_success event
+          const newStepContent = {
+            step: step + 1,
+            content: {
+              type: "text_content" as const,
+              value: event.text,
+            },
+          };
+          updatedAgentMessage = {
+            ...agentMessage,
+            content: event.text, // Update the content field so it's visible in the UI
+            contents: [...(agentMessage.contents || []), newStepContent],
+          };
+        }
+
+        await handleNonDeferredEvents(auth, {
+          event: event.isError
+            ? {
+                type: "tool_error",
+                created: event.created,
+                configurationId: agentConfiguration.sId,
+                messageId: agentMessage.sId,
+                conversationId: conversation.sId,
+                error: {
+                  code: "early_exit",
+                  message: event.text,
+                  metadata: {
+                    errorTitle: "Early exit",
+                  },
+                },
+                isLastBlockingEventForStep: true,
+              }
+            : {
+                type: "agent_message_success",
+                created: event.created,
+                configurationId: agentConfiguration.sId,
+                messageId: agentMessage.sId,
+                message: {
+                  ...updatedAgentMessage,
+                  content: updatedAgentMessage.content,
+                  completedTs: event.created,
+                },
+                runIds: runIds ?? [],
+              },
+
+          agentMessage,
+          conversation,
+          step,
+        });
+
+        return { deferredEvents, shouldPauseAgentLoop: true };
+
+      case "tool_paused":
+        // Internal sentinel emitted by `exit_events` whenever a tool returned
+        // a `tool_blocked_awaiting_input` resource. Carries no UI payload —
+        // user-facing blocking events (if any) flowed through earlier
+        // iterations of this for-await and already populated `deferredEvents`.
+        // Sole purpose: pause the loop on the event channel rather than
+        // relying on `action.status` introspection.
+        return { deferredEvents, shouldPauseAgentLoop: true };
+
+      case "tool_personal_auth_required":
+      case "tool_file_auth_required":
+      case "tool_approve_execution":
+      case "tool_ask_user_question":
+        // The agent loop activity always runs tools with an agent loop context, so sandbox
+        // function scoped events cannot surface here.
+        assert(
+          "conversationId" in event,
+          "Unexpected sandbox function tool event in the agent loop."
+        );
+
+        updateActiveObservation(
+          {
+            output: { status: event.type },
+            level: "WARNING",
+          },
+          { asType: "tool" }
+        );
+
+        // Batched for publishing after all parallel tools complete to avoid partial UI state.
+        deferredEvents.push({
+          event,
+          context: {
+            agentMessageId: agentMessage.sId,
+            agentMessageRowId: agentMessage.agentMessageId,
+            conversationId: conversation.sId,
+            step,
+            workspaceId: conversation.owner.id,
+          },
+          shouldPauseAgentLoop: true,
+        });
+
+        await ConversationResource.markAsActionRequired(auth, {
+          conversation,
+        });
+
+        if (!conversation.actionRequired) {
+          notifyManualActionRequired(auth, {
+            conversationId: conversation.sId,
+            actionId: action.sId,
+          });
+        }
+
+        return { deferredEvents };
+
+      case "tool_success":
+        updateActiveObservation(
+          {
+            output: { status: "success" },
+          },
+          { asType: "tool" }
+        );
+
+        void emitAuditLogEventDirect({
+          workspace: conversation.owner,
+          action: "tool.executed",
+          actor: {
+            type: "agent",
+            id: agentConfiguration.sId,
+            name: agentConfiguration.name,
+          },
+          // The agent is the actor, so it is deliberately not repeated as a
+          // target: pod function tool calls share this action and have no agent.
+          targets: [
+            buildAuditLogTarget("workspace", conversation.owner),
+            buildAuditLogTarget("tool", {
+              sId: action.toolConfiguration.name,
+              name: action.toolConfiguration.originalName,
+            }),
+          ],
+          context: { location: auth.clientIp() ?? "internal" },
+          metadata: {
+            tool_name: action.toolConfiguration.originalName,
+            tool_type: isLightClientSideMCPToolConfiguration(
+              action.toolConfiguration
+            )
+              ? "remote"
+              : "internal",
+            mcp_server_name: action.toolConfiguration.mcpServerName,
+            conversation_id: conversation.sId,
+            agent_message_id: agentMessage.sId,
+            action_id: action.sId,
+            ...(conversation.triggerId
+              ? { trigger_id: conversation.triggerId }
+              : {}),
+            initiating_user_id: auth.user()?.sId ?? "unknown",
+            initiating_user_email: auth.user()?.email ?? "unknown",
+            ...extractDataSourceIds(action.augmentedInputs),
+          },
+        });
+
+        await handleNonDeferredEvents(auth, {
+          event: {
+            type: "agent_action_success",
+            created: event.created,
+            configurationId: agentConfiguration.sId,
+            messageId: agentMessage.sId,
+            // The generic tool runner event only carries the processed output; the agent loop
+            // action payload is rebuilt from the action resource, which reflects the final status
+            // (updated in place during execution).
+            action: {
+              ...action.toJSON(),
+              output: event.output,
+              generatedFiles: event.generatedFiles,
+            },
+          },
+          agentMessage,
+          conversation,
+          step,
+        });
+        break;
+
+      case "tool_notification":
+        // Tools executed from the agent loop activity always run with an agent loop context, so
+        // sandbox function notification events cannot surface here.
+        assert(
+          isAgentLoopToolEvent(event),
+          "Unexpected sandbox function tool notification in the agent loop."
+        );
+        await handleNonDeferredEvents(auth, {
+          event,
+          agentMessage,
+          conversation,
+          step,
+        });
+        break;
+
+      default:
+        assertNever(event);
+    }
+  }
+
+  return { deferredEvents };
+}

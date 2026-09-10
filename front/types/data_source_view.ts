@@ -1,0 +1,84 @@
+import { z } from "zod";
+
+import type { DataSourceViewCategory } from "./api/public/spaces";
+import type { ContentNodeWithParent } from "./connectors/connectors_api";
+import type {
+  AgentsAndSkillsUsageType,
+  ConnectorStatusDetails,
+  DataSourceType,
+} from "./data_source";
+import type { ModelId } from "./shared/model_id";
+import type { EditedByUser } from "./user";
+
+/**
+ * @swaggerschema DatasourceView (swagger_schemas.ts), PrivateDataSourceView (swagger_private_schemas.ts)
+ */
+export interface DataSourceViewType {
+  category: DataSourceViewCategory;
+  createdAt: number;
+  dataSource: DataSourceType;
+  editedByUser?: EditedByUser | null;
+  id: ModelId;
+  kind: DataSourceViewKind;
+  parentsIn: string[] | null;
+  sId: string;
+  spaceId: string;
+  updatedAt: number;
+}
+
+export type DataSourceViewsWithDetails = DataSourceViewType & {
+  dataSource: DataSourceType & ConnectorStatusDetails;
+  usage: AgentsAndSkillsUsageType;
+};
+
+export type DataSourceViewContentNode = ContentNodeWithParent & {
+  dataSourceView: DataSourceViewType;
+};
+
+export const isEqualNode = (
+  lhs: DataSourceViewContentNode,
+  rhs: DataSourceViewContentNode
+) =>
+  lhs.internalId === rhs.internalId &&
+  lhs.dataSourceView.dataSource.sId === rhs.dataSourceView.dataSource.sId;
+
+export type DataSourceViewSelectionConfiguration = {
+  dataSourceView: DataSourceViewType;
+  selectedResources: DataSourceViewContentNode[];
+  excludedResources: DataSourceViewContentNode[];
+  isSelectAll: boolean;
+  tagsFilter: TagsFilter;
+};
+
+const TAGS_FILTER_MODES = ["custom", "auto"] as const;
+export type TagsFilterMode = (typeof TAGS_FILTER_MODES)[number];
+
+export const TagsFilterSchema = z
+  .object({
+    in: z.array(z.string()),
+    not: z.array(z.string()),
+    mode: z.enum(TAGS_FILTER_MODES),
+  })
+  .nullable();
+export type TagsFilter = z.infer<typeof TagsFilterSchema>;
+
+export function defaultSelectionConfiguration(
+  dataSourceView: DataSourceViewType
+): DataSourceViewSelectionConfiguration {
+  return {
+    dataSourceView,
+    isSelectAll: false,
+    selectedResources: [],
+    excludedResources: [],
+    tagsFilter: null,
+  };
+}
+
+export type DataSourceViewSelectionConfigurations = Record<
+  string, // DataSourceView.sId
+  DataSourceViewSelectionConfiguration
+>;
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const DATA_SOURCE_VIEW_KINDS = ["default", "custom"] as const;
+export type DataSourceViewKind = (typeof DATA_SOURCE_VIEW_KINDS)[number];

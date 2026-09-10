@@ -1,0 +1,179 @@
+import { getMCPConnectionAccessToken } from "@app/lib/actions/mcp_oauth_access_token";
+import type { Authenticator } from "@app/lib/auth";
+import { RubyError } from "@app/lib/error";
+import type { MCPServerConnectionConnectionType } from "@app/lib/resources/mcp_server_connection_resource";
+import { MCPServerConnectionResource } from "@app/lib/resources/mcp_server_connection_resource";
+import logger from "@app/logger/logger";
+import type { OAuthConnectionType, OAuthProvider } from "@app/types/oauth/lib";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+
+type MCPServerAdminAuthenticationReason = "setup" | "reconnect";
+
+// Dedicated function to get the connection details for an MCP server.
+// Not using the one from mcp_metadata.ts to avoid circular dependency.
+export async function getConnectionForMCPServer(
+  auth: Authenticator,
+  {
+    mcpServerId,
+    connectionType,
+  }: {
+    mcpServerId: string;
+    connectionType: MCPServerConnectionConnectionType;
+  }
+): Promise<
+  Result<
+    {
+      connection: OAuthConnectionType;
+      access_token: string;
+      access_token_expiry: number | null;
+      scrubbed_raw_json: unknown;
+    },
+    RubyError<"mcp_access_token_error" | "connection_not_found">
+  >
+> {
+  const localLogger = logger.child({
+    workspaceId: auth.getNonNullableWorkspace().sId,
+    mcpServerId,
+    connectionType,
+  });
+
+  const connection = await MCPServerConnectionResource.findByMCPServer(auth, {
+    mcpServerId,
+    connectionType,
+  });
+
+  if (connection.isErr()) {
+    localLogger.info(
+      { error: connection.error },
+      "No connection found for MCP server"
+    );
+    return new Err(
+      new RubyError(
+        "connection_not_found",
+        "No connection found for MCP server"
+      )
+    );
+  }
+
+  if (!connection.value.connectionId) {
+    localLogger.info(
+      { credentialId: connection.value.credentialId },
+      "MCP server connection is not configured for OAuth"
+    );
+    return new Err(
+      new RubyError("connection_not_found", "Connection not found")
+    );
+  }
+
+  const tokenResult = await getMCPConnectionAccessToken(auth, {
+    connectionId: connection.value.connectionId,
+    localLogger,
+  });
+
+  if (tokenResult.isErr()) {
+    localLogger.warn(
+      { error: tokenResult.error },
+      "Failed to get access token for MCP server"
+    );
+    return new Err(
+      new RubyError(
+        "mcp_access_token_error",
+        "Failed to get access token for MCP server"
+      )
+    );
+  }
+
+  return new Ok(tokenResult.value);
+}
+
+const MCPServerRequiresPersonalAuthenticationErrorName =
+  "MCPServerRequiresPersonalAuthenticationError";
+
+export class MCPServerPersonalAuthenticationRequiredError extends Error {
+  mcpServerId: string;
+  provider: OAuthProvider;
+  scope?: string;
+
+  constructor(mcpServerId: string, provider: OAuthProvider, scope?: string) {
+    super(`MCP server ${mcpServerId} requires personal authentication`);
+    this.name = MCPServerRequiresPersonalAuthenticationErrorName;
+    this.mcpServerId = mcpServerId;
+    this.provider = provider;
+    this.scope = scope;
+  }
+
+  static is(
+    error: unknown
+  ): error is MCPServerPersonalAuthenticationRequiredError {
+    return (
+      error instanceof Error &&
+      error.name === MCPServerRequiresPersonalAuthenticationErrorName &&
+      "mcpServerId" in error
+    );
+  }
+}
+
+const MCPServerRequiresAdminAuthenticationErrorName =
+  "MCPServerRequiresAdminAuthenticationError";
+
+export class MCPServerRequiresAdminAuthenticationError extends Error {
+  mcpServerId: string;
+  provider: OAuthProvider;
+  scope?: string;
+  reason: MCPServerAdminAuthenticationReason;
+
+  constructor(
+    mcpServerId: string,
+    provider: OAuthProvider,
+    scope?: string,
+    reason: MCPServerAdminAuthenticationReason = "setup"
+  ) {
+    super(
+      reason === "setup"
+        ? `MCP server ${mcpServerId} requires your admin(s) to set up the workspace connection on Ruby.`
+        : `MCP server ${mcpServerId} requires your admin(s) to reconnect the workspace connection on Ruby.`
+    );
+    this.name = MCPServerRequiresAdminAuthenticationErrorName;
+    this.mcpServerId = mcpServerId;
+    this.provider = provider;
+    this.scope = scope;
+    this.reason = reason;
+  }
+
+  static is(
+    error: unknown
+  ): error is MCPServerRequiresAdminAuthenticationError {
+    return (
+      error instanceof Error &&
+      error.name === MCPServerRequiresAdminAuthenticationErrorName &&
+      "mcpServerId" in error
+    );
+  }
+}
+
+const MCPServerRateLimitedErrorName = "MCPServerRateLimitedError";
+
+export class MCPServerRateLimitedError extends Error {
+  mcpServerId: string;
+
+  constructor(mcpServerId: string) {
+    super(`MCP server ${mcpServerId} is rate limited.`);
+    this.name = MCPServerRateLimitedErrorName;
+    this.mcpServerId = mcpServerId;
+  }
+
+  static is(error: unknown): error is MCPServerRateLimitedError {
+    return (
+      error instanceof Error &&
+      error.name === MCPServerRateLimitedErrorName &&
+      "mcpServerId" in error
+    );
+  }
+}
+
+export function getMCPServerAdminAuthenticationReason(
+  error: RubyError<"mcp_access_token_error" | "connection_not_found">
+): MCPServerAdminAuthenticationReason {
+  return error.code === "connection_not_found" ? "setup" : "reconnect";
+}

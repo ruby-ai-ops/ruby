@@ -1,0 +1,87 @@
+import * as _ from "lodash";
+
+import { PlanModel, SubscriptionModel } from "@app/lib/models/plan";
+import {
+  FREE_NO_PLAN_CODE,
+  FREE_TEST_PLAN_CODE,
+} from "@app/lib/plans/plan_codes";
+import { MembershipResource } from "@app/lib/resources/membership_resource";
+import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { CustomerioServerSideTracking } from "@app/lib/tracking/customerio/server";
+import { renderLightWorkspaceType } from "@app/lib/workspace";
+import logger from "@app/logger/logger";
+import { makeScript } from "@app/scripts/helpers";
+import { removeNulls } from "@app/types/shared/utils/general";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+
+const backfillCustomerIo = async (execute: boolean) => {
+  const allActiveSubscriptions = await SubscriptionModel.findAll({
+    where: {
+      status: "active",
+    },
+  });
+  const planIds = removeNulls(allActiveSubscriptions.map((s) => s.planId));
+  const planById = _.keyBy(
+    planIds.length
+      ? await PlanModel.findAll({
+          where: {
+            id: planIds,
+          },
+        })
+      : [],
+    (p) => p.id.toString()
+  );
+  const workpsaceIds = allActiveSubscriptions.map((s) => s.workspaceId);
+  const workspaceById = _.keyBy(
+    workpsaceIds.length
+      ? await WorkspaceResource.fetchByModelIds(workpsaceIds)
+      : [],
+    (ws) => ws.id.toString()
+  );
+
+  for (const sub of allActiveSubscriptions) {
+    const plan = planById[sub.planId.toString()];
+    if (!plan || [FREE_TEST_PLAN_CODE, FREE_NO_PLAN_CODE].includes(plan.code)) {
+      // Ignore free plans
+      continue;
+    }
+
+    const workspace = workspaceById[sub.workspaceId.toString()];
+    if (!workspace) {
+      logger.error(
+        { subscriptionId: sub.id },
+        "Unreachable: subscription does not have a workspace"
+      );
+      continue;
+    }
+
+    const { memberships: workspaceMemberships } =
+      await MembershipResource.getLatestMemberships({
+        workspace: renderLightWorkspaceType({ workspace }),
+      });
+    const userIds = workspaceMemberships.map((m) => m.userId);
+    const users = await UserResource.fetchByModelIds(userIds);
+
+    logger.info(
+      { workspaceId: workspace.sId, usersCount: users.length },
+      "----------\nBackfilling users for workspace..."
+    );
+
+    for (const user of users) {
+      logger.info(
+        { userId: user.sId, workspaceId: workspace.sId },
+        "Backfilling user..."
+      );
+      if (execute) {
+        await CustomerioServerSideTracking.backfillUser({
+          user: user.toJSON(),
+        });
+      }
+    }
+  }
+};
+
+makeScript({}, async ({ execute }) => {
+  await backfillCustomerIo(execute);
+});

@@ -1,0 +1,253 @@
+import type { Authenticator } from "@app/lib/auth";
+import { amountCents } from "@app/lib/metronome/amounts";
+import { listMetronomeContractRateSchedule } from "@app/lib/metronome/client";
+import { getCreditTypeFromContract } from "@app/lib/metronome/coupons";
+import { getActiveContract } from "@app/lib/metronome/plan_type";
+import type { SeatAwuCreditsPeriod } from "@app/lib/metronome/seat_types";
+import {
+  getAwuAllocationInfoForSeatType,
+  getProductSeatTypes,
+  getSeatSubscriptionsFromContract,
+  getSeatTypesByProductIdFromContract,
+  isMauContract,
+} from "@app/lib/metronome/seat_types";
+import { isCreditPricedPlanPrefix } from "@app/lib/plans/plan_codes";
+import { MembershipResource } from "@app/lib/resources/membership_resource";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
+import { WorkspaceSeatLimitResource } from "@app/lib/resources/workspace_seat_limit_resource";
+import logger from "@app/logger/logger";
+import type { SupportedCurrency } from "@app/types/currency";
+import type { MembershipSeatType } from "@app/types/memberships";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+
+export type SeatBillingFrequency =
+  | "weekly"
+  | "monthly"
+  | "quarterly"
+  | "annual";
+
+export interface SeatTypeInfo {
+  // Human-readable plan name surfaced by Metronome (e.g. "Pro Seat") — use
+  // for display so the UI doesn't need to know about specific seat types.
+  name: string;
+  awuCredits: number;
+  awuCreditsPeriod: SeatAwuCreditsPeriod;
+  priceCents: number;
+  currency: SupportedCurrency;
+  // `priceCents` is the amount billed per `billingFrequency` (per month for
+  // monthly, per year for annual).
+  billingFrequency: SeatBillingFrequency;
+  // Billing floor: the count billed to Metronome even when actual headcount
+  // is lower. Seats within this floor are "free" to assign (already paid).
+  minSeats: number;
+  // Hard cap on assignments; null means no cap.
+  maxSeats: number | null;
+  // Number of workspace members currently assigned to this seat type.
+  assignedCount: number;
+  // Current billing period of this seat type's Metronome subscription (ISO
+  // dates). Used to prorate annual seat changes for the remainder of the
+  // term; null when the subscription has no active period right now.
+  currentBillingPeriod: { startsAt: string; endsAt: string } | null;
+}
+
+// Dynamic seat-type → info map. The list of seat types is driven by the
+// contract's subscriptions (each tagged with the `RUBY_SEAT_TYPE` custom
+// field) — not a hardcoded "pro" / "max" enum.
+export type SeatPlanResponseBody = Partial<
+  Record<MembershipSeatType, SeatTypeInfo>
+>;
+
+function getSeatBillingFrequency(
+  billingFrequency: string
+): SeatBillingFrequency {
+  switch (billingFrequency) {
+    case "WEEKLY":
+      return "weekly";
+    case "QUARTERLY":
+      return "quarterly";
+    case "ANNUAL":
+      return "annual";
+    case "MONTHLY":
+    default:
+      return "monthly";
+  }
+}
+
+export class SeatPlanError extends Error {
+  constructor(
+    readonly type:
+      | "not_configured"
+      | "currency_resolution_failed"
+      | "rate_schedule_fetch_failed",
+    readonly cause?: Error
+  ) {
+    super(type);
+  }
+}
+
+export async function getSeatPlan(
+  auth: Authenticator
+): Promise<Result<SeatPlanResponseBody, SeatPlanError>> {
+  const workspace = auth.getNonNullableWorkspace();
+  const contract = await getActiveContract(workspace.sId);
+
+  if (!contract || !contract.rate_card_id) {
+    return new Err(new SeatPlanError("not_configured"));
+  }
+
+  // Non-CP plans (legacy shadow contracts) don't use per-seat billing in the
+  // invite flow — return empty so the UI skips the seat selector and invites
+  // always use "none", consistent with SCIM/auto-join.
+  const subscription = await SubscriptionResource.fetchActiveByWorkspaceModelId(
+    workspace.id
+  );
+  if (!subscription || !isCreditPricedPlanPrefix(subscription.getPlan().code)) {
+    return new Ok({});
+  }
+
+  const creditTypeResult = await getCreditTypeFromContract(contract);
+  if (creditTypeResult.isErr()) {
+    logger.warn(
+      {
+        workspaceId: workspace.sId,
+        rateCardId: contract.rate_card_id,
+        err: creditTypeResult.error,
+      },
+      "[Metronome] Failed to resolve contract currency for seat plan"
+    );
+    return new Err(
+      new SeatPlanError("currency_resolution_failed", creditTypeResult.error)
+    );
+  }
+  const { currency } = creditTypeResult.value;
+
+  // MAU contracts don't bill per-seat — return an empty seat plan up-front.
+  if (isMauContract(contract)) {
+    return new Ok({});
+  }
+
+  // Build `productId → seatType` from contract subscriptions so we can resolve
+  // rate-schedule entries without comparing product names or IDs.
+  const [productSeatTypes, seatLimits, seatCounts] = await Promise.all([
+    getProductSeatTypes(),
+    WorkspaceSeatLimitResource.fetchByWorkspace({ workspace }),
+    MembershipResource.getActiveSeatTypeCountsForWorkspace({ workspace }),
+  ]);
+  const seatTypesByProductId = getSeatTypesByProductIdFromContract(
+    contract,
+    productSeatTypes
+  );
+  if (seatTypesByProductId.size === 0) {
+    return new Ok({});
+  }
+
+  // Resolve each seat's billing frequency from the matching subscription on
+  // the contract. Keep the full Metronome cadence in the response so callers
+  // don't need to assume that all non-annual seats are monthly.
+  const billingFrequencyBySeatType = new Map<
+    MembershipSeatType,
+    SeatBillingFrequency
+  >();
+  const currentBillingPeriodBySeatType = new Map<
+    MembershipSeatType,
+    { startsAt: string; endsAt: string } | null
+  >();
+  const seatSubscriptions = getSeatSubscriptionsFromContract(
+    contract,
+    productSeatTypes
+  );
+  for (const [seatType, sub] of seatSubscriptions) {
+    billingFrequencyBySeatType.set(
+      seatType,
+      getSeatBillingFrequency(sub.subscription_rate.billing_frequency)
+    );
+    const currentPeriod = sub.billing_periods.current;
+    currentBillingPeriodBySeatType.set(
+      seatType,
+      currentPeriod
+        ? {
+            startsAt: currentPeriod.starting_at,
+            endsAt: currentPeriod.ending_before,
+          }
+        : null
+    );
+  }
+
+  const priceCentsBySeatType = new Map<MembershipSeatType, number>();
+  const nameBySeatType = new Map<MembershipSeatType, string>();
+  try {
+    // Use the contract-level rate schedule (not the rate card's) so contract
+    // overrides on entitlement and price are applied. This endpoint only
+    // returns entitled rates and exposes `override_rate` when a contract
+    // override changes the price.
+    for await (const entry of listMetronomeContractRateSchedule({
+      metronomeCustomerId: contract.customer_id,
+      metronomeContractId: contract.id,
+      at: new Date().toISOString(),
+    })) {
+      if (!entry.entitled) {
+        continue;
+      }
+      const price = entry.override_rate?.price ?? entry.list_rate.price;
+      if (price === undefined) {
+        continue;
+      }
+      const seatType = seatTypesByProductId.get(entry.product_id);
+      if (!seatType) {
+        continue;
+      }
+      // Metronome quotes prices in its per-currency native unit (USD in
+      // cents, others in whole units); normalize to actual cents here. The
+      // rate is whatever the entry's billing_frequency dictates — monthly
+      // for monthly subscriptions, annual for annual subscriptions — and
+      // `billingFrequency` on the response tells the UI which is which.
+      priceCentsBySeatType.set(seatType, amountCents(price, currency));
+      nameBySeatType.set(seatType, entry.product_name);
+      if (priceCentsBySeatType.size >= seatTypesByProductId.size) {
+        break;
+      }
+    }
+  } catch (err) {
+    const normalized = normalizeError(err);
+    logger.warn(
+      {
+        workspaceId: workspace.sId,
+        rateCardId: contract.rate_card_id,
+        err: normalized,
+      },
+      "[Metronome] Failed to fetch rate schedule for seat products"
+    );
+    return new Err(new SeatPlanError("rate_schedule_fetch_failed", normalized));
+  }
+
+  const response: SeatPlanResponseBody = {};
+  for (const seatType of seatTypesByProductId.values()) {
+    const priceCents = priceCentsBySeatType.get(seatType);
+    const name = nameBySeatType.get(seatType);
+    if (priceCents === undefined || name === undefined) {
+      continue;
+    }
+    const awuAllocation = getAwuAllocationInfoForSeatType(
+      contract,
+      seatType,
+      productSeatTypes
+    );
+    const limit = seatLimits.get(seatType);
+    response[seatType] = {
+      name,
+      awuCredits: awuAllocation.credits,
+      awuCreditsPeriod: awuAllocation.period,
+      priceCents,
+      currency,
+      billingFrequency: billingFrequencyBySeatType.get(seatType) ?? "monthly",
+      minSeats: limit?.minSeats ?? 0,
+      maxSeats: limit?.maxSeats ?? null,
+      assignedCount: seatCounts[seatType] ?? 0,
+      currentBillingPeriod:
+        currentBillingPeriodBySeatType.get(seatType) ?? null,
+    };
+  }
+  return new Ok(response);
+}

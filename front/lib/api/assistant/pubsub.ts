@@ -1,0 +1,276 @@
+import type { AgentActionRunningEvents } from "@app/lib/actions/mcp";
+import { getMessageChannelId } from "@app/lib/api/assistant/streaming/helpers";
+import type { ConversationEvents } from "@app/lib/api/assistant/streaming/types";
+import type { EventPayload } from "@app/lib/api/redis-hybrid-manager";
+import { getRedisHybridManager } from "@app/lib/api/redis-hybrid-manager";
+import type { Authenticator } from "@app/lib/auth";
+import { getTemporalClientForAgentNamespace } from "@app/lib/temporal";
+import { createCallbackReader } from "@app/lib/utils";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import { makeAgentLoopWorkflowId } from "@app/temporal/agent_loop/lib/workflow_ids";
+import {
+  cancelAgentLoopSignal,
+  gracefullyStopAgentLoopSignal,
+  interruptAgentLoopSignal,
+} from "@app/temporal/agent_loop/signals";
+import type {
+  AgentActionSuccessEvent,
+  AgentErrorEvent,
+  AgentGenerationCancelledEvent,
+  AgentToolCallStartedEvent,
+} from "@app/types/assistant/agent";
+import type { GenerationTokensEvent } from "@app/types/assistant/generation";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { SignalDefinition } from "@temporalio/workflow";
+
+export async function* getConversationEvents({
+  conversationId,
+  lastEventId,
+  signal,
+}: {
+  conversationId: string;
+  lastEventId: string | null;
+  signal: AbortSignal;
+}): AsyncGenerator<
+  {
+    eventId: string;
+    data: ConversationEvents;
+  },
+  void
+> {
+  const pubsubChannel = getConversationChannelId(conversationId);
+
+  const callbackReader = createCallbackReader<EventPayload | "close">();
+  let { history, unsubscribe } = await getRedisHybridManager().subscribe(
+    pubsubChannel,
+    callbackReader.callback,
+    "conversation_events",
+    { lastEventId }
+  );
+
+  // Unsubscribe if the signal is aborted, to unblock the callbackReader.next() await below.
+  signal.addEventListener("abort", unsubscribe, { once: true });
+
+  try {
+    for (const event of history) {
+      yield {
+        eventId: event.id,
+        data: JSON.parse(event.message.payload),
+      };
+    }
+    // Free history entries: V8 retains all locals across `await` in async generators,
+    // pinning large event payloads for the entire SSE connection lifetime.
+    history = [];
+
+    // As most clients always listen to conversation events, we have a longer timeout to limit the overhead of initiating a new subscription.
+    // See https://ruby4ai.slack.com/archives/C050SM8NSPK/p1757577149634519
+    const TIMEOUT = 180000; // 3 minutes
+
+    // Do not loop forever, we will timeout after some time to avoid blocking the load balancer
+    while (true) {
+      if (signal.aborted) {
+        break;
+      }
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<"timeout">((resolve) => {
+        timeoutId = setTimeout(() => resolve("timeout"), TIMEOUT);
+      });
+      const rawEvent = await Promise.race([
+        callbackReader.next(),
+        timeoutPromise,
+      ]);
+
+      // Determine if we timeouted.
+      if (rawEvent === "timeout") {
+        break;
+      }
+      clearTimeout(timeoutId);
+
+      if (rawEvent === "close") {
+        break;
+      }
+
+      const event = {
+        eventId: rawEvent.id,
+        data: JSON.parse(rawEvent.message.payload),
+      };
+
+      yield event;
+    }
+  } catch (e) {
+    logger.error({ error: e }, "Error getting conversation events");
+  } finally {
+    signal.removeEventListener("abort", unsubscribe);
+    unsubscribe();
+  }
+}
+
+async function signalAgentLoops(
+  auth: Authenticator,
+  {
+    messageIds,
+    conversationId,
+    signal,
+  }: {
+    messageIds: string[];
+    conversationId: string;
+    signal: SignalDefinition<[void]>;
+  }
+): Promise<{ failedMessageIds: string[] }> {
+  const client = await getTemporalClientForAgentNamespace();
+  const workspaceId = auth.getNonNullableWorkspace().sId;
+  const failedMessageIds: string[] = [];
+
+  await concurrentExecutor(
+    messageIds,
+    async (messageId) => {
+      const workflowId = makeAgentLoopWorkflowId({
+        workspaceId,
+        conversationId,
+        agentMessageId: messageId,
+      });
+      try {
+        const handle = client.workflow.getHandle(workflowId);
+        await handle.signal(signal);
+      } catch (err) {
+        // Swallow errors from signaling (workflow might not exist anymore)
+        logger.warn(
+          { error: normalizeError(err), conversationId, messageId },
+          "Failed to signal agent loop workflow"
+        );
+        failedMessageIds.push(messageId);
+      }
+    },
+    { concurrency: 8 }
+  );
+
+  return { failedMessageIds };
+}
+
+export async function cancelAgentLoop(
+  auth: Authenticator,
+  {
+    messageIds,
+    conversationId,
+  }: { messageIds: string[]; conversationId: string }
+): Promise<{ failedMessageIds: string[] }> {
+  return signalAgentLoops(auth, {
+    messageIds,
+    conversationId,
+    signal: cancelAgentLoopSignal,
+  });
+}
+
+export async function gracefullyStopAgentLoop(
+  auth: Authenticator,
+  {
+    messageIds,
+    conversationId,
+  }: { messageIds: string[]; conversationId: string }
+): Promise<void> {
+  await signalAgentLoops(auth, {
+    messageIds,
+    conversationId,
+    signal: gracefullyStopAgentLoopSignal,
+  });
+}
+
+export async function interruptAgentLoop(
+  auth: Authenticator,
+  {
+    messageIds,
+    conversationId,
+  }: { messageIds: string[]; conversationId: string }
+): Promise<{ failedMessageIds: string[] }> {
+  return signalAgentLoops(auth, {
+    messageIds,
+    conversationId,
+    signal: interruptAgentLoopSignal,
+  });
+}
+
+export type MessageStreamEvent = {
+  eventId: string;
+  data: (
+    | AgentErrorEvent
+    | AgentActionRunningEvents
+    | AgentActionSuccessEvent
+    | AgentGenerationCancelledEvent
+    | AgentToolCallStartedEvent
+    | GenerationTokensEvent
+  ) & {
+    step: number;
+  };
+};
+
+export async function* getMessagesEvents(
+  auth: Authenticator,
+  {
+    messageId,
+    lastEventId,
+    signal,
+  }: { messageId: string; lastEventId: string | null; signal: AbortSignal }
+): AsyncGenerator<MessageStreamEvent, void> {
+  const pubsubChannel = getMessageChannelId(messageId);
+
+  const start = Date.now();
+  const TIMEOUT = 60000; // 1 minute
+
+  const callbackReader = createCallbackReader<EventPayload | "close">();
+  let { history, unsubscribe } = await getRedisHybridManager().subscribe(
+    pubsubChannel,
+    callbackReader.callback,
+    "message_events",
+    { lastEventId }
+  );
+
+  // Unsubscribe if the signal is aborted
+  signal.addEventListener("abort", unsubscribe, { once: true });
+
+  try {
+    for (const event of history) {
+      yield {
+        eventId: event.id,
+        data: JSON.parse(event.message.payload),
+      };
+    }
+    // Free history entries: V8 retains all locals across `await` in async generators,
+    // pinning large event payloads for the entire SSE connection lifetime.
+    history = [];
+
+    // Do not loop forever, we will timeout after some time to avoid blocking the load balancer
+    while (Date.now() - start < TIMEOUT) {
+      if (signal.aborted) {
+        break;
+      }
+
+      const rawEvent = await callbackReader.next();
+
+      if (rawEvent === "close") {
+        break;
+      }
+
+      const event = {
+        eventId: rawEvent.id,
+        data: JSON.parse(rawEvent.message.payload),
+      };
+
+      // If the payload is an end-of-stream event, we stop the generator.
+      if (event.data.type === "end-of-stream") {
+        break;
+      }
+
+      yield event;
+    }
+  } catch (e) {
+    logger.error({ error: e }, "Error getting messages events");
+  } finally {
+    signal.removeEventListener("abort", unsubscribe);
+    unsubscribe();
+  }
+}
+
+function getConversationChannelId(channelId: string) {
+  return `conversation-${channelId}`;
+}

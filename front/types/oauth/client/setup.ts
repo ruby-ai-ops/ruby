@@ -1,0 +1,106 @@
+import config from "@app/lib/api/config";
+import type { CellInfo } from "@app/types/cell";
+import type {
+  OAuthConnectionType,
+  OAuthCredentials,
+  OAuthProvider,
+  OAuthUseCase,
+} from "../../oauth/lib";
+import { isOAuthConnectionType } from "../../oauth/lib";
+import { isDevelopment } from "../../shared/env";
+import type { Result } from "../../shared/result";
+import { Err, Ok } from "../../shared/result";
+import type { LightWorkspaceType } from "../../user";
+
+export async function setupOAuthConnection({
+  owner,
+  provider,
+  useCase,
+  extraConfig,
+  cellInfo,
+}: {
+  owner: LightWorkspaceType;
+  provider: OAuthProvider;
+  useCase: OAuthUseCase;
+  extraConfig: OAuthCredentials;
+  cellInfo: CellInfo | null;
+}): Promise<Result<OAuthConnectionType, Error>> {
+  return new Promise((resolve) => {
+    const oauthBaseUrl = config.getAppUrl();
+    // Pass opener origin through OAuth flow so finalize page can postMessage back
+    const openerOrigin = window.location.origin;
+    let url = `${oauthBaseUrl}/w/${owner.sId}/oauth/${provider}/setup?useCase=${useCase}&openerOrigin=${encodeURIComponent(openerOrigin)}`;
+    if (extraConfig) {
+      url += `&extraConfig=${encodeURIComponent(JSON.stringify(extraConfig))}`;
+    }
+    // Pass region so the OAuth popup's CellContext initializes with the correct API URL.
+    if (cellInfo) {
+      url += `&cell=${encodeURIComponent(cellInfo.name)}`;
+    }
+    const oauthPopup = window.open(url);
+    let authComplete = false;
+
+    const handleFinalization = (data: any) => {
+      if (authComplete) {
+        return; // Already processed
+      }
+
+      if (data.type === "connection_finalized" && data.provider === provider) {
+        authComplete = true;
+        const { error, connection } = data;
+
+        cleanup();
+        oauthPopup?.close();
+
+        if (error) {
+          resolve(new Err(new Error(error)));
+        } else if (
+          connection &&
+          isOAuthConnectionType(connection) &&
+          connection.provider === provider
+        ) {
+          resolve(new Ok(connection));
+        } else {
+          resolve(
+            new Err(
+              new Error("Invalid connection data received from auth window")
+            )
+          );
+        }
+      }
+    };
+
+    // Method 1: window.postMessage (preferred, direct communication)
+    // The finalize page runs on the app (SPA), same origin as the opener.
+    // In dev, bypass origin check as an extra safeguard for cross-port communication.
+    const expectedOrigin = new URL(oauthBaseUrl).origin;
+    const handleWindowMessage = (event: MessageEvent) => {
+      if (!isDevelopment() && event.origin !== expectedOrigin) {
+        return;
+      }
+      handleFinalization(event.data);
+    };
+
+    window.addEventListener("message", handleWindowMessage);
+
+    // Method 2: BroadcastChannel (fallback)
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel("oauth_finalize");
+      channel.addEventListener("message", (event: MessageEvent) => {
+        handleFinalization(event.data);
+      });
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      // biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
+    } catch (e) {
+      // BroadcastChannel not supported
+    }
+
+    const cleanup = () => {
+      window.removeEventListener("message", handleWindowMessage);
+      if (channel) {
+        channel.close();
+      }
+    };
+  });
+}

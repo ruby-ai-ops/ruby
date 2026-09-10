@@ -1,0 +1,192 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { z } from "zod";
+
+export const ZENDESK_TOOLS_METADATA = [
+  {
+    name: "get_ticket",
+    description:
+      "Look up and retrieve a Zendesk support ticket by its ID. " +
+      "Returns subject, description, status, priority, assignee, and other metadata. " +
+      "Optionally include ticket metrics, the full conversation of comments, " +
+      "and file attachments. " +
+      "If the ticket suggests that attachments may contain useful screenshots or documents, " +
+      "call this tool again with includeAttachments set to true.",
+    schema: {
+      ticketId: z
+        .number()
+        .int()
+        .positive()
+        .describe("The ID of the Zendesk ticket to retrieve."),
+      includeMetrics: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include ticket metrics (resolution/wait times, replies). Defaults to false."
+        ),
+      includeConversation: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include the full conversation (all comments). Defaults to false."
+        ),
+      includeAttachments: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include file attachments from ticket comments. Defaults to false."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Retrieving Zendesk ticket",
+      done: "Retrieve Zendesk ticket",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "search_tickets",
+    description:
+      "Search and find Zendesk tickets using query syntax. " +
+      "Returns matching tickets with their details. " +
+      "Filter by status (open, pending, solved), priority (low, medium, high), " +
+      "type, assignee, tags, dates, and text fields.",
+    schema: {
+      query: z
+        .string()
+        .describe(
+          "Zendesk search query. Supports field:value pairs for status, priority, type, assignee, or tags. Do not include 'type:ticket'."
+        ),
+      sortBy: z
+        .enum(["updated_at", "created_at", "priority", "status", "ticket_type"])
+        .optional()
+        .describe(
+          "Field to sort results by. Defaults to relevance if not specified."
+        ),
+      sortOrder: z
+        .enum(["asc", "desc"])
+        .optional()
+        .describe("Sort order. Defaults to 'desc' if not specified."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Searching Zendesk tickets",
+      done: "Search Zendesk tickets",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "list_ticket_fields",
+    description:
+      "List and enumerate all Zendesk ticket field definitions, including built-in fields " +
+      "(Subject, Priority, Status) and custom fields, with their id, title, type, " +
+      "and active state. Use this to discover what fields exist on a ticket.",
+    schema: {
+      includeInactive: z
+        .boolean()
+        .optional()
+        .describe("Include inactive fields. Defaults to false."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Zendesk ticket fields",
+      done: "List Zendesk ticket fields",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "draft_reply",
+    description:
+      "Draft a reply to a Zendesk ticket. Creates a private comment " +
+      "(not visible to the end user) " +
+      "that can be edited before being published. This is useful for preparing responses before " +
+      "making them public.",
+    schema: {
+      ticketId: z
+        .number()
+        .int()
+        .positive()
+        .describe("The ID of the Zendesk ticket to reply to."),
+      body: z.string().describe("The content of the draft reply."),
+    },
+    stake: "low", // Low because it's a draft.
+    displayLabels: {
+      running: "Drafting reply to Zendesk",
+      done: "Draft reply to Zendesk",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "post_reply",
+    description:
+      "Post or send a public reply (response) on a Zendesk ticket, visible to the " +
+      "end user (the customer).",
+    schema: {
+      ticketId: z
+        .number()
+        .int()
+        .positive()
+        .describe("The ID of the Zendesk ticket to reply to."),
+      body: z.string().describe("The content of the reply."),
+    },
+    stake: "high",
+    displayLabels: {
+      running: "Posting reply to Zendesk",
+      done: "Post reply to Zendesk",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "update_ticket_tags",
+    description:
+      "Add tags to a Zendesk ticket, or replace all of its tags. " +
+      "By default (override=false) the provided tags are added to the existing ones. " +
+      "With override=true they replace the full list (omitted tags are removed).",
+    schema: {
+      ticketId: z
+        .number()
+        .int()
+        .positive()
+        .describe("The ID of the Zendesk ticket to update."),
+      tags: z
+        .array(z.string())
+        .describe(
+          "Tags to add, or the complete new list of tags if override=true."
+        ),
+      override: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, replaces all existing tags with the provided list. It removes any tag not in the list. " +
+            "If false or omitted, adds the tags to the existing ones. Defaults to false."
+        ),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Updating Zendesk ticket tags",
+      done: "Update Zendesk ticket tags",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+] as const;
+
+export const ZENDESK_SERVER = {
+  serverInfo: {
+    name: "zendesk",
+    version: "1.0.0",
+    description:
+      "Access and manage support tickets, help center, and customer interactions.",
+    authorization: {
+      provider: "zendesk" as const,
+      supported_use_cases: ["platform_actions", "personal_actions"] as const,
+    },
+    icon: "ZendeskLogo",
+    documentationUrl: null,
+  },
+  tools: ZENDESK_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

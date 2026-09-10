@@ -1,0 +1,177 @@
+import { frontSequelize } from "@app/lib/resources/storage";
+import {
+  DANGEROUSLY_UNBOUNDED_TEXT,
+  DataTypes,
+} from "@app/lib/resources/storage/data_types";
+import type { DataSourceViewModel } from "@app/lib/resources/storage/models/data_source_view";
+import { FileModel } from "@app/lib/resources/storage/models/files";
+import { SpaceModel } from "@app/lib/resources/storage/models/spaces";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import { WorkspaceAwareModel } from "@app/lib/resources/storage/wrappers/workspace_models";
+import type {
+  ContentFragmentExpiredReason,
+  ContentFragmentVersion,
+  SupportedContentFragmentType,
+} from "@app/types/content_fragment";
+import type { ContentNodeType } from "@app/types/core/content_node";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { CreationOptional, ForeignKey } from "sequelize";
+
+export class ContentFragmentModel extends WorkspaceAwareModel<ContentFragmentModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare sId: string;
+  declare title: string;
+  declare contentType: SupportedContentFragmentType;
+  declare sourceUrl: string | null; // GCS (upload) or Slack or ...
+
+  // The field below should be set for all fragments that are converted to text
+  // before being put in model context (PDF, text, CSV, future: .docx...)
+  declare textBytes: number | null;
+
+  // user-related context
+  declare userContextUsername: string | null;
+  declare userContextFullName: string | null;
+  declare userContextEmail: string | null;
+  declare userContextProfilePictureUrl: string | null;
+
+  declare userId: ForeignKey<UserModel["id"]> | null;
+  declare fileId: ForeignKey<FileModel["id"]> | null;
+  declare spaceId: ForeignKey<SpaceModel["id"]> | null;
+
+  declare nodeId: string | null;
+  declare nodeDataSourceViewId: ForeignKey<DataSourceViewModel["id"]> | null;
+  declare nodeType: ContentNodeType | null;
+
+  // Denormalized from messages for conversation-scoped fetches (plain column, no FK — the value
+  // is derived from messages at write time). Permanently nullable: project-context fragments live
+  // on a space and have no owning conversation.
+  declare conversationId: CreationOptional<ModelId | null>;
+
+  declare version: ContentFragmentVersion;
+  declare expiredReason: ContentFragmentExpiredReason | null;
+}
+
+ContentFragmentModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    sId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    title: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: false,
+    },
+    contentType: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    sourceUrl: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: true,
+    },
+    textBytes: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+    userContextProfilePictureUrl: {
+      type: DataTypes.STRING(2048),
+      allowNull: true,
+    },
+    userContextUsername: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    userContextFullName: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    userContextEmail: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    version: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "latest",
+    },
+    nodeId: {
+      type: DataTypes.STRING(512),
+      allowNull: true,
+    },
+    nodeType: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    expiredReason: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    spaceId: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+    },
+    conversationId: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+    },
+  },
+  {
+    modelName: "content_fragment",
+    sequelize: frontSequelize,
+    indexes: [
+      { fields: ["fileId"] },
+      { fields: ["spaceId"], concurrently: true },
+      // TODO(WORKSPACE_ID_ISOLATION 2025-05-14): Remove index
+      { fields: ["sId", "version"] },
+      {
+        fields: ["workspaceId", "sId", "version"],
+        concurrently: true,
+      },
+      {
+        fields: ["workspaceId", "spaceId"],
+        concurrently: true,
+      },
+      {
+        fields: ["nodeDataSourceViewId"],
+        concurrently: true,
+        name: "content_fragments_node_dsv_id",
+      },
+      { fields: ["workspaceId", "conversationId"], concurrently: true },
+    ],
+  }
+);
+
+UserModel.hasMany(ContentFragmentModel, {
+  foreignKey: { name: "userId", allowNull: true }, // null = ContentFragment is not associated with a user
+});
+ContentFragmentModel.belongsTo(UserModel, {
+  foreignKey: { name: "userId", allowNull: true },
+});
+
+ContentFragmentModel.belongsTo(FileModel, {
+  foreignKey: { name: "fileId", allowNull: true },
+});
+FileModel.hasOne(ContentFragmentModel, {
+  foreignKey: { name: "fileId", allowNull: true },
+});
+
+ContentFragmentModel.belongsTo(SpaceModel, {
+  as: "space",
+  foreignKey: { name: "spaceId", allowNull: true },
+  onDelete: "RESTRICT",
+});
+SpaceModel.hasMany(ContentFragmentModel, {
+  as: "contentFragments",
+});

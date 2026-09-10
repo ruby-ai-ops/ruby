@@ -1,0 +1,563 @@
+import { CreateConnectionOAuthModal } from "@app/components/data_source/CreateConnectionOAuthModal";
+import { CreateOrUpdateConnectionBigQueryModal } from "@app/components/data_source/CreateOrUpdateConnectionBigQueryModal";
+import { CreateOrUpdateConnectionSnowflakeModal } from "@app/components/data_source/CreateOrUpdateConnectionSnowflakeModal";
+import { useTheme } from "@app/components/sparkle/ThemeContext";
+import { useSendNotification } from "@app/hooks/useNotification";
+import { useFeatureFlags } from "@app/lib/auth/AuthContext";
+import { useCellContext } from "@app/lib/auth/CellContext";
+import {
+  CONNECTOR_CONFIGURATIONS,
+  isConnectionIdRequiredForProvider,
+  isConnectorProviderAllowedForPlan,
+} from "@app/lib/connector_providers";
+import {
+  CONNECTOR_UI_CONFIGURATIONS,
+  getConnectorProviderLogoWithFallback,
+} from "@app/lib/connector_providers_ui";
+import { clientFetch } from "@app/lib/egress/client";
+import { useAppRouter } from "@app/lib/platform";
+import { useSystemSpace } from "@app/lib/swr/spaces";
+import {
+  TRACKING_ACTIONS,
+  TRACKING_AREAS,
+  trackEvent,
+  withTracking,
+} from "@app/lib/tracking";
+import type { PostDataSourceRequestBody } from "@app/types/api/data_sources";
+import type { CellInfo } from "@app/types/cell";
+import type {
+  ConnectorProvider,
+  ConnectorType,
+  DataSourceType,
+} from "@app/types/data_source";
+import { setupOAuthConnection } from "@app/types/oauth/client/setup";
+import type { OAuthUseCase } from "@app/types/oauth/lib";
+import { isOAuthProvider } from "@app/types/oauth/lib";
+import type { PlanType } from "@app/types/plan";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
+import type { SpaceType } from "@app/types/space";
+import type { LightWorkspaceType, WorkspaceType } from "@app/types/user";
+import {
+  Button,
+  CloudArrowLeftRight,
+  Dialog,
+  DialogContainer,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@ruby-ai/sparkle";
+import { useCallback, useState } from "react";
+
+export type DataSourceIntegration = {
+  connectorProvider: ConnectorProvider;
+  setupWithSuffix: string | null;
+};
+
+type AddConnectionMenuProps = {
+  owner: WorkspaceType;
+  plan: PlanType;
+  setIsProviderLoading: (provider: ConnectorProvider, value: boolean) => void;
+  onCreated(dataSource: DataSourceType): void;
+  integrations: DataSourceIntegration[];
+};
+
+export async function setupConnection({
+  owner,
+  provider,
+  useCase = "connection",
+  extraConfig,
+  cellInfo,
+}: {
+  owner: LightWorkspaceType;
+  provider: ConnectorProvider;
+  useCase?: OAuthUseCase;
+  extraConfig: Record<string, string>;
+  cellInfo: CellInfo | null;
+}): Promise<
+  Result<{ connectionId: string; relatedCredentialId?: string }, Error>
+> {
+  if (!isOAuthProvider(provider)) {
+    return new Err(new Error(`Unknown provider ${provider}`));
+  }
+
+  // OAuth flow
+  const cRes = await setupOAuthConnection({
+    owner,
+    provider,
+    useCase,
+    extraConfig,
+    cellInfo,
+  });
+  if (!cRes.isOk()) {
+    return cRes;
+  }
+
+  return new Ok({
+    connectionId: cRes.value.connection_id,
+    relatedCredentialId:
+      cRes.value.related_credential_id === null
+        ? undefined
+        : cRes.value.related_credential_id,
+  });
+}
+
+export const AddConnectionMenu = ({
+  owner,
+  plan,
+  setIsProviderLoading,
+  onCreated,
+  integrations,
+}: AddConnectionMenuProps) => {
+  const sendNotification = useSendNotification();
+  const [showUpgradePopup, setShowUpgradePopup] = useState<boolean>(false);
+  const [showPreviewPopupForProvider, setShowPreviewPopupForProvider] =
+    useState<{ isOpen: boolean; connector: ConnectorProvider | null }>({
+      isOpen: false,
+      connector: null,
+    });
+  const [showConfirmConnection, setShowConfirmConnection] = useState<{
+    isOpen: boolean;
+    integration: DataSourceIntegration | null;
+  }>({
+    isOpen: false,
+    integration: null,
+  });
+
+  const router = useAppRouter();
+  const { isDark } = useTheme();
+  const { featureFlags } = useFeatureFlags();
+  const { systemSpace } = useSystemSpace({ workspaceId: owner.sId });
+  const cellContext = useCellContext();
+
+  const handleOnClose = useCallback(
+    () =>
+      setShowConfirmConnection((prev) => ({
+        isOpen: false,
+        integration: prev.integration,
+      })),
+    []
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
+  const handleCredentialProviderManagedDataSource = useCallback(
+    async ({
+      connectionId,
+      provider,
+      suffix,
+      extraConfig,
+    }: {
+      connectionId: string;
+      provider: ConnectorProvider;
+      suffix: string | null;
+      extraConfig: Record<string, string>;
+    }) => {
+      if (!systemSpace) {
+        throw new Error("System space is required");
+      }
+
+      return postDataSource({
+        owner,
+        systemSpace,
+        provider,
+        connectionId,
+        suffix,
+        extraConfig,
+      });
+    },
+    [owner, systemSpace]
+  );
+
+  // Filter available integrations.
+  const availableIntegrations = integrations.filter((i) => {
+    const hide = CONNECTOR_UI_CONFIGURATIONS[i.connectorProvider].hide;
+    const rolloutFlag =
+      CONNECTOR_CONFIGURATIONS[i.connectorProvider].rollingOutFlag;
+    const hasFlag = rolloutFlag && featureFlags.includes(rolloutFlag);
+
+    return (
+      isConnectorProviderAllowedForPlan(
+        plan,
+        i.connectorProvider,
+        featureFlags
+      ) &&
+      isConnectionIdRequiredForProvider(i.connectorProvider) &&
+      // If the connector is hidden, it should only be shown if the feature flag is enabled.
+      (!hide || hasFlag)
+    );
+  });
+
+  const postDataSource = async ({
+    owner,
+    systemSpace,
+    provider,
+    connectionId,
+    relatedCredentialId,
+    suffix,
+    extraConfig,
+  }: {
+    owner: WorkspaceType;
+    systemSpace: SpaceType;
+    provider: ConnectorProvider;
+    connectionId: string;
+    relatedCredentialId?: string;
+    suffix: string | null;
+    extraConfig: Record<string, string>;
+  }): Promise<Response> => {
+    const res = await clientFetch(
+      suffix
+        ? `/api/w/${
+            owner.sId
+          }/spaces/${systemSpace.sId}/data_sources?suffix=${encodeURIComponent(suffix)}`
+        : `/api/w/${owner.sId}/spaces/${systemSpace.sId}/data_sources`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          provider,
+          connectionId,
+          relatedCredentialId,
+          name: undefined,
+          configuration: null,
+          extraConfig,
+        } satisfies PostDataSourceRequestBody),
+      }
+    );
+    return res;
+  };
+
+  const handleOauthProviderManagedDataSource = async (
+    provider: ConnectorProvider,
+    suffix: string | null,
+    extraConfig: Record<string, string>
+  ) => {
+    try {
+      const connectionRes = await setupConnection({
+        owner,
+        provider,
+        extraConfig,
+        cellInfo: cellContext.cellInfo,
+      });
+      if (connectionRes.isErr()) {
+        throw connectionRes.error;
+      }
+
+      if (!systemSpace) {
+        throw new Error("System space is required");
+      }
+
+      setShowConfirmConnection((prev) => ({
+        isOpen: false,
+        integration: prev.integration,
+      }));
+      setIsProviderLoading(provider, true);
+
+      const res = await postDataSource({
+        owner,
+        systemSpace,
+        provider,
+        connectionId: connectionRes.value.connectionId,
+        relatedCredentialId: connectionRes.value.relatedCredentialId,
+        suffix,
+        extraConfig,
+      });
+
+      if (res.ok) {
+        const createdManagedDataSource: {
+          dataSource: DataSourceType;
+          connector: ConnectorType;
+        } = await res.json();
+        trackEvent({
+          area: TRACKING_AREAS.DATA_SOURCES,
+          object: "connection",
+          action: TRACKING_ACTIONS.CREATE,
+          extra: {
+            provider,
+            data_source_id: createdManagedDataSource.dataSource.sId,
+          },
+        });
+        onCreated(createdManagedDataSource.dataSource);
+      } else {
+        const error = await res.json();
+        const errorMessage =
+          error?.error?.connectors_error?.message ??
+          error?.error?.message ??
+          undefined;
+
+        sendNotification({
+          type: "error",
+          title: `Failed to enable connection (${provider})`,
+          description: errorMessage,
+        });
+      }
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      // biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
+    } catch (e) {
+      setShowConfirmConnection((prev) => ({
+        isOpen: false,
+        integration: prev.integration,
+      }));
+      sendNotification({
+        type: "error",
+        title: `Failed to enable connection (${provider})`,
+      });
+    } finally {
+      setIsProviderLoading(provider, false);
+    }
+  };
+
+  const handleConnectionClick = (integration: DataSourceIntegration) => {
+    const configuration =
+      CONNECTOR_CONFIGURATIONS[integration.connectorProvider];
+
+    let isBuilt = configuration.status === "built";
+
+    if (
+      configuration.status === "rolling_out" &&
+      !!configuration.rollingOutFlag
+    ) {
+      isBuilt = featureFlags.includes(configuration.rollingOutFlag);
+    }
+
+    const isProviderAllowed = isConnectorProviderAllowedForPlan(
+      plan,
+      configuration.connectorProvider,
+      featureFlags
+    );
+
+    if (!isProviderAllowed) {
+      setShowUpgradePopup(true);
+    } else {
+      if (isBuilt) {
+        setShowConfirmConnection({
+          isOpen: true,
+          integration,
+        });
+      } else {
+        setShowPreviewPopupForProvider({
+          isOpen: true,
+          connector: integration.connectorProvider,
+        });
+      }
+    }
+  };
+
+  if (!systemSpace) {
+    return null;
+  }
+
+  const { integration, isOpen } = showConfirmConnection || {};
+  const connectorProvider = integration?.connectorProvider;
+
+  return (
+    availableIntegrations.length > 0 && (
+      <>
+        <Dialog
+          open={showUpgradePopup}
+          onOpenChange={(open) => {
+            if (!open) {
+              setShowUpgradePopup(false);
+            }
+          }}
+        >
+          <DialogContent size="md" isAlertDialog>
+            <DialogHeader hideButton>
+              <DialogTitle>${plan.name} plan</DialogTitle>
+            </DialogHeader>
+            <DialogContainer>
+              Unlock this managed data source by upgrading your plan.
+            </DialogContainer>
+            <DialogFooter
+              leftButtonProps={{
+                label: "Cancel",
+                variant: "outline",
+              }}
+              rightButtonProps={{
+                label: "Validate",
+                variant: "primary",
+                onClick: () => {
+                  void router.push(`/w/${owner.sId}/subscription`);
+                },
+              }}
+            />
+          </DialogContent>
+        </Dialog>
+
+        {[connectorProvider].map((c) => {
+          switch (c) {
+            case "bigquery":
+              return (
+                <CreateOrUpdateConnectionBigQueryModal
+                  key={`bigquery-${isOpen}`}
+                  owner={owner}
+                  connectorProviderConfiguration={CONNECTOR_CONFIGURATIONS[c]}
+                  isOpen={isOpen}
+                  onClose={handleOnClose}
+                  createDatasource={(
+                    args: Omit<
+                      Parameters<
+                        typeof handleCredentialProviderManagedDataSource
+                      >[0],
+                      "suffix" | "extraConfig"
+                    >
+                  ) =>
+                    handleCredentialProviderManagedDataSource({
+                      ...args,
+                      suffix: integration?.setupWithSuffix ?? null,
+                      extraConfig: {}, // No extra config needed for BigQuery
+                    })
+                  }
+                  onSuccess={onCreated}
+                />
+              );
+            case "snowflake":
+              return (
+                <CreateOrUpdateConnectionSnowflakeModal
+                  key={`snowflake-${isOpen}`}
+                  owner={owner}
+                  connectorProviderConfiguration={CONNECTOR_CONFIGURATIONS[c]}
+                  isOpen={isOpen}
+                  onClose={handleOnClose}
+                  createDatasource={(
+                    args: Omit<
+                      Parameters<
+                        typeof handleCredentialProviderManagedDataSource
+                      >[0],
+                      "suffix" | "extraConfig"
+                    >
+                  ) =>
+                    handleCredentialProviderManagedDataSource({
+                      ...args,
+                      suffix: integration?.setupWithSuffix ?? null,
+                      extraConfig: {}, // No extra config needed for Snowflake
+                    })
+                  }
+                  onSuccess={onCreated}
+                />
+              );
+            case "github":
+            case "confluence":
+            case "google_drive":
+            case "intercom":
+            case "notion":
+            case "slack":
+            case "microsoft":
+            case "zendesk":
+            case "salesforce":
+            case "webcrawler":
+            case "gong":
+              return (
+                <CreateConnectionOAuthModal
+                  key={`${c}-${isOpen}`}
+                  connectorProviderConfiguration={CONNECTOR_CONFIGURATIONS[c]}
+                  isOpen={isOpen}
+                  onClose={handleOnClose}
+                  onConfirm={(extraConfig: Record<string, string>) => {
+                    if (showConfirmConnection.integration) {
+                      void handleOauthProviderManagedDataSource(
+                        c,
+                        integration?.setupWithSuffix ?? null,
+                        extraConfig
+                      );
+                    }
+                  }}
+                />
+              );
+            case "microsoft_bot":
+            case "slack_bot":
+            case "discord_bot":
+            case "ruby_project":
+            case undefined:
+              return null;
+            default:
+              assertNeverAndIgnore(c);
+          }
+        })}
+
+        <Dialog
+          open={showPreviewPopupForProvider.isOpen}
+          onOpenChange={(open) => {
+            if (!open) {
+              setShowPreviewPopupForProvider((prev) => ({
+                isOpen: false,
+                connector: prev.connector,
+              }));
+            }
+          }}
+        >
+          <DialogContent size="md">
+            <DialogHeader>
+              <DialogTitle>Coming Soon!</DialogTitle>
+              <DialogDescription>
+                Please email us at support@ruby.ad for early access.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter
+              leftButtonProps={{
+                label: "Cancel",
+                variant: "outline",
+                onClick: () => {
+                  setShowPreviewPopupForProvider((prev) => ({
+                    isOpen: false,
+                    connector: prev.connector,
+                  }));
+                },
+              }}
+              rightButtonProps={{
+                label: "Contact us",
+                variant: "highlight",
+                onClick: () => {
+                  window.open(
+                    `mailto:support@ruby.ad?subject=Early access to the ${showPreviewPopupForProvider.connector} connection`
+                  );
+                },
+              }}
+            />
+          </DialogContent>
+        </Dialog>
+
+        <DropdownMenu modal={false}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              label="Add Connections"
+              variant="primary"
+              icon={CloudArrowLeftRight}
+              size="sm"
+              onClick={withTracking(
+                TRACKING_AREAS.DATA_SOURCES,
+                "add_connection_menu"
+              )}
+            />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            {availableIntegrations.map((i) => (
+              <DropdownMenuItem
+                key={i.connectorProvider}
+                label={CONNECTOR_CONFIGURATIONS[i.connectorProvider].name}
+                icon={getConnectorProviderLogoWithFallback({
+                  provider: i.connectorProvider,
+                  isDark,
+                })}
+                onClick={withTracking(
+                  TRACKING_AREAS.DATA_SOURCES,
+                  "provider_select",
+                  () => handleConnectionClick(i),
+                  { provider: i.connectorProvider }
+                )}
+              />
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </>
+    )
+  );
+};

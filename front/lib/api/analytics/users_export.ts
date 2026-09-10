@@ -1,0 +1,216 @@
+import {
+  COMPLETED_AT_FIELD,
+  CONSUMPTION_DIMENSION_FIELDS,
+  CREDIT_MICRO_FIELD,
+  MAX_EXPORT_TERMS_SIZE,
+  uniqueMessagesCardinalityAgg,
+} from "@app/lib/api/analytics/consumption/scope";
+import {
+  bucketsToArray,
+  searchConsumptionAnalytics,
+} from "@app/lib/api/elasticsearch";
+import { microCreditsToCredits } from "@app/lib/credits/units";
+import { MembershipModel } from "@app/lib/resources/storage/models/membership";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import { getUserGroupMemberships } from "@app/lib/workspace_usage";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import type { WorkspaceType } from "@app/types/user";
+import type { estypes } from "@elastic/elasticsearch";
+import moment from "moment-timezone";
+import { Op } from "sequelize";
+
+type TopUserExportBucket = {
+  key: string;
+  doc_count: number;
+  unique_messages?: estypes.AggregationsCardinalityAggregate;
+  last_message?: estypes.AggregationsMaxAggregate;
+  active_days?: estypes.AggregationsDateHistogramAggregate;
+  credit_micro?: estypes.AggregationsSumAggregate;
+};
+
+type TopUsersExportAggs = {
+  by_user?: estypes.AggregationsMultiBucketAggregateBase<TopUserExportBucket>;
+};
+
+// `revoked` when the membership has ended, `unregistered` when the user never
+// logged in, `active` otherwise.
+type UserExportStatus = "active" | "revoked" | "unregistered";
+
+export interface UserExportRow {
+  userId: string;
+  userName: string;
+  userEmail: string;
+  userStatus: UserExportStatus;
+  lastLoginAt: string;
+  messageCount: number;
+  lastMessageSent: string;
+  activeDaysCount: number;
+  groups: string;
+  credits: number;
+}
+
+export const USER_EXPORT_HEADERS: (keyof UserExportRow)[] = [
+  "userId",
+  "userName",
+  "userEmail",
+  "userStatus",
+  "lastLoginAt",
+  "messageCount",
+  "lastMessageSent",
+  "activeDaysCount",
+  "groups",
+  "credits",
+];
+
+export async function fetchUserExportRows({
+  baseQuery,
+  owner,
+  startDate,
+  endDate,
+  timezone,
+}: {
+  baseQuery: estypes.QueryDslQueryContainer;
+  owner: WorkspaceType;
+  startDate: Date;
+  endDate: Date;
+  timezone: string;
+}): Promise<Result<UserExportRow[], Error>> {
+  const esResult = await searchConsumptionAnalytics<never, TopUsersExportAggs>(
+    {
+      bool: {
+        filter: [baseQuery],
+      },
+    },
+    {
+      aggregations: {
+        by_user: {
+          terms: {
+            field: CONSUMPTION_DIMENSION_FIELDS.user,
+            size: MAX_EXPORT_TERMS_SIZE,
+          },
+          aggs: {
+            unique_messages: uniqueMessagesCardinalityAgg(),
+            last_message: { max: { field: COMPLETED_AT_FIELD } },
+            active_days: {
+              date_histogram: {
+                field: COMPLETED_AT_FIELD,
+                calendar_interval: "day",
+                min_doc_count: 1,
+                time_zone: timezone,
+              },
+            },
+            credit_micro: { sum: { field: CREDIT_MICRO_FIELD } },
+          },
+        },
+      },
+      size: 0,
+    }
+  );
+
+  if (esResult.isErr()) {
+    return new Err(new Error(esResult.error.message));
+  }
+
+  const buckets = bucketsToArray<TopUserExportBucket>(
+    esResult.value.aggregations?.by_user?.buckets
+  );
+
+  const esMetrics = new Map(
+    buckets.map((b) => {
+      const lastMessageMs = b.last_message?.value;
+      const activeDaysBuckets = b.active_days?.buckets;
+      return [
+        String(b.key),
+        {
+          messageCount: Math.round(b.unique_messages?.value ?? 0),
+          lastMessageSent:
+            typeof lastMessageMs === "number"
+              ? moment(lastMessageMs).tz(timezone).format("YYYY-MM-DD")
+              : "",
+          activeDaysCount: Array.isArray(activeDaysBuckets)
+            ? activeDaysBuckets.filter((d) => d.doc_count > 0).length
+            : 0,
+          credits: Math.round(
+            microCreditsToCredits(b.credit_micro?.value ?? 0)
+          ),
+        },
+      ] as const;
+    })
+  );
+
+  // TODO(business-functions-use-resources): Migrate to MembershipResource when it supports custom
+  // date range filters.
+  const memberships = await MembershipModel.findAll({
+    where: {
+      workspaceId: owner.id,
+      startAt: { [Op.lte]: endDate },
+      [Op.or]: [{ endAt: null }, { endAt: { [Op.gte]: startDate } }],
+    },
+    include: [
+      {
+        model: UserModel,
+        required: true,
+        attributes: [
+          "id",
+          "sId",
+          "firstName",
+          "lastName",
+          "email",
+          "lastLoginAt",
+        ],
+      },
+    ],
+  });
+
+  const groupsMap = await getUserGroupMemberships(owner.id, startDate, endDate);
+
+  const now = new Date();
+
+  const rows: UserExportRow[] = memberships.map((membership) => {
+    const user = membership.user;
+    const userId = user.sId;
+    const metrics = esMetrics.get(userId);
+    const userModelId = String(user.id);
+
+    return {
+      userId,
+      userName:
+        [user.firstName, user.lastName].filter(Boolean).join(" ") ||
+        user.email ||
+        "Unknown",
+      userEmail: user.email ?? "",
+      userStatus: getUserExportStatus({ membership, user, now }),
+      lastLoginAt: user.lastLoginAt
+        ? moment(user.lastLoginAt).tz(timezone).format("YYYY-MM-DD")
+        : "",
+      messageCount: metrics?.messageCount ?? 0,
+      lastMessageSent: metrics?.lastMessageSent ?? "",
+      activeDaysCount: metrics?.activeDaysCount ?? 0,
+      groups: groupsMap[userModelId] ?? "",
+      credits: metrics?.credits ?? 0,
+    };
+  });
+
+  rows.sort((a, b) => b.messageCount - a.messageCount);
+
+  return new Ok(rows);
+}
+
+function getUserExportStatus({
+  membership,
+  user,
+  now,
+}: {
+  membership: MembershipModel;
+  user: UserModel;
+  now: Date;
+}): UserExportStatus {
+  if (membership.endAt && membership.endAt < now) {
+    return "revoked";
+  }
+  if (!user.lastLoginAt) {
+    return "unregistered";
+  }
+  return "active";
+}

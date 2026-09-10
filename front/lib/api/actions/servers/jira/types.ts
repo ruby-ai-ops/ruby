@@ -1,0 +1,613 @@
+import { z } from "zod";
+
+// Search filter constants and types
+export const SEARCH_ISSUES_MAX_RESULTS = 20;
+export const SEARCH_USERS_MAX_RESULTS = 200;
+
+const SUPPORTED_OPERATORS = ["=", "<", ">", "<=", ">=", "!="] as const;
+export type SupportedOperator = (typeof SUPPORTED_OPERATORS)[number];
+
+export const SORT_DIRECTIONS = ["ASC", "DESC"] as const;
+export type SortDirection = (typeof SORT_DIRECTIONS)[number];
+
+export const FIELD_MAPPINGS = {
+  assignee: { jqlField: "assignee" },
+  created: { jqlField: "created", supportsOperators: true },
+  creator: { jqlField: "creator" },
+  dueDate: { jqlField: "dueDate", supportsOperators: true },
+  fixVersion: { jqlField: "fixVersion" },
+  issueType: { jqlField: "issueType" },
+  labels: { jqlField: "labels" },
+  priority: { jqlField: "priority" },
+  parentIssueKey: { jqlField: "parent" },
+  project: { jqlField: "project" },
+  reporter: { jqlField: "reporter" },
+  resolved: { jqlField: "resolved", supportsOperators: true },
+  status: { jqlField: "status" },
+  summary: { jqlField: "summary", supportsFuzzy: true },
+  updated: { jqlField: "updated", supportsOperators: true },
+  votes: { jqlField: "votes", supportsOperators: true },
+  watchers: { jqlField: "watchers", supportsOperators: true },
+  customField: {
+    jqlField: "customField",
+    isCustomField: true,
+    supportsFuzzy: true,
+  },
+} as const;
+
+export const SEARCH_FILTER_FIELDS = Object.keys(
+  FIELD_MAPPINGS
+) as (keyof typeof FIELD_MAPPINGS)[];
+
+export type SearchFilterField = (typeof SEARCH_FILTER_FIELDS)[number];
+
+export interface SearchFilter {
+  field: string;
+  value: string;
+  fuzzy?: boolean;
+  customFieldName?: string;
+  operator?: SupportedOperator;
+}
+
+// Get regular field names (excluding customField)
+const regularFieldNames = SEARCH_FILTER_FIELDS.filter(
+  (field) => field !== "customField"
+) as [string, ...string[]];
+
+const baseFilterSchema = z.object({
+  value: z.string().describe("The value to search for"),
+  operator: z
+    .enum(SUPPORTED_OPERATORS)
+    .optional()
+    .describe(
+      `Operator for comparison. Supported operators: ${SUPPORTED_OPERATORS.join(", ")}. Only supported for date fields like 'dueDate', 'created', 'resolved'. For dates, use format '2023-07-03' or relative format like '-25d', '7d', '2w', '1M', etc.`
+    ),
+  fuzzy: z
+    .boolean()
+    .optional()
+    .describe(
+      "Use fuzzy search (~) for partial/similar matches instead of exact match (=). Only supported for 'summary' field. Use fuzzy when: searching for partial text, handling typos, finding related terms. Use exact when: looking for specific titles, precise matching needed."
+    ),
+});
+
+const customFieldFilterSchema = baseFilterSchema.extend({
+  field: z.literal("customField"),
+  customFieldName: z
+    .string()
+    .describe(
+      "The name of the custom field to search (e.g., 'Story Points', 'Epic Link')."
+    ),
+});
+
+const regularFieldFilterSchema = baseFilterSchema.extend({
+  field: z
+    .enum(regularFieldNames)
+    .describe(
+      `The field to filter by. Must be one of: ${regularFieldNames.join(", ")}.`
+    ),
+});
+
+export const JiraSearchFilterSchema = z.discriminatedUnion("field", [
+  customFieldFilterSchema,
+  regularFieldFilterSchema,
+]);
+
+// Sort schema using existing FIELD_MAPPINGS
+export const JiraSortSchema = z.object({
+  field: z
+    .enum(SEARCH_FILTER_FIELDS as [SearchFilterField, ...SearchFilterField[]])
+    .describe(
+      `The field to sort by. Must be one of: ${SEARCH_FILTER_FIELDS.join(", ")}.`
+    ),
+  direction: z
+    .enum(SORT_DIRECTIONS)
+    .describe(`Sort direction. Must be one of: ${SORT_DIRECTIONS.join(", ")}.`),
+});
+
+export const JiraResourceSchema = z.array(
+  z.object({
+    id: z.string(),
+    url: z.string(),
+    name: z.string(),
+  })
+);
+
+export const JiraProjectSchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  name: z.string(),
+});
+
+export const JiraProjectVersionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  released: z.boolean().optional(),
+  releaseDate: z.string().optional(),
+  startDate: z.string().optional(),
+  archived: z.boolean().optional(),
+});
+
+const JiraTransitionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+});
+
+export const JiraTransitionsSchema = z.object({
+  transitions: z.array(JiraTransitionSchema),
+});
+
+export const JiraCreateMetaSchema = z.object({
+  fields: z.array(z.unknown()), // JIRA returns an array of field definitions, not an object
+});
+
+const JiraFieldSchema = z.object({
+  id: z.string(),
+  key: z.string().optional(),
+  name: z.string(),
+  custom: z.boolean(),
+  schema: z
+    .object({
+      type: z.string(),
+      custom: z.string().optional(),
+    })
+    .optional(),
+});
+
+export const JiraFieldsSchema = z.array(JiraFieldSchema);
+
+export const JiraUserInfoSchema = z
+  .object({
+    accountId: z.string(),
+    emailAddress: z.string(),
+    displayName: z.string(),
+    accountType: z.string(),
+    locale: z.string().optional(),
+  })
+  .passthrough();
+
+export const JiraConnectionInfoSchema = z.object({
+  user: z.object({
+    account_id: z.string(),
+    name: z.string(),
+    nickname: z.string(),
+  }),
+  instance: z.object({
+    cloud_id: z.string(),
+    site_url: z.string(),
+    site_name: z.string(),
+    api_base_url: z.string(),
+  }),
+});
+
+export const JiraTransitionIssueSchema = z.void();
+
+// Atlassian Document Format (ADF) schemas
+// Based on: https://developer.atlassian.com/cloud/jira/platform/apis/document/structure/
+const ADFMarkSchema = z.object({
+  type: z.string(),
+  attrs: z.record(z.any()).optional(),
+});
+
+const ADFTextNodeSchema = z.object({
+  type: z.literal("text"),
+  text: z.string(),
+  marks: z.array(ADFMarkSchema).optional(),
+});
+
+const ADFHardBreakNodeSchema = z.object({
+  type: z.literal("hardBreak"),
+});
+
+const ADFRuleNodeSchema = z.object({
+  type: z.literal("rule"),
+});
+
+// Explicit schemas for inline nodes we actively render
+const ADFEmojiNodeSchema = z.object({
+  type: z.literal("emoji"),
+  attrs: z
+    .object({
+      shortName: z.string().optional(),
+      id: z.string().optional(),
+      text: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+
+const ADFMentionNodeSchema = z.object({
+  type: z.literal("mention"),
+  attrs: z
+    .object({
+      id: z.string().optional(),
+      text: z.string().optional(),
+      accessLevel: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+
+const ADFInlineCardNodeSchema = z.object({
+  type: z.literal("inlineCard"),
+  attrs: z
+    .object({
+      url: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+
+const ADFBlockCardNodeSchema = z.object({
+  type: z.literal("blockCard"),
+  attrs: z
+    .object({
+      url: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+
+const ADFStatusNodeSchema = z.object({
+  type: z.literal("status"),
+  attrs: z
+    .object({
+      text: z.string().optional(),
+      color: z.string().optional(),
+      localId: z.string().optional(),
+      style: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+
+const ADFDateNodeSchema = z.object({
+  type: z.literal("date"),
+  attrs: z
+    .object({
+      timestamp: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+
+export const ADFContentNodeSchema: z.ZodType<any> = z.lazy(() =>
+  z.union([
+    // Text and basic inline nodes
+    ADFTextNodeSchema,
+    ADFHardBreakNodeSchema,
+    ADFRuleNodeSchema,
+
+    // Inline nodes we explicitly handle in rendering
+    ADFEmojiNodeSchema,
+    ADFMentionNodeSchema,
+    ADFInlineCardNodeSchema,
+    ADFBlockCardNodeSchema,
+    ADFStatusNodeSchema,
+    ADFDateNodeSchema,
+
+    // Block nodes with content
+    z.object({
+      type: z.enum([
+        "paragraph",
+        "heading",
+        "blockquote",
+        "panel",
+        "bulletList",
+        "orderedList",
+        "listItem",
+        "expand",
+        "nestedExpand",
+        "mediaSingle",
+        "mediaGroup",
+      ]),
+      attrs: z.record(z.any()).optional(),
+      content: z.array(ADFContentNodeSchema).optional(),
+    }),
+
+    // Code block (special case - content is text nodes only)
+    z.object({
+      type: z.literal("codeBlock"),
+      attrs: z.record(z.any()).optional(),
+      content: z
+        .array(
+          z.object({
+            type: z.literal("text"),
+            text: z.string(),
+          })
+        )
+        .optional(),
+    }),
+
+    // Table nodes
+    z.object({
+      type: z.enum(["table", "tableRow", "tableCell", "tableHeader"]),
+      attrs: z.record(z.any()).optional(),
+      content: z.array(ADFContentNodeSchema).optional(),
+    }),
+
+    // Media nodes (no content, just attrs)
+    z.object({
+      type: z.enum(["media", "mediaInline"]),
+      attrs: z.record(z.any()).optional(),
+    }),
+
+    // Catch-all for any other ADF node types (future-proofing)
+    // This allows unknown ADF nodes to pass validation and be handled
+    // by the rendering layer's default case
+    z
+      .object({
+        type: z.string(),
+        attrs: z.record(z.any()).optional(),
+        content: z.array(ADFContentNodeSchema).optional(),
+        text: z.string().optional(),
+        marks: z.array(ADFMarkSchema).optional(),
+      })
+      .passthrough(),
+  ])
+);
+
+export type ADFContentNode = z.infer<typeof ADFContentNodeSchema>;
+
+export const ADFDocumentSchema = z.object({
+  type: z.literal("doc"),
+  version: z.literal(1),
+  content: z.array(ADFContentNodeSchema).optional(),
+});
+
+export type ADFDocument = z.infer<typeof ADFDocumentSchema>;
+
+export const JiraSearchRequestSchema = z.object({
+  jql: z.string(),
+  maxResults: z.number(),
+  fields: z.array(z.string()),
+  nextPageToken: z.string().optional(),
+});
+
+export const JiraCreateCommentRequestSchema = z.object({
+  body: z.object({
+    type: z.literal("doc"),
+    version: z.number(),
+    content: z.array(
+      z.object({
+        type: z.string(),
+        content: z.array(
+          z.object({
+            type: z.string(),
+            text: z.string(),
+          })
+        ),
+      })
+    ),
+  }),
+  visibility: z
+    .object({
+      type: z.enum(["group", "role"]),
+      value: z.string(),
+    })
+    .optional(),
+});
+
+export const JiraTransitionRequestSchema = z.object({
+  transition: z.object({
+    id: z.string(),
+  }),
+  update: z
+    .object({
+      comment: z.array(
+        z.object({
+          add: z.object({
+            body: z.string(),
+          }),
+        })
+      ),
+    })
+    .optional(),
+});
+
+export const JiraIssueLinkTypeSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  inward: z.string(),
+  outward: z.string(),
+});
+
+export const JiraCreateIssueLinkRequestSchema = z.object({
+  type: z.object({
+    name: z
+      .string()
+      .describe("Link type name (e.g., 'Blocks', 'Relates', 'Duplicates')"),
+  }),
+  inwardIssue: z.object({
+    key: z
+      .string()
+      .describe("Issue key that will be on the 'inward' side of the link"),
+  }),
+  outwardIssue: z.object({
+    key: z
+      .string()
+      .describe("Issue key that will be on the 'outward' side of the link"),
+  }),
+  comment: z
+    .object({
+      body: z.string(),
+    })
+    .optional()
+    .describe("Optional comment when creating the link"),
+});
+
+export const JiraIssueTypeSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  subtask: z.boolean().optional(),
+});
+
+const JiraUserSchema = z.object({
+  accountId: z.string(),
+  displayName: z.string(),
+  emailAddress: z.string().optional(),
+  accountType: z.string(),
+  active: z.boolean(),
+});
+
+export const JiraUsersSearchResultSchema = z.array(JiraUserSchema);
+
+// JIRA Comment schema (defined after ADF schemas to avoid circular dependency)
+export const JiraCommentSchema = z.object({
+  id: z.string(),
+  body: ADFDocumentSchema,
+  author: z
+    .object({
+      accountId: z.string(),
+      displayName: z.string().optional(),
+    })
+    .optional(),
+  created: z.string().optional(),
+  updated: z.string().optional(),
+});
+
+// Schema for listing comments response
+export const JiraCommentsListSchema = z.object({
+  comments: z.array(JiraCommentSchema),
+  startAt: z.number().optional(),
+  maxResults: z.number().optional(),
+  total: z.number().optional(),
+});
+
+const JiraAttachmentSchema = z.object({
+  id: z.string(),
+  filename: z.string(),
+  author: z.object({
+    accountId: z.string(),
+    displayName: z.string().optional(),
+    emailAddress: z.string().optional(),
+  }),
+  created: z.string(),
+  size: z.number(),
+  mimeType: z.string(),
+  content: z.string().optional(),
+  thumbnail: z.string().optional(),
+  self: z.string(),
+});
+export const JiraAttachmentsResultSchema = z.array(JiraAttachmentSchema);
+
+export const JiraIssueWithAttachmentsSchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  fields: z.object({
+    attachment: z.array(JiraAttachmentSchema).optional(),
+  }),
+});
+
+// Jira entity schemas - shared field definitions
+const JiraIssueFieldsSchema = z
+  .object({
+    project: z.object({
+      key: z.string(),
+    }),
+    summary: z.string(),
+    description: ADFDocumentSchema.nullable(),
+    issuetype: z
+      .object({
+        id: z.string().optional(),
+        name: z.string().optional(),
+      })
+      .describe(
+        "The issue type, identified by `id` (preferred) or `name`. Use `get_issue_types` " +
+          "to list the valid types and their ids for the project. Prefer `id`: resolving a " +
+          "type by `name` is ambiguous when several projects share a localized type name " +
+          "(e.g. sub-task types), which can make Jira reject an otherwise valid type."
+      ),
+    status: z.object({
+      name: z.string(),
+    }),
+    priority: z
+      .object({
+        name: z.string(),
+      })
+      .nullable(),
+    assignee: z
+      .object({
+        accountId: z.string(),
+        displayName: z.string().optional(),
+      })
+      .nullable(),
+    reporter: z
+      .object({
+        accountId: z.string(),
+        displayName: z.string().optional(),
+      })
+      .nullable(),
+    labels: z.array(z.string()).nullable(),
+    duedate: z.string().nullable().optional(),
+    parent: z
+      .object({
+        key: z.string(),
+      })
+      .nullable(),
+    created: z.string().optional(),
+    updated: z.string().optional(),
+  })
+  .passthrough();
+
+export const JiraIssueSchema = z
+  .object({
+    id: z.string(),
+    key: z.string(),
+    browseUrl: z.string().optional(),
+    fields: JiraIssueFieldsSchema.deepPartial().optional(),
+  })
+  .passthrough();
+
+export const JiraSearchResultSchema = z.object({
+  issues: z.array(
+    z.object({
+      id: z.string(),
+      key: z.string(),
+      browseUrl: z.string().optional(),
+      fields: JiraIssueFieldsSchema.deepPartial().optional(),
+    })
+  ),
+  isLast: z.boolean().optional(),
+  nextPageToken: z.string().optional(),
+});
+
+export const JiraCreateIssueRequestSchema = JiraIssueFieldsSchema.partial({
+  description: true,
+  status: true,
+  priority: true,
+  assignee: true,
+  reporter: true,
+  labels: true,
+  parent: true,
+  created: true,
+  updated: true,
+  duedate: true,
+})
+  .extend({
+    description: z.union([z.string(), ADFDocumentSchema]).optional(),
+  })
+  .passthrough(); // Allow custom fields
+
+// Inferred types
+export type JiraSearchResult = z.infer<typeof JiraSearchResultSchema>;
+export type JiraErrorResult = string;
+export type JiraIssue = z.infer<typeof JiraIssueSchema>;
+export type JiraComment = z.infer<typeof JiraCommentSchema>;
+export function isADFDocument(value: unknown): value is ADFDocument {
+  return ADFDocumentSchema.safeParse(value).success;
+}
+
+const CascadingSelectChildSchema = z.object({
+  value: z.string(),
+  child: z.object({ value: z.string() }),
+});
+
+type CascadingSelectChild = z.infer<typeof CascadingSelectChildSchema>;
+
+export function isCascadingSelectChild(
+  value: unknown
+): value is CascadingSelectChild {
+  return CascadingSelectChildSchema.safeParse(value).success;
+}

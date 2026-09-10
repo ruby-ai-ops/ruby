@@ -1,0 +1,56 @@
+import type { ToolContext } from "@app/lib/actions/types";
+import { isLightServerSideMCPToolConfiguration } from "@app/lib/actions/types/guards";
+import type { Authenticator } from "@app/lib/auth";
+import { RubyAppSecretModel } from "@app/lib/models/ruby_app_secret";
+import { decrypt } from "@app/types/shared/utils/encryption";
+import ValTown from "@valtown/sdk";
+
+interface ValTownError {
+  status?: number;
+  message?: string;
+}
+
+export function isValTownError(error: unknown): error is ValTownError {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    ("status" in error || "message" in error)
+  );
+}
+
+export async function getValTownClient(
+  auth: Authenticator,
+  toolContext?: ToolContext
+): Promise<ValTown | null> {
+  const toolConfig = toolContext?.runContext?.toolConfiguration;
+  if (
+    !toolConfig ||
+    !isLightServerSideMCPToolConfiguration(toolConfig) ||
+    !toolConfig.secretName
+  ) {
+    return null;
+  }
+
+  const secret = await RubyAppSecretModel.findOne({
+    where: {
+      name: toolConfig.secretName,
+      workspaceId: auth.getNonNullableWorkspace().id,
+    },
+  });
+
+  const apiKey = secret
+    ? decrypt({
+        encrypted: secret.hash,
+        key: auth.getNonNullableWorkspace().sId,
+        useCase: "developer_secret",
+      })
+    : null;
+
+  if (!apiKey) {
+    return null;
+  }
+
+  return new ValTown({
+    bearerToken: apiKey,
+  });
+}

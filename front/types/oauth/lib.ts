@@ -1,0 +1,979 @@
+import type { ByokModelProviderIdType } from "@app/types/assistant/models/types";
+import type { ApiKeyCredentialsType } from "@app/types/provider_credential";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { validateUrl } from "@app/types/shared/utils/url_utils";
+import { z } from "zod";
+
+// Extra config type for OAuth setup - generic key-value pairs for provider-specific config
+export const ExtraConfigTypeSchema = z.record(z.string(), z.string());
+export type ExtraConfigType = z.infer<typeof ExtraConfigTypeSchema>;
+
+export const OAUTH_USE_CASES = [
+  "connection",
+  "labs_transcripts",
+  "platform_actions",
+  "personal_actions",
+  "bot",
+  // Get a token to manage webhooks in the provider.
+  "webhooks",
+] as const;
+
+export type OAuthUseCase = (typeof OAUTH_USE_CASES)[number];
+
+export type MCPOAuthUseCase = Extract<
+  OAuthUseCase,
+  "platform_actions" | "personal_actions"
+>;
+
+export function isOAuthUseCase(obj: unknown): obj is OAuthUseCase {
+  return OAUTH_USE_CASES.includes(obj as OAuthUseCase);
+}
+
+export const OAUTH_PROVIDERS = [
+  "confluence",
+  "confluence_tools",
+  "discord",
+  "fathom",
+  "freshservice",
+  "github",
+  "google_drive",
+  "gmail",
+  "intercom",
+  "jira",
+  "linear",
+  "monday",
+  "notion",
+  "productboard",
+  "shopify",
+  "slack",
+  "slack_tools",
+  "gong",
+  "microsoft",
+  "microsoft_tools",
+  "zendesk",
+  "salesforce",
+  "servicenow",
+  "hubspot",
+  "ukg_ready",
+  "mcp", // MCP is a special provider for MCP servers.
+  "mcp_static", // MCP static is a special provider for MCP servers requiring static OAuth credentials.
+  "snowflake", // Snowflake OAuth for MCP server integration.
+  "vanta",
+] as const;
+
+export const OAUTH_PROVIDER_NAMES: Record<OAuthProvider, string> = {
+  confluence: "Confluence",
+  confluence_tools: "Confluence Tools",
+  discord: "Discord",
+  fathom: "Fathom",
+  freshservice: "Freshservice",
+  github: "GitHub",
+  gmail: "Gmail",
+  google_drive: "Google",
+  intercom: "Intercom",
+  jira: "Jira",
+  linear: "Linear",
+  monday: "Monday",
+  notion: "Notion",
+  productboard: "Productboard",
+  shopify: "Shopify",
+  slack: "Slack",
+  slack_tools: "Slack Tools",
+  gong: "Gong",
+  microsoft: "Microsoft",
+  microsoft_tools: "Microsoft Tools",
+  zendesk: "Zendesk",
+  salesforce: "Salesforce",
+  servicenow: "ServiceNow",
+  hubspot: "Hubspot",
+  ukg_ready: "UKG Ready",
+  mcp: "MCP",
+  mcp_static: "MCP",
+  snowflake: "Snowflake",
+  vanta: "Vanta",
+};
+
+const SUPPORTED_OAUTH_CREDENTIALS = [
+  "client_id",
+  "client_secret",
+  "instance_url",
+  "code_verifier",
+  "code_challenge",
+  "scope",
+  "resource",
+  "token_endpoint",
+  "token_endpoint_auth_method",
+  "authorization_endpoint",
+  "freshservice_domain",
+  "freshworks_org_url",
+  "zendesk_subdomain",
+  "shopify_store_domain",
+  "databricks_workspace_url",
+  "servicenow_instance_url",
+  "snowflake_account",
+  "snowflake_role",
+  "snowflake_warehouse",
+  "ukg_ready_company_id",
+  "jira_cloud_url",
+  "confluence_cloud_url",
+] as const;
+
+export type SupportedOAuthCredentials =
+  (typeof SUPPORTED_OAUTH_CREDENTIALS)[number];
+
+export const isSupportedOAuthCredential = (
+  obj: unknown
+): obj is SupportedOAuthCredentials => {
+  return SUPPORTED_OAUTH_CREDENTIALS.includes(obj as SupportedOAuthCredentials);
+};
+
+export type OAuthCredentialInput = {
+  label: string;
+  value: string | undefined;
+  helpMessage?: string;
+  validator?: (value: string) => boolean;
+} & (
+  | {
+      overridableAtPersonalAuth: true;
+      personalAuthLabel: string;
+      personalAuthHelpMessage: string;
+    }
+  | { overridableAtPersonalAuth?: false }
+);
+
+export type OAuthCredentialInputs = Partial<
+  Record<SupportedOAuthCredentials, OAuthCredentialInput>
+>;
+
+export type OAuthCredentials = Partial<
+  Record<SupportedOAuthCredentials, string>
+>;
+
+// `mcp` is the only OAuth provider whose endpoints are discovered at runtime via
+// the MCP server's `.well-known` metadata (the dynamic OAuth flow).
+export function providerUsesWellKnownOAuthDiscovery(
+  provider: OAuthProvider
+): boolean {
+  return provider === "mcp";
+}
+// Customises the generic `mcp_static` OAuth flow for servers whose OAuth
+// endpoints and MCP URL are derived from a single host URL, instead of entering each endpoint URL manually.
+export type HostDerivedOAuthConfig = {
+  hostCredential: SupportedOAuthCredentials;
+  hostLabel: string;
+  hostHelpMessage: string;
+  authorizationEndpointPath: string;
+  tokenEndpointPath: string;
+  scope: string;
+  mcpUrlPathSuffix: string;
+};
+
+export function getHostDerivedOAuthCredentialInputs(
+  hostConfig: HostDerivedOAuthConfig
+): OAuthCredentialInputs {
+  return {
+    [hostConfig.hostCredential]: {
+      label: hostConfig.hostLabel,
+      value: undefined,
+      helpMessage: hostConfig.hostHelpMessage,
+      validator: isValidUrl,
+    },
+    client_id: {
+      label: "OAuth Client ID",
+      value: undefined,
+      helpMessage: "The client ID from your OAuth app.",
+      validator: isValidClientIdOrSecret,
+    },
+    client_secret: {
+      label: "OAuth Client Secret",
+      value: undefined,
+      helpMessage: "The client secret from your OAuth app.",
+      validator: isValidClientIdOrSecret,
+    },
+  };
+}
+
+export function getHostDerivedOAuthExtraConfig({
+  hostConfig,
+  authCredentials,
+}: {
+  hostConfig: HostDerivedOAuthConfig;
+  authCredentials: OAuthCredentials | null | undefined;
+}): ExtraConfigType | null {
+  const rawHost = authCredentials?.[hostConfig.hostCredential]?.trim();
+  if (!rawHost) {
+    return null;
+  }
+  const host = rawHost.replace(/\/$/, "");
+
+  const extraConfig: ExtraConfigType = {
+    client_id: authCredentials?.client_id ?? "",
+    authorization_endpoint: host + hostConfig.authorizationEndpointPath,
+    token_endpoint: host + hostConfig.tokenEndpointPath,
+    scope: hostConfig.scope,
+  };
+  if (authCredentials?.client_secret) {
+    extraConfig.client_secret = authCredentials.client_secret;
+  }
+  return extraConfig;
+}
+
+export function getHostDerivedMcpServerUrl({
+  hostConfig,
+  authCredentials,
+}: {
+  hostConfig: HostDerivedOAuthConfig;
+  authCredentials: OAuthCredentials | null | undefined;
+}): string | undefined {
+  const rawHost = authCredentials?.[hostConfig.hostCredential]?.trim();
+  if (!rawHost) {
+    return undefined;
+  }
+  return rawHost.replace(/\/$/, "") + hostConfig.mcpUrlPathSuffix;
+}
+
+export function getOverridablePersonalAuthInputs({
+  provider,
+}: {
+  provider: OAuthProvider;
+}): OAuthCredentialInputs | null {
+  const allInputs = getProviderRequiredOAuthCredentialInputs({
+    provider,
+    useCase: "personal_actions",
+  });
+  if (!allInputs) {
+    return null;
+  }
+
+  const filtered: OAuthCredentialInputs = {};
+  for (const [key, input] of Object.entries(allInputs)) {
+    if (input.overridableAtPersonalAuth && isSupportedOAuthCredential(key)) {
+      filtered[key] = input;
+    }
+  }
+
+  return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
+export function getProviderRequiredOAuthCredentialInputs({
+  provider,
+  useCase,
+}: {
+  provider: OAuthProvider;
+  useCase: OAuthUseCase;
+}): OAuthCredentialInputs | null {
+  switch (provider) {
+    case "salesforce":
+      if (useCase === "personal_actions" || useCase === "platform_actions") {
+        const result: OAuthCredentialInputs = {
+          instance_url: {
+            label: "Instance URL",
+            value: undefined,
+            helpMessage:
+              "Must be a valid Salesforce domain in https and ending with « .salesforce.com ».",
+            validator: isValidSalesforceDomain,
+          },
+          client_id: {
+            label: "OAuth Client ID",
+            value: undefined,
+            helpMessage: "The client ID from your Salesforce connected app.",
+            validator: isValidClientIdOrSecret,
+          },
+          client_secret: {
+            label: "OAuth Client Secret",
+            value: undefined,
+            helpMessage:
+              "The client secret from your Salesforce connected app.",
+            validator: isValidClientIdOrSecret,
+          },
+        };
+
+        return result;
+      }
+      return null;
+    case "gmail":
+      if (useCase === "personal_actions" || useCase === "platform_actions") {
+        const result: OAuthCredentialInputs = {
+          client_id: {
+            label: "OAuth Client ID",
+            value: undefined,
+            helpMessage: "The client ID from your Gmail connected app.",
+            validator: isValidClientIdOrSecret,
+          },
+          client_secret: {
+            label: "OAuth Client Secret",
+            value: undefined,
+            helpMessage: "The client secret from your Gmail connected app.",
+            validator: isValidClientIdOrSecret,
+          },
+        };
+        return result;
+      }
+      return null;
+    case "freshservice":
+      if (useCase === "personal_actions" || useCase === "platform_actions") {
+        const result: OAuthCredentialInputs = {
+          freshworks_org_url: {
+            label: "Freshworks Organization URL",
+            value: undefined,
+            helpMessage:
+              "Your Freshworks organization URL (e.g. yourcompany.myfreshworks.com, or a custom domain such as it.example.com).",
+          },
+          freshservice_domain: {
+            label: "Freshservice Domain URL",
+            value: undefined,
+            helpMessage:
+              "Your Freshservice domain URL (e.g., yourcompany.freshservice.com).",
+          },
+        };
+        return result;
+      }
+      return null;
+    case "zendesk":
+      if (useCase === "personal_actions" || useCase === "platform_actions") {
+        const result: OAuthCredentialInputs = {
+          zendesk_subdomain: {
+            label: "Zendesk account subdomain",
+            value: undefined,
+            helpMessage: "The first part of your Zendesk account URL.",
+            validator: isValidZendeskSubdomain,
+          },
+        };
+        return result;
+      }
+      return null;
+    case "shopify":
+      if (useCase === "platform_actions") {
+        return {
+          shopify_store_domain: {
+            label: "Shopify store domain",
+            value: undefined,
+            helpMessage:
+              "Your store's permanent myshopify.com domain (e.g., my-store.myshopify.com).",
+            validator: isValidShopifyStoreDomain,
+          },
+        };
+      }
+      return null;
+    case "servicenow":
+      if (useCase === "personal_actions" || useCase === "platform_actions") {
+        const result: OAuthCredentialInputs = {
+          servicenow_instance_url: {
+            label: "ServiceNow Instance URL",
+            value: undefined,
+            helpMessage:
+              "Your ServiceNow instance URL (e.g., https://your-instance.service-now.com).",
+            validator: isValidUrl,
+          },
+          client_id: {
+            label: "OAuth Client ID",
+            value: undefined,
+            helpMessage: "The client ID from your ServiceNow OAuth app.",
+            validator: isValidClientIdOrSecret,
+          },
+          client_secret: {
+            label: "OAuth Client Secret",
+            value: undefined,
+            helpMessage: "The client secret from your ServiceNow OAuth app.",
+            validator: isValidClientIdOrSecret,
+          },
+        };
+        return result;
+      }
+      return null;
+    case "ukg_ready":
+      if (useCase === "personal_actions") {
+        // UKG Ready uses PKCE authorization code flow (no client_secret needed)
+        const result: OAuthCredentialInputs = {
+          instance_url: {
+            label: "UKG Ready Instance URL",
+            value: undefined,
+            helpMessage:
+              "Your UKG Ready instance URL (e.g., https://secure0.saashr.com)",
+            validator: isValidUrl,
+          },
+          ukg_ready_company_id: {
+            label: "Company ID",
+            value: undefined,
+            helpMessage: "Your UKG Ready company identifier",
+            validator: isValidClientIdOrSecret,
+          },
+          client_id: {
+            label: "OAuth Client ID",
+            value: undefined,
+            helpMessage: "The client ID from your UKG Ready OAuth app",
+            validator: isValidClientIdOrSecret,
+          },
+        };
+        return result;
+      }
+      return null;
+    case "jira":
+      if (useCase === "platform_actions" || useCase === "personal_actions") {
+        const result: OAuthCredentialInputs = {
+          jira_cloud_url: {
+            label: "Jira Cloud URL",
+            value: undefined,
+            helpMessage:
+              "Your Atlassian Cloud URL (e.g. https://company.atlassian.net). " +
+              "Optional — leave blank to use the first accessible instance.",
+            validator: isValidAtlassianCloudUrlOrEmpty,
+            overridableAtPersonalAuth: false,
+          },
+        };
+        return result;
+      }
+      return null;
+    case "confluence_tools":
+      if (useCase === "platform_actions" || useCase === "personal_actions") {
+        const result: OAuthCredentialInputs = {
+          confluence_cloud_url: {
+            label: "Confluence Cloud URL",
+            value: undefined,
+            helpMessage:
+              "Your Atlassian Cloud URL (e.g. https://company.atlassian.net). " +
+              "Optional — leave blank to use the first accessible instance.",
+            validator: isValidAtlassianCloudUrlOrEmpty,
+            overridableAtPersonalAuth: false,
+          },
+        };
+        return result;
+      }
+      return null;
+    case "hubspot":
+    case "slack":
+    case "slack_tools":
+    case "gong":
+    case "microsoft":
+    case "microsoft_tools":
+    case "monday":
+    case "notion":
+    case "confluence":
+    case "github":
+    case "google_drive":
+    case "intercom":
+    case "linear":
+    case "mcp":
+    case "discord":
+    case "fathom":
+    case "productboard":
+      return null;
+    case "vanta": {
+      const result: OAuthCredentialInputs = {
+        client_id: {
+          label: "Vanta Client ID",
+          value: undefined,
+          helpMessage: "The client ID from your Vanta application.",
+          validator: isValidClientIdOrSecret,
+        },
+        client_secret: {
+          label: "Vanta Client Secret",
+          value: undefined,
+          helpMessage: "The client secret from your Vanta application.",
+          validator: isValidClientIdOrSecret,
+        },
+      };
+      return result;
+    }
+    case "mcp_static":
+      if (useCase === "personal_actions" || useCase === "platform_actions") {
+        const result: OAuthCredentialInputs = {
+          client_id: {
+            label: "OAuth Client ID",
+            value: undefined,
+            helpMessage: "The client ID from your MCP server.",
+            validator: isValidClientIdOrSecret,
+          },
+          client_secret: {
+            label: "OAuth Client Secret",
+            value: undefined,
+            helpMessage:
+              "The client secret from your MCP server (optional for PKCE flows).",
+            validator: isValidOptionalClientSecret,
+          },
+          token_endpoint: {
+            label: "OAuth Token Endpoint",
+            value: undefined,
+            helpMessage: "The token endpoint from your MCP server.",
+            validator: isValidUrl,
+          },
+          authorization_endpoint: {
+            label: "OAuth Authorization Endpoint",
+            value: undefined,
+            helpMessage: "The authorization endpoint from your MCP server.",
+            validator: isValidUrl,
+          },
+          scope: {
+            label: "OAuth Scope(s)",
+            value: undefined,
+            helpMessage: "The scope(s) to request (space separated list).",
+            validator: isValidScope,
+          },
+          resource: {
+            label: "OAuth Resource / Audience",
+            value: undefined,
+            helpMessage:
+              "The resource or audience identifier (RFC 8707) your MCP " +
+              "server expects in the access token. Required if your OAuth " +
+              "server issues audience-scoped tokens.",
+            validator: isValidOptionalResource,
+          },
+          token_endpoint_auth_method: {
+            label: "Token Endpoint Authentication Method",
+            value: "client_secret_post",
+            helpMessage:
+              "How to send the client ID/secret when exchanging tokens.",
+            validator: isValidTokenEndpointAuthMethod,
+          },
+        };
+        return result;
+      }
+      return null;
+    case "snowflake":
+      if (useCase === "personal_actions") {
+        const result: OAuthCredentialInputs = {
+          snowflake_account: {
+            label: "Snowflake Account",
+            value: undefined,
+            helpMessage:
+              "Your Snowflake account identifier (e.g., abc123.us-east-1 or myorg-myaccount).",
+            validator: isValidSnowflakeAccount,
+          },
+          client_id: {
+            label: "OAuth Client ID",
+            value: undefined,
+            helpMessage:
+              "The client ID from your Snowflake security integration.",
+            validator: isValidClientIdOrSecret,
+          },
+          client_secret: {
+            label: "OAuth Client Secret",
+            value: undefined,
+            helpMessage:
+              "The client secret from your Snowflake security integration.",
+            validator: isValidClientIdOrSecret,
+          },
+          snowflake_role: {
+            label: "Default Snowflake Role",
+            value: undefined,
+            helpMessage:
+              "The default Snowflake role (e.g., ANALYST). Users can override this during their personal authentication.",
+            validator: isValidSnowflakeRole,
+            overridableAtPersonalAuth: true,
+            personalAuthLabel: "Snowflake Role",
+            personalAuthHelpMessage:
+              "Enter a role to override the default, or leave empty to use the workspace default.",
+          },
+          snowflake_warehouse: {
+            label: "Snowflake Warehouse",
+            value: undefined,
+            helpMessage: "The warehouse to use for queries (e.g., COMPUTE_WH).",
+            validator: isValidSnowflakeWarehouse,
+          },
+        };
+        return result;
+      }
+      // platform_actions uses static credentials via the registry.
+      return null;
+    default:
+      assertNever(provider);
+  }
+}
+
+export type OAuthProvider = (typeof OAUTH_PROVIDERS)[number];
+
+export function isOAuthProvider(obj: unknown): obj is OAuthProvider {
+  return OAUTH_PROVIDERS.includes(obj as OAuthProvider);
+}
+
+function isValidScope(obj: unknown): obj is string | undefined {
+  return !obj || typeof obj === "string";
+}
+
+export type OAuthConnectionType = {
+  connection_id: string;
+  created: number;
+  metadata: Record<string, string>;
+  provider: OAuthProvider;
+  status: "pending" | "finalized";
+  related_credential_id?: string | null;
+};
+
+export function isOAuthConnectionType(
+  obj: unknown
+): obj is OAuthConnectionType {
+  const connection = obj as OAuthConnectionType;
+  return (
+    typeof connection.connection_id === "string" &&
+    typeof connection.created === "number" &&
+    isOAuthProvider(connection.provider) &&
+    (connection.status === "pending" || connection.status === "finalized")
+  );
+}
+
+// OAuth Providers utils
+
+// FIXME: Duplicated from lib/api.
+export function isValidZendeskSubdomain(s: unknown): s is string {
+  return (
+    typeof s === "string" && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(s)
+  );
+}
+
+const SHOPIFY_STORE_DOMAIN_REGEX =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$/;
+
+export function normalizeShopifyStoreDomain(s: unknown): string | null {
+  if (typeof s !== "string") {
+    return null;
+  }
+
+  const domain = s.trim().toLowerCase();
+  return SHOPIFY_STORE_DOMAIN_REGEX.test(domain) ? domain : null;
+}
+
+export function isValidShopifyStoreDomain(s: unknown): s is string {
+  return normalizeShopifyStoreDomain(s) !== null;
+}
+
+const ATLASSIAN_CLOUD_URL_REGEX =
+  /^https:\/\/[a-z0-9][a-z0-9-]*\.atlassian\.net$/i;
+
+export function normalizeAtlassianCloudUrl(raw: string): string {
+  let url = raw.trim();
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
+  }
+  return url.replace(/\/+$/, "");
+}
+
+export function isValidAtlassianCloudUrlOrEmpty(
+  cloudUrl: string | undefined
+): boolean {
+  if (!cloudUrl || cloudUrl.trim() === "") {
+    return true;
+  }
+  return ATLASSIAN_CLOUD_URL_REGEX.test(normalizeAtlassianCloudUrl(cloudUrl));
+}
+
+export function isValidSalesforceDomain(s: unknown): s is string {
+  return (
+    typeof s === "string" &&
+    s.startsWith("https://") &&
+    s.endsWith(".salesforce.com")
+  );
+}
+
+export function isValidClientIdOrSecret(s: unknown): s is string {
+  return typeof s === "string" && s.trim().length > 0;
+}
+
+function isValidOptionalClientSecret(s: unknown): s is string {
+  // Allow empty strings for optional client secrets (e.g., PKCE flows)
+  return typeof s === "string";
+}
+
+export function isValidUrl(s: unknown): s is string {
+  return typeof s === "string" && validateUrl(s).valid;
+}
+
+function isValidTokenEndpointAuthMethod(s: unknown): s is string {
+  return (
+    typeof s === "string" &&
+    (s === "client_secret_post" || s === "client_secret_basic")
+  );
+}
+
+function isValidOptionalResource(s: unknown): s is string {
+  // Optional (RFC 8707): most OAuth servers do not require an audience/resource.
+  return typeof s === "string";
+}
+
+export function isValidSnowflakeAccount(s: unknown): s is string {
+  // Snowflake account identifiers can be in formats like:
+  // - abc123 (legacy locator)
+  // - abc123.us-east-1 (locator with region)
+  // - myorg-myaccount (org name format)
+  // - myorg-myaccount.privatelink (privatelink)
+  // Users sometimes paste a full hostname/URL; we explicitly reject those.
+  // The connectors/oauth layers expect the account identifier only.
+  // Allow alphanumeric, hyphens, underscores, and dots
+  if (typeof s !== "string") {
+    return false;
+  }
+
+  const v = s.trim();
+  if (v.length === 0) {
+    return false;
+  }
+
+  const lower = v.toLowerCase();
+  if (
+    lower.includes("snowflakecomputing.com") ||
+    lower.startsWith("http://") ||
+    lower.startsWith("https://")
+  ) {
+    return false;
+  }
+
+  // Common typos / hostnames.
+  if (v.includes("..") || v.includes("/") || v.includes(":")) {
+    return false;
+  }
+
+  // Snowflake account identifiers are either:
+  // - account locators (include digits), optionally with region/cloud suffix
+  // - org-account format (contains a hyphen)
+  // If it's only letters/underscores/dots, it is almost certainly user input noise.
+  if (!/[-0-9]/.test(v)) {
+    return false;
+  }
+
+  return /^[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]$/.test(v);
+}
+
+export function isValidSnowflakeRole(s: unknown): s is string {
+  // Snowflake role names are uppercase identifiers
+  // Allow alphanumeric and underscores
+  return (
+    typeof s === "string" &&
+    s.trim().length > 0 &&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(s.trim())
+  );
+}
+
+function isValidSnowflakeWarehouse(s: unknown): s is string {
+  // Snowflake warehouse names follow same rules as roles
+  // Allow alphanumeric and underscores
+  return (
+    typeof s === "string" &&
+    s.trim().length > 0 &&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(s.trim())
+  );
+}
+
+/**
+ * Pure validation function for OAuth credential inputs.
+ * Returns null if all credentials are valid, or the first error message string.
+ */
+export function validateOAuthCredentials({
+  provider,
+  useCase,
+  authCredentials,
+  credentialInputs,
+}: {
+  provider: OAuthProvider;
+  useCase: OAuthUseCase | null;
+  authCredentials: OAuthCredentials | null;
+  // When provided, validate against these inputs instead of the provider's
+  // default set (e.g. host-derived static-OAuth servers show custom fields).
+  credentialInputs?: OAuthCredentialInputs | null;
+}): string | null {
+  if (!useCase) {
+    return null;
+  }
+
+  const inputs =
+    credentialInputs ??
+    getProviderRequiredOAuthCredentialInputs({
+      provider,
+      useCase,
+    });
+
+  if (!inputs) {
+    return null;
+  }
+
+  if (!authCredentials) {
+    return "Credentials required";
+  }
+
+  for (const [key, inputData] of Object.entries(inputs)) {
+    if (!isSupportedOAuthCredential(key) || inputData.value) {
+      continue; // Skip unsupported or pre-filled values.
+    }
+
+    const value = authCredentials[key] ?? "";
+    if (inputData.validator) {
+      if (!inputData.validator(value)) {
+        return value.length === 0
+          ? `${inputData.label} is required`
+          : `Invalid ${inputData.label}`;
+      }
+    } else if (!value) {
+      return `${inputData.label} is required`;
+    }
+  }
+
+  return null;
+}
+
+// Credentials Providers
+
+export const PROVIDERS_WITH_WORKSPACE_CONFIGURATIONS = ["gong"] as const;
+
+export type ProvidersWithWorkspaceConfigurations =
+  (typeof PROVIDERS_WITH_WORKSPACE_CONFIGURATIONS)[number];
+
+export const CREDENTIALS_PROVIDERS = [
+  "snowflake",
+  "bigquery",
+  "salesforce",
+  "notion",
+  "slack",
+] as const;
+export type CredentialsProvider = (typeof CREDENTIALS_PROVIDERS)[number];
+
+export function isCredentialProvider(obj: unknown): obj is CredentialsProvider {
+  return CREDENTIALS_PROVIDERS.includes(obj as CredentialsProvider);
+}
+
+export function isProviderWithDefaultWorkspaceConfiguration(
+  obj: unknown
+): obj is ProvidersWithWorkspaceConfigurations {
+  return PROVIDERS_WITH_WORKSPACE_CONFIGURATIONS.includes(
+    obj as ProvidersWithWorkspaceConfigurations
+  );
+}
+
+// Credentials
+
+const SnowflakeAccountSchema = z
+  .string()
+  .refine(isValidSnowflakeAccount, { message: "SnowflakeAccount" });
+
+// Base schema fields with common properties
+const SNOWFLAKE_BASE_CREDENTIALS_FIELDS = {
+  username: z.string(),
+  account: SnowflakeAccountSchema,
+  role: z.string(),
+  warehouse: z.string(),
+};
+
+// Legacy schema for backward compatibility
+export const SnowflakeLegacyCredentialsSchema = z.object({
+  ...SNOWFLAKE_BASE_CREDENTIALS_FIELDS,
+  password: z.string(),
+});
+
+export const SnowflakePasswordCredentialsSchema = z.object({
+  ...SNOWFLAKE_BASE_CREDENTIALS_FIELDS,
+  auth_type: z.literal("password"),
+  password: z.string(),
+});
+
+export const SnowflakeKeyPairCredentialsSchema = z.object({
+  ...SNOWFLAKE_BASE_CREDENTIALS_FIELDS,
+  auth_type: z.literal("keypair"),
+  private_key: z.string(),
+  private_key_passphrase: z.string().optional(),
+});
+
+export const SnowflakeCredentialsSchema = z.union([
+  SnowflakeLegacyCredentialsSchema,
+  SnowflakePasswordCredentialsSchema,
+  SnowflakeKeyPairCredentialsSchema,
+]);
+
+export type SnowflakeCredentials = z.infer<typeof SnowflakeCredentialsSchema>;
+
+export const CheckBigQueryCredentialsSchema = z.object({
+  type: z.string(),
+  project_id: z.string(),
+  private_key_id: z.string(),
+  private_key: z.string(),
+  client_email: z.string(),
+  client_id: z.string(),
+  auth_uri: z.string(),
+  token_uri: z.string(),
+  auth_provider_x509_cert_url: z.string(),
+  client_x509_cert_url: z.string(),
+  universe_domain: z.string(),
+});
+
+export type CheckBigQueryCredentials = z.infer<
+  typeof CheckBigQueryCredentialsSchema
+>;
+
+export const BigQueryCredentialsWithLocationSchema = z.object({
+  type: z.string(),
+  project_id: z.string(),
+  private_key_id: z.string(),
+  private_key: z.string(),
+  client_email: z.string(),
+  client_id: z.string(),
+  auth_uri: z.string(),
+  token_uri: z.string(),
+  auth_provider_x509_cert_url: z.string(),
+  client_x509_cert_url: z.string(),
+  universe_domain: z.string(),
+  location: z.string(),
+});
+
+export type BigQueryCredentialsWithLocation = z.infer<
+  typeof BigQueryCredentialsWithLocationSchema
+>;
+
+export const ApiKeyCredentialsSchema = z.object({
+  api_key: z.string(),
+});
+export type LinearCredentials = z.infer<typeof ApiKeyCredentialsSchema>;
+
+const HubspotCredentialsSchema = z.object({
+  accessToken: z.string(),
+  portalId: z.string(),
+});
+export type HubspotCredentials = z.infer<typeof HubspotCredentialsSchema>;
+
+export const SalesforceCredentialsSchema = z.object({
+  client_id: z.string(),
+  client_secret: z.string(),
+});
+export type SalesforceCredentials = z.infer<typeof SalesforceCredentialsSchema>;
+
+export const NotionCredentialsSchema = z.object({
+  integration_token: z.string(),
+});
+export type NotionCredentials = z.infer<typeof NotionCredentialsSchema>;
+
+export type ConnectionCredentials =
+  | SnowflakeCredentials
+  | BigQueryCredentialsWithLocation
+  | SalesforceCredentials
+  | HubspotCredentials
+  | LinearCredentials
+  | NotionCredentials;
+
+export type ModelProviderPostCredentialsBody = {
+  provider: ByokModelProviderIdType;
+  credentials: ApiKeyCredentialsType;
+};
+
+export type OauthAPIPostConnectionCredentialsResponse = {
+  credential: {
+    credential_id: string;
+    provider: CredentialsProvider;
+    created: number;
+  };
+};
+
+export type OauthAPIPostModelProviderCredentialsResponse = {
+  credential: {
+    credential_id: string;
+    provider: ByokModelProviderIdType;
+    created: number;
+  };
+};
+
+export type OauthAPIGetCredentialsResponse = {
+  credential: {
+    credential_id: string;
+    created: number;
+    provider: CredentialsProvider;
+    metadata: {
+      workspace_id: string;
+      user_id: string;
+    };
+    content: ConnectionCredentials;
+  };
+};

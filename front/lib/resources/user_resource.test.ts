@@ -1,0 +1,821 @@
+import type { CacheableFunction, JsonSerializable } from "@app/lib/utils/cache";
+import type { Result } from "@app/types/shared/result";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const inMemoryCache = vi.hoisted(() => new Map<string, string>());
+const deletedKeys = vi.hoisted(() => [] as string[]);
+const mockEsSearchUsers = vi.hoisted(() => vi.fn());
+const mockEsSearchAllUsers = vi.hoisted(() => vi.fn());
+
+// Elasticsearch isn't available in unit tests; mock the search layer so we can
+// control the returned order and capture the arguments the resource forwards.
+vi.mock("@app/lib/user_search/search", () => ({
+  searchUsers: mockEsSearchUsers,
+  searchAllUsers: mockEsSearchAllUsers,
+}));
+
+vi.mock("@app/lib/utils/cache", () => ({
+  buildCacheWithRedisKey: (cacheId: string, resolverKey: string) =>
+    `cacheWithRedis-${cacheId}-${resolverKey}`,
+  cacheWithRedis: vi
+    .fn()
+    .mockImplementation(
+      <T, Args extends unknown[]>(
+        fn: CacheableFunction<JsonSerializable<T>, Args>,
+        resolver: (...args: Args) => string
+      ) => {
+        return async (...args: Args): Promise<JsonSerializable<T>> => {
+          const key = `cacheWithRedis-${fn.name}-${resolver(...args)}`;
+          const cached = inMemoryCache.get(key);
+          if (cached) {
+            return JSON.parse(cached) as JsonSerializable<T>;
+          }
+          const result = await fn(...args);
+          inMemoryCache.set(key, JSON.stringify(result));
+          return result;
+        };
+      }
+    ),
+  cacheWithRedisResult: vi
+    .fn()
+    .mockImplementation(
+      <T, E, Args extends unknown[]>(
+        fn: (...args: Args) => Promise<Result<JsonSerializable<T>, E>>
+      ) => {
+        return async (
+          ...args: Args
+        ): Promise<Result<JsonSerializable<T>, E>> => {
+          return fn(...args);
+        };
+      }
+    ),
+  invalidateCacheWithRedis: vi
+    .fn()
+    .mockImplementation(
+      <T, Args extends unknown[]>(
+        fn: CacheableFunction<JsonSerializable<T>, Args>,
+        resolver: (...args: Args) => string
+      ) => {
+        return (...args: Args): Promise<void> => {
+          const key = `cacheWithRedis-${fn.name}-${resolver(...args)}`;
+          inMemoryCache.delete(key);
+          deletedKeys.push(key);
+          return Promise.resolve();
+        };
+      }
+    ),
+  bestEffortInvalidateCacheWithRedis: vi
+    .fn()
+    .mockImplementation(
+      <T, Args extends unknown[]>(
+        fn: CacheableFunction<JsonSerializable<T>, Args>,
+        resolver: (...args: Args) => string
+      ) => {
+        return (...args: Args): Promise<void> => {
+          const key = `cacheWithRedis-${fn.name}-${resolver(...args)}`;
+          inMemoryCache.delete(key);
+          deletedKeys.push(key);
+          return Promise.resolve();
+        };
+      }
+    ),
+  batchInvalidateCacheWithRedis: vi
+    .fn()
+    .mockImplementation(
+      <T, Args extends unknown[]>(
+        fn: CacheableFunction<JsonSerializable<T>, Args>,
+        resolver: (...args: Args) => string
+      ) => {
+        return async (argsList: Args[]): Promise<void> => {
+          for (const args of argsList) {
+            const key = `cacheWithRedis-${fn.name}-${resolver(...args)}`;
+            inMemoryCache.delete(key);
+            deletedKeys.push(key);
+          }
+        };
+      }
+    ),
+  invalidateCacheAfterCommit: vi
+    .fn()
+    .mockImplementation(
+      (_transaction: unknown, invalidateFn: () => Promise<void>): void => {
+        void invalidateFn();
+      }
+    ),
+}));
+
+import { Authenticator } from "@app/lib/auth";
+import { frontSequelize } from "@app/lib/resources/storage";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
+import { UserFactory } from "@app/tests/utils/UserFactory";
+import { WorkspaceFactory } from "@app/tests/utils/WorkspaceFactory";
+import { Ok } from "@app/types/shared/result";
+import type { WorkspaceType } from "@app/types/user";
+
+function getCacheKeyForWorkOSUserId(workOSUserId: string): string {
+  return `cacheWithRedis-_fetchByWorkOSUserIdUncached-user:workos:${workOSUserId}`;
+}
+
+describe("UserResource", () => {
+  let user: UserResource;
+  let workspace: WorkspaceType;
+  let auth: Authenticator;
+
+  beforeEach(async () => {
+    workspace = await WorkspaceFactory.basic();
+    user = await UserFactory.basic();
+    auth = await Authenticator.internalAdminForWorkspace(workspace.sId);
+  });
+
+  describe("fetchByModelIds", () => {
+    it("returns no users without querying for empty ids", async () => {
+      const onQuery = vi.fn();
+      frontSequelize.addHook("afterQuery", "empty-user-ids", onQuery);
+      try {
+        expect(await UserResource.fetchByModelIds([])).toEqual([]);
+        expect(onQuery).not.toHaveBeenCalled();
+      } finally {
+        frontSequelize.removeHook("afterQuery", "empty-user-ids");
+      }
+    });
+
+    it("returns users for non-empty ids", async () => {
+      const users = await UserResource.fetchByModelIds([user.id]);
+      expect(users.map((u) => u.id)).toEqual([user.id]);
+    });
+  });
+
+  describe("searchUsers", () => {
+    beforeEach(() => {
+      mockEsSearchUsers.mockReset();
+      mockEsSearchAllUsers.mockReset();
+    });
+
+    it("forwards orderBy and returns users in the order Elasticsearch returned", async () => {
+      const alice = await UserFactory.basic();
+      const bob = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, alice, { role: "user" });
+      await MembershipFactory.associate(workspace, bob, { role: "user" });
+
+      // Elasticsearch returns bob before alice (e.g. name descending); the
+      // resource must forward the sort and preserve this order — its own DB
+      // re-fetch (an `IN` query) does not guarantee ordering.
+      mockEsSearchUsers.mockResolvedValue(
+        new Ok({
+          users: [
+            { user_id: bob.sId, email: "b@example.com", full_name: "Bob" },
+            { user_id: alice.sId, email: "a@example.com", full_name: "Alice" },
+          ],
+          total: 2,
+        })
+      );
+
+      const result = await UserResource.searchUsers(auth, {
+        searchTerm: "",
+        offset: 0,
+        limit: 10,
+        orderBy: { field: "name", direction: "desc" },
+      });
+
+      expect(mockEsSearchUsers).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: { field: "name", direction: "desc" },
+        })
+      );
+      expect(result.isOk()).toBe(true);
+      const users = result.isOk() ? result.value.users : [];
+      expect(users.map((u) => u.sId)).toEqual([bob.sId, alice.sId]);
+    });
+
+    it("preserves the Elasticsearch total when the current page is empty", async () => {
+      mockEsSearchUsers.mockResolvedValue(
+        new Ok({
+          users: [],
+          total: 2,
+        })
+      );
+
+      const result = await UserResource.searchUsers(auth, {
+        searchTerm: "",
+        offset: 10,
+        limit: 10,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (result.isErr()) {
+        return;
+      }
+
+      expect(result.value.users).toEqual([]);
+      expect(result.value.total).toBe(2);
+    });
+  });
+
+  describe("searchAllUsers", () => {
+    beforeEach(() => {
+      mockEsSearchAllUsers.mockReset();
+    });
+
+    it("returns all users in the order Elasticsearch returned", async () => {
+      const alice = await UserFactory.basic();
+      const bob = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, alice, { role: "user" });
+      await MembershipFactory.associate(workspace, bob, { role: "user" });
+
+      mockEsSearchAllUsers.mockResolvedValue(
+        new Ok({
+          users: [
+            { user_id: bob.sId, email: "b@example.com", full_name: "Bob" },
+            { user_id: alice.sId, email: "a@example.com", full_name: "Alice" },
+          ],
+          total: 2,
+        })
+      );
+
+      const result = await UserResource.searchAllUsers(auth, {
+        searchTerm: "",
+      });
+
+      expect(mockEsSearchAllUsers).toHaveBeenCalledWith(
+        expect.objectContaining({
+          searchTerm: "",
+        })
+      );
+      expect(result.isOk()).toBe(true);
+      const users = result.isOk() ? result.value.users : [];
+      expect(users.map((u) => u.sId)).toEqual([bob.sId, alice.sId]);
+    });
+  });
+
+  describe("caching behavior", () => {
+    beforeEach(async () => {
+      inMemoryCache.clear();
+      deletedKeys.length = 0;
+    });
+
+    describe("fetchByWorkOSUserId", () => {
+      it("caches the user on first call", async () => {
+        const workOSUserId = `workos-cache-test-${Date.now()}`;
+        await UserFactory.withWorkOSId(workOSUserId);
+        const cacheKey = getCacheKeyForWorkOSUserId(workOSUserId);
+
+        expect(inMemoryCache.has(cacheKey)).toBe(false);
+
+        const { UserResource } = await import(
+          "@app/lib/resources/user_resource"
+        );
+        await UserResource.fetchByWorkOSUserId(workOSUserId);
+
+        expect(inMemoryCache.has(cacheKey)).toBe(true);
+      });
+
+      it("serves from cache on second call", async () => {
+        const workOSUserId = `workos-cache-serve-${Date.now()}`;
+        await UserFactory.withWorkOSId(workOSUserId);
+        const cacheKey = getCacheKeyForWorkOSUserId(workOSUserId);
+
+        const { UserResource } = await import(
+          "@app/lib/resources/user_resource"
+        );
+        await UserResource.fetchByWorkOSUserId(workOSUserId);
+        expect(inMemoryCache.has(cacheKey)).toBe(true);
+
+        await UserResource.fetchByWorkOSUserId(workOSUserId);
+        expect(inMemoryCache.has(cacheKey)).toBe(true);
+      });
+    });
+
+    describe("update (via updateName)", () => {
+      it("invalidates cache when user with workOSUserId is updated", async () => {
+        const workOSUserId = `workos-update-test-${Date.now()}`;
+        const userWithWorkOS = await UserFactory.withWorkOSId(workOSUserId);
+        const cacheKey = getCacheKeyForWorkOSUserId(workOSUserId);
+
+        const { UserResource } = await import(
+          "@app/lib/resources/user_resource"
+        );
+        await UserResource.fetchByWorkOSUserId(workOSUserId);
+        expect(inMemoryCache.has(cacheKey)).toBe(true);
+
+        await userWithWorkOS.updateName("NewFirst", "NewLast");
+
+        expect(deletedKeys).toContain(cacheKey);
+        expect(inMemoryCache.has(cacheKey)).toBe(false);
+      });
+    });
+
+    describe("updateInfo", () => {
+      it("invalidates cache for both old and new workOSUserId when changed", async () => {
+        const oldWorkOSUserId = `workos-old-${Date.now()}`;
+        const newWorkOSUserId = `workos-new-${Date.now()}`;
+        const userWithWorkOS = await UserFactory.withWorkOSId(oldWorkOSUserId);
+
+        const oldCacheKey = getCacheKeyForWorkOSUserId(oldWorkOSUserId);
+
+        const { UserResource } = await import(
+          "@app/lib/resources/user_resource"
+        );
+        await UserResource.fetchByWorkOSUserId(oldWorkOSUserId);
+        expect(inMemoryCache.has(oldCacheKey)).toBe(true);
+
+        await userWithWorkOS.updateInfo(
+          userWithWorkOS.username,
+          userWithWorkOS.firstName,
+          userWithWorkOS.lastName,
+          userWithWorkOS.email,
+          newWorkOSUserId
+        );
+
+        expect(deletedKeys).toContain(oldCacheKey);
+        const newCacheKey = getCacheKeyForWorkOSUserId(newWorkOSUserId);
+        expect(deletedKeys).toContain(newCacheKey);
+      });
+    });
+
+    describe("setWorkOSUserId", () => {
+      it("invalidates cache for old workOSUserId when changed", async () => {
+        const oldWorkOSUserId = `workos-set-old-${Date.now()}`;
+        const newWorkOSUserId = `workos-set-new-${Date.now()}`;
+        const userWithWorkOS = await UserFactory.withWorkOSId(oldWorkOSUserId);
+
+        const oldCacheKey = getCacheKeyForWorkOSUserId(oldWorkOSUserId);
+
+        const { UserResource } = await import(
+          "@app/lib/resources/user_resource"
+        );
+        await UserResource.fetchByWorkOSUserId(oldWorkOSUserId);
+        expect(inMemoryCache.has(oldCacheKey)).toBe(true);
+
+        await userWithWorkOS.setWorkOSUserId(newWorkOSUserId);
+
+        expect(deletedKeys).toContain(oldCacheKey);
+        const newCacheKey = getCacheKeyForWorkOSUserId(newWorkOSUserId);
+        expect(deletedKeys).toContain(newCacheKey);
+      });
+    });
+  });
+
+  describe("getMetadataAsArray", () => {
+    it("should return empty array when metadata does not exist", async () => {
+      const result = await user.getMetadataAsArray("nonexistent-key");
+      expect(result).toEqual([]);
+    });
+
+    it("should return array with single value when metadata contains one item", async () => {
+      const key = "test-key";
+      const value = "single-value";
+
+      await user.setMetadata(key, value);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual([value]);
+    });
+
+    it("should return array with multiple values when metadata contains comma-separated items", async () => {
+      const key = "test-key";
+      const values = ["value1", "value2", "value3"];
+      const commaSeparatedValue = values.join(",");
+
+      await user.setMetadata(key, commaSeparatedValue);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual(values);
+    });
+
+    it("should handle empty string values in array", async () => {
+      const key = "test-key";
+      const values = ["value1", "", "value3"];
+      const commaSeparatedValue = values.join(",");
+
+      await user.setMetadata(key, commaSeparatedValue);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual(values);
+    });
+
+    it("should handle values with spaces", async () => {
+      const key = "test-key";
+      const values = ["value with spaces", "another value", "third"];
+      const commaSeparatedValue = values.join(",");
+
+      await user.setMetadata(key, commaSeparatedValue);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual(values);
+    });
+
+    it("should handle single empty string", async () => {
+      const key = "test-key";
+      const value = "";
+
+      await user.setMetadata(key, value);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual([""]);
+    });
+  });
+
+  describe("upsertMetadataArray", () => {
+    it("should create new metadata when key does not exist", async () => {
+      const key = "new-key";
+      const value = "first-value";
+
+      await user.upsertMetadataArray(key, value);
+
+      const metadata = await user.getMetadata(key);
+      expect(metadata).toBeTruthy();
+      expect(metadata?.value).toBe(value);
+      expect(metadata?.key).toBe(key);
+      expect(metadata?.userId).toBe(user.id);
+    });
+
+    it("should add value to existing metadata array", async () => {
+      const key = "existing-key";
+      const initialValue = "initial-value";
+      const newValue = "new-value";
+
+      // Create initial metadata
+      await user.setMetadata(key, initialValue);
+
+      // Add new value
+      await user.upsertMetadataArray(key, newValue);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual([initialValue, newValue]);
+    });
+
+    it("should not add duplicate values", async () => {
+      const key = "duplicate-key";
+      const value = "duplicate-value";
+
+      // Add value twice
+      await user.upsertMetadataArray(key, value);
+      await user.upsertMetadataArray(key, value);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual([value]);
+    });
+
+    it("should handle adding to existing comma-separated values", async () => {
+      const key = "multi-key";
+      const initialValues = ["value1", "value2"];
+      const newValue = "value3";
+
+      // Set initial comma-separated values
+      await user.setMetadata(key, initialValues.join(","));
+
+      // Add new value
+      await user.upsertMetadataArray(key, newValue);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual([...initialValues, newValue]);
+    });
+
+    it("should not add duplicate to existing comma-separated values", async () => {
+      const key = "multi-duplicate-key";
+      const initialValues = ["value1", "value2", "value3"];
+      const duplicateValue = "value2";
+
+      // Set initial comma-separated values
+      await user.setMetadata(key, initialValues.join(","));
+
+      // Try to add duplicate value
+      await user.upsertMetadataArray(key, duplicateValue);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual(initialValues);
+    });
+
+    it("should handle empty string values", async () => {
+      const key = "empty-key";
+      const emptyValue = "";
+
+      await user.upsertMetadataArray(key, emptyValue);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual([emptyValue]);
+    });
+
+    it("should handle values with commas by preserving them", async () => {
+      const key = "comma-key";
+      const valueWithComma = "value,with,commas";
+
+      await user.upsertMetadataArray(key, valueWithComma);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual([valueWithComma]);
+    });
+
+    it("should handle adding empty string to existing values", async () => {
+      const key = "mixed-key";
+      const initialValue = "initial";
+      const emptyValue = "";
+
+      await user.setMetadata(key, initialValue);
+      await user.upsertMetadataArray(key, emptyValue);
+
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual([initialValue, emptyValue]);
+    });
+  });
+
+  describe("integration tests", () => {
+    it("should work correctly with multiple operations on same key", async () => {
+      const key = "integration-key";
+      const values = ["first", "second", "third"];
+
+      // Add values one by one
+      for (const value of values) {
+        await user.upsertMetadataArray(key, value);
+      }
+
+      // Verify all values are present
+      const result = await user.getMetadataAsArray(key);
+      expect(result).toEqual(values);
+
+      // Try adding duplicate
+      await user.upsertMetadataArray(key, values[1]);
+
+      // Should still have same values (no duplicate)
+      const resultAfterDuplicate = await user.getMetadataAsArray(key);
+      expect(resultAfterDuplicate).toEqual(values);
+
+      // Add new value
+      const newValue = "fourth";
+      await user.upsertMetadataArray(key, newValue);
+
+      const finalResult = await user.getMetadataAsArray(key);
+      expect(finalResult).toEqual([...values, newValue]);
+    });
+
+    it("should handle multiple different keys independently", async () => {
+      const key1 = "key1";
+      const key2 = "key2";
+      const values1 = ["a", "b"];
+      const values2 = ["x", "y", "z"];
+
+      // Add values to different keys
+      for (const value of values1) {
+        await user.upsertMetadataArray(key1, value);
+      }
+
+      for (const value of values2) {
+        await user.upsertMetadataArray(key2, value);
+      }
+
+      // Verify keys are independent
+      const result1 = await user.getMetadataAsArray(key1);
+      const result2 = await user.getMetadataAsArray(key2);
+
+      expect(result1).toEqual(values1);
+      expect(result2).toEqual(values2);
+    });
+  });
+
+  describe("basic metadata operations", () => {
+    describe("setMetadata and getMetadata", () => {
+      it("should create new metadata", async () => {
+        const key = "test-key";
+        const value = "test-value";
+
+        await user.setMetadata(key, value);
+
+        const metadata = await user.getMetadata(key);
+        expect(metadata).not.toBeNull();
+        expect(metadata?.key).toBe(key);
+        expect(metadata?.value).toBe(value);
+        expect(metadata?.userId).toBe(user.id);
+      });
+
+      it("should update existing metadata", async () => {
+        const key = "update-key";
+        const initialValue = "initial";
+        const updatedValue = "updated";
+
+        await user.setMetadata(key, initialValue);
+        await user.setMetadata(key, updatedValue);
+
+        const metadata = await user.getMetadata(key);
+        expect(metadata?.value).toBe(updatedValue);
+      });
+
+      it("should return null for non-existent key", async () => {
+        const metadata = await user.getMetadata("non-existent-key");
+        expect(metadata).toBeNull();
+      });
+    });
+
+    describe("deleteMetadata", () => {
+      it("should delete metadata by key", async () => {
+        const key = "delete-key";
+        await user.setMetadata(key, "value");
+
+        await user.deleteMetadata({ key });
+
+        const metadata = await user.getMetadata(key);
+        expect(metadata).toBeNull();
+      });
+
+      it("should not affect other keys when deleting", async () => {
+        const key1 = "key-to-delete";
+        const key2 = "key-to-keep";
+
+        await user.setMetadata(key1, "value1");
+        await user.setMetadata(key2, "value2");
+
+        await user.deleteMetadata({ key: key1 });
+
+        expect(await user.getMetadata(key1)).toBeNull();
+        expect(await user.getMetadata(key2)).not.toBeNull();
+      });
+    });
+
+    describe("deleteAllMetadata", () => {
+      it("should delete all metadata for user", async () => {
+        await user.setMetadata("key1", "value1");
+        await user.setMetadata("key2", "value2");
+        await user.setMetadata("key3", "value3");
+
+        await user.deleteAllMetadata(auth);
+
+        expect(await user.getMetadata("key1")).toBeNull();
+        expect(await user.getMetadata("key2")).toBeNull();
+        expect(await user.getMetadata("key3")).toBeNull();
+      });
+    });
+  });
+
+  describe("tool approvals", () => {
+    let workspace: WorkspaceType;
+    let auth: Authenticator;
+
+    beforeEach(async () => {
+      workspace = await WorkspaceFactory.basic();
+      await MembershipFactory.associate(workspace, user, { role: "user" });
+      auth = await Authenticator.internalAdminForWorkspace(workspace.sId);
+    });
+
+    describe("createToolApproval and hasApprovedTool", () => {
+      it("should create low-stake tool approval", async () => {
+        const mcpServerId = "server-123";
+        const toolName = "test-tool";
+
+        await user.createToolApproval(auth, { mcpServerId, toolName });
+
+        const hasApproval = await user.hasApprovedTool(auth, {
+          mcpServerId,
+          toolName,
+        });
+        expect(hasApproval).toBe(true);
+      });
+
+      it("should return false for non-existent approval", async () => {
+        const hasApproval = await user.hasApprovedTool(auth, {
+          mcpServerId: "unknown-server",
+          toolName: "unknown-tool",
+        });
+        expect(hasApproval).toBe(false);
+      });
+
+      it("should create approval with argsAndValues", async () => {
+        const mcpServerId = "server-args";
+        const toolName = "args-tool";
+        const argsAndValues = { param1: "value1", param2: "value2" };
+
+        await user.createToolApproval(auth, {
+          mcpServerId,
+          toolName,
+          argsAndValues,
+        });
+
+        const hasApproval = await user.hasApprovedTool(auth, {
+          mcpServerId,
+          toolName,
+          argsAndValues,
+        });
+        expect(hasApproval).toBe(true);
+      });
+
+      it("should differentiate approvals by argsAndValues", async () => {
+        const mcpServerId = "server-scoped-args";
+        const toolName = "scoped-tool";
+
+        await user.createToolApproval(auth, {
+          mcpServerId,
+          toolName,
+          argsAndValues: { objectName: "Contact" },
+        });
+
+        expect(
+          await user.hasApprovedTool(auth, {
+            mcpServerId,
+            toolName,
+            argsAndValues: { objectName: "Contact" },
+          })
+        ).toBe(true);
+        expect(
+          await user.hasApprovedTool(auth, {
+            mcpServerId,
+            toolName,
+            argsAndValues: { objectName: "Account" },
+          })
+        ).toBe(false);
+      });
+
+      it("should sort argsAndValues keys for consistent matching", async () => {
+        const mcpServerId = "server-sort";
+        const toolName = "sort-tool";
+
+        // Create with keys in one order
+        await user.createToolApproval(auth, {
+          mcpServerId,
+          toolName,
+          argsAndValues: { z: "1", a: "2" },
+        });
+
+        // Check with keys in different order
+        const hasApproval = await user.hasApprovedTool(auth, {
+          mcpServerId,
+          toolName,
+          argsAndValues: { a: "2", z: "1" },
+        });
+        expect(hasApproval).toBe(true);
+      });
+
+      it("should not create duplicate approvals", async () => {
+        const mcpServerId = "server-dup";
+        const toolName = "dup-tool";
+
+        await user.createToolApproval(auth, { mcpServerId, toolName });
+        await user.createToolApproval(auth, { mcpServerId, toolName });
+
+        const hasApproval = await user.hasApprovedTool(auth, {
+          mcpServerId,
+          toolName,
+        });
+        expect(hasApproval).toBe(true);
+      });
+    });
+
+    describe("getUserToolApprovals", () => {
+      it("should return empty array when no approvals exist", async () => {
+        const approvals = await user.getUserToolApprovals(auth);
+        expect(approvals).toEqual([]);
+      });
+
+      it("should group tool names by mcpServerId", async () => {
+        await user.createToolApproval(auth, {
+          mcpServerId: "server-a",
+          toolName: "tool-1",
+        });
+        await user.createToolApproval(auth, {
+          mcpServerId: "server-a",
+          toolName: "tool-2",
+        });
+        await user.createToolApproval(auth, {
+          mcpServerId: "server-b",
+          toolName: "tool-3",
+        });
+
+        const approvals = await user.getUserToolApprovals(auth);
+
+        expect(approvals).toHaveLength(2);
+
+        const serverA = approvals.find((a) => a.mcpServerId === "server-a");
+        const serverB = approvals.find((a) => a.mcpServerId === "server-b");
+
+        expect(serverA).toBeDefined();
+        expect(serverA!.toolNames).toHaveLength(2);
+        expect(serverA!.toolNames).toContain("tool-1");
+        expect(serverA!.toolNames).toContain("tool-2");
+
+        expect(serverB).toBeDefined();
+        expect(serverB!.toolNames).toEqual(["tool-3"]);
+      });
+    });
+
+    describe("deleteToolApprovals", () => {
+      it("should delete approvals for the given mcpServerId only", async () => {
+        await user.createToolApproval(auth, {
+          mcpServerId: "server-x",
+          toolName: "tool-1",
+        });
+        await user.createToolApproval(auth, {
+          mcpServerId: "server-x",
+          toolName: "tool-2",
+        });
+        await user.createToolApproval(auth, {
+          mcpServerId: "server-y",
+          toolName: "tool-3",
+        });
+
+        await user.deleteToolApprovals(auth, { mcpServerId: "server-x" });
+
+        const approvals = await user.getUserToolApprovals(auth);
+        expect(approvals).toHaveLength(1);
+        expect(approvals[0].mcpServerId).toBe("server-y");
+      });
+    });
+  });
+});

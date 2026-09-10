@@ -1,0 +1,17 @@
+{
+  "action": "oauth.revoked",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "mcp_connection"
+    }
+  ],
+  "metadata": {
+    "provider": "string",
+    "connection_id": "string",
+    "connection_type": "string",
+    "actor_type": "string"
+  }
+}

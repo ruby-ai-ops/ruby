@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Ruby",
+  "version": "0.1.15",
+  "description": "Get more done, faster, with the power of your agents at your fingertips.",
+  "icons": {
+    "16": "images/ruby16.png",
+    "32": "images/ruby32.png",
+    "48": "images/ruby48.png",
+    "128": "images/ruby128.png"
+  },
+  "background": {
+    "scripts": ["background.js"],
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Ruby ⇧⌘E"
+  },
+  "commands": {
+    "_execute_sidebar_action": {
+      "suggested_key": {
+        "default": "Ctrl + Shift + E",
+        "mac": "Command + Shift + E"
+      }
+    }
+  },
+  "sidebar_action": {
+    "default_panel": "main.html",
+    "default_title": "Ruby",
+    "open_at_install": true,
+    "default_icon": {
+      "16": "images/ruby16.png",
+      "32": "images/ruby32.png"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["page.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "permissions": ["identity", "storage", "tabs", "scripting", "contextMenus"],
+  "optional_permissions": ["notifications"],
+  "host_permissions": ["<all_urls>"]
+}

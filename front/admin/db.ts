@@ -1,0 +1,337 @@
+import { ActivationPodModel } from "@app/lib/models/activation/activation_pod";
+import { ActivationRecommendationModel } from "@app/lib/models/activation/activation_recommendation";
+import { ActivationWorkAreaModel } from "@app/lib/models/activation/activation_work_area";
+import { AgentStepContentToolExecutionModel } from "@app/lib/models/agent/actions/agent_step_content_tool_execution";
+import { ConversationMCPServerViewModel } from "@app/lib/models/agent/actions/conversation_mcp_server_view";
+import { AgentDataSourceConfigurationModel } from "@app/lib/models/agent/actions/data_sources";
+import { InternalMCPServerCredentialModel } from "@app/lib/models/agent/actions/internal_mcp_server_credentials";
+import {
+  AgentChildAgentConfigurationModel,
+  AgentMCPActionModel,
+  AgentMCPActionOutputItemModel,
+  AgentMCPServerConfigurationModel,
+} from "@app/lib/models/agent/actions/mcp";
+import { MCPServerConnectionModel } from "@app/lib/models/agent/actions/mcp_server_connection";
+import { MCPServerViewModel } from "@app/lib/models/agent/actions/mcp_server_view";
+import { AgentProjectConfigurationModel } from "@app/lib/models/agent/actions/projects";
+import { RemoteMCPServerModel } from "@app/lib/models/agent/actions/remote_mcp_server";
+import { RemoteMCPServerToolMetadataModel } from "@app/lib/models/agent/actions/remote_mcp_server_tool_metadata";
+import { AgentTablesQueryConfigurationTableModel } from "@app/lib/models/agent/actions/tables_query";
+import {
+  AgentConfigurationModel,
+  AgentModel,
+  AgentUserRelationModel,
+  GlobalAgentSettingsModel,
+} from "@app/lib/models/agent/agent";
+import { AgentDataRetentionModel } from "@app/lib/models/agent/agent_data_retention";
+import { AgentMessageConsumptionItemModel } from "@app/lib/models/agent/agent_message_consumption_item";
+import { AgentSkillModel } from "@app/lib/models/agent/agent_skill";
+import { AgentStepContentModel } from "@app/lib/models/agent/agent_step_content";
+import { AgentSuggestionModel } from "@app/lib/models/agent/agent_suggestion";
+import {
+  AgentMessageFeedbackModel,
+  AgentMessageModel,
+  CompactionMessageModel,
+  ConversationModel,
+  ConversationParticipantModel,
+  MentionModel,
+  MessageModel,
+  MessageReactionModel,
+  UserConversationReadsModel,
+  UserMessageModel,
+} from "@app/lib/models/agent/conversation";
+
+import { ConversationForkModel } from "@app/lib/models/agent/conversation_fork";
+import { ConversationSelectedSpaceModel } from "@app/lib/models/agent/conversation_selected_space";
+import { GroupAgentModel } from "@app/lib/models/agent/group_agent";
+import { TagAgentModel } from "@app/lib/models/agent/tag_agent";
+import { TriggerModel } from "@app/lib/models/agent/triggers/triggers";
+import { WebhookRequestModel } from "@app/lib/models/agent/triggers/webhook_request";
+import { WebhookRequestTriggerModel } from "@app/lib/models/agent/triggers/webhook_request_trigger";
+import { WebhookSourceModel } from "@app/lib/models/agent/triggers/webhook_source";
+import { WebhookSourcesViewModel } from "@app/lib/models/agent/triggers/webhook_sources_view";
+import { RubyAppSecretModel } from "@app/lib/models/ruby_app_secret";
+import { ExtensionConfigurationModel } from "@app/lib/models/extension";
+import { FeatureFlagModel } from "@app/lib/models/feature_flag";
+import { GlobalFeatureFlagModel } from "@app/lib/models/global_feature_flag";
+import { MembershipInvitationModel } from "@app/lib/models/membership_invitation";
+import { PlanModel, SubscriptionModel } from "@app/lib/models/plan";
+import { ProviderCredentialModel } from "@app/lib/models/provider_credential";
+import {
+  SkillConfigurationModel,
+  SkillDataSourceConfigurationModel,
+  SkillFileAttachmentModel,
+  SkillMCPServerConfigurationModel,
+  SkillVersionModel,
+} from "@app/lib/models/skill";
+import {
+  AgentMessageSkillModel,
+  ConversationSkillModel,
+} from "@app/lib/models/skill/conversation_skill";
+import { SelfImprovingSkillsUsageModel } from "@app/lib/models/skill/self_improving_skills_usage";
+import { SkillReferenceModel } from "@app/lib/models/skill/skill_reference";
+import { SkillSuggestionModel } from "@app/lib/models/skill/skill_suggestion";
+import { SkillUserFavoriteModel } from "@app/lib/models/skill/skill_user_favorite";
+import { TagModel } from "@app/lib/models/tags";
+import { WorkspaceSensitivityLabelConfigModel } from "@app/lib/models/workspace_sensitivity_label_config";
+import { AcademyChapterVisitModel } from "@app/lib/resources/storage/models/academy_chapter_visit";
+import { AcademyQuizAttemptModel } from "@app/lib/resources/storage/models/academy_quiz_attempt";
+import { AgentMemoryModel } from "@app/lib/resources/storage/models/agent_memories";
+import {
+  AppModel,
+  CloneModel,
+  DatasetModel,
+  ProviderModel,
+} from "@app/lib/resources/storage/models/apps";
+import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
+import { CouponRedemptionModel } from "@app/lib/resources/storage/models/coupon_redemptions";
+import { CouponModel } from "@app/lib/resources/storage/models/coupons";
+import { CreditUsageConfigurationModel } from "@app/lib/resources/storage/models/credit_usage_configurations";
+import { CreditModel } from "@app/lib/resources/storage/models/credits";
+import { DataSourceModel } from "@app/lib/resources/storage/models/data_source";
+import { DataSourceViewModel } from "@app/lib/resources/storage/models/data_source_view";
+import { FileSystemBlobCleanupModel } from "@app/lib/resources/storage/models/file_system_blob_cleanup";
+import { FileSystemMutationModel } from "@app/lib/resources/storage/models/file_system_mutation";
+import { FileSystemNodeModel } from "@app/lib/resources/storage/models/file_system_node";
+import {
+  AuthorizedFileAccessModel,
+  ExternalViewerSessionModel,
+  FileModel,
+  ShareableFileModel,
+  SharingGrantModel,
+} from "@app/lib/resources/storage/models/files";
+import { GroupMembershipModel } from "@app/lib/resources/storage/models/group_memberships";
+import { GroupPermissionModel } from "@app/lib/resources/storage/models/group_permissions";
+import { GroupModel } from "@app/lib/resources/storage/models/groups";
+import { KeyModel } from "@app/lib/resources/storage/models/keys";
+import { KillSwitchModel } from "@app/lib/resources/storage/models/kill_switches";
+// Labs - Can be removed at all times if a solution is dropped
+import {
+  LabsTranscriptsConfigurationModel,
+  LabsTranscriptsHistoryModel,
+} from "@app/lib/resources/storage/models/labs_transcripts";
+import { MembershipModel } from "@app/lib/resources/storage/models/membership";
+import { MembershipUpgradeRequestModel } from "@app/lib/resources/storage/models/membership_upgrade_requests";
+import { ModelDegradationModel } from "@app/lib/resources/storage/models/model_degradations";
+import { OnboardingTaskModel } from "@app/lib/resources/storage/models/onboarding_tasks";
+import { PluginRunModel } from "@app/lib/resources/storage/models/plugin_runs";
+import { ProgrammaticUsageConfigurationModel } from "@app/lib/resources/storage/models/programmatic_usage_configurations";
+import { ProjectMetadataModel } from "@app/lib/resources/storage/models/project_metadata";
+import {
+  ProjectTaskConversationModel,
+  ProjectTaskModel,
+  ProjectTaskSourceModel,
+  ProjectTaskVersionModel,
+} from "@app/lib/resources/storage/models/project_task";
+import { ProjectTaskStateModel } from "@app/lib/resources/storage/models/project_task_state";
+import {
+  RunModel,
+  RunUsageModel,
+} from "@app/lib/resources/storage/models/runs";
+import {
+  SandboxModel,
+  SandboxOwnerModel,
+} from "@app/lib/resources/storage/models/sandbox";
+import { SandboxEnvVarModel } from "@app/lib/resources/storage/models/sandbox_env_var";
+import {
+  SandboxFunctionInvocationModel,
+  SandboxFunctionModel,
+} from "@app/lib/resources/storage/models/sandbox_function";
+import { SandboxFunctionMCPActionModel } from "@app/lib/resources/storage/models/sandbox_function_mcp_action";
+import { SpaceModel } from "@app/lib/resources/storage/models/spaces";
+import {
+  TakeawaySourcesModel,
+  TakeawaysModel,
+  TakeawaysVersionModel,
+} from "@app/lib/resources/storage/models/takeaways";
+import { TemplateModel } from "@app/lib/resources/storage/models/templates";
+import {
+  UserMetadataModel,
+  UserModel,
+  UserToolApprovalModel,
+} from "@app/lib/resources/storage/models/user";
+import { UserProjectPreferencesModel } from "@app/lib/resources/storage/models/user_project_preferences";
+import { WakeUpModel } from "@app/lib/resources/storage/models/wakeup";
+import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
+import { WorkspaceHasDomainModel } from "@app/lib/resources/storage/models/workspace_has_domain";
+import { WorkspacePlanLimitOverrideModel } from "@app/lib/resources/storage/models/workspace_plan_limit_override";
+import { WorkspaceSeatLimitModel } from "@app/lib/resources/storage/models/workspace_seat_limit";
+import { WorkspaceVerificationAttemptModel } from "@app/lib/resources/storage/models/workspace_verification_attempt";
+import { isDevelopment, isTest } from "@app/types/shared/env";
+
+/**
+ * Loads all Sequelize models, useful for some tests
+ * /!\ Order matters here.
+ */
+export function loadAllModels() {
+  return [
+    UserModel,
+    WorkspaceModel,
+    UserMetadataModel,
+    WorkspaceHasDomainModel,
+    MembershipModel,
+    MembershipUpgradeRequestModel,
+    MembershipInvitationModel,
+    GroupModel,
+    GroupMembershipModel,
+    TagModel,
+    SpaceModel,
+    ProjectMetadataModel,
+    AppModel,
+    DatasetModel,
+    ProviderModel,
+    CloneModel,
+    KeyModel,
+    // FileSystemNodeModel first: files references it through fileSystemNodeId.
+    FileSystemNodeModel,
+    FileModel,
+    FileSystemMutationModel,
+    FileSystemBlobCleanupModel,
+    SandboxFunctionModel,
+    SandboxFunctionInvocationModel,
+    ShareableFileModel,
+    AuthorizedFileAccessModel,
+    SharingGrantModel,
+    ExternalViewerSessionModel,
+    RubyAppSecretModel,
+    GroupPermissionModel,
+    WebhookSourceModel,
+    WebhookSourcesViewModel,
+    TriggerModel,
+    WebhookRequestModel,
+    WebhookRequestTriggerModel,
+    ConversationModel,
+    ConversationSelectedSpaceModel,
+    ConversationParticipantModel,
+    UserConversationReadsModel,
+    WakeUpModel,
+    DataSourceModel,
+    DataSourceViewModel,
+    RunModel,
+    RunUsageModel,
+    ExtensionConfigurationModel,
+    PlanModel,
+    SubscriptionModel,
+    ProviderCredentialModel,
+    TemplateModel,
+    CreditModel,
+    CouponModel,
+    CouponRedemptionModel,
+    ProgrammaticUsageConfigurationModel,
+    CreditUsageConfigurationModel,
+    AgentModel,
+    AgentConfigurationModel,
+    AgentUserRelationModel,
+    GlobalAgentSettingsModel,
+    TagAgentModel,
+    GroupAgentModel,
+    RemoteMCPServerModel,
+    MCPServerViewModel,
+    MCPServerConnectionModel,
+    RemoteMCPServerToolMetadataModel,
+    InternalMCPServerCredentialModel,
+    ConversationMCPServerViewModel,
+    SandboxFunctionMCPActionModel,
+    AgentMCPServerConfigurationModel,
+    AgentTablesQueryConfigurationTableModel,
+    AgentDataSourceConfigurationModel,
+    AgentProjectConfigurationModel,
+    UserMessageModel,
+    AgentMessageModel,
+    AgentMessageFeedbackModel,
+    ContentFragmentModel,
+    CompactionMessageModel,
+    MessageModel,
+    MessageReactionModel,
+    MentionModel,
+    AgentDataRetentionModel,
+    AgentStepContentModel,
+    AgentMCPActionModel,
+    AgentMCPActionOutputItemModel,
+    AgentMessageConsumptionItemModel,
+    AgentStepContentToolExecutionModel,
+    AgentChildAgentConfigurationModel,
+    FeatureFlagModel,
+    GlobalFeatureFlagModel,
+    KillSwitchModel,
+    LabsTranscriptsConfigurationModel,
+    LabsTranscriptsHistoryModel,
+    ModelDegradationModel,
+    PluginRunModel,
+    AgentMemoryModel,
+    OnboardingTaskModel,
+    UserToolApprovalModel,
+    SkillConfigurationModel,
+    SkillDataSourceConfigurationModel,
+    SkillVersionModel,
+    SkillReferenceModel,
+    AgentSkillModel,
+    ConversationSkillModel,
+    AgentMessageSkillModel,
+    SkillUserFavoriteModel,
+    SkillMCPServerConfigurationModel,
+    SkillFileAttachmentModel,
+    SkillSuggestionModel,
+    SelfImprovingSkillsUsageModel,
+    WorkspaceVerificationAttemptModel,
+    AgentSuggestionModel,
+    AcademyQuizAttemptModel,
+    AcademyChapterVisitModel,
+    SandboxModel,
+    SandboxOwnerModel,
+    ConversationForkModel,
+    ProjectTaskModel,
+    ProjectTaskConversationModel,
+    ProjectTaskSourceModel,
+    ProjectTaskStateModel,
+    ProjectTaskVersionModel,
+    TakeawaysModel,
+    TakeawaySourcesModel,
+    TakeawaysVersionModel,
+    UserProjectPreferencesModel,
+    WorkspaceSensitivityLabelConfigModel,
+    SandboxEnvVarModel,
+    WorkspaceSeatLimitModel,
+    WorkspacePlanLimitOverrideModel,
+    ActivationPodModel,
+    ActivationRecommendationModel,
+    ActivationWorkAreaModel,
+  ];
+}
+
+async function main() {
+  if (!isDevelopment() && !isTest()) {
+    throw new Error(
+      "This script should only be run in development or test mode"
+    );
+  }
+
+  for (const model of loadAllModels()) {
+    await model.sync({ alter: true });
+  }
+
+  // Seed pro plans so they're available before parallel test workers start.
+  // This avoids deadlocks from concurrent upserts in WorkspaceFactory.
+  const { upsertProPlans } = await import("@app/lib/plans/pro_plans");
+  const { upsertCreditPricedPlans } = await import(
+    "@app/lib/plans/credit_priced_plans"
+  );
+  await upsertProPlans();
+  await upsertCreditPricedPlans();
+
+  process.exit(0);
+}
+
+// Only run main when executed directly (e.g., `npx tsx admin/db.ts`),
+// not when imported as a module (e.g., in tests importing `loadAllModels`).
+if (process.argv[1]?.includes("admin/db")) {
+  main()
+    .then(() => {
+      console.log("Done");
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}

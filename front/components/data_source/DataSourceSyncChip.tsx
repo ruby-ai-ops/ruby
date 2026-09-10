@@ -1,0 +1,164 @@
+import { CONNECTOR_CONFIGURATIONS } from "@app/lib/connector_providers";
+import { DATASOURCE_QUOTA_PER_SEAT } from "@app/lib/plans/usage/types";
+import { timeAgoFrom } from "@app/lib/utils";
+import type { ConnectorType } from "@app/types/data_source";
+import { fileSizeToHumanReadable } from "@app/types/files";
+import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
+import { Chip, Tooltip } from "@ruby-ai/sparkle";
+
+interface ConnectorSyncingChipProps {
+  activeSeats: number;
+  connector: ConnectorType;
+  connectorError: string | null;
+}
+
+export default function ConnectorSyncingChip({
+  activeSeats,
+  connector,
+  connectorError,
+}: ConnectorSyncingChipProps) {
+  if (connectorError) {
+    return (
+      <Chip color="warning">Error loading synchronization information</Chip>
+    );
+  }
+
+  if (connector.errorType) {
+    switch (connector.errorType) {
+      case "oauth_token_revoked":
+        return (
+          <Tooltip
+            label={
+              "Our access to your account has been revoked. Re-authorize to keep the connection up-to-date."
+            }
+            trigger={<Chip color="warning">Re-authorization required</Chip>}
+          />
+        );
+      case "third_party_internal_error":
+        return (
+          <Tooltip
+            label={
+              `We have encountered an error with ${CONNECTOR_CONFIGURATIONS[connector.type].name}. ` +
+              "We sent you an email to resolve the issue."
+            }
+            trigger={<Chip color="warning">Synchronization failed</Chip>}
+          />
+        );
+      case "transient_upstream_error":
+        return (
+          <Tooltip
+            label={
+              `We are having trouble retrieving your data from ${CONNECTOR_CONFIGURATIONS[connector.type].name}. ` +
+              "Synchronization will resume automatically once the issue is resolved."
+            }
+            className="max-w-md"
+            trigger={<Chip color="warning">Synchronization delayed</Chip>}
+          />
+        );
+      case "webcrawling_error_content_too_large":
+        return (
+          <Tooltip
+            label={
+              "The synchronization failed because too many excessively large pages were found."
+            }
+            className="max-w-md"
+            trigger={<Chip color="warning">Pages too large</Chip>}
+          />
+        );
+      case "webcrawling_error_empty_content":
+        return (
+          <Tooltip
+            label={"The synchronization failed to retrieve any content."}
+            className="max-w-md"
+            trigger={<Chip color="warning">Empty content</Chip>}
+          />
+        );
+      case "webcrawling_error_blocked":
+        return (
+          <Tooltip
+            label={
+              "The synchronization failed because the websites blocks automated visits."
+            }
+            className="max-w-md"
+            trigger={<Chip color="warning">Access blocked</Chip>}
+          />
+        );
+      case "webcrawling_synchronization_limit_reached":
+        return (
+          <Tooltip
+            label={
+              "The website synchronization reached the maximum page limit."
+            }
+            className="max-w-md"
+            trigger={<Chip color="info">Limit reached</Chip>}
+          />
+        );
+      case "webcrawling_error":
+        return <Chip color="warning">Synchronization failed</Chip>;
+      case "remote_database_connection_not_readonly":
+        return (
+          <Tooltip
+            label={
+              "We need read-only access to your database to synchronize data." +
+              " Please update the permissions and try again."
+            }
+            trigger={<Chip color="warning">Synchronization failed</Chip>}
+          />
+        );
+      case "remote_database_network_error":
+        return (
+          <Tooltip
+            label={
+              "We encountered a network error while trying to connect to your database." +
+              "Please check your network connection and try again."
+            }
+            trigger={<Chip color="warning">Synchronization failed</Chip>}
+          />
+        );
+      case "workspace_quota_exceeded":
+        return (
+          <Tooltip
+            label={`You've exceeded the total storage quota of ${fileSizeToHumanReadable(activeSeats * DATASOURCE_QUOTA_PER_SEAT)} for your workspace. Contact support@ruby.ad to upgrade your plan.`}
+            trigger={<Chip color="warning">Quota exceeded</Chip>}
+          />
+        );
+      case "workspace_plan_no_api_access":
+        return (
+          <Tooltip
+            label="Your current plan does not allow API access, which is required to synchronize data. Contact support@ruby.ad to upgrade your plan."
+            trigger={<Chip color="warning">Synchronization failed</Chip>}
+          />
+        );
+      default:
+        assertNeverAndIgnore(connector.errorType);
+    }
+  } else if (connector.pausedAt) {
+    return (
+      <Tooltip
+        label="Synchronization is paused. New content won't be synced until resumed."
+        trigger={<Chip>Paused</Chip>}
+      />
+    );
+  } else {
+    // Check if a sync is currently in progress
+    const isSyncInProgress =
+      connector.lastSyncStartTime !== undefined &&
+      (connector.lastSyncFinishTime === undefined ||
+        connector.lastSyncStartTime > connector.lastSyncFinishTime);
+
+    if (isSyncInProgress) {
+      return (
+        <Chip color="info" isBusy>
+          Synchronizing
+          {connector.firstSyncProgress
+            ? ` (${connector.firstSyncProgress})`
+            : null}
+        </Chip>
+      );
+    } else if (connector.lastSyncSuccessfulTime) {
+      return <Chip>{timeAgoFrom(connector.lastSyncSuccessfulTime)} ago</Chip>;
+    } else {
+      return <Chip color="info">Pending</Chip>;
+    }
+  }
+}

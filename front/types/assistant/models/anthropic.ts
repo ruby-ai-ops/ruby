@@ -1,0 +1,677 @@
+import type { ModelConfigurationType } from "./types";
+
+export const CLAUDE_4_OPUS_20250514_MODEL_ID =
+  "claude-4-opus-20250514" as const;
+export const CLAUDE_4_SONNET_20250514_MODEL_ID =
+  "claude-4-sonnet-20250514" as const;
+export const CLAUDE_4_5_SONNET_20250929_MODEL_ID =
+  "claude-sonnet-4-5-20250929" as const;
+export const CLAUDE_3_OPUS_2024029_MODEL_ID = "claude-3-opus-20240229" as const;
+export const CLAUDE_3_5_SONNET_20240620_MODEL_ID =
+  "claude-3-5-sonnet-20240620" as const;
+export const CLAUDE_3_5_SONNET_20241022_MODEL_ID =
+  "claude-3-5-sonnet-20241022" as const;
+export const CLAUDE_3_7_SONNET_20250219_MODEL_ID =
+  "claude-3-7-sonnet-20250219" as const;
+export const CLAUDE_3_HAIKU_20240307_MODEL_ID =
+  "claude-3-haiku-20240307" as const;
+export const CLAUDE_3_5_HAIKU_20241022_MODEL_ID =
+  "claude-3-5-haiku-20241022" as const;
+export const CLAUDE_4_5_HAIKU_20251001_MODEL_ID =
+  "claude-haiku-4-5-20251001" as const;
+export const CLAUDE_4_5_OPUS_20251101_MODEL_ID =
+  "claude-opus-4-5-20251101" as const;
+export const CLAUDE_OPUS_4_6_MODEL_ID = "claude-opus-4-6" as const;
+export const CLAUDE_OPUS_4_7_MODEL_ID = "claude-opus-4-7" as const;
+export const CLAUDE_OPUS_4_8_MODEL_ID = "claude-opus-4-8" as const;
+export const CLAUDE_OPUS_5_MODEL_ID = "claude-opus-5" as const;
+export const CLAUDE_FABLE_5_MODEL_ID = "claude-fable-5" as const;
+export const CLAUDE_SONNET_4_6_MODEL_ID = "claude-sonnet-4-6" as const;
+export const CLAUDE_SONNET_5_MODEL_ID = "claude-sonnet-5" as const;
+
+export const ANTHROPIC_TOKEN_COUNT_ADJUSTMENT = 1.3;
+export const CLAUDE_4_OPUS_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_4_OPUS_20250514_MODEL_ID,
+  displayName: "Claude 4 Opus",
+  contextSize: 200_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude 4 Opus model, a powerful model in the Claude 4 family (200k context).",
+  shortDescription: "A powerful Claude 4 model.",
+  isLegacy: true,
+  isLatest: false,
+  generationTokensCount: 32_000,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsBatchProcessing: true,
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+  availableIfOneOf: {
+    featureFlag: "claude_4_opus_feature",
+  },
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+};
+export const CLAUDE_4_SONNET_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_4_SONNET_20250514_MODEL_ID,
+  displayName: "Claude 4 Sonnet",
+  contextSize: 200_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude 4 Sonnet model, balancing power and efficiency (200k context).",
+  shortDescription: "Anthropic's balanced Claude 4 model.",
+  isLegacy: true,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsBatchProcessing: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+};
+export const CLAUDE_4_5_SONNET_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_4_5_SONNET_20250929_MODEL_ID,
+  displayName: "Claude 4.5 Sonnet",
+  contextSize: 200_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude 4.5 Sonnet model with enhanced reasoning and tool use (200k context).",
+  shortDescription: "Anthropic's previous balanced model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+export const CLAUDE_3_5_HAIKU_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_3_5_HAIKU_20241022_MODEL_ID,
+  displayName: "Claude 3.5 Haiku",
+  contextSize: 180_000,
+  recommendedTopK: 32,
+  recommendedExhaustiveTopK: 64, // 32_768
+  largeModel: false,
+  description:
+    "Anthropic's Claude 3.5 Haiku model, cost effective and high throughput (200k context).",
+  shortDescription: "Anthropic's cost-effective model.",
+  isLegacy: true,
+  isLatest: false,
+  generationTokensCount: 2048,
+  supportsVision: false,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsBatchProcessing: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+};
+export const CLAUDE_3_HAIKU_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_3_HAIKU_20240307_MODEL_ID,
+  displayName: "Claude 3 Haiku",
+  contextSize: 180_000,
+  recommendedTopK: 32,
+  recommendedExhaustiveTopK: 64, // 32_768
+  largeModel: false,
+  description:
+    "Anthropic's Claude 3 Haiku model, cost effective and high throughput (200k context).",
+  shortDescription: "Anthropic's cost-effective model.",
+  isLegacy: true,
+  isLatest: false,
+  generationTokensCount: 2048,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+};
+export const CLAUDE_4_5_HAIKU_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_4_5_HAIKU_20251001_MODEL_ID,
+  displayName: "Claude 4.5 Haiku",
+  contextSize: 180_000,
+  recommendedTopK: 32,
+  recommendedExhaustiveTopK: 64, // 32_768
+  largeModel: false,
+  description:
+    "Anthropic's Claude 4.5 Haiku model, cost effective and high throughput (200k context).",
+  shortDescription: "Anthropic's latest super-fast model.",
+  isLegacy: false,
+  isLatest: true,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+export const CLAUDE_4_5_OPUS_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_4_5_OPUS_20251101_MODEL_ID,
+  displayName: "Claude 4.5 Opus",
+  contextSize: 200_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude 4.5 Opus model, an advanced model with strong coding and reasoning capabilities (200k context).",
+  shortDescription: "Anthropic's most advanced model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  availableIfOneOf: {
+    featureFlag: "claude_4_5_opus_feature",
+  },
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+export const CLAUDE_OPUS_4_6_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_OPUS_4_6_MODEL_ID,
+  displayName: "Claude Opus 4.6",
+  contextSize: 250_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude Opus 4.6 model, an advanced model with enhanced reasoning capabilities (200k context).",
+  shortDescription: "Anthropic's previous flagship model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "medium",
+  useNativeLightReasoning: true,
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  customThinkingType: "auto",
+  availableIfOneOf: {
+    plansWithAdvancedModels: true,
+    featureFlag: "claude_4_5_opus_feature",
+  },
+  customBetas: ["auto-thinking-2026-01-12", "max-effort-2026-01-24"],
+  disablePrefill: true,
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+export const CLAUDE_OPUS_4_7_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_OPUS_4_7_MODEL_ID,
+  displayName: "Claude Opus 4.7",
+  contextSize: 250_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude Opus 4.7 model, an advanced model with a step-change improvement in agentic coding (200k context).",
+  shortDescription: "Anthropic's previous flagship model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "medium",
+  useNativeLightReasoning: true,
+  // Opus 4.7 uses a new tokenizer (~555k words/1M tokens vs ~750k for anthropic_base).
+  // Ratio: 750/555 ≈ 1.35, applied on top of the base 1.3 adjustment → 1.3 × 1.35 ≈ 1.75.
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT * 1.35,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  customThinkingType: "auto",
+  availableIfOneOf: {
+    plansWithAdvancedModels: true,
+    featureFlag: "claude_4_5_opus_feature",
+  },
+  customBetas: ["auto-thinking-2026-01-12", "max-effort-2026-01-24"],
+  disablePrefill: true,
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+export const CLAUDE_OPUS_4_8_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_OPUS_4_8_MODEL_ID,
+  displayName: "Claude Opus 4.8",
+  contextSize: 250_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude Opus 4.8 model, an advanced model with strong agentic coding, reasoning, and judgement (200k context).",
+  shortDescription: "Anthropic's previous flagship model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "medium",
+  useNativeLightReasoning: true,
+  // Opus 4.8 shares Opus 4.7's tokenizer (~555k words/1M tokens vs ~750k for
+  // anthropic_base). Ratio: 750/555 ≈ 1.35, applied on top of the base 1.3
+  // adjustment → 1.3 × 1.35 ≈ 1.75.
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT * 1.35,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  customThinkingType: "auto",
+  availableIfOneOf: {
+    plansWithAdvancedModels: true,
+    featureFlag: "claude_4_5_opus_feature",
+  },
+  customBetas: ["auto-thinking-2026-01-12", "max-effort-2026-01-24"],
+  disablePrefill: true,
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+// https://platform.claude.com/docs/en/about-claude/models/overview
+export const CLAUDE_OPUS_5_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_OPUS_5_MODEL_ID,
+  displayName: "Claude Opus 5",
+  contextSize: 250_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude Opus 5 model, the latest and most capable model for complex agentic coding and enterprise work (250k context).",
+  shortDescription: "Anthropic's latest flagship model.",
+  isLegacy: false,
+  isLatest: true,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "medium",
+  useNativeLightReasoning: true,
+  // Opus 5 shares the Opus 4.7/4.8 tokenizer (~555k words/1M tokens vs ~750k
+  // for anthropic_base). Ratio: 750/555 ≈ 1.35, applied on top of the base 1.3
+  // adjustment → 1.3 × 1.35 ≈ 1.75.
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT * 1.35,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  customThinkingType: "auto",
+  availableIfOneOf: {
+    creditPricedPlan: true,
+    plansWithAdvancedModels: true,
+    featureFlag: "claude_4_5_opus_feature",
+  },
+  customBetas: ["auto-thinking-2026-01-12", "max-effort-2026-01-24"],
+  disablePrefill: true,
+  // Global (Anthropic direct) only for now; Vertex EU comes in a follow-up once
+  // quota is provisioned, like Opus 4.8 and Sonnet 5 did.
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+};
+// https://platform.claude.com/docs/en/about-claude/models/overview
+export const CLAUDE_FABLE_5_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_FABLE_5_MODEL_ID,
+  displayName: "Claude Fable 5",
+  contextSize: 250_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude Fable 5 model, their most intelligent model, a new tier above Opus (250k context).",
+  shortDescription: "Anthropic's most powerful model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  // Fable 5 rejects an explicit `thinking: {type: "disabled"}` (400), so
+  // "none" is unsupported and "light" relies on native light reasoning
+  // (adaptive thinking with low effort) instead of disabling thinking.
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "medium",
+  useNativeLightReasoning: true,
+  // Fable 5 shares the Opus 4.7/4.8 tokenizer (~555k words/1M tokens vs ~750k
+  // for anthropic_base). Ratio: 750/555 ≈ 1.35, applied on top of the base 1.3
+  // adjustment → 1.3 × 1.35 ≈ 1.75.
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT * 1.35,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  customThinkingType: "auto",
+  availableIfOneOf: {
+    featureFlag: "claude_fable_5_feature",
+  },
+  customBetas: ["auto-thinking-2026-01-12", "max-effort-2026-01-24"],
+  // Fable 5's safety classifiers can decline a request; retry server-side on
+  // Opus 4.8 so the user still gets an answer in one round trip.
+  fallbackModels: [CLAUDE_OPUS_4_8_MODEL_ID],
+  // Served from a separate Anthropic workspace (EAP) whose org has the 30-day
+  // data retention Fable 5 requires; the Ruby-managed org does not, and returns
+  // 400 `model_not_available` for this model.
+  useEapKey: true,
+  disablePrefill: true,
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+};
+// https://platform.claude.com/docs/en/about-claude/models/overview
+export const CLAUDE_SONNET_5_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_SONNET_5_MODEL_ID,
+  displayName: "Claude Sonnet 5",
+  contextSize: 250_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude Sonnet 5 model, reaching near-Opus quality on coding and agentic work while balancing power and efficiency (200k context).",
+  shortDescription: "Anthropic's latest balanced model.",
+  isLegacy: false,
+  isLatest: true,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "medium",
+  useNativeLightReasoning: true,
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: false,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  customThinkingType: "auto",
+  customBetas: ["auto-thinking-2026-01-12", "max-effort-2026-01-24"],
+  disablePrefill: true,
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+export const CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_SONNET_4_6_MODEL_ID,
+  displayName: "Claude Sonnet 4.6",
+  contextSize: 250_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "Anthropic's Claude Sonnet 4.6 model, balancing power and efficiency with enhanced reasoning capabilities (200k context).",
+  shortDescription: "Anthropic's balanced model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportsResponseFormat: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: true,
+    high: true,
+  },
+  defaultReasoningEffort: "medium",
+  useNativeLightReasoning: true,
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  supportsPromptCaching: true,
+  supportsBatchProcessing: true,
+  supportsToolSearch: true,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  customThinkingType: "auto",
+  customBetas: ["auto-thinking-2026-01-12", "max-effort-2026-01-24"],
+  disablePrefill: true,
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+
+/**
+ * Deprecated
+ */
+
+export const CLAUDE_3_OPUS_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_3_OPUS_2024029_MODEL_ID,
+  displayName: "Claude 3 Opus",
+  contextSize: 180_000,
+  recommendedTopK: 32,
+  recommendedExhaustiveTopK: 64, // 32_768
+  largeModel: true,
+  description: "Anthropic's Claude 3 Opus model (200k context).",
+  shortDescription: "Anthropic's largest model.",
+  isLegacy: true,
+  isLatest: false,
+  generationTokensCount: 4096,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+};
+export const CLAUDE_3_5_SONNET_20240620_DEPRECATED_MODEL_CONFIG: ModelConfigurationType =
+  {
+    providerId: "anthropic",
+    modelId: CLAUDE_3_5_SONNET_20240620_MODEL_ID,
+    displayName: "Claude 3.5 Sonnet",
+    contextSize: 180_000,
+    recommendedTopK: 32,
+    recommendedExhaustiveTopK: 64, // 32_768
+    largeModel: true,
+    description: "Anthropic's latest Claude 3.5 Sonnet model (200k context).",
+    shortDescription: "Anthropic's latest model.",
+    isLegacy: true,
+    isLatest: false,
+    generationTokensCount: 8192,
+    supportsVision: true,
+    supportedReasoningEfforts: {
+      none: false,
+      light: true,
+      medium: false,
+      high: false,
+    },
+    defaultReasoningEffort: "light",
+    tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+    tokenizer: { type: "tiktoken", base: "anthropic_base" },
+    regionalAvailability: {
+      "us-central1": true,
+      "europe-west1": false,
+    },
+  };
+export const CLAUDE_3_5_SONNET_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_3_5_SONNET_20241022_MODEL_ID,
+  displayName: "Claude 3.5 Sonnet",
+  contextSize: 180_000,
+  recommendedTopK: 32,
+  recommendedExhaustiveTopK: 64, // 32_768
+  largeModel: true,
+  description: "Anthropic's latest Claude 3.5 Sonnet model (200k context).",
+  shortDescription: "Anthropic's latest model.",
+  isLegacy: true,
+  isLatest: false,
+  generationTokensCount: 8192,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+};
+export const CLAUDE_3_7_SONNET_DEFAULT_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "anthropic",
+  modelId: CLAUDE_3_7_SONNET_20250219_MODEL_ID,
+  displayName: "Claude 3.7 Sonnet",
+  contextSize: 200_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 64, // 32_768
+  largeModel: true,
+  description: "Anthropic's latest Claude 3.7 Sonnet model (200k context).",
+  shortDescription: "Anthropic's best model.",
+  isLegacy: true,
+  isLatest: false,
+  generationTokensCount: 64_000,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: false,
+    light: true,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "light",
+  tokenCountAdjustment: ANTHROPIC_TOKEN_COUNT_ADJUSTMENT,
+  tokenizer: { type: "tiktoken", base: "anthropic_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": false,
+  },
+};

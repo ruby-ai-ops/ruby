@@ -1,0 +1,520 @@
+import {
+  buildAuditLogTarget,
+  emitAuditLogEvent,
+} from "@app/lib/api/audit/workos_audit";
+import type { Authenticator } from "@app/lib/auth";
+import { metronomeAmount } from "@app/lib/metronome/amounts";
+import {
+  addCreditToContract,
+  ceilToHourISO,
+  createMetronomeCredit,
+  floorToHourISO,
+  getMetronomeRateCardById,
+  listMetronomePackages,
+  updateMetronomeCreditEndDate,
+} from "@app/lib/metronome/client";
+import {
+  AWU_PRIORITY_PURCHASED_COMMIT,
+  CONTRACT_CREDIT_TYPE_CUSTOM_FIELD_KEY,
+  CONTRACT_CREDIT_TYPE_POOL,
+  CURRENCY_TO_CREDIT_TYPE_ID,
+  getCreditTypeAwuId,
+  getProductFreeCreditId,
+  getProductSeatSubscriptionCreditsId,
+  SEAT_PRIORITY_COUPON_CREDIT,
+} from "@app/lib/metronome/constants";
+import type { CachedContract } from "@app/lib/metronome/plan_type";
+import { getActiveContract } from "@app/lib/metronome/plan_type";
+import { SEAT_TAG, USAGE_TAG } from "@app/lib/metronome/setup_common";
+import { CouponRedemptionResource } from "@app/lib/resources/coupon_redemption_resource";
+import type {
+  CouponResource,
+  CouponValidationError,
+} from "@app/lib/resources/coupon_resource";
+import logger from "@app/logger/logger";
+import type { CouponDiscountType } from "@app/types/coupon";
+import type { SupportedCurrency } from "@app/types/currency";
+import { isSupportedCurrency } from "@app/types/currency";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { addMonths } from "date-fns";
+
+async function getCreditTypeFromRateCardId(
+  rateCardId: string
+): Promise<
+  Result<{ creditTypeId: string; currency: SupportedCurrency }, Error>
+> {
+  const result = await getMetronomeRateCardById({ rateCardId });
+  if (result.isErr()) {
+    return result;
+  }
+  const fiat_credit_type_id = result.value.fiat_credit_type?.id;
+  if (!fiat_credit_type_id) {
+    return new Err(new Error("Rate card has no fiat_credit_type_id"));
+  }
+  const creditTypeIdToCurrency = Object.fromEntries(
+    Object.entries(CURRENCY_TO_CREDIT_TYPE_ID).map(([c, id]) => [id, c])
+  );
+  const currency = creditTypeIdToCurrency[fiat_credit_type_id];
+  if (!isSupportedCurrency(currency)) {
+    return new Err(
+      new Error(
+        `Unsupported currency for credit type id: ${fiat_credit_type_id}`
+      )
+    );
+  }
+  return new Ok({ creditTypeId: fiat_credit_type_id, currency });
+}
+
+export async function getCreditTypeFromContract(
+  contract: CachedContract
+): Promise<
+  Result<{ creditTypeId: string; currency: SupportedCurrency }, Error>
+> {
+  if (!contract.rate_card_id) {
+    return new Err(new Error("Contract has no rate_card_id"));
+  }
+  return getCreditTypeFromRateCardId(contract.rate_card_id);
+}
+
+export async function getCreditTypeFromPackage(
+  packageAlias: string
+): Promise<
+  Result<{ creditTypeId: string; currency: SupportedCurrency }, Error>
+> {
+  const packagesResult = await listMetronomePackages();
+  if (packagesResult.isErr()) {
+    return packagesResult;
+  }
+  const pkg = packagesResult.value.find((p) =>
+    p.aliases.includes(packageAlias)
+  );
+  if (!pkg) {
+    return new Err(new Error(`No package found for alias: ${packageAlias}`));
+  }
+  if (!pkg.rateCardId) {
+    return new Err(new Error(`Package ${packageAlias} has no rate_card_id`));
+  }
+  return getCreditTypeFromRateCardId(pkg.rateCardId);
+}
+
+function getApplicableProductTagsForDiscountType(
+  discountType: CouponDiscountType
+): string[] {
+  switch (discountType) {
+    case "seat":
+      return [SEAT_TAG];
+    case "credit_pool_top_up":
+      return [USAGE_TAG];
+    default:
+      return assertNever(discountType);
+  }
+}
+
+export async function createSeatCouponCredit({
+  metronomeCustomerId,
+  metronomeContractId,
+  coupon,
+  redemptionId,
+  redeemedAt,
+  creditTypeId,
+  currency,
+}: {
+  metronomeCustomerId: string;
+  metronomeContractId?: string;
+  coupon: CouponResource;
+  redemptionId: string;
+  redeemedAt: Date;
+  creditTypeId: string;
+  currency: SupportedCurrency;
+}): Promise<Result<string[], Error>> {
+  const durationMonths = coupon.durationMonths ?? 1;
+  const sharedParams = {
+    metronomeCustomerId,
+    productId: getProductSeatSubscriptionCreditsId(),
+    creditTypeId,
+    amount: metronomeAmount(coupon.amount * 100, currency),
+    startingAt: floorToHourISO(redeemedAt),
+    endingBefore: ceilToHourISO(addMonths(redeemedAt, durationMonths)),
+    name: `Coupon: ${coupon.code}`,
+    priority: SEAT_PRIORITY_COUPON_CREDIT,
+    applicableProductTags: getApplicableProductTagsForDiscountType(
+      coupon.discountType
+    ),
+  };
+
+  if (metronomeContractId) {
+    // Seat-subscription discount, denominated in fiat (`creditTypeId` is a
+    // currency credit type, never AWU) — not part of the AWU pool balance,
+    // so it must not carry the RUBY_CONTRACT_CREDIT_TYPE=pool stamp.
+    const result = await addCreditToContract({
+      ...sharedParams,
+      metronomeContractId,
+      uniquenessKey: `coupon-${redemptionId}-0`,
+    });
+    if (result.isErr()) {
+      return new Err(result.error);
+    }
+    return new Ok(result.value !== null ? [result.value.creditId] : []);
+  }
+
+  const result = await createMetronomeCredit({
+    ...sharedParams,
+    idempotencyKey: `coupon-${redemptionId}-0`,
+  });
+
+  if (result.isErr()) {
+    return new Err(result.error);
+  }
+
+  return new Ok(result.value !== null ? [result.value.id] : []);
+}
+
+// Default access window for a bonus AWU credit grant when the coupon does not
+// specify a duration. Mirrors the one-year access of a purchased Top-Up commit.
+const CREDITS_COUPON_DEFAULT_DURATION_MONTHS = 12;
+
+// Grant the bonus AWU credits of a "credit_pool_top_up" coupon as a free credit
+// on the workspace's Metronome customer. Mirrors the free-credit grant path of
+// the `grant-awu-credits` poke plugin: AWU credit type, "usage" tag,
+// purchased-commit priority. For "credit_pool_top_up" coupons, `coupon.amount`
+// is the number of AWU credits to grant directly (AWU is currency-independent).
+async function createPoolTopupCouponCredit({
+  metronomeCustomerId,
+  metronomeContractId,
+  coupon,
+  redemptionId,
+  redeemedAt,
+}: {
+  metronomeCustomerId: string;
+  metronomeContractId?: string;
+  coupon: CouponResource;
+  redemptionId: string;
+  redeemedAt: Date;
+}): Promise<Result<string[], Error>> {
+  const durationMonths =
+    coupon.durationMonths ?? CREDITS_COUPON_DEFAULT_DURATION_MONTHS;
+
+  const sharedParams = {
+    metronomeCustomerId,
+    productId: getProductFreeCreditId(),
+    creditTypeId: getCreditTypeAwuId(),
+    amount: coupon.amount,
+    startingAt: floorToHourISO(redeemedAt),
+    endingBefore: ceilToHourISO(addMonths(redeemedAt, durationMonths)),
+    name: `Coupon: ${coupon.code}`,
+    priority: AWU_PRIORITY_PURCHASED_COMMIT,
+    applicableProductTags:
+      getApplicableProductTagsForDiscountType("credit_pool_top_up"),
+  };
+
+  if (metronomeContractId) {
+    const result = await addCreditToContract({
+      ...sharedParams,
+      metronomeContractId,
+      uniquenessKey: `coupon-credits-${redemptionId}-0`,
+      customFields: {
+        [CONTRACT_CREDIT_TYPE_CUSTOM_FIELD_KEY]: CONTRACT_CREDIT_TYPE_POOL,
+      },
+    });
+    if (result.isErr()) {
+      return new Err(result.error);
+    }
+    return new Ok(result.value !== null ? [result.value.creditId] : []);
+  }
+
+  const result = await createMetronomeCredit({
+    ...sharedParams,
+    idempotencyKey: `coupon-credits-${redemptionId}-0`,
+    customFields: {
+      [CONTRACT_CREDIT_TYPE_CUSTOM_FIELD_KEY]: CONTRACT_CREDIT_TYPE_POOL,
+    },
+  });
+
+  if (result.isErr()) {
+    return new Err(result.error);
+  }
+
+  return new Ok(result.value !== null ? [result.value.id] : []);
+}
+
+type RedeemPoolTopupCouponError =
+  | { code: "workspace_not_on_metronome" }
+  | { code: "coupon_validation_failed"; reason: CouponValidationError };
+
+// Redeem a "credit_pool_top_up" coupon as a standalone, synchronous action (the "Use
+// coupon" Top-Up tab): no payment is involved, the coupon simply grants free
+// AWU credits to the workspace pool. Mirrors `redeemSeatCoupon` (the subscription
+// path) end-to-end: validate → check for an existing redemption → create the
+// pending redemption (incrementing the count) → grant the credit → mark active.
+// On a Metronome failure the pending redemption is rolled back so the count is
+// released (safe here because, unlike a payment-gated flow, nothing has been
+// charged).
+export async function redeemPoolTopupCoupon(
+  auth: Authenticator,
+  { coupon }: { coupon: CouponResource }
+): Promise<
+  Result<CouponRedemptionResource, RedeemPoolTopupCouponError | Error>
+> {
+  const validation = coupon.validateRedemptionForContext("credits");
+  if (validation.isErr()) {
+    return new Err({
+      code: "coupon_validation_failed",
+      reason: validation.error,
+    });
+  }
+
+  const workspace = auth.getNonNullableWorkspace();
+  const { metronomeCustomerId } = workspace;
+  if (!metronomeCustomerId) {
+    return new Err({ code: "workspace_not_on_metronome" });
+  }
+
+  const existingRedemption =
+    await CouponRedemptionResource.findActiveOrPendingByCouponAndWorkspace(
+      auth,
+      { coupon }
+    );
+  if (existingRedemption) {
+    return new Err({
+      code: "coupon_validation_failed",
+      reason: { code: "already_redeemed" },
+    });
+  }
+
+  // Attach the credit to the active contract when there is one so it shows up
+  // on the contract (invoice preview, contract-scoped balances). Fall back to
+  // a customer-level credit otherwise, mirroring `createSeatCouponCredit`.
+  const contract = await getActiveContract(workspace.sId);
+
+  const pendingResult = await CouponRedemptionResource.createPending(auth, {
+    coupon,
+  });
+  if (pendingResult.isErr()) {
+    return new Err(pendingResult.error);
+  }
+  const redemption = pendingResult.value;
+
+  const creditResult = await createPoolTopupCouponCredit({
+    metronomeCustomerId,
+    metronomeContractId: contract?.id,
+    coupon,
+    redemptionId: redemption.sId,
+    redeemedAt: redemption.redeemedAt,
+  });
+
+  if (creditResult.isErr()) {
+    logger.error(
+      {
+        err: creditResult.error,
+        couponId: coupon.sId,
+        workspaceId: workspace.sId,
+      },
+      "[Metronome] Failed to create credits coupon credit — rolling back redemption"
+    );
+    const rollbackResult = await redemption.rollback(coupon);
+    if (rollbackResult.isErr()) {
+      logger.error(
+        {
+          err: rollbackResult.error,
+          couponId: coupon.sId,
+          workspaceId: workspace.sId,
+        },
+        "[Metronome] Failed to create credits coupon credit - failed to rollback coupon redemption"
+      );
+    }
+    return new Err(creditResult.error);
+  }
+
+  await redemption.markActive(creditResult.value);
+
+  void emitAuditLogEvent({
+    auth,
+    action: "coupon.redeemed",
+    targets: [buildAuditLogTarget("workspace", workspace)],
+    metadata: {
+      code: coupon.code,
+      redemption_id: redemption.sId,
+      amount: String(coupon.amount),
+    },
+  });
+
+  return new Ok(redemption);
+}
+
+export async function endCouponCredit({
+  metronomeCustomerId,
+  metronomeCreditIds,
+  endAt,
+}: {
+  metronomeCustomerId: string;
+  metronomeCreditIds: string[];
+  endAt: Date;
+}): Promise<Result<void, Error>> {
+  const accessEndingBefore = ceilToHourISO(endAt);
+
+  for (const creditId of metronomeCreditIds) {
+    const result = await updateMetronomeCreditEndDate({
+      metronomeCustomerId,
+      creditId,
+      accessEndingBefore,
+    });
+    if (result.isErr()) {
+      return result;
+    }
+  }
+
+  return new Ok(undefined);
+}
+
+type RedeemSeatCouponError =
+  | { code: "workspace_not_on_metronome" }
+  | { code: "coupon_validation_failed"; reason: CouponValidationError };
+
+export async function redeemSeatCoupon(
+  auth: Authenticator,
+  {
+    coupon,
+    metronomePackageAlias,
+  }: {
+    coupon: CouponResource;
+    metronomePackageAlias?: string;
+  }
+): Promise<Result<CouponRedemptionResource, RedeemSeatCouponError | Error>> {
+  const validation = coupon.validateRedemptionForContext("subscription");
+  if (validation.isErr()) {
+    return new Err({
+      code: "coupon_validation_failed",
+      reason: validation.error,
+    });
+  }
+
+  const workspace = auth.getNonNullableWorkspace();
+  const { metronomeCustomerId } = workspace;
+  if (!metronomeCustomerId) {
+    return new Err({ code: "workspace_not_on_metronome" });
+  }
+
+  const existingRedemption =
+    await CouponRedemptionResource.findActiveOrPendingByCouponAndWorkspace(
+      auth,
+      { coupon }
+    );
+  if (existingRedemption) {
+    return new Err({
+      code: "coupon_validation_failed",
+      reason: { code: "already_redeemed" },
+    });
+  }
+
+  let creditTypeIdResult;
+  let contract: CachedContract | null = null;
+  if (metronomePackageAlias) {
+    creditTypeIdResult = await getCreditTypeFromPackage(metronomePackageAlias);
+  } else {
+    contract = await getActiveContract(workspace.sId);
+    if (!contract) {
+      return new Err(
+        new Error("No active Metronome contract found for workspace")
+      );
+    }
+    creditTypeIdResult = await getCreditTypeFromContract(contract);
+  }
+  if (creditTypeIdResult.isErr()) {
+    return creditTypeIdResult;
+  }
+  const { creditTypeId, currency } = creditTypeIdResult.value;
+
+  const pendingResult = await CouponRedemptionResource.createPending(auth, {
+    coupon,
+  });
+  if (pendingResult.isErr()) {
+    return new Err(pendingResult.error);
+  }
+  const redemption = pendingResult.value;
+
+  const creditResult = await createSeatCouponCredit({
+    metronomeCustomerId,
+    metronomeContractId: contract?.id,
+    coupon,
+    redemptionId: redemption.sId,
+    redeemedAt: redemption.redeemedAt,
+    creditTypeId,
+    currency,
+  });
+
+  if (creditResult.isErr()) {
+    logger.error(
+      {
+        err: creditResult.error,
+        couponId: coupon.sId,
+        workspaceId: workspace.sId,
+      },
+      "[Metronome] Failed to create coupon credit — rolling back redemption"
+    );
+    const rollbackResult = await redemption.rollback(coupon);
+    if (rollbackResult.isErr()) {
+      logger.error(
+        {
+          err: rollbackResult.error,
+          couponId: coupon.sId,
+          workspaceId: workspace.sId,
+        },
+        "[Metronome] Failed to create coupon credit - failed to rollback coupon redemption"
+      );
+    }
+    return new Err(creditResult.error);
+  }
+
+  await redemption.markActive(creditResult.value);
+
+  void emitAuditLogEvent({
+    auth,
+    action: "coupon.redeemed",
+    targets: [buildAuditLogTarget("workspace", workspace)],
+    metadata: {
+      code: coupon.code,
+      redemption_id: redemption.sId,
+      amount: String(coupon.amount),
+    },
+  });
+
+  return new Ok(redemption);
+}
+
+export async function revokeCouponRedemption(
+  auth: Authenticator,
+  { redemption }: { redemption: CouponRedemptionResource }
+): Promise<Result<void, Error>> {
+  const workspace = auth.getNonNullableWorkspace();
+  const { metronomeCustomerId } = workspace;
+  if (!metronomeCustomerId) {
+    return new Err(new Error("Workspace has no Metronome customer ID"));
+  }
+
+  const endResult = await endCouponCredit({
+    metronomeCustomerId,
+    metronomeCreditIds: redemption.metronomeCreditIds,
+    endAt: new Date(),
+  });
+  if (endResult.isErr()) {
+    return endResult;
+  }
+
+  const revokeResult = await redemption.markRevoked();
+  if (revokeResult.isErr()) {
+    return revokeResult;
+  }
+
+  void emitAuditLogEvent({
+    auth,
+    action: "coupon.revoked",
+    targets: [buildAuditLogTarget("workspace", workspace)],
+    metadata: {
+      redemption_id: redemption.sId,
+    },
+  });
+
+  return new Ok(undefined);
+}

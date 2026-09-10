@@ -1,0 +1,187 @@
+import type { MCPToolConfigurationType } from "@app/lib/actions/mcp";
+import { INTERNAL_SERVERS_WITH_WEBSEARCH } from "@app/lib/actions/mcp_internal_actions/constants";
+import type { StepContext } from "@app/lib/actions/types";
+import { isServerSideMCPToolConfigurationWithName } from "@app/lib/actions/types/guards";
+import type { ModelConfigurationType } from "@app/types/assistant/models/types";
+
+const WEBSEARCH_ACTION_NUM_RESULTS = 16;
+export const SLACK_SEARCH_ACTION_NUM_RESULTS = 24;
+export const NOTION_SEARCH_ACTION_NUM_RESULTS = 16;
+export const RUN_AGENT_ACTION_NUM_RESULTS = 64;
+
+/**
+ * This function computes the topK for retrieval actions. This is used by both the action (to
+ * compute the topK) and computing the citation counts for retrieval actions (mcp included)
+ *
+ * We share the topK across retrieval actions from the same step. If there are multiple retrieval
+ * actions in the same step we get the maximum topK and divide it by the number of retrieval actions
+ * in the step.
+ */
+function getRetrievalTopK({
+  model,
+  stepActions,
+}: {
+  model: ModelConfigurationType;
+  stepActions: MCPToolConfigurationType[];
+}): number {
+  const searchActions = stepActions.filter(
+    (tool) =>
+      isServerSideMCPToolConfigurationWithName(tool, "search") ||
+      (isServerSideMCPToolConfigurationWithName(tool, "conversation_files") &&
+        tool.originalName === "semantic_search") ||
+      (isServerSideMCPToolConfigurationWithName(tool, "pod_manager") &&
+        tool.originalName === "semantic_search")
+  );
+
+  const includeActions = stepActions.filter(
+    (tool) =>
+      isServerSideMCPToolConfigurationWithName(tool, "include_data") ||
+      (isServerSideMCPToolConfigurationWithName(tool, "pod_manager") &&
+        tool.originalName === "retrieve_recent_documents")
+  );
+  const dsFsActions = stepActions.filter((tool) =>
+    isServerSideMCPToolConfigurationWithName(tool, "data_sources_file_system")
+  );
+
+  const actionsCount =
+    searchActions.length + includeActions.length + dsFsActions.length;
+
+  if (actionsCount === 0) {
+    return 0;
+  }
+
+  const topKs = searchActions
+    .map(() => model.recommendedTopK)
+    .concat(includeActions.map(() => model.recommendedExhaustiveTopK))
+    .concat(dsFsActions.map(() => model.recommendedTopK));
+
+  return Math.ceil(Math.max(...topKs) / actionsCount);
+}
+
+/**
+ * This function computes the number of results for websearch actions. This is used by both the
+ * action (to compute the number of results) and computing the citation counts for websearch
+ * actions.
+ *
+ * We share the number of results across websearch actions from the same step. If there are multiple
+ * websearch actions in the same step we get the maximum number of results and divide it by The
+ * number of websearch actions in the step.
+ */
+function getWebsearchNumResults({
+  stepActions,
+}: {
+  stepActions: MCPToolConfigurationType[];
+}): number {
+  const websearchActions = stepActions.filter((tool) =>
+    INTERNAL_SERVERS_WITH_WEBSEARCH.some((n) =>
+      isServerSideMCPToolConfigurationWithName(tool, n)
+    )
+  );
+  const totalActions = websearchActions.length;
+
+  if (totalActions === 0) {
+    return 0;
+  }
+
+  return Math.ceil(WEBSEARCH_ACTION_NUM_RESULTS / totalActions);
+}
+
+/**
+ * This function computes the number of citations per actions within one step. It is centralized
+ * here as it is used from the runners and across runners which leads to circular imports.
+ *
+ * It works as follows:
+ * - Returns 0 for actions that do not have citations.
+ * - Returns the shared topK for retrieval actions.
+ * - Returns the shared number of results for websearch actions.
+ */
+function getCitationsCount({
+  model,
+  stepActions,
+  stepActionIndex,
+}: {
+  model: ModelConfigurationType;
+  stepActions: MCPToolConfigurationType[];
+  stepActionIndex: number;
+}): number {
+  const action = stepActions[stepActionIndex];
+
+  if (
+    INTERNAL_SERVERS_WITH_WEBSEARCH.some((n) =>
+      isServerSideMCPToolConfigurationWithName(action, n)
+    )
+  ) {
+    return getWebsearchNumResults({
+      stepActions,
+    });
+  }
+
+  if (isServerSideMCPToolConfigurationWithName(action, "slack")) {
+    return SLACK_SEARCH_ACTION_NUM_RESULTS;
+  }
+
+  if (isServerSideMCPToolConfigurationWithName(action, "notion")) {
+    return NOTION_SEARCH_ACTION_NUM_RESULTS;
+  }
+
+  if (isServerSideMCPToolConfigurationWithName(action, "run_agent")) {
+    return RUN_AGENT_ACTION_NUM_RESULTS;
+  }
+
+  if (
+    isServerSideMCPToolConfigurationWithName(
+      action,
+      "data_sources_file_system"
+    ) &&
+    action.originalName === "cat"
+  ) {
+    return 1;
+  }
+
+  return getRetrievalTopK({
+    model,
+    stepActions,
+  });
+}
+
+export function computeStepContexts({
+  model,
+  stepActions,
+  citationsRefsOffset,
+}: {
+  model: ModelConfigurationType;
+  stepActions: MCPToolConfigurationType[];
+  citationsRefsOffset: number;
+}): StepContext[] {
+  const retrievalTopK = getRetrievalTopK({
+    model,
+    stepActions,
+  });
+
+  const websearchResults = getWebsearchNumResults({
+    stepActions,
+  });
+
+  const stepContexts: StepContext[] = [];
+  let currentOffset = citationsRefsOffset;
+
+  for (let i = 0; i < stepActions.length; i++) {
+    const citationsCount = getCitationsCount({
+      model,
+      stepActions,
+      stepActionIndex: i,
+    });
+
+    stepContexts.push({
+      citationsCount,
+      citationsOffset: currentOffset,
+      resumeState: null,
+      retrievalTopK,
+      websearchResultCount: websearchResults,
+    });
+
+    currentOffset += citationsCount;
+  }
+
+  return stepContexts;
+}

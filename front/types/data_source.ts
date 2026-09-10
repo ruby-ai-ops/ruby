@@ -1,0 +1,95 @@
+import type { UsedBySkillType } from "@app/types/assistant/skill_configuration";
+import type { InternalConnectorType } from "@app/types/connectors/connectors_api";
+import type { ModelId } from "./shared/model_id";
+import type { Result } from "./shared/result";
+import { Err, Ok } from "./shared/result";
+import type { EditedByUser } from "./user";
+
+export const CONNECTOR_PROVIDERS = [
+  "bigquery",
+  "confluence",
+  "discord_bot",
+  "ruby_project",
+  "github",
+  "gong",
+  "google_drive",
+  "intercom",
+  "microsoft",
+  "microsoft_bot",
+  "notion",
+  "salesforce",
+  "slack",
+  "slack_bot",
+  "snowflake",
+  "webcrawler",
+  "zendesk",
+] as const;
+
+export type ConnectorProvider = (typeof CONNECTOR_PROVIDERS)[number];
+
+export function isConnectorProvider(val: string): val is ConnectorProvider {
+  return (CONNECTOR_PROVIDERS as unknown as string[]).includes(val);
+}
+
+/**
+ * @swaggerschema Datasource (swagger_schemas.ts), PrivateDataSource (swagger_private_schemas.ts)
+ */
+export type DataSourceType = {
+  id: ModelId;
+  sId: string;
+  createdAt: number;
+  name: string;
+  description: string | null;
+  assistantDefaultSelected: boolean;
+  rubyAPIProjectId: string;
+  rubyAPIDataSourceId: string;
+  connectorId: string | null;
+  connectorProvider: ConnectorProvider | null;
+  editedByUser?: EditedByUser | null;
+};
+
+export type WithConnector = {
+  connectorProvider: ConnectorProvider;
+  connectorId: string;
+};
+
+export type ConnectorType = Omit<InternalConnectorType, "connectionId"> & {
+  connectionId?: null;
+};
+
+export type ConnectorStatusDetails = {
+  connector: ConnectorType | null;
+  fetchConnectorError: boolean;
+  fetchConnectorErrorMessage: string | null;
+};
+
+export type DataSourceWithConnectorDetailsType = DataSourceType &
+  WithConnector &
+  ConnectorStatusDetails;
+
+export type AgentsUsageType = {
+  count: number;
+  agents: Array<{ sId: string; name: string; pictureUrl: string }>;
+};
+
+export type AgentsAndSkillsUsageType = AgentsUsageType & {
+  skills: UsedBySkillType[];
+};
+
+export function isDataSourceNameValid(name: string): Result<void, string> {
+  const trimmed = name.trim();
+  if (trimmed.length === 0) {
+    return new Err("DataSource name cannot be empty");
+  }
+  if (name.startsWith("managed-")) {
+    return new Err("DataSource name cannot start with the prefix `managed-`");
+  }
+
+  return new Ok(undefined);
+}
+
+export type DataSourceTag = {
+  tag: string;
+  rubyAPIDataSourceId: string;
+  connectorProvider: ConnectorProvider | null;
+};

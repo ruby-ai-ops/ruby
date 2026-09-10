@@ -1,0 +1,50 @@
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { APIError } from "@ruby-ai/client";
+
+/**
+ * Patterns that indicate transient network errors. These errors are typically caused by
+ * infrastructure issues (load balancer timeouts, connection resets, network interruptions) and
+ * should not trigger alerts.
+ *
+ * Examples:
+ * - "TypeError: terminated" - TCP connection terminated unexpectedly
+ * - "Exceeded maximum reconnection attempts" - Stream reconnection exhausted
+ * - "ECONNRESET" - Connection reset by peer
+ */
+const TRANSIENT_NETWORK_ERROR_PATTERNS = [
+  /aborted/i,
+  /An unexpected error occurred/i,
+  /ECONNREFUSED/i,
+  /ECONNRESET/i,
+  /ETIMEDOUT/i,
+  /exceeded maximum reconnection attempts/i,
+  /not connected/i,
+  /socket hang up/i,
+  /terminated/i,
+];
+
+/**
+ * Checks if an error message matches any known transient network error pattern.
+ */
+function matchesTransientPattern(message: string): boolean {
+  return TRANSIENT_NETWORK_ERROR_PATTERNS.some((pattern) =>
+    pattern.test(message)
+  );
+}
+
+/**
+ * Determines if an API error is a transient network error.
+ */
+export function isTransientNetworkError(error: APIError): boolean {
+  const message = error.message || "";
+  return matchesTransientPattern(message);
+}
+
+/**
+ * Determines if a stream error is a transient network error.
+ */
+export function isTransientStreamError(error: unknown): boolean {
+  const normalized = normalizeError(error);
+  const message = normalized.message || "";
+  return matchesTransientPattern(message);
+}

@@ -1,0 +1,93 @@
+import type { ConversationError } from "@app/types/assistant/conversation";
+import { isAPIErrorResponse } from "@app/types/error";
+import { safeParseJSON } from "@app/types/shared/utils/json_utils";
+import {
+  AlertCircle,
+  Button,
+  Icon,
+  LinkWrapper,
+  LogIn01,
+} from "@ruby-ai/sparkle";
+import type { ComponentType } from "react";
+
+interface ConversationErrorProps {
+  error: ConversationError;
+}
+
+export function ConversationErrorDisplay({ error }: ConversationErrorProps) {
+  const errorMessageRes = safeParseJSON(JSON.stringify(error));
+
+  if (errorMessageRes.isErr() || !isAPIErrorResponse(errorMessageRes.value)) {
+    return <ConversationGenericError />;
+  }
+
+  switch (errorMessageRes.value.error.type) {
+    case "conversation_access_restricted":
+      return <ConversationAccessRestricted />;
+
+    case "conversation_not_found":
+      return <ConversationNotFound />;
+
+    default:
+      return <ConversationGenericError />;
+  }
+}
+
+function ConversationAccessRestricted() {
+  return (
+    <ErrorDisplay
+      icon={AlertCircle}
+      title="You don't have access to this page"
+      message={["This conversation may include restricted data."]}
+    />
+  );
+}
+
+function ConversationNotFound() {
+  return (
+    <ErrorDisplay
+      icon={AlertCircle}
+      title="Conversation Not Found"
+      message="This conversation may have been deleted or moved."
+    />
+  );
+}
+
+function ConversationGenericError() {
+  return (
+    <ErrorDisplay
+      title="Error Loading Conversation"
+      message={[
+        "Something went wrong while loading the conversation.",
+        "Please try again later.",
+      ]}
+    />
+  );
+}
+
+interface ErrorDisplayProps {
+  icon?: ComponentType<{
+    className?: string;
+  }>;
+  message: string | string[];
+  title: string;
+}
+
+export function ErrorDisplay({ icon, message, title }: ErrorDisplayProps) {
+  return (
+    <div className="flex h-dvh flex-col items-center justify-center gap-3">
+      {icon && <Icon visual={icon} className="text-info-400" size="lg" />}
+      <p className="heading-xl text-center text-foreground">{title}</p>
+      <div className="copy-sm text-center text-muted-foreground">
+        {Array.isArray(message) ? (
+          message.map((line, index) => <p key={index}>{line}</p>)
+        ) : (
+          <p>{message}</p>
+        )}
+      </div>
+      <LinkWrapper href="/">
+        <Button variant="outline" label="Back to homepage" icon={LogIn01} />
+      </LinkWrapper>
+    </div>
+  );
+}

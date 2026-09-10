@@ -1,0 +1,50 @@
+name: Setup PostgreSQL
+description: Setup a PostgreSQL database
+author: Harmon
+branding:
+  icon: database
+  color: blue
+inputs:
+  postgresql docker image:
+    description: Base Docker image name to use (e.g. 'postgres' for official, 'bitnami/postgresql' for Bitnami)
+    required: false
+    default: "postgres"
+  # See https://hub.docker.com/_/postgres for supported versions
+  # and further details on input environment variables
+  postgresql version:
+    description: Version of PostgreSQL to use
+    required: false
+    default: latest
+  postgresql db:
+    description: POSTGRES_DB - name for the default database that is created
+    required: false
+    default: ""
+  postgresql user:
+    description: POSTGRES_USER - create the specified user with superuser power
+    required: false
+    default: ""
+  postgresql password:
+    description: POSTGRES_PASSWORD - superuser password
+    required: false
+    default: ""
+  postgresql init scripts:
+    description: POSTGRES_INIT_SCRIPTS - directory containing DB init scripts
+    required: false
+    default: ""
+  postgresql conf:
+    description: POSTGRES_CONF - postgres configurations
+    required: false
+    default: ""
+  postgresql port:
+    description: POSTGRES_PORT - port to bind to the docker
+    required: false
+    default: 5432
+  postgresql auth:
+    description: POSTGRES_AUTH - set auth method for host connections
+    required: false
+    default: ""
+runs:
+  using: docker
+  env:
+    PORT: ${{ inputs.postgresql_port }}
+  image: Dockerfile

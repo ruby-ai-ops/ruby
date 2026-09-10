@@ -1,0 +1,402 @@
+import type { CreateMCPServerDialogFormValues } from "@app/components/actions/mcp/forms/types";
+import { requiresBearerTokenConfiguration } from "@app/lib/actions/mcp_helper";
+import { getDefaultRemoteMCPServerById } from "@app/lib/actions/mcp_internal_actions/remote_servers";
+import type { AuthorizationInfo } from "@app/lib/actions/mcp_metadata_extraction";
+import type {
+  CreateMCPServerResponseBody,
+  MCPServerType,
+  MCPServerViewNameConflict,
+  MCPServerViewNameConflictDetails,
+} from "@app/lib/api/mcp";
+import { isMCPServerViewNameConflict } from "@app/lib/api/mcp";
+import type { MCPConnectionType } from "@app/lib/swr/mcp_servers";
+import { isMCPCreateServerError } from "@app/lib/swr/mcp_servers";
+import type { DiscoverOAuthMetadataResponseBody } from "@app/types/api/oauth/providers/mcp";
+import type { CellInfo } from "@app/types/cell";
+import { setupOAuthConnection } from "@app/types/oauth/client/setup";
+import type { MCPOAuthUseCase } from "@app/types/oauth/lib";
+import {
+  getHostDerivedMcpServerUrl,
+  getHostDerivedOAuthExtraConfig,
+} from "@app/types/oauth/lib";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { sanitizeHeadersArray } from "@app/types/shared/utils/http_headers";
+import type { WorkspaceType } from "@app/types/user";
+
+type CreateMCPServerDialogSubmitResult =
+  | {
+      type: "oauth_required";
+      authorization: AuthorizationInfo;
+      authCredentials: CreateMCPServerDialogFormValues["authCredentials"];
+      remoteMCPServerOAuthDiscoveryDone: boolean;
+    }
+  | {
+      type: "server_created";
+      server: MCPServerType;
+      remoteMCPServerOAuthDiscoveryDone: boolean;
+    }
+  | {
+      type: "name_conflict";
+      name: string;
+      conflictDetails?: MCPServerViewNameConflictDetails;
+      oauthConnectionId: string | null;
+      remoteMCPServerOAuthDiscoveryDone: boolean;
+    };
+
+type CreateMCPServerDialogSubmitErrorKind =
+  | "discover_oauth_metadata"
+  | "missing_use_case"
+  | "oauth_connection"
+  | "create_server";
+
+export class CreateMCPServerDialogSubmitError extends Error {
+  readonly kind: CreateMCPServerDialogSubmitErrorKind;
+  readonly remoteMCPServerOAuthDiscoveryDone: boolean;
+  readonly isRemoteServerError: boolean;
+
+  constructor({
+    kind,
+    message,
+    remoteMCPServerOAuthDiscoveryDone,
+    isRemoteServerError = false,
+  }: {
+    kind: CreateMCPServerDialogSubmitErrorKind;
+    message: string;
+    remoteMCPServerOAuthDiscoveryDone: boolean;
+    isRemoteServerError?: boolean;
+  }) {
+    super(message);
+    this.kind = kind;
+    this.remoteMCPServerOAuthDiscoveryDone = remoteMCPServerOAuthDiscoveryDone;
+    this.isRemoteServerError = isRemoteServerError;
+  }
+}
+
+export function isCreateServerError(
+  error: Error
+): error is CreateMCPServerDialogSubmitError & { kind: "create_server" } {
+  return (
+    error instanceof CreateMCPServerDialogSubmitError &&
+    error.kind === "create_server"
+  );
+}
+
+type DiscoverOAuthMetadataFn = (
+  url: string,
+  customHeaders?: { key: string; value: string }[]
+) => Promise<Result<DiscoverOAuthMetadataResponseBody, Error>>;
+
+type CreateRemoteMCPServerFn = (args: {
+  url: string;
+  defaultServerId?: number;
+  includeGlobal: boolean;
+  sharedSecret?: string;
+  oauthConnection?: MCPConnectionType;
+  customHeaders?: { key: string; value: string }[];
+  viewName?: string;
+}) => Promise<
+  Result<CreateMCPServerResponseBody, Error | MCPServerViewNameConflict>
+>;
+
+type CreateInternalMCPServerFn = (
+  args: {
+    name: string;
+    includeGlobal: boolean;
+    sharedSecret?: string;
+    customHeaders?: Array<{ key: string; value: string }>;
+    viewName?: string;
+    oauthScope?: string;
+  } & (
+    | { oauthConnection: MCPConnectionType; useCase?: never }
+    | { oauthConnection?: never; useCase: MCPOAuthUseCase }
+    | { oauthConnection?: never; useCase?: never }
+  )
+) => Promise<Result<CreateMCPServerResponseBody, Error>>;
+
+interface SubmitCreateMCPServerDialogFormParams {
+  owner: WorkspaceType;
+  internalMCPServer?: MCPServerType;
+  defaultServerId?: number;
+  values: CreateMCPServerDialogFormValues;
+  // Workflow state - managed via useState in the dialog, not in form state.
+  // These are server-derived values, not user input.
+  authorization: AuthorizationInfo | null;
+  remoteMCPServerOAuthDiscoveryDone: boolean;
+  oauthConnectionId: string | null;
+  discoverOAuthMetadata: DiscoverOAuthMetadataFn;
+  createWithURL: CreateRemoteMCPServerFn;
+  createInternalMCPServer: CreateInternalMCPServerFn;
+  onBeforeCreateServer: () => void;
+  cellInfo: CellInfo | null;
+}
+
+export async function submitCreateMCPServerDialogForm({
+  owner,
+  internalMCPServer,
+  defaultServerId,
+  values,
+  authorization,
+  remoteMCPServerOAuthDiscoveryDone,
+  oauthConnectionId,
+  discoverOAuthMetadata,
+  createWithURL,
+  createInternalMCPServer,
+  onBeforeCreateServer,
+  cellInfo,
+}: SubmitCreateMCPServerDialogFormParams): Promise<
+  Result<CreateMCPServerDialogSubmitResult, Error>
+> {
+  let oauthConnection: MCPConnectionType | undefined;
+  let nextRemoteMCPServerOAuthDiscoveryDone = remoteMCPServerOAuthDiscoveryDone;
+
+  if (values.remoteServerUrl) {
+    // URL validation is handled by Zod schema
+    if (
+      values.authMethod === "oauth-dynamic" &&
+      !remoteMCPServerOAuthDiscoveryDone
+    ) {
+      const discoverOAuthMetadataRes = await discoverOAuthMetadata(
+        values.remoteServerUrl,
+        values.useCustomHeaders
+          ? sanitizeHeadersArray(values.customHeaders)
+          : undefined
+      );
+
+      if (discoverOAuthMetadataRes.isOk()) {
+        nextRemoteMCPServerOAuthDiscoveryDone = true;
+        if (discoverOAuthMetadataRes.value.oauthRequired) {
+          return new Ok({
+            type: "oauth_required",
+            authorization: {
+              provider: "mcp",
+              supported_use_cases: ["platform_actions", "personal_actions"],
+            },
+            authCredentials:
+              discoverOAuthMetadataRes.value.connectionMetadata ?? null,
+            remoteMCPServerOAuthDiscoveryDone:
+              nextRemoteMCPServerOAuthDiscoveryDone,
+          });
+        }
+      } else if (discoverOAuthMetadataRes.isErr()) {
+        nextRemoteMCPServerOAuthDiscoveryDone = false;
+        return new Err(
+          new CreateMCPServerDialogSubmitError({
+            kind: "discover_oauth_metadata",
+            message: discoverOAuthMetadataRes.error.message,
+            remoteMCPServerOAuthDiscoveryDone:
+              nextRemoteMCPServerOAuthDiscoveryDone,
+          })
+        );
+      }
+    }
+  }
+
+  const oauthUseCase = values.useCase;
+
+  if (authorization && !oauthUseCase) {
+    return new Err(
+      new CreateMCPServerDialogSubmitError({
+        kind: "missing_use_case",
+        message: "Please select a use case",
+        remoteMCPServerOAuthDiscoveryDone:
+          nextRemoteMCPServerOAuthDiscoveryDone,
+      })
+    );
+  }
+
+  // Compute the effective OAuth scope: use admin-selected scopes if provided,
+  // otherwise fall back to the server's full default scope.
+  // Scopes marked with `impliedBy` are excluded when their parent scope is
+  // selected (e.g. Files.Read.All is excluded when Files.ReadWrite.All is
+  // selected, since ReadWrite already includes read access).
+  const effectiveScope =
+    values.selectedScopes !== undefined && authorization?.availableScopes
+      ? values.selectedScopes
+          .filter((scopeValue) => {
+            const def = authorization.availableScopes!.find(
+              (s) => s.value === scopeValue
+            );
+            return !(
+              def?.impliedBy && values.selectedScopes!.includes(def.impliedBy)
+            );
+          })
+          .join(" ")
+      : authorization?.scope;
+
+  // Host-derived static-OAuth servers collect a single host
+  // URL + client ID/secret; the OAuth endpoints, scope and MCP server URL are
+  // all derived from that host.
+  const defaultConfig =
+    defaultServerId !== undefined
+      ? getDefaultRemoteMCPServerById(defaultServerId)
+      : null;
+  const hostDerivedOAuth = defaultConfig?.hostDerivedOAuth;
+
+  if (authorization && oauthUseCase) {
+    if (oauthConnectionId) {
+      oauthConnection = {
+        useCase: oauthUseCase,
+        connectionId: oauthConnectionId,
+      };
+    } else {
+      const derivedExtraConfig = hostDerivedOAuth
+        ? getHostDerivedOAuthExtraConfig({
+            hostConfig: hostDerivedOAuth,
+            authCredentials: values.authCredentials,
+          })
+        : null;
+
+      const cRes = await setupOAuthConnection({
+        owner,
+        provider: authorization.provider,
+        // During setup, the use case is always "platform_actions".
+        useCase: "platform_actions",
+        extraConfig: derivedExtraConfig ?? {
+          ...(values.authCredentials ?? {}),
+          ...(effectiveScope ? { scope: effectiveScope } : {}),
+        },
+        cellInfo,
+      });
+
+      if (cRes.isErr()) {
+        return new Err(
+          new CreateMCPServerDialogSubmitError({
+            kind: "oauth_connection",
+            message: cRes.error.message,
+            remoteMCPServerOAuthDiscoveryDone:
+              nextRemoteMCPServerOAuthDiscoveryDone,
+          })
+        );
+      }
+
+      oauthConnection = {
+        useCase: oauthUseCase,
+        connectionId: cRes.value.connection_id,
+      };
+    }
+  }
+
+  onBeforeCreateServer();
+  const effectiveRemoteServerUrl = hostDerivedOAuth
+    ? (getHostDerivedMcpServerUrl({
+        hostConfig: hostDerivedOAuth,
+        authCredentials: values.authCredentials,
+      }) ?? values.remoteServerUrl)
+    : values.remoteServerUrl;
+
+  let server: MCPServerType | undefined;
+
+  if (internalMCPServer) {
+    const viewName = values.viewName?.trim();
+    const sanitizedHeaders =
+      requiresBearerTokenConfiguration(internalMCPServer) &&
+      values.useCustomHeaders
+        ? sanitizeHeadersArray(values.customHeaders)
+        : undefined;
+
+    const optionalFields =
+      requiresBearerTokenConfiguration(internalMCPServer) &&
+      (values.sharedSecret !== undefined ||
+        (sanitizedHeaders && sanitizedHeaders.length > 0))
+        ? {
+            sharedSecret: values.sharedSecret,
+            customHeaders:
+              sanitizedHeaders && sanitizedHeaders.length > 0
+                ? sanitizedHeaders
+                : undefined,
+          }
+        : {};
+
+    const scopeField =
+      effectiveScope !== undefined ? { oauthScope: effectiveScope } : {};
+
+    const createRes = oauthConnection
+      ? await createInternalMCPServer({
+          name: internalMCPServer.name,
+          oauthConnection,
+          includeGlobal: true,
+          ...(viewName ? { viewName } : {}),
+          ...scopeField,
+          ...optionalFields,
+        })
+      : await createInternalMCPServer({
+          name: internalMCPServer.name,
+          includeGlobal: true,
+          ...(viewName ? { viewName } : {}),
+          ...scopeField,
+          ...optionalFields,
+        });
+
+    if (createRes.isErr()) {
+      return new Err(
+        new CreateMCPServerDialogSubmitError({
+          kind: "create_server",
+          message: createRes.error.message,
+          remoteMCPServerOAuthDiscoveryDone:
+            nextRemoteMCPServerOAuthDiscoveryDone,
+        })
+      );
+    }
+
+    server = createRes.value.server;
+  }
+
+  if (effectiveRemoteServerUrl) {
+    const viewName = values.viewName?.trim();
+    const createRes = await createWithURL({
+      url: effectiveRemoteServerUrl,
+      defaultServerId,
+      includeGlobal: true,
+      ...(viewName ? { viewName } : {}),
+      sharedSecret:
+        values.authMethod === "bearer" ? values.sharedSecret : undefined,
+      oauthConnection,
+      customHeaders: values.useCustomHeaders
+        ? sanitizeHeadersArray(values.customHeaders)
+        : undefined,
+    });
+
+    if (createRes.isErr()) {
+      const err = createRes.error;
+      if (isMCPServerViewNameConflict(err)) {
+        return new Ok({
+          type: "name_conflict",
+          name: err.nameConflict,
+          conflictDetails: err.conflictDetails,
+          oauthConnectionId: oauthConnection?.connectionId ?? null,
+          remoteMCPServerOAuthDiscoveryDone:
+            nextRemoteMCPServerOAuthDiscoveryDone,
+        });
+      }
+      return new Err(
+        new CreateMCPServerDialogSubmitError({
+          kind: "create_server",
+          message: err.message,
+          remoteMCPServerOAuthDiscoveryDone:
+            nextRemoteMCPServerOAuthDiscoveryDone,
+          isRemoteServerError:
+            isMCPCreateServerError(err) && err.isRemoteServerError,
+        })
+      );
+    }
+    server = createRes.value.server;
+  }
+
+  if (!server) {
+    return new Err(
+      new CreateMCPServerDialogSubmitError({
+        kind: "create_server",
+        message: "Failed to create MCP server",
+        remoteMCPServerOAuthDiscoveryDone:
+          nextRemoteMCPServerOAuthDiscoveryDone,
+      })
+    );
+  }
+
+  return new Ok({
+    type: "server_created",
+    server,
+    remoteMCPServerOAuthDiscoveryDone: nextRemoteMCPServerOAuthDiscoveryDone,
+  });
+}

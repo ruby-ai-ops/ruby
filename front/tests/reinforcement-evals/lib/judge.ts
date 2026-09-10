@@ -1,0 +1,149 @@
+import type { Authenticator } from "@app/lib/auth";
+import type {
+  JudgeResult,
+  TestCase,
+  ToolCall,
+} from "@app/tests/reinforcement-evals/lib/types";
+import { getTestCaseInputForDisplay } from "@app/tests/reinforcement-evals/lib/types";
+import { getJudgeLLM } from "@app/tests/utils/eval_llm";
+
+const JUDGE_PROMPT = `You are evaluating the quality of a Reinforced Skills analyst's suggestions.
+
+The analyst reviews conversations that used skills and proposes improvements to skill configurations (instructions, tools).
+
+## Scoring Rubric
+
+- 0: Failed to produce relevant suggestions or major issues (wrong tool, irrelevant content)
+- 1: Partially addressed the issue, missing key elements or low quality suggestions
+- 2: Good suggestions with minor issues (slightly off-target, incomplete analysis)
+- 3: Excellent, well-targeted suggestions that clearly address the identified issues
+
+You MUST provide your response in this exact format:
+
+REASONING: <your detailed analysis>
+SCORE: <number>
+
+Where <number> is between 0 and 3.
+
+IMPORTANT: You must include both REASONING: and SCORE: labels. The score MUST appear at the end of your response.
+
+---
+
+## Test Input
+
+{{TEST_INPUT}}
+
+## Tool Calls Made
+
+{{TOOL_CALLS}}
+
+## Response Text (if any)
+
+{{RESPONSE_TEXT}}
+
+## Scenario-Specific Criteria
+
+{{JUDGE_CRITERIA}}
+
+---
+
+## General Evaluation Checklist (apply to all scenarios)
+
+1. **Correct Tool Usage**: Did the analyst call edit_skill with the right fields?
+   - instructionEdits for instruction improvements and tool reference changes
+   - Tool reference changes must add/remove inline <tool id="..." name="..."/> tags in instructionEdits content
+2. **Suggestion Quality**: Are the suggestions specific, actionable, and well-reasoned?
+   - Does the analysis field explain WHY the change is needed?
+   - Is the suggested content appropriate and well-written?
+3. **Scope Appropriateness**: Did it avoid over-engineering?
+   - Focused on the actual issue rather than rewriting everything
+   - Suggestions preserve the skill's existing goals
+4. **If instructionEdits are present**:
+   - Do the edits directly address the identified issue?
+   - Are the old_string values accurate matches of the existing instructions?
+   - Would the new_string replacements meaningfully improve the skill?
+5. **If tool reference changes are present**:
+   - Is the correct inline <tool id="..." name="..."/> tag added/removed in the edited instruction content?
+   - Is the add/remove behavior appropriate for the conversation evidence?
+   - Does the analysis explain the use case?
+
+Provide your evaluation using the REASONING: and SCORE: format described above.`;
+
+export async function evaluateWithJudge(
+  auth: Authenticator,
+  testCase: TestCase,
+  toolCalls: ToolCall[],
+  responseText: string,
+  numRuns: number = 1
+): Promise<JudgeResult> {
+  const prompt = JUDGE_PROMPT.replace(
+    "{{TEST_INPUT}}",
+    getTestCaseInputForDisplay(testCase)
+  )
+    .replace(
+      "{{TOOL_CALLS}}",
+      toolCalls.length > 0
+        ? toolCalls
+            .map(
+              (tc) => `- ${tc.name}(${JSON.stringify(tc.arguments, null, 2)})`
+            )
+            .join("\n\n")
+        : "(none)"
+    )
+    .replace("{{RESPONSE_TEXT}}", responseText || "(none)")
+    .replace("{{JUDGE_CRITERIA}}", testCase.judgeCriteria);
+
+  const scores: number[] = [];
+  let lastReasoning = "";
+
+  const llm = await getJudgeLLM(auth);
+
+  for (let i = 0; i < numRuns; i++) {
+    const events = llm.stream({
+      conversation: {
+        messages: [
+          {
+            role: "user",
+            name: "User",
+            content: [{ type: "text", text: prompt }],
+          },
+        ],
+      },
+      prompt:
+        "You are a careful evaluator. Analyze the reinforced skills output and provide a fair assessment.",
+      specifications: [],
+    });
+
+    let response = "";
+    for await (const event of events) {
+      if (event.type === "text_delta") {
+        response += event.content.delta;
+      }
+      if (event.type === "error") {
+        throw new Error(`Judge evaluation error: ${event.content.message}`);
+      }
+    }
+
+    const scoreMatch = response.match(/SCORE:\s*(\d)/i);
+    if (scoreMatch) {
+      const score = parseInt(scoreMatch[1], 10);
+      if (score >= 0 && score <= 3) {
+        scores.push(score);
+      }
+    }
+
+    const reasoningMatch = response.match(
+      /REASONING:\s*([\s\S]+?)(?=SCORE:|$)/i
+    );
+    if (reasoningMatch) {
+      lastReasoning = reasoningMatch[1].trim();
+    }
+  }
+
+  const finalScore =
+    scores.length > 0
+      ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
+      : 0;
+
+  return { finalScore, scores, reasoning: lastReasoning };
+}

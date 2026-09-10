@@ -1,0 +1,271 @@
+import "@uiw/react-textarea-code-editor/dist.css";
+
+import DataSourcePicker from "@app/components/data_source/DataSourcePicker";
+import { SuspensedCodeEditor } from "@app/components/SuspensedCodeEditor";
+import { useTheme } from "@app/components/sparkle/ThemeContext";
+import TablePicker from "@app/components/tables/TablePicker";
+import { classNames, shallowBlockClone } from "@app/lib/utils";
+import type {
+  AppType,
+  SpecificationBlockType,
+  SpecificationType,
+} from "@app/types/app";
+import type { BlockType, RunType } from "@app/types/run";
+import type { WorkspaceType } from "@app/types/user";
+import { Button, Label, Plus, XClose } from "@ruby-ai/sparkle";
+import last from "lodash/last";
+import { useCallback, useEffect } from "react";
+import Block from "./Block";
+
+export interface TableConfig {
+  workspace_id: string;
+  data_source_id: string;
+  table_id: string;
+}
+
+export function TablesManager({
+  owner,
+  app,
+  block,
+  readOnly,
+  onBlockUpdate,
+}: React.PropsWithChildren<{
+  owner: WorkspaceType;
+  app: AppType;
+  block: SpecificationBlockType;
+  readOnly: boolean;
+  onBlockUpdate: (block: SpecificationBlockType) => void;
+}>) {
+  const addNewTable = useCallback(() => {
+    const b = shallowBlockClone(block);
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+    if (!b.config.tables) {
+      b.config.tables = [];
+    }
+    b.config.tables.push({});
+    onBlockUpdate(b);
+  }, [block, onBlockUpdate]);
+
+  const removeTable = (index: number) => {
+    const b = shallowBlockClone(block);
+    b.config.tables.splice(index, 1);
+    onBlockUpdate(b);
+  };
+
+  const updateTableConfig = (index: number, updates: Partial<TableConfig>) => {
+    const b = shallowBlockClone(block);
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+    if (!b.config.tables) {
+      b.config.tables = [];
+    }
+    b.config.tables[index] = {
+      ...b.config.tables[index],
+      ...updates,
+    };
+    onBlockUpdate(b);
+  };
+
+  const getSelectedTables = (): Array<{
+    dataSourceId: string;
+    tableId: string;
+  }> => {
+    return (
+      block.config.tables?.map((t: TableConfig) => ({
+        dataSourceId: t.data_source_id,
+        tableId: t.table_id,
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+      })) || []
+    );
+  };
+
+  useEffect(() => {
+    if (!block.config.tables?.length) {
+      addNewTable();
+    }
+  }, [block.config.tables?.length, addNewTable]);
+
+  return (
+    <div className="pb-2">
+      <Label>Table</Label>
+      {block.config.tables?.map((table: TableConfig, index: number) => (
+        <div key={index}>
+          <div className="flex flex-col items-center xl:flex-row">
+            <div className="flex flex-col xl:flex-row xl:space-x-2">
+              <div className="mr-2 flex flex-row">
+                <DataSourcePicker
+                  owner={owner}
+                  readOnly={readOnly}
+                  currentDataSources={
+                    table?.data_source_id
+                      ? [
+                          {
+                            data_source_id: table.data_source_id,
+                            workspace_id: table.workspace_id,
+                          },
+                        ]
+                      : []
+                  }
+                  space={app.space}
+                  onDataSourcesUpdate={(dataSources) => {
+                    if (dataSources.length === 0) {
+                      return;
+                    }
+                    const ds = dataSources[0];
+                    updateTableConfig(index, {
+                      workspace_id: ds.workspace_id,
+                      data_source_id: ds.data_source_id,
+                      table_id: undefined, // Reset table_id when data source changes
+                    });
+                  }}
+                  linksDisabled
+                />
+              </div>
+            </div>
+
+            {table?.data_source_id && (
+              <div className="flex flex-col xl:flex-row xl:space-x-2">
+                <div className="flex-rows flex">
+                  <TablePicker
+                    owner={owner}
+                    space={app.space}
+                    dataSource={{
+                      workspace_id: table.workspace_id,
+                      data_source_id: table.data_source_id,
+                    }}
+                    readOnly={readOnly}
+                    currentTableId={table.table_id}
+                    onTableUpdate={(selectedTable) => {
+                      updateTableConfig(index, {
+                        table_id: selectedTable.internalId,
+                      });
+                    }}
+                    excludeTables={getSelectedTables()}
+                  />
+                </div>
+              </div>
+            )}
+            {!readOnly && block.config.tables?.length > 1 && (
+              <div>
+                <Button
+                  onClick={() => removeTable(index)}
+                  className={classNames(
+                    "text-muted-foreground",
+                    "hover:text-muted-foreground"
+                  )}
+                  icon={XClose}
+                  size="xs"
+                  variant="outline"
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+
+      <div>
+        <Button
+          type="button"
+          onClick={addNewTable}
+          className="mt-2"
+          icon={Plus}
+          label="Add Table"
+          size="xs"
+          variant="outline"
+          disabled={
+            !last(block.config.tables as Partial<TableConfig>[])?.table_id
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+export default function Database({
+  owner,
+  app,
+  spec,
+  run,
+  block,
+  status,
+  running,
+  readOnly,
+  showOutputs,
+  onBlockUpdate,
+  onBlockDelete,
+  onBlockUp,
+  onBlockDown,
+  onBlockNew,
+}: React.PropsWithChildren<{
+  owner: WorkspaceType;
+  app: AppType;
+  spec: SpecificationType;
+  run: RunType | null;
+  block: SpecificationBlockType;
+  status: any;
+  running: boolean;
+  readOnly: boolean;
+  showOutputs: boolean;
+  onBlockUpdate: (block: SpecificationBlockType) => void;
+  onBlockDelete: () => void;
+  onBlockUp: () => void;
+  onBlockDown: () => void;
+  onBlockNew: (blockType: BlockType | "map_reduce" | "while_end") => void;
+}>) {
+  const { isDark } = useTheme();
+
+  return (
+    <Block
+      owner={owner}
+      app={app}
+      spec={spec}
+      run={run}
+      block={block}
+      status={status}
+      running={running}
+      readOnly={readOnly}
+      showOutputs={showOutputs}
+      canUseCache={false}
+      onBlockUpdate={onBlockUpdate}
+      onBlockDelete={onBlockDelete}
+      onBlockUp={onBlockUp}
+      onBlockDown={onBlockDown}
+      onBlockNew={onBlockNew}
+    >
+      <div className="mx-4 flex w-full flex-col">
+        <TablesManager
+          owner={owner}
+          app={app}
+          block={block}
+          readOnly={readOnly}
+          onBlockUpdate={onBlockUpdate}
+        />
+
+        <div>
+          <Label>Query</Label>
+          <div className="w-full font-normal">
+            <SuspensedCodeEditor
+              data-color-mode={isDark ? "dark" : "light"}
+              readOnly={readOnly}
+              value={block.spec.query}
+              language="jinja2"
+              placeholder=""
+              onChange={(e) => {
+                const b = shallowBlockClone(block);
+                b.spec.query = e.target.value;
+                onBlockUpdate(b);
+              }}
+              padding={3}
+              minHeight={80}
+              className="rounded-lg bg-muted-background"
+              style={{
+                fontSize: 13,
+                fontFamily:
+                  "ui-monospace, SFMono-Regular, SF Mono, Consolas, Liberation Mono, Menlo, monospace",
+              }}
+            />
+          </div>
+        </div>
+      </div>
+    </Block>
+  );
+}

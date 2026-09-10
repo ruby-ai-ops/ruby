@@ -1,0 +1,375 @@
+import type { MCPToolStakeLevelType } from "@app/lib/actions/constants";
+import {
+  FALLBACK_INTERNAL_AUTO_SERVERS_TOOL_STAKE_LEVEL,
+  FALLBACK_MCP_TOOL_STAKE_LEVEL,
+} from "@app/lib/actions/constants";
+import {
+  getMcpServerViewDescription,
+  isRemoteMCPServerType,
+  requiresBearerTokenConfiguration,
+} from "@app/lib/actions/mcp_helper";
+import {
+  getInternalMCPServerToolArgumentsRequiringApproval,
+  INTERNAL_MCP_SERVERS,
+  isInternalMCPServerName,
+} from "@app/lib/actions/mcp_internal_actions/constants";
+import type { MCPServerViewType } from "@app/lib/api/mcp";
+import type { HeaderRow, MetaRow } from "@app/types/shared/utils/http_headers";
+import { sanitizeHeadersArray } from "@app/types/shared/utils/http_headers";
+import { z } from "zod";
+
+// Tool settings for a single tool.
+export type ToolSettings = {
+  enabled: boolean;
+  permission: MCPToolStakeLevelType;
+};
+
+export function encodeMCPToolNameForForm(toolName: string): string {
+  // `encodeURIComponent` leaves dots untouched, but RHF treats dots as nested
+  // field separators, so we escape them explicitly as well.
+  return encodeURIComponent(toolName).replaceAll(".", "%2E");
+}
+
+function decodeMCPToolNameFromForm(encodedToolName: string): string {
+  return decodeURIComponent(encodedToolName);
+}
+
+function encodeToolSettingsForForm(
+  toolSettings: Record<string, ToolSettings>
+): Record<string, ToolSettings> {
+  return Object.fromEntries(
+    Object.entries(toolSettings).map(([toolName, settings]) => [
+      encodeMCPToolNameForForm(toolName),
+      settings,
+    ])
+  );
+}
+
+function decodeToolSettingsFromForm(
+  toolSettings: Record<string, ToolSettings>
+): Record<string, ToolSettings> {
+  return Object.fromEntries(
+    Object.entries(toolSettings).map(([encodedToolName, settings]) => [
+      decodeMCPToolNameFromForm(encodedToolName),
+      settings,
+    ])
+  );
+}
+
+// Server settings fields (Info tab).
+export type ServerSettings = {
+  name: string;
+  description: string;
+  isRestrictedToSkills: boolean;
+  icon?: string;
+  sharedSecret?: string;
+  customHeaders?: HeaderRow[] | null;
+  metaFields?: MetaRow[] | null;
+};
+
+// Complete form values including all tabs.
+export type MCPServerFormValues = ServerSettings & {
+  // Tools tab - map of RHF-safe encoded tool names to settings.
+  toolSettings: Record<string, ToolSettings>;
+
+  // Sharing tab - map of spaceId to enabled/disabled
+  sharingSettings: Record<string, boolean>;
+};
+
+export function getDefaultInternalToolStakeLevel(
+  server: MCPServerViewType["server"],
+  toolName: string
+): MCPToolStakeLevelType {
+  if (isRemoteMCPServerType(server) || !isInternalMCPServerName(server.name)) {
+    return FALLBACK_MCP_TOOL_STAKE_LEVEL;
+  }
+
+  const {
+    metadata: { tools },
+    availability,
+  } = INTERNAL_MCP_SERVERS[server.name];
+
+  return (
+    tools.find((tool) => tool.name === toolName)?.stake ??
+    (availability === "manual"
+      ? FALLBACK_MCP_TOOL_STAKE_LEVEL
+      : FALLBACK_INTERNAL_AUTO_SERVERS_TOOL_STAKE_LEVEL)
+  );
+}
+
+export function canToolUseMediumStakeLevel(
+  server: MCPServerViewType["server"],
+  toolName: string
+): boolean {
+  if (isRemoteMCPServerType(server) || !isInternalMCPServerName(server.name)) {
+    return false;
+  }
+
+  return Boolean(
+    getInternalMCPServerToolArgumentsRequiringApproval(server.name, toolName)
+      ?.length
+  );
+}
+
+export function getMCPServerFormDefaults(
+  view: MCPServerViewType,
+  mcpServerWithViews?: { views: Array<{ spaceId: string }> },
+  spaces?: Array<{ sId: string; kind: string }>
+): MCPServerFormValues {
+  const requiresBearerToken = requiresBearerTokenConfiguration(view.server);
+
+  // Tool settings defaults.
+  const toolSettings: Record<string, ToolSettings> = {};
+  for (const tool of view.server.tools ?? []) {
+    const metadata = view.toolsMetadata?.find((m) => m.toolName === tool.name);
+    const defaultPermission =
+      metadata?.permission ??
+      getDefaultInternalToolStakeLevel(view.server, tool.name);
+    toolSettings[tool.name] = {
+      enabled: metadata?.enabled ?? true,
+      permission: defaultPermission,
+    };
+  }
+
+  // Sharing settings defaults - which spaces have this server.
+  // Initialize ALL spaces (regular and global) with false, then set enabled ones to true.
+  const sharingSettings: Record<string, boolean> = {};
+
+  // First, initialize all spaces to false so they're properly registered
+  if (spaces) {
+    for (const space of spaces) {
+      if (space.kind === "regular" || space.kind === "global") {
+        sharingSettings[space.sId] = false;
+      }
+    }
+  }
+
+  // Then set the enabled ones to true
+  if (mcpServerWithViews && spaces) {
+    for (const serverView of mcpServerWithViews.views) {
+      const space = spaces.find((s) => s.sId === serverView.spaceId);
+      if (space && (space.kind === "regular" || space.kind === "global")) {
+        sharingSettings[serverView.spaceId] = true;
+      }
+    }
+  } else if (mcpServerWithViews) {
+    // Fallback if spaces not provided (shouldn't happen in practice)
+    for (const serverView of mcpServerWithViews.views) {
+      sharingSettings[serverView.spaceId] = true;
+    }
+  }
+
+  const defaults: MCPServerFormValues = {
+    name: view.name ?? view.server.name,
+    description: getMcpServerViewDescription(view),
+    isRestrictedToSkills: view.isRestrictedToSkills,
+    toolSettings: encodeToolSettingsForForm(toolSettings),
+    sharingSettings,
+  };
+
+  if (requiresBearerToken) {
+    defaults.sharedSecret = view.server.sharedSecret ?? "";
+    defaults.customHeaders = Object.entries(
+      view.server.customHeaders ?? {}
+    ).map(([key, value]) => ({
+      key,
+      value: String(value),
+    }));
+  }
+
+  if (isRemoteMCPServerType(view.server)) {
+    defaults.icon = view.server.icon;
+    defaults.metaFields = Object.entries(view.server.meta ?? {}).map(
+      ([key, value]) => ({ key, value })
+    );
+  }
+
+  return defaults;
+}
+
+export function getMCPServerFormSchema(
+  view: MCPServerViewType,
+  options?: {
+    existingViewNames?: string[];
+    initialName?: string;
+  }
+) {
+  const { existingViewNames = [], initialName } = options ?? {};
+  const requiresBearerToken = requiresBearerTokenConfiguration(view.server);
+  let schema = z.object({
+    name: z
+      .string()
+      .min(1, "Name is required.")
+      .refine(
+        (val) => {
+          const trimmed = val.trim();
+          if (!initialName || trimmed === initialName) {
+            return true;
+          }
+          return !existingViewNames.includes(trimmed);
+        },
+        { message: "This name is already in use." }
+      ),
+    description: z.string().min(1, "Description is required."),
+    isRestrictedToSkills: z.boolean(),
+    toolSettings: z.record(
+      z.object({
+        enabled: z.boolean(),
+        permission: z.string(),
+      })
+    ),
+    sharingSettings: z.record(z.boolean()),
+  });
+
+  if (isRemoteMCPServerType(view.server)) {
+    schema = schema.extend({
+      icon: z.string().optional(),
+      metaFields: z
+        .array(z.object({ key: z.string(), value: z.string() }))
+        .nullable()
+        .optional(),
+    });
+  }
+
+  if (requiresBearerToken) {
+    schema = schema.extend({
+      sharedSecret: z.string().optional(),
+      customHeaders: z
+        .array(
+          z.object({
+            key: z.string(),
+            value: z.string(),
+          })
+        )
+        .nullable()
+        .optional(),
+    });
+  }
+
+  return schema;
+}
+
+type FormDiffType = {
+  serverView?: { name: string; description: string };
+  isRestrictedToSkills?: boolean;
+  icon?: string;
+  authSharedSecret?: string;
+  authCustomHeaders?: HeaderRow[] | null;
+  authMeta?: Record<string, string> | null;
+  toolChanges?: Array<{
+    toolName: string;
+    enabled: boolean;
+    permission: MCPToolStakeLevelType;
+  }>;
+  sharingChanges?: Array<{
+    spaceId: string;
+    action: "add" | "remove";
+  }>;
+};
+
+export function diffMCPServerForm(
+  initial: MCPServerFormValues,
+  current: MCPServerFormValues,
+  {
+    isRemote,
+    requiresBearerToken,
+  }: {
+    isRemote: boolean;
+    requiresBearerToken: boolean;
+  }
+): FormDiffType {
+  const out: FormDiffType = {};
+
+  // Check info changes.
+  if (
+    current.name !== initial.name ||
+    current.description !== initial.description
+  ) {
+    out.serverView = {
+      name: current.name,
+      description: current.description,
+    };
+  }
+
+  if (current.isRestrictedToSkills !== initial.isRestrictedToSkills) {
+    out.isRestrictedToSkills = current.isRestrictedToSkills;
+  }
+
+  // Check remote-specific changes.
+  if (isRemote) {
+    if (current.icon && current.icon !== initial.icon) {
+      out.icon = current.icon;
+    }
+
+    const iMeta = sanitizeHeadersArray(initial.metaFields ?? []);
+    const cMeta = sanitizeHeadersArray(current.metaFields ?? []);
+    if (JSON.stringify(iMeta) !== JSON.stringify(cMeta)) {
+      out.authMeta =
+        cMeta.length > 0
+          ? Object.fromEntries(cMeta.map(({ key, value }) => [key, value]))
+          : null;
+    }
+  }
+
+  if (requiresBearerToken) {
+    if (
+      typeof current.sharedSecret === "string" &&
+      current.sharedSecret !== initial.sharedSecret &&
+      current.sharedSecret.length > 0
+    ) {
+      out.authSharedSecret = current.sharedSecret;
+    }
+
+    const iSan = sanitizeHeadersArray(initial.customHeaders ?? []);
+    const cSan = sanitizeHeadersArray(current.customHeaders ?? []);
+    if (JSON.stringify(iSan) !== JSON.stringify(cSan)) {
+      out.authCustomHeaders = cSan.length > 0 ? cSan : null;
+    }
+  }
+
+  // Check tool changes.
+  const initialToolSettings = decodeToolSettingsFromForm(initial.toolSettings);
+  const currentToolSettings = decodeToolSettingsFromForm(current.toolSettings);
+  const toolChanges: typeof out.toolChanges = [];
+  for (const [toolName, currentSettings] of Object.entries(
+    currentToolSettings
+  )) {
+    const initialSettings = initialToolSettings[toolName];
+    if (
+      initialSettings &&
+      (initialSettings.enabled !== currentSettings.enabled ||
+        initialSettings.permission !== currentSettings.permission)
+    ) {
+      toolChanges.push({
+        toolName,
+        enabled: currentSettings.enabled,
+        permission: currentSettings.permission,
+      });
+    }
+  }
+  if (toolChanges.length > 0) {
+    out.toolChanges = toolChanges;
+  }
+
+  // Check sharing changes.
+  const sharingChanges: typeof out.sharingChanges = [];
+  const allSpaceIds = new Set([
+    ...Object.keys(initial.sharingSettings),
+    ...Object.keys(current.sharingSettings),
+  ]);
+  for (const spaceId of allSpaceIds) {
+    const wasEnabled = initial.sharingSettings[spaceId] ?? false;
+    const isEnabled = current.sharingSettings[spaceId] ?? false;
+    if (wasEnabled !== isEnabled) {
+      sharingChanges.push({
+        spaceId,
+        action: isEnabled ? "add" : "remove",
+      });
+    }
+  }
+  if (sharingChanges.length > 0) {
+    out.sharingChanges = sharingChanges;
+  }
+
+  return out;
+}

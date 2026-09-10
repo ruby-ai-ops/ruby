@@ -1,0 +1,16 @@
+{
+  "action": "datasource.updated",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "data_source"
+    }
+  ],
+  "metadata": {
+    "data_source_name": "string",
+    "field": "string",
+    "actor_type": "string"
+  }
+}

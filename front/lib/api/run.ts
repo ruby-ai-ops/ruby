@@ -1,0 +1,332 @@
+import { computeTokensCostForUsageInMicroUsd } from "@app/lib/api/assistant/token_pricing";
+import apiConfig from "@app/lib/api/config";
+import type { Authenticator } from "@app/lib/auth";
+import { USAGE_TYPE_PROGRAMMATIC } from "@app/lib/metronome/constants";
+import type { RunUsageType } from "@app/lib/resources/run_resource";
+import { RunResource } from "@app/lib/resources/run_resource";
+import logger from "@app/logger/logger";
+import type { AppType, SpecificationType } from "@app/types/app";
+import type {
+  ModelIdType,
+  ModelProviderIdType,
+} from "@app/types/assistant/models/types";
+import { CoreAPI } from "@app/types/core/core_api";
+import type { BlockType, RunConfig, RunType, TraceType } from "@app/types/run";
+import type { ModelId } from "@app/types/shared/model_id";
+import { createParser } from "eventsource-parser";
+import fs from "fs";
+import path from "path";
+import peg from "pegjs";
+
+import { recomputeIndents, restoreTripleBackticks } from "../specification";
+
+type RunTrace = [[BlockType, string], TraceType[][]];
+
+export type {
+  GetRunBlockResponseBody,
+  GetRunResponseBody,
+  GetRunStatusResponseBody,
+  GetRunsResponseBody,
+  PostRunCancelResponseBody,
+  PostRunsResponseBody,
+} from "@app/types/api/apps";
+
+/**
+ * Walks an app-run's `block_execution` traces and emits one `RunUsageType` per trace that carries
+ * `meta.token_usage`, attaching the block's provider/model and the computed cost in micro-USD.
+ */
+function extractUsageFromExecutions(
+  block: { provider_id: ModelProviderIdType; model_id: ModelIdType },
+  traces: TraceType[][]
+): RunUsageType[] {
+  if (!block) {
+    return [];
+  }
+
+  const usages: RunUsageType[] = [];
+
+  traces.forEach((tracesInner) => {
+    tracesInner.forEach((trace) => {
+      if (trace?.meta) {
+        const { token_usage } = trace.meta as {
+          token_usage: {
+            prompt_tokens: number;
+            completion_tokens: number;
+            cached_tokens?: number;
+            cache_creation_input_tokens?: number;
+            reasoning_tokens?: number;
+          };
+        };
+        if (token_usage) {
+          const promptTokens = token_usage.prompt_tokens;
+          const completionTokens = token_usage.completion_tokens;
+          const reasoningTokens = token_usage.reasoning_tokens;
+          const cachedTokens = token_usage.cached_tokens;
+          const cacheCreationTokens = token_usage.cache_creation_input_tokens;
+
+          const usageCostMicroUsd = computeTokensCostForUsageInMicroUsd({
+            modelId: block.model_id,
+            promptTokens,
+            completionTokens,
+            cachedTokens: cachedTokens ?? null,
+            cacheCreationTokens: cacheCreationTokens ?? null,
+          });
+
+          usages.push({
+            providerId: block.provider_id,
+            modelId: block.model_id,
+            promptTokens,
+            completionTokens,
+            reasoningTokens: reasoningTokens ?? null,
+            cachedTokens: cachedTokens ?? null,
+            cacheCreationTokens: cacheCreationTokens ?? null,
+            costMicroUsd: usageCostMicroUsd,
+            isBatch: false,
+          });
+        }
+      }
+    });
+  });
+
+  return usages;
+}
+
+/**
+ * Drains a CoreAPI `createRunStream` result: parses `block_execution` SSE events to aggregate
+ * token usages, optionally records the trace list (for blocking responses), forwards each raw
+ * chunk to `onChunk` (used by SSE streaming responses to write to the client), and on completion
+ * creates the `RunResource` row and records the usage. Returns the rubyRunId so the caller can
+ * fetch run status / shape the response.
+ *
+ * The shared usage/trace bookkeeping is identical across blocking/streaming/non-blocking
+ * flavors of the run endpoint; the only differences live in the surrounding HTTP layer.
+ */
+export async function consumeRunStream({
+  auth,
+  appModelId,
+  workspaceModelId,
+  useRubyCredentials,
+  blocksConfig,
+  runStream,
+  collectTraces,
+  onChunk,
+}: {
+  auth: Authenticator;
+  appModelId: ModelId;
+  workspaceModelId: ModelId;
+  useRubyCredentials: boolean;
+  blocksConfig: Record<string, any>;
+  runStream: {
+    chunkStream: AsyncIterable<Uint8Array>;
+    rubyRunId: Promise<string>;
+  };
+  collectTraces: boolean;
+  onChunk?: (chunk: Uint8Array) => void | Promise<void>;
+}): Promise<{
+  usages: RunUsageType[];
+  traces: RunTrace[];
+  rubyRunId: string;
+}> {
+  const usages: RunUsageType[] = [];
+  const traces: RunTrace[] = [];
+
+  // Intercept block_execution events to store token usages.
+  const parser = createParser((event) => {
+    if (event.type === "event") {
+      if (event.data) {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "block_execution") {
+            if (collectTraces) {
+              traces.push([
+                [data.content.block_type, data.content.block_name],
+                data.content.execution,
+              ]);
+            }
+            const block = blocksConfig[data.content.block_name];
+
+            const blockUsages = extractUsageFromExecutions(
+              block,
+              data.content.execution
+            );
+            usages.push(...blockUsages);
+          }
+        } catch (err) {
+          logger.error(
+            { error: err },
+            "Error parsing run events while extracting usage from executions"
+          );
+        }
+      }
+    }
+  });
+
+  for await (const chunk of runStream.chunkStream) {
+    parser.feed(new TextDecoder().decode(chunk));
+    if (onChunk) {
+      await onChunk(chunk);
+    }
+  }
+
+  // TODO(2025-04-23): We should record usage earlier, as soon as we get the runId. So we know
+  // that the run is available before we yield the "agent_message_success" event.
+  const rubyRunId = await runStream.rubyRunId;
+  const run = await RunResource.makeNew({
+    rubyRunId,
+    appId: appModelId,
+    runType: "deploy",
+    workspaceId: workspaceModelId,
+    useWorkspaceCredentials: !useRubyCredentials,
+  });
+
+  // App runs are invoked through the public API, so their usage is programmatic.
+  await run.recordRunUsage(auth, usages, {
+    usageType: USAGE_TYPE_PROGRAMMATIC,
+  });
+  return { usages, traces, rubyRunId };
+}
+
+export async function getSpecification(
+  app: AppType,
+  specificationHash: string
+) {
+  const coreAPI = new CoreAPI(apiConfig.getCoreAPIConfig(), logger);
+
+  const s = await coreAPI.getSpecification({
+    projectId: app.rubyAPIProjectId,
+    specificationHash,
+  });
+
+  if (s.isErr()) {
+    return null;
+  }
+  // TODO(spolu): check type compatibility at run time.
+  const libDir = path.join(process.cwd(), "lib");
+  const rubyPegJs = fs.readFileSync(libDir + "/ruby.pegjs", "utf8");
+  const specParser = peg.generate(rubyPegJs);
+
+  const spec = specParser.parse(
+    s.value.specification.data
+  ) as SpecificationType;
+
+  return spec;
+}
+
+export async function getRun(
+  auth: Authenticator,
+  app: AppType,
+  runId: string
+): Promise<{
+  spec: SpecificationType;
+  config: RunConfig;
+  run: RunType;
+} | null> {
+  const coreAPI = new CoreAPI(apiConfig.getCoreAPIConfig(), logger);
+  const r = await coreAPI.getRunStatus({
+    projectId: app.rubyAPIProjectId,
+    runId: runId as string,
+  });
+  if (r.isErr()) {
+    return null;
+  }
+  const run = r.value.run;
+  const config = run.config;
+
+  // Retrieve specification and parse it.
+  const specHash = run.app_hash;
+
+  let spec = await getSpecification(app, specHash as string);
+
+  if (!spec) {
+    return null;
+  }
+
+  for (let i = 0; i < spec.length; i++) {
+    if (spec[i].name in config.blocks) {
+      spec[i].config = { ...config.blocks[spec[i].name] };
+      delete spec[i].config.type;
+      // We remove the dataset from the config so that INPUT block do not refer to a dataset in
+      // the context of a run display.
+      if (spec[i].type === "input") {
+        delete spec[i].config.dataset;
+      }
+      if (spec[i].type === "llm") {
+        if (spec[i].spec.stop) {
+          spec[i].spec.stop = spec[i].spec.stop.split("\n");
+        }
+        if (spec[i].spec.few_shot_preprompt) {
+          spec[i].spec.few_shot_preprompt = restoreTripleBackticks(
+            spec[i].spec.few_shot_preprompt
+          );
+        }
+        if (spec[i].spec.few_shot_prompt) {
+          spec[i].spec.few_shot_prompt = restoreTripleBackticks(
+            spec[i].spec.few_shot_prompt
+          );
+        }
+        if (spec[i].spec.prompt) {
+          spec[i].spec.prompt = restoreTripleBackticks(spec[i].spec.prompt);
+        }
+      }
+      if (spec[i].type === "chat") {
+        if (spec[i].spec.stop) {
+          spec[i].spec.stop = spec[i].spec.stop.split("\n");
+        }
+        if (spec[i].spec.instructions) {
+          spec[i].spec.instructions = restoreTripleBackticks(
+            spec[i].spec.instructions
+          );
+        }
+        if (spec[i].spec.messages_code) {
+          spec[i].spec.messages_code = restoreTripleBackticks(
+            spec[i].spec.messages_code
+          );
+        }
+        if (spec[i].spec.functions_code) {
+          spec[i].spec.functions_code = restoreTripleBackticks(
+            spec[i].spec.functions_code
+          );
+        }
+      }
+      if (spec[i].type === "while") {
+        if (spec[i].spec.condition_code) {
+          spec[i].spec.condition_code = restoreTripleBackticks(
+            spec[i].spec.condition_code
+          );
+        }
+      }
+      if (spec[i].type === "data_source") {
+        if (spec[i].spec.query) {
+          spec[i].spec.query = restoreTripleBackticks(spec[i].spec.query);
+        }
+        if (spec[i].spec.full_text) {
+          spec[i].spec.full_text =
+            spec[i].spec.full_text === "true" ? true : false;
+        }
+      }
+      if (spec[i].type === "curl") {
+        if (spec[i].spec.url && spec[i].spec.url.includes("://")) {
+          spec[i].spec.scheme = spec[i].spec.url.split("://")[0];
+          spec[i].spec.url = spec[i].spec.url.split("://")[1];
+        }
+      }
+    } else {
+      spec[i].config = {};
+    }
+  }
+  spec = recomputeIndents(spec);
+
+  return {
+    spec,
+    config,
+    run: {
+      run_id: run.run_id,
+      created: run.created,
+      run_type: run.run_type,
+      app_hash: run.app_hash,
+      config: run.config,
+      status: run.status,
+      traces: [],
+    },
+  };
+}

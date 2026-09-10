@@ -1,0 +1,802 @@
+import { MCPError } from "@app/lib/actions/mcp_errors";
+import type { ToolHandlers } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { buildTools } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import type { AshbyClient } from "@app/lib/api/actions/servers/ashby/client";
+import {
+  AshbyAPIError,
+  getAshbyClient,
+} from "@app/lib/api/actions/servers/ashby/client";
+import {
+  assertCandidateNotHired,
+  diagnoseFieldSubmissions,
+  findHiredApplication,
+  findUniqueCandidate,
+  resolveAshbyUser,
+  resolveFieldSubmissions,
+} from "@app/lib/api/actions/servers/ashby/helpers";
+import {
+  ASHBY_TOOLS_METADATA,
+  CREATE_REFERRAL_TOOL_NAME,
+  GET_REFERRAL_FORM_TOOL_NAME,
+} from "@app/lib/api/actions/servers/ashby/metadata";
+import {
+  renderCandidateList,
+  renderCandidateNotes,
+  renderHireData,
+  renderInterviewFeedbackRecap,
+  renderJobPostingList,
+  renderOpeningList,
+  renderReferralForm,
+  renderReport,
+} from "@app/lib/api/actions/servers/ashby/rendering";
+import type {
+  AshbyFeedbackSubmission,
+  AshbyJobInfo,
+} from "@app/lib/api/actions/servers/ashby/types";
+import { Err, Ok } from "@app/types/shared/result";
+import sanitizeHtml from "sanitize-html";
+import { validate as validateUuid } from "uuid";
+
+const DEFAULT_SEARCH_LIMIT = 20;
+
+const handlers: ToolHandlers<typeof ASHBY_TOOLS_METADATA> = {
+  search_candidates: async ({ email, name }, extra) => {
+    if (!email && !name) {
+      return new Err(
+        new MCPError(
+          "At least one search parameter (email or name) must be provided.",
+          {
+            tracked: false,
+          }
+        )
+      );
+    }
+
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+    const result = await client.searchCandidates({ email, name });
+
+    if (result.isErr()) {
+      return new Err(
+        new MCPError(`Failed to search candidates: ${result.error.message}`)
+      );
+    }
+
+    const candidates = result.value;
+
+    if (!candidates || candidates.length === 0) {
+      return new Ok([
+        {
+          type: "text" as const,
+          text: "No candidates found matching the search criteria.",
+        },
+      ]);
+    }
+
+    const candidatesText = renderCandidateList(candidates);
+    const searchParams = [
+      email ? `email: ${email}` : null,
+      name ? `name: ${name}` : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+
+    const resultText = `Found ${candidates.length} candidate(s) matching search (${searchParams}):\n\n${candidatesText}`;
+
+    if (candidates.length === DEFAULT_SEARCH_LIMIT) {
+      return new Ok([
+        {
+          type: "text" as const,
+          text:
+            resultText +
+            `\n\nNote: Results are limited to ${DEFAULT_SEARCH_LIMIT} candidates. ` +
+            "Consider refining your search if you need more specific results.",
+        },
+      ]);
+    }
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: resultText,
+      },
+    ]);
+  },
+
+  get_report_data: async ({ reportUrl }, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    // Parse the report ID from the URL
+    // Expected format: https://app.ashbyhq.com/.../[reportId]
+    if (!reportUrl.startsWith("https://app.ashbyhq.com/")) {
+      return new Err(
+        new MCPError(
+          "Invalid Ashby report URL. Expected format: https://app.ashbyhq.com/.../[reportId]"
+        )
+      );
+    }
+
+    const reportId = new URL(reportUrl).pathname.split("/").pop();
+    if (!reportId || !validateUuid(reportId)) {
+      return new Err(
+        new MCPError(
+          "Invalid Ashby report URL. Expected format: https://app.ashbyhq.com/.../[reportId]"
+        )
+      );
+    }
+
+    const result = await client.getReportData({ reportId });
+
+    if (result.isErr()) {
+      return new Err(
+        new MCPError(`Failed to retrieve report data: ${result.error.message}`)
+      );
+    }
+
+    const results = result.value;
+
+    if (!results) {
+      return new Err(
+        new MCPError(
+          "Report retrieval failed: unknown error, the ID extracted from the URL may not map to " +
+            "an existing report. Dashboards and saved views are not supported."
+        )
+      );
+    }
+
+    if (results.status !== "complete") {
+      return new Err(
+        new MCPError(
+          `Report retrieval failed: ${results.failureReason ?? "unknown error"} ` +
+            `(status: ${results.status})`
+        )
+      );
+    }
+
+    const renderedOutputs = await renderReport(results, { reportId });
+
+    return new Ok(renderedOutputs);
+  },
+
+  get_interview_feedback: async ({ email, name }, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    const candidateResult = await findUniqueCandidate(client, {
+      email,
+      name,
+    });
+    if (candidateResult.isErr()) {
+      return new Err(candidateResult.error);
+    }
+
+    const candidate = candidateResult.value;
+
+    if (!candidate.applicationIds || candidate.applicationIds.length === 0) {
+      return new Err(
+        new MCPError(
+          `Candidate ${candidate.name} ` +
+            (candidate.primaryEmailAddress?.value
+              ? `(${candidate.primaryEmailAddress?.value}) `
+              : "") +
+            "has no applications in the system.",
+          {
+            tracked: false,
+          }
+        )
+      );
+    }
+
+    const hiredCheckResult = await assertCandidateNotHired(client, candidate);
+    if (hiredCheckResult.isErr()) {
+      return hiredCheckResult;
+    }
+
+    let latestApplicationFeedback: AshbyFeedbackSubmission[] | null = null;
+    let latestApplicationDate: Date | null = null;
+
+    for (const applicationId of candidate.applicationIds) {
+      const feedbackResult = await client.listApplicationFeedback({
+        applicationId,
+      });
+
+      if (feedbackResult.isErr()) {
+        continue;
+      }
+
+      // We consider the max date across all feedback for the application.
+      for (const feedback of feedbackResult.value) {
+        if (!feedback.submittedAt) {
+          continue;
+        }
+        const submittedAt = new Date(feedback.submittedAt);
+        if (!latestApplicationDate || submittedAt > latestApplicationDate) {
+          latestApplicationDate = submittedAt;
+          latestApplicationFeedback = feedbackResult.value;
+        }
+      }
+    }
+
+    if (!latestApplicationFeedback || latestApplicationFeedback.length === 0) {
+      return new Err(
+        new MCPError(
+          `No submitted interview feedback found for candidate ${candidate.name}.`,
+          {
+            tracked: false,
+          }
+        )
+      );
+    }
+
+    const recapText = renderInterviewFeedbackRecap(
+      candidate,
+      latestApplicationFeedback
+    );
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: recapText,
+      },
+    ]);
+  },
+
+  get_candidate_notes: async ({ email, name }, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    const candidateResult = await findUniqueCandidate(client, {
+      email,
+      name,
+    });
+
+    if (candidateResult.isErr()) {
+      return new Err(candidateResult.error);
+    }
+
+    const candidate = candidateResult.value;
+
+    const hiredCheckResult = await assertCandidateNotHired(client, candidate);
+    if (hiredCheckResult.isErr()) {
+      return hiredCheckResult;
+    }
+
+    const notesResult = await client.listCandidateNotes({
+      candidateId: candidate.id,
+    });
+
+    if (notesResult.isErr()) {
+      return new Err(
+        new MCPError(
+          `Failed to retrieve notes for candidate: ${notesResult.error.message}`
+        )
+      );
+    }
+
+    const notes = notesResult.value;
+
+    if (notes.length === 0) {
+      return new Ok([
+        {
+          type: "text" as const,
+          text:
+            `No notes found for candidate ${candidate.name}` +
+            (candidate.primaryEmailAddress?.value
+              ? ` (${candidate.primaryEmailAddress.value})`
+              : "") +
+            ".",
+        },
+      ]);
+    }
+
+    const notesText = renderCandidateNotes(candidate, notes);
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: notesText,
+      },
+    ]);
+  },
+
+  list_openings: async ({ cursor, limit }, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    const result = await client.listOpenings({
+      cursor,
+      limit,
+    });
+
+    if (result.isErr()) {
+      return new Err(
+        new MCPError(`Failed to list openings: ${result.error.message}`)
+      );
+    }
+
+    const { results: openings, moreDataAvailable, nextCursor } = result.value;
+
+    if (openings.length === 0) {
+      return new Ok([
+        {
+          type: "text" as const,
+          text: "No openings found.",
+        },
+      ]);
+    }
+
+    const lines = [
+      `Found ${openings.length} opening(s):`,
+      "",
+      renderOpeningList(openings),
+    ];
+
+    if (moreDataAvailable) {
+      lines.push(
+        "",
+        nextCursor
+          ? `More openings are available. Call list_openings with cursor: ${nextCursor}`
+          : "More openings are available, but Ashby did not return a next cursor."
+      );
+    }
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: lines.join("\n"),
+      },
+    ]);
+  },
+
+  create_candidate_note: async ({ email, name, noteContent }, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client: AshbyClient = clientResult.value;
+
+    const candidateResult = await findUniqueCandidate(client, {
+      email,
+      name,
+    });
+
+    if (candidateResult.isErr()) {
+      return new Err(candidateResult.error);
+    }
+
+    const candidate = candidateResult.value;
+
+    const noteResult = await client.createCandidateNote({
+      candidateId: candidate.id,
+      note: {
+        type: "text/html",
+        value: sanitizeHtml(noteContent),
+      },
+    });
+
+    if (noteResult.isErr()) {
+      return new Err(
+        new MCPError(
+          `Failed to create note on candidate: ${noteResult.error.message}`
+        )
+      );
+    }
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text:
+          `Successfully created note on candidate ${candidate.name}'s ` +
+          (candidate.primaryEmailAddress?.value
+            ? `(${candidate.primaryEmailAddress?.value}) `
+            : "") +
+          `profile.\n\nNote ID: ${noteResult.value.id}`,
+      },
+    ]);
+  },
+
+  [GET_REFERRAL_FORM_TOOL_NAME]: async (_, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    const formResult = await client.getReferralFormInfo();
+    if (formResult.isErr()) {
+      return new Err(
+        new MCPError(
+          `Failed to retrieve referral form: ${formResult.error.message}`,
+          {
+            cause: formResult.error,
+          }
+        )
+      );
+    }
+
+    const jobsResult = await client.listJobs();
+    if (jobsResult.isErr()) {
+      return new Err(
+        new MCPError(`Failed to list jobs: ${jobsResult.error.message}`, {
+          cause: jobsResult.error,
+        })
+      );
+    }
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: renderReferralForm(formResult.value, {
+          jobs: jobsResult.value,
+        }),
+      },
+    ]);
+  },
+
+  get_hire_data: async ({ email, name }, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    const candidateResult = await findUniqueCandidate(client, { email, name });
+    if (candidateResult.isErr()) {
+      return new Err(candidateResult.error);
+    }
+
+    const candidate = candidateResult.value;
+
+    // Find the hired application.
+    const hiredAppResult = await findHiredApplication(client, candidate);
+    if (hiredAppResult.isErr()) {
+      return hiredAppResult;
+    }
+
+    const { applicationId, jobId } = hiredAppResult.value;
+
+    // Fetch detailed candidate info.
+    const candidateInfoResult = await client.getCandidateInfo({
+      id: candidate.id,
+    });
+    if (candidateInfoResult.isErr() || !candidateInfoResult.value) {
+      return new Err(
+        new MCPError(
+          "Failed to retrieve candidate info: " +
+            (candidateInfoResult.isErr()
+              ? candidateInfoResult.error.message
+              : "no result")
+        )
+      );
+    }
+
+    const candidateInfo = candidateInfoResult.value;
+
+    // Fetch offers for the hired application.
+    const offersResult = await client.listOffers({ applicationId });
+    if (offersResult.isErr()) {
+      return new Err(
+        new MCPError(`Failed to list offers: ${offersResult.error.message}`, {
+          cause: offersResult.error,
+        })
+      );
+    }
+
+    // Pick the latest offer by latestVersion.createdAt.
+    const latestOffer = offersResult.value.reduce((latest, offer) => {
+      const latestCreatedAt = latest?.latestVersion?.createdAt ?? "";
+      const offerCreatedAt = offer.latestVersion?.createdAt ?? "";
+      return offerCreatedAt > latestCreatedAt ? offer : latest;
+    }, offersResult.value[0] ?? null);
+
+    // Fetch detailed offer info for the latest offer.
+    let offerInfo = null;
+    if (latestOffer) {
+      const offerInfoResult = await client.getOfferInfo({
+        offerId: latestOffer.id,
+      });
+      if (offerInfoResult.isErr()) {
+        return new Err(
+          new MCPError(
+            `Failed to get offer info for offer ${latestOffer.id}: ${offerInfoResult.error.message}`,
+            { cause: offerInfoResult.error }
+          )
+        );
+      }
+      offerInfo = offerInfoResult.value ?? null;
+    }
+
+    // Fetch job info if we have a jobId.
+    let jobInfo: AshbyJobInfo | undefined;
+    if (jobId) {
+      const jobInfoResult = await client.getJobInfo({ id: jobId });
+      if (jobInfoResult.isErr()) {
+        return new Err(
+          new MCPError(
+            `Failed to get job info: ${jobInfoResult.error.message}`,
+            {
+              cause: jobInfoResult.error,
+            }
+          )
+        );
+      }
+      jobInfo = jobInfoResult.value;
+    }
+
+    const text = renderHireData({
+      candidateInfo,
+      offerInfo,
+      jobInfo,
+      applicationId,
+    });
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text,
+      },
+    ]);
+  },
+
+  list_job_postings: async ({ location, department, listedOnly }, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    const result = await client.listJobPostings({
+      location,
+      department,
+      listedOnly,
+    });
+
+    if (result.isErr()) {
+      return new Err(
+        new MCPError(`Failed to list job postings: ${result.error.message}`)
+      );
+    }
+
+    const postings = result.value;
+
+    if (postings.length === 0) {
+      return new Ok([
+        {
+          type: "text" as const,
+          text: "No job postings found matching the criteria.",
+        },
+      ]);
+    }
+
+    const postingsText = renderJobPostingList(postings);
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: `Found ${postings.length} job posting(s):\n\n${postingsText}`,
+      },
+    ]);
+  },
+
+  update_job_posting: async (
+    {
+      jobPostingId,
+      title,
+      descriptionHtml,
+      workplaceType,
+      suppressDescriptionOpening,
+      suppressDescriptionClosing,
+    },
+    extra
+  ) => {
+    if (!title && !descriptionHtml && !workplaceType) {
+      return new Err(
+        new MCPError(
+          "At least one of title, descriptionHtml, or workplaceType " +
+            "must be provided.",
+          { tracked: false }
+        )
+      );
+    }
+
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    // Fetch current job posting info before updating.
+    const infoResult = await client.getJobPostingInfo({ jobPostingId });
+    if (infoResult.isErr()) {
+      return new Err(
+        new MCPError(
+          `Failed to fetch job posting info: ${infoResult.error.message}`
+        )
+      );
+    }
+
+    if (!infoResult.value) {
+      return new Err(
+        new MCPError("Failed to fetch job posting info from Ashby.")
+      );
+    }
+
+    const previousPosting = infoResult.value;
+
+    const updateResult = await client.updateJobPosting({
+      jobPostingId,
+      title,
+      description: descriptionHtml
+        ? { type: "text/html", content: sanitizeHtml(descriptionHtml) }
+        : undefined,
+      workplaceType,
+      suppressDescriptionOpening,
+      suppressDescriptionClosing,
+    });
+
+    if (updateResult.isErr()) {
+      return new Err(
+        new MCPError(
+          `Failed to update job posting: ${updateResult.error.message}`
+        )
+      );
+    }
+
+    if (!updateResult.value) {
+      return new Err(
+        new MCPError("Failed to update job posting: no result returned.")
+      );
+    }
+
+    const updatedFields = [
+      title ? "title" : null,
+      descriptionHtml ? "description" : null,
+      workplaceType ? "workplace type" : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+
+    const lines = [
+      `Successfully updated job posting ${updatedFields}.`,
+      "",
+      `Job Posting ID: ${updateResult.value.id}`,
+      `Title: ${updateResult.value.title}`,
+    ];
+
+    if (previousPosting.descriptionHtml) {
+      lines.push("", "Previous description:", previousPosting.descriptionHtml);
+    }
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: lines.join("\n"),
+      },
+    ]);
+  },
+
+  [CREATE_REFERRAL_TOOL_NAME]: async ({ fieldSubmissions }, extra) => {
+    const clientResult = getAshbyClient(extra);
+    if (clientResult.isErr()) {
+      return clientResult;
+    }
+
+    const client = clientResult.value;
+
+    const ashbyUserResult = await resolveAshbyUser(client, extra);
+    if (ashbyUserResult.isErr()) {
+      return ashbyUserResult;
+    }
+
+    const ashbyUser = ashbyUserResult.value;
+
+    const formResult = await client.getReferralFormInfo();
+    if (formResult.isErr()) {
+      return new Err(
+        new MCPError(
+          `Failed to retrieve referral form: ${formResult.error.message}`,
+          {
+            cause: formResult.error,
+          }
+        )
+      );
+    }
+
+    const form = formResult.value;
+
+    const jobsResult = await client.listJobs();
+    if (jobsResult.isErr()) {
+      return new Err(
+        new MCPError(`Failed to list jobs: ${jobsResult.error.message}`, {
+          cause: jobsResult.error,
+        })
+      );
+    }
+
+    const jobs = jobsResult.value;
+
+    const submissionsResult = resolveFieldSubmissions(form, fieldSubmissions, {
+      jobs,
+    });
+    if (submissionsResult.isErr()) {
+      return submissionsResult;
+    }
+
+    const referralResult = await client.createReferral({
+      id: form.id,
+      creditedToUserId: ashbyUser.id,
+      fieldSubmissions: submissionsResult.value,
+    });
+
+    if (referralResult.isErr()) {
+      const { error } = referralResult;
+      // They have a catch-all error `invalid_input` - run field diagnosis to help the model fix it.
+      if (
+        error instanceof AshbyAPIError &&
+        error.errorInfo?.code === "invalid_input"
+      ) {
+        const diagnosis = diagnoseFieldSubmissions(
+          form,
+          submissionsResult.value,
+          { jobs }
+        );
+        return new Err(
+          new MCPError(
+            `Ashby rejected the referral due to invalid input.\n\n${diagnosis}`,
+            { tracked: false }
+          )
+        );
+      }
+      return new Err(
+        new MCPError(`Failed to create referral: ${error.message}`, {
+          cause: error,
+        })
+      );
+    }
+
+    if (!referralResult.value) {
+      return new Err(
+        new MCPError("Failed to create referral: no result returned.")
+      );
+    }
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text:
+          `Successfully created referral.\n\n` +
+          `Credited to: ${ashbyUser.firstName} ${ashbyUser.lastName} (${ashbyUser.email})\n` +
+          `Referral ID: ${referralResult.value.id}\n` +
+          `Status: ${referralResult.value.status}`,
+      },
+    ]);
+  },
+};
+
+export const TOOLS = buildTools(ASHBY_TOOLS_METADATA, handlers);

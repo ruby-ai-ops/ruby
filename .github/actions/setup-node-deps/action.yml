@@ -1,0 +1,71 @@
+name: "Setup Node Dependencies"
+description: "Setup Node.js and cache dependencies for SDK/JS and Front"
+inputs:
+  build-sdks:
+    description: "Build SDK/JS"
+    required: false
+    default: "false"
+  build-sparkle:
+    description: "Build Sparkle"
+    required: false
+    default: "false"
+  node-version:
+    description: "Node.js version to use"
+    required: false
+    default: "24.16.0"
+outputs:
+  cache-hit-node-modules:
+    description: "Whether node_modules cache was hit"
+    value: ${{ steps.cache-node-modules.outputs.cache-hit }}
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        # node_modules are already restored below via actions/cache, so npm ci
+        # is skipped on cache hit and this cache is never read. Downloading it
+        # anyway costs ~15s per job for nothing.
+        package-manager-cache: false
+
+    - name: Upgrade npm
+      shell: bash
+      run: npm install -g npm@11.10.0
+
+    - name: Cache node_modules
+      id: cache-node-modules
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          node_modules
+          front/node_modules
+          front-api/node_modules
+          front-spa/node_modules
+          marketing/node_modules
+          connectors/node_modules
+          sparkle/node_modules
+          cli/ruby-cli/node_modules
+          extension/node_modules
+          viz/node_modules
+          sdks/js/node_modules
+        key: workspaces-node-modules-${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles('package-lock.json') }}
+        restore-keys: |
+          workspaces-node-modules-${{ runner.os }}-node${{ inputs.node-version }}-
+
+    - name: Install workspaces dependencies
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      shell: bash
+      run: npm ci
+
+    - name: Build SDK/JS
+      if: inputs.build-sdks == 'true'
+      working-directory: sdks/js
+      shell: bash
+      run: npm run build
+
+    - name: Build Sparkle
+      if: inputs.build-sparkle == 'true'
+      working-directory: sparkle
+      shell: bash
+      run: npm run build

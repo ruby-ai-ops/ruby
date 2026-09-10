@@ -1,0 +1,226 @@
+/**
+ * Provider-agnostic sandbox abstraction.
+ *
+ * Every sandbox provider (E2B, etc.) must implement the SandboxProvider
+ * interface. The rest of the codebase interacts with sandboxes exclusively
+ * through this contract — swapping providers only requires writing a new
+ * adapter.
+ */
+
+import type {
+  NetworkPolicy,
+  SandboxImageId,
+  SandboxResources,
+} from "@app/lib/api/sandbox/image/types";
+import type { RootCommand } from "@app/lib/api/sandbox/root_command";
+import tracer from "@app/logger/tracer";
+import type { Result } from "@app/types/shared/result";
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+/**
+ * Opaque handle returned by create() and wake().
+ * Contains the provider-assigned identifier used for all subsequent operations.
+ */
+export interface SandboxHandle {
+  providerId: string;
+}
+
+/**
+ * Configuration for provisioning a new sandbox.
+ * Flat structure derived from SandboxImage.toCreateConfig() with optional overrides.
+ */
+export interface SandboxCreateConfig {
+  /** Typed image identifier (name + tag) - required. Use getSandboxImage().toCreateConfig(). */
+  imageId: SandboxImageId;
+  /** Environment variables for the sandbox runtime. */
+  envVars?: Record<string, string>;
+  /** Network egress policy. */
+  network?: NetworkPolicy;
+  /** Resource allocation for the sandbox. */
+  resources?: SandboxResources;
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+
+export interface ExecResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export const SANDBOX_EXEC_USERS = ["agent", "agent-proxied"] as const;
+
+export type SandboxExecUser = (typeof SANDBOX_EXEC_USERS)[number];
+
+export function isSandboxExecUser(user: string): user is SandboxExecUser {
+  return SANDBOX_EXEC_USERS.some((execUser) => execUser === user);
+}
+
+export interface ExecOptions {
+  /** Working directory for command execution. */
+  workingDirectory?: string;
+  /** Timeout in milliseconds. */
+  timeoutMs?: number;
+  /** Additional environment variables for this execution only. */
+  envVars?: Record<string, string>;
+  /** Data to send to the command over stdin. Never encoded into argv. */
+  stdin?: string | Uint8Array;
+  /**
+   * Allows a small `stdin` to be handed to the command through its environment instead of over
+   * separate calls to the sandbox, saving two round trips.
+   *
+   * Off by default, and it must stay off for anything secret. Delivering stdin out of band is how
+   * callers keep tokens and credentials out of process metadata, and a provider reports the
+   * environment of a running command in its process listing. Set this only where the payload is
+   * the command's own input and the latency is worth it.
+   */
+  allowStdinInEnvironment?: boolean;
+  /** Optional non-root user to run the command as. Use execRoot for root. */
+  user?: SandboxExecUser;
+}
+
+export type RootExecOptions = Omit<ExecOptions, "user">;
+
+// ---------------------------------------------------------------------------
+// Filesystem
+// ---------------------------------------------------------------------------
+
+export interface FileEntry {
+  path: string;
+  size: number;
+  isDirectory: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown (or returned) when the provider no longer knows about a sandbox.
+ * E.g. E2B killed it after its lifetime expired.
+ */
+export class SandboxNotFoundError extends Error {
+  constructor(providerId: string) {
+    super(`Sandbox ${providerId} not found at provider.`);
+    this.name = "SandboxNotFoundError";
+  }
+}
+
+/**
+ * Returned when a command ran past its execution timeout and was killed by the
+ * provider. The command may have partially executed.
+ */
+export class SandboxExecTimeoutError extends Error {
+  constructor(timeoutMs?: number) {
+    super(
+      timeoutMs === undefined
+        ? "The sandbox command timed out."
+        : `The sandbox command timed out after ${timeoutMs}ms.`
+    );
+    this.name = "SandboxExecTimeoutError";
+  }
+}
+
+export function isSandboxExecTimeoutError(
+  error: Error
+): error is SandboxExecTimeoutError {
+  return error instanceof SandboxExecTimeoutError;
+}
+
+// ---------------------------------------------------------------------------
+// Provider interface
+// ---------------------------------------------------------------------------
+
+/**
+ * Contract that all sandbox providers must satisfy.
+ *
+ * Every method receives the provider-assigned `providerId` (from
+ * SandboxHandle) to identify the target sandbox. Methods return `Result` to
+ * signal recoverable failures — callers never need try/catch.
+ */
+export interface SandboxProvider {
+  create(
+    config: SandboxCreateConfig,
+    tracingOpts: { workspaceId: string }
+  ): Promise<Result<SandboxHandle, Error>>;
+  wake(
+    providerId: string,
+    tracingOpts: { workspaceId: string }
+  ): Promise<Result<SandboxHandle, Error>>;
+  sleep(
+    providerId: string,
+    tracingOpts: { workspaceId: string }
+  ): Promise<Result<void, Error>>;
+  destroy(
+    providerId: string,
+    tracingOpts: { workspaceId: string }
+  ): Promise<Result<void, Error>>;
+
+  exec(
+    providerId: string,
+    command: string,
+    execOpts: ExecOptions | undefined,
+    tracingOpts: { workspaceId: string }
+  ): Promise<Result<ExecResult, Error>>;
+
+  execRoot(
+    providerId: string,
+    command: RootCommand,
+    execOpts: RootExecOptions | undefined,
+    tracingOpts: { workspaceId: string }
+  ): Promise<Result<ExecResult, Error>>;
+
+  writeFile(
+    providerId: string,
+    path: string,
+    data: ArrayBuffer,
+    tracingOpts: { workspaceId: string }
+  ): Promise<Result<void, Error>>;
+
+  readFile(
+    providerId: string,
+    path: string,
+    tracingOpts: { workspaceId: string }
+  ): Promise<Buffer>;
+
+  listFiles(
+    providerId: string,
+    path: string,
+    opts: { recursive?: boolean } | undefined,
+    tracingOpts: { workspaceId: string }
+  ): Promise<FileEntry[]>;
+}
+
+// ---------------------------------------------------------------------------
+// APM instrumentation helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Wraps provider operations with APM spans for tracing.
+ *
+ * This helper is provider-agnostic and can be used by any SandboxProvider
+ * implementation to add lightweight APM instrumentation.
+ */
+export function traceSandboxOperation<T>(
+  operation: string,
+  fn: () => Promise<T>,
+  tags?: Record<string, string>
+): Promise<T> {
+  return tracer.trace(
+    `sandbox.provider.${operation}`,
+    { resource: operation },
+    async (span) => {
+      if (tags) {
+        Object.entries(tags).forEach(([key, value]) => {
+          span?.setTag(key, value);
+        });
+      }
+      return fn();
+    }
+  );
+}

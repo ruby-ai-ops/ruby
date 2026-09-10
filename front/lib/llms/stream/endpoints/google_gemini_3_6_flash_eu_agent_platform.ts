@@ -1,0 +1,13 @@
+import { WithRubyGoogleGeminiThreeDotSixFlashConfig } from "@app/lib/llms/providers/google_ai_studio/models/gemini_3_6_flash";
+import { defineRubyStreamEndpoint } from "@app/lib/llms/stream/ruby_stream_endpoint";
+import { GoogleGeminiThreeDotSixFlashEuropeAgentPlatformStream } from "@app/lib/model_constructors/stream/endpoints/google_gemini_3_6_flash_eu_agent_platform";
+
+export class RubyGoogleGeminiThreeDotSixFlashEuropeAgentPlatformStream extends WithRubyGoogleGeminiThreeDotSixFlashConfig(
+  GoogleGeminiThreeDotSixFlashEuropeAgentPlatformStream
+) {
+  static readonly endpointFilter = {};
+}
+
+defineRubyStreamEndpoint(
+  RubyGoogleGeminiThreeDotSixFlashEuropeAgentPlatformStream
+);

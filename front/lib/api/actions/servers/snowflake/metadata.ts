@@ -1,0 +1,150 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { z } from "zod";
+
+export const MAX_QUERY_ROWS = 1000;
+
+const SNOWFLAKE_LIST_DATABASES_TOOL_NAME = "list_databases" as const;
+const SNOWFLAKE_LIST_SCHEMAS_TOOL_NAME = "list_schemas" as const;
+const SNOWFLAKE_LIST_TABLES_TOOL_NAME = "list_tables" as const;
+const SNOWFLAKE_DESCRIBE_TABLE_TOOL_NAME = "describe_table" as const;
+const SNOWFLAKE_DESCRIBE_SEMANTIC_VIEW_TOOL_NAME =
+  "describe_semantic_view" as const;
+const SNOWFLAKE_QUERY_TOOL_NAME = "query" as const;
+
+export const SNOWFLAKE_TOOLS_METADATA = [
+  {
+    name: SNOWFLAKE_LIST_DATABASES_TOOL_NAME,
+    description:
+      "List all databases accessible to the authenticated Snowflake user.",
+    schema: {},
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Snowflake databases",
+      done: "List Snowflake databases",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: SNOWFLAKE_LIST_SCHEMAS_TOOL_NAME,
+    description: "List all schemas within a specified Snowflake database.",
+    schema: {
+      database: z
+        .string()
+        .describe("The name of the database to list schemas from."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Snowflake schemas",
+      done: "List Snowflake schemas",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: SNOWFLAKE_LIST_TABLES_TOOL_NAME,
+    description:
+      "List all tables, views, and semantic views within a specified Snowflake schema.",
+    schema: {
+      database: z.string().describe("The name of the database."),
+      schema: z
+        .string()
+        .describe("The name of the schema to list tables from."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Snowflake tables",
+      done: "List Snowflake tables",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: SNOWFLAKE_DESCRIBE_TABLE_TOOL_NAME,
+    description:
+      "Get the schema (column names, types, and constraints) of a Snowflake table.",
+    schema: {
+      database: z.string().describe("The name of the database."),
+      schema: z.string().describe("The name of the schema."),
+      table: z.string().describe("The name of the table to describe."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Describing Snowflake table",
+      done: "Describe Snowflake table",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: SNOWFLAKE_DESCRIBE_SEMANTIC_VIEW_TOOL_NAME,
+    description: `Get the structure (dimensions and metrics) of a Snowflake semantic view. Use this instead of ${SNOWFLAKE_DESCRIBE_TABLE_TOOL_NAME} when the object kind is SEMANTIC_VIEW.`,
+    schema: {
+      database: z.string().describe("The name of the database."),
+      schema: z.string().describe("The name of the schema."),
+      semantic_view: z
+        .string()
+        .describe("The name of the semantic view to describe."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Describing Snowflake semantic view",
+      done: "Describe Snowflake semantic view",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: SNOWFLAKE_QUERY_TOOL_NAME,
+    description: `Execute a read-only SQL SELECT query against Snowflake to analyze data, answer questions, calculate metrics such as revenue, or retrieve rows. Write operations are not permitted. Before writing a query, use ${SNOWFLAKE_LIST_DATABASES_TOOL_NAME}, ${SNOWFLAKE_LIST_SCHEMAS_TOOL_NAME}, ${SNOWFLAKE_LIST_TABLES_TOOL_NAME}, and ${SNOWFLAKE_DESCRIBE_TABLE_TOOL_NAME} (or ${SNOWFLAKE_DESCRIBE_SEMANTIC_VIEW_TOOL_NAME} for semantic views) to explore the schema when database, schema, table, view, or column names are unknown.`,
+    schema: {
+      sql: z
+        .string()
+        .describe("The SQL query to execute. Must be a read-only query."),
+      database: z
+        .string()
+        .optional()
+        .describe("The database context for the query."),
+      schema: z
+        .string()
+        .optional()
+        .describe("The schema context for the query."),
+      warehouse: z
+        .string()
+        .optional()
+        .describe("The warehouse to use for query execution."),
+      max_rows: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_QUERY_ROWS)
+        .optional()
+        .describe(
+          `Maximum number of rows to return. Defaults to ${MAX_QUERY_ROWS}.`
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Executing Snowflake query",
+      done: "Execute Snowflake query",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+] as const;
+
+export const SNOWFLAKE_SERVER = {
+  serverInfo: {
+    name: "snowflake",
+    version: "1.0.0",
+    description:
+      "Execute read-only SQL queries and browse schema in Snowflake.",
+    authorization: {
+      provider: "snowflake",
+      supported_use_cases: ["personal_actions", "platform_actions"],
+    },
+    icon: "SnowflakeLogo",
+    documentationUrl: "https://docs.ruby.ad/docs/snowflake-tool",
+  },
+  tools: SNOWFLAKE_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

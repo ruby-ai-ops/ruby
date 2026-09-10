@@ -1,0 +1,29 @@
+import { getSpaceIcon, getSpaceName } from "@app/lib/spaces";
+import type { EnrichedSpaceType, SpaceType } from "@app/types/space";
+import { Chip } from "@ruby-ai/sparkle";
+
+interface SpaceChipsProps {
+  spaces: EnrichedSpaceType[];
+  onRemoveSpace?: (space: SpaceType) => void;
+}
+
+export function SpaceChips({ spaces, onRemoveSpace }: SpaceChipsProps) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {spaces.map((space) => (
+        <Chip
+          size="xs"
+          key={space.sId}
+          label={getSpaceName(space)}
+          icon={getSpaceIcon(space)}
+          color={space.isRestricted ? "info" : "primary"}
+          onRemove={
+            space.kind !== "global" && onRemoveSpace
+              ? () => onRemoveSpace(space)
+              : undefined
+          }
+        />
+      ))}
+    </div>
+  );
+}

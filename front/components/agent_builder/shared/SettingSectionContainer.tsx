@@ -1,0 +1,21 @@
+import { cn, Label } from "@ruby-ai/sparkle";
+import type { ReactNode } from "react";
+
+interface SettingSectionContainerProps {
+  title: string;
+  children: ReactNode;
+  className?: string;
+}
+
+export function SettingSectionContainer({
+  title,
+  children,
+  className,
+}: SettingSectionContainerProps) {
+  return (
+    <div className={cn("flex flex-col gap-2", className)}>
+      <Label className="text-base font-semibold text-foreground">{title}</Label>
+      {children}
+    </div>
+  );
+}

@@ -1,0 +1,82 @@
+import { frontSequelize } from "@app/lib/resources/storage";
+import { DataTypes } from "@app/lib/resources/storage/data_types";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import { WorkspaceAwareModel } from "@app/lib/resources/storage/wrappers/workspace_models";
+import type { MembershipSeatType } from "@app/types/memberships";
+import type { RoleType } from "@app/types/user";
+import type { CreationOptional, ForeignKey } from "sequelize";
+
+export class MembershipInvitationModel extends WorkspaceAwareModel<MembershipInvitationModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare sId: string;
+  declare inviteEmail: string;
+  declare status: "pending" | "consumed" | "revoked";
+  declare initialRole: Exclude<RoleType, "none">;
+
+  declare invitedUserId: ForeignKey<UserModel["id"]> | null;
+
+  declare reminderSentAt: Date | null;
+  declare seatType: MembershipSeatType | null;
+}
+MembershipInvitationModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    sId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    inviteEmail: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    status: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "pending",
+    },
+    initialRole: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "user",
+    },
+    reminderSentAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    seatType: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+  },
+  {
+    modelName: "membership_invitation",
+    sequelize: frontSequelize,
+    indexes: [
+      { fields: ["workspaceId", "status"] },
+      { unique: true, fields: ["sId"] },
+      { fields: ["inviteEmail", "status"] },
+      {
+        fields: ["createdAt", "id"],
+        where: { status: "pending", reminderSentAt: null },
+        concurrently: true,
+      },
+    ],
+  }
+);
+
+UserModel.hasMany(MembershipInvitationModel, {
+  foreignKey: "invitedUserId",
+});

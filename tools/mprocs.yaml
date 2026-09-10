@@ -1,0 +1,202 @@
+# Configuration for mprocs to run the dev environment locally.
+# Requirements:
+# * mprocs (`brew install mprocs`)
+# * bacon (`cargo install bacon`)
+
+# ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
+# you need to restart front-workers after sdks-js is loaded: select front-workers in the mprocs window and press r
+# ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
+
+procs:
+  _check-start-script:
+    cwd: "<CONFIG_DIR>/.."
+    cmd: ["bash", "tools/check-start-mprocs.sh"]
+    autostart: true
+    autorestart: false
+
+  core:
+    cwd: "<CONFIG_DIR>/../core"
+    shell: "bacon core-api"
+
+  sqlite-workers:
+    cwd: "<CONFIG_DIR>/../core"
+    env:
+      CORE_API: "http://localhost:3001"
+      IS_LOCAL_DEV: "1"
+      DATABASES_STORE_DATABASE_URI: "postgresql://dev:dev@localhost:5432/ruby_databases_store"
+      CORE_API_KEY: "soupinou"
+    shell: "bacon sqlite-worker"
+
+  oauth:
+    cwd: "<CONFIG_DIR>/../core"
+    shell: "RUST_BACKTRACE=1 bacon oauth"
+
+  sparkle:
+    cwd: "<CONFIG_DIR>/../sparkle"
+    shell: |
+      npm run watch
+
+  sdks-js:
+    cwd: "<CONFIG_DIR>/../sdks/js"
+    shell: |
+      ./admin/dev.sh
+
+  migrations:
+    cwd: "<CONFIG_DIR>/.."
+    env:
+      READY_FILE: "sdks/js/dist/client.esm.js.map"
+    shell: "bash tools/run-migrations.sh"
+
+  front-api-hono:
+    cwd: "<CONFIG_DIR>/../front-api"
+    env:
+      NODE_ENV: "development"
+      HOSTNAME: "0.0.0.0"
+      # Guard: throw if anything tries to load `next` at runtime.
+      NODE_OPTIONS: "--require=./forbid-next.cjs"
+      READY_FILE: "../sdks/js/dist/client.esm.js.map"
+    shell: |
+      echo "Waiting for sdks-js to compile..."
+      echo "Expecting file: $READY_FILE"
+      while [ ! -f "$READY_FILE" ]; do sleep 1; done
+      echo "sdks-js ready. Starting front-api (Hono only, no Next)."
+      npm run dev
+
+  front-workers:
+    cwd: "<CONFIG_DIR>/.."
+    shell: "bash tools/wait-for-front-api.sh"
+
+  connectors:
+    cwd: "<CONFIG_DIR>/../connectors"
+    env:
+      READY_FILE: "../sdks/js/dist/client.esm.js.map"
+    shell: |
+      bash ../tools/wait-for-temporal.sh
+      echo "Waiting for sdks-js to compile..."
+      while [ ! -f "$READY_FILE" ]; do sleep 1; done
+      echo "sdks-js ready. Starting connectors."
+      ./admin/dev.sh
+    autostart: false
+
+  front-spa:
+    cwd: "<CONFIG_DIR>/../front-spa"
+    env:
+      READY_FILE: "../sparkle/dist/cjs/index.js"
+    shell: |
+      echo "Waiting for sparkle to compile..."
+      echo "Expecting file: $READY_FILE"
+      while [ ! -f "$READY_FILE" ]; do sleep 1; done
+      bash ../tools/wait-for-front-api-ready.sh
+      npm run dev:app
+
+  front-poke:
+    cwd: "<CONFIG_DIR>/../front-spa"
+    env:
+      READY_FILE: "../sparkle/dist/cjs/index.js"
+    shell: |
+      echo "Waiting for sparkle to compile..."
+      echo "Expecting file: $READY_FILE"
+      while [ ! -f "$READY_FILE" ]; do sleep 1; done
+      bash ../tools/wait-for-front-api-ready.sh
+      npm run dev:poke
+
+  marketing-site:
+    cwd: "<CONFIG_DIR>/../marketing"
+    env:
+      READY_FILE: "../sparkle/dist/cjs/index.js"
+    shell: |
+      echo "Waiting for sparkle to compile..."
+      echo "Expecting file: $READY_FILE"
+      while [ ! -f "$READY_FILE" ]; do sleep 1; done
+      echo "sparkle ready. Starting marketing site on port 3009."
+      npm run dev -- -p 3009
+    autostart: false
+
+  sparkle-storybook:
+    cwd: "<CONFIG_DIR>/../sparkle"
+    shell: |
+      npm run storybook
+    autostart: false
+
+  sparkle-playground:
+    cwd: "<CONFIG_DIR>/../sparkle/playground"
+    shell: |
+      npm install && npm run dev
+    autostart: false
+
+  viz:
+    cwd: "<CONFIG_DIR>/../viz"
+    shell: |
+      npm run dev
+    autostart: true
+
+  extension-chrome:
+    cwd: "<CONFIG_DIR>/../extension"
+    shell: |
+      npm run dev:chrome
+    autostart: false
+
+  extension-firefox:
+    cwd: "<CONFIG_DIR>/../extension"
+    shell: |
+      npm run dev:firefox
+    autostart: false
+
+  ngrok:
+    # Doc: https://app.notion.com/p/ruby-ai/Runbook-Local-Setup-Slack-2ad003fc529d4144bb0ee61b7fd797c9?source=copy_link#2a728599d941807fb71dccb4addc0234
+    shell: "ngrok start localhost-via-https"
+    autostart: false
+
+  firebase-webhook-router:
+    cwd: "<CONFIG_DIR>/../firebase-functions/webhook-router"
+    shell: |
+      if [ -f /.dockerenv ] || [ "${RUBY_IN_CONTAINER:-}" = 1 ]; then
+        echo "Skipping firebase-webhook-router compose: no Docker socket in shared dev container."
+        exit 0
+      fi
+      docker-compose up --build
+    autostart: false
+
+  # apache-tika: Document text extraction. TIKA_URL=http://localhost:9998.
+  apache-tika:
+    cwd: "<CONFIG_DIR>/.."
+    shell: |
+      if [ -f /.dockerenv ] || [ "${RUBY_IN_CONTAINER:-}" = 1 ]; then
+        echo "Skipping apache-tika compose: no Docker socket in shared dev container."
+        exit 0
+      fi
+      docker compose up apache-tika
+    autostart: false
+
+  # kibana: Elasticsearch UI. kibana_settings runs first as a docker-compose dep.
+  kibana:
+    cwd: "<CONFIG_DIR>/.."
+    shell: |
+      if [ -f /.dockerenv ] || [ "${RUBY_IN_CONTAINER:-}" = 1 ]; then
+        echo "Skipping kibana compose: no Docker socket in shared dev container."
+        exit 0
+      fi
+      docker compose up kibana_settings kibana
+    autostart: false
+
+  # Gotenberg: Office/PDF document preview conversion (LibreOffice route).
+  # front-api reads its URL from DOCUMENT_RENDERER_URL (set to http://localhost:3100).
+  gotenberg:
+    cwd: "<CONFIG_DIR>/.."
+    shell: |
+      if [ -f /.dockerenv ] || [ "${RUBY_IN_CONTAINER:-}" = 1 ]; then
+        echo "Skipping gotenberg compose: no Docker socket in shared dev container."
+        exit 0
+      fi
+      docker compose --profile gotenberg up gotenberg
+    autostart: false
+
+  novu:
+    # Doc: https://docs.novu.co/framework/studio
+    shell: "npx --yes novu@latest dev --port 3000"
+    autostart: false
+
+  stripe:
+    # Doc: https://app.notion.com/p/ruby-ai/Runbook-Local-Dev-setup-720bffc7d67a447184cb957e9471380c?source=copy_link#5814f227351d4d258422e21e8de39c82/
+    shell: "stripe listen --forward-to localhost:3000/api/stripe/webhook"
+    autostart: false

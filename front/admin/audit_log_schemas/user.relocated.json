@@ -1,0 +1,13 @@
+{
+  "action": "user.relocated",
+  "targets": [
+    {
+      "type": "user"
+    }
+  ],
+  "metadata": {
+    "from_region": "string",
+    "to_region": "string",
+    "actor_type": "string"
+  }
+}

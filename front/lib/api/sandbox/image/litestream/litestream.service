@@ -1,0 +1,39 @@
+[Unit]
+Description=Ruby Litestream replication daemon for pod state
+After=network.target
+
+[Service]
+User=ruby-state
+Group=ruby-state
+ExecStart=/opt/bin/litestream replicate -config /etc/litestream.yml
+Restart=always
+RestartSec=2s
+
+# Pinned: fluent-bit's journal grep filter forwards on this identifier.
+SyslogIdentifier=litestream
+
+# Control socket directory (/run/litestream), created by systemd as
+# ruby-state. The pre-sleep `litestream sync -wait` runs against the socket
+# in there; the socket is enabled by the static /etc/litestream.yml baked at
+# image build (directory-watcher config over /sandbox-state/databases).
+RuntimeDirectory=litestream
+RuntimeDirectoryMode=0755
+
+# Defense in depth, modeled on ruby-egress-resolver.service. The daemon only
+# needs rw under /sandbox-state (live databases and the replica gcsfuse
+# mount); the control socket is AF_UNIX and the file replica needs no network.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/sandbox-state
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

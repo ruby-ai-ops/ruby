@@ -1,0 +1,12 @@
+{
+  "action": "workspace.deleted",
+  "targets": [
+    {
+      "type": "workspace"
+    }
+  ],
+  "metadata": {
+    "relocated": "string",
+    "actor_type": "string"
+  }
+}

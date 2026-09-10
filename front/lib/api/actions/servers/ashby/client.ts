@@ -1,0 +1,380 @@
+import { MCPError } from "@app/lib/actions/mcp_errors";
+import type { ToolHandlerExtra } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import type {
+  AshbyAPIErrorInfo,
+  AshbyApplicationFeedbackListRequest,
+  AshbyApplicationInfoRequest,
+  AshbyCandidateCreateNoteRequest,
+  AshbyCandidateInfoRequest,
+  AshbyCandidateListNotesRequest,
+  AshbyCandidateNote,
+  AshbyCandidateSearchRequest,
+  AshbyFeedbackSubmission,
+  AshbyJob,
+  AshbyJobInfoRequest,
+  AshbyJobPostingInfoRequest,
+  AshbyJobPostingListRequest,
+  AshbyJobPostingUpdateRequest,
+  AshbyOffer,
+  AshbyOfferInfoRequest,
+  AshbyOfferListRequest,
+  AshbyOpening,
+  AshbyOpeningListRequest,
+  AshbyReferralCreateRequest,
+  AshbyReportSynchronousRequest,
+  AshbyUserSearchRequest,
+} from "@app/lib/api/actions/servers/ashby/types";
+import {
+  AshbyAPIErrorResponseSchema,
+  AshbyApplicationFeedbackListResponseSchema,
+  AshbyApplicationInfoResponseSchema,
+  AshbyCandidateCreateNoteResponseSchema,
+  AshbyCandidateInfoResponseSchema,
+  AshbyCandidateListNotesResponseSchema,
+  AshbyCandidateSearchResponseSchema,
+  AshbyJobInfoResponseSchema,
+  AshbyJobPostingInfoResponseSchema,
+  AshbyJobPostingListResponseSchema,
+  AshbyJobPostingUpdateResponseSchema,
+  AshbyJobSchema,
+  AshbyOfferInfoResponseSchema,
+  AshbyOfferListResponseSchema,
+  AshbyOpeningListResponseSchema,
+  AshbyReferralCreateResponseSchema,
+  AshbyReferralFormInfoResponseSchema,
+  AshbyReportSynchronousResponseSchema,
+  AshbyUserSearchResponseSchema,
+} from "@app/lib/api/actions/servers/ashby/types";
+import { untrustedFetch } from "@app/lib/egress/server";
+import logger from "@app/logger/logger";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { z } from "zod";
+
+const ASHBY_API_BASE_URL = "https://api.ashbyhq.com";
+
+export class AshbyAPIError extends Error {
+  readonly errorInfo: AshbyAPIErrorInfo | undefined;
+  readonly errors: string[] | undefined;
+
+  constructor({
+    errorInfo,
+    errors,
+  }: {
+    errorInfo?: AshbyAPIErrorInfo;
+    errors?: string[];
+  }) {
+    const detail = errorInfo?.message ?? errors?.join(", ") ?? errorInfo?.code;
+    super(`Ashby API error: ${detail ?? "unknown error"}`);
+    this.errorInfo = errorInfo;
+    this.errors = errors;
+  }
+}
+
+export function getAshbyClient(
+  extra: ToolHandlerExtra
+): Result<AshbyClient, MCPError> {
+  const apiKey = extra.authInfo?.token;
+  if (!apiKey) {
+    return new Err(
+      new MCPError(
+        "Ashby API key not configured. Please configure the API key in the MCP server settings.",
+        {
+          tracked: false,
+        }
+      )
+    );
+  }
+
+  return new Ok(new AshbyClient(apiKey));
+}
+
+export class AshbyClient {
+  private apiKey: string;
+
+  constructor(apiKey: string) {
+    this.apiKey = apiKey;
+  }
+
+  private getAuthHeader(): string {
+    const credentials = Buffer.from(`${this.apiKey}:`).toString("base64");
+    return `Basic ${credentials}`;
+  }
+
+  private async postRequest<T extends z.ZodTypeAny>(
+    endpoint: string,
+    data: unknown,
+    resultsSchema: T,
+    options: { isPaginated: true }
+  ): Promise<
+    Result<
+      { results: z.infer<T>; moreDataAvailable?: boolean; nextCursor?: string },
+      Error
+    >
+  >;
+  private async postRequest<T extends z.ZodTypeAny>(
+    endpoint: string,
+    data: unknown,
+    resultsSchema: T,
+    options?: { isPaginated?: false }
+  ): Promise<Result<z.infer<T>, Error>>;
+  private async postRequest<T extends z.ZodTypeAny>(
+    endpoint: string,
+    data: unknown,
+    resultsSchema: T,
+    options?: { isPaginated?: boolean }
+  ): Promise<
+    Result<
+      | z.infer<T>
+      | {
+          results: z.infer<T>;
+          moreDataAvailable?: boolean;
+          nextCursor?: string;
+        },
+      Error
+    >
+  > {
+    const response = await untrustedFetch(`${ASHBY_API_BASE_URL}/${endpoint}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: this.getAuthHeader(),
+      },
+      body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return new Err(
+        new Error(
+          `Ashby API error (${response.status}): ${errorText || response.statusText}`
+        )
+      );
+    }
+
+    const rawData = await response.json();
+
+    const errorCheck = AshbyAPIErrorResponseSchema.safeParse(rawData);
+    if (errorCheck.success) {
+      return new Err(
+        new AshbyAPIError({
+          errorInfo: errorCheck.data.errorInfo,
+          errors: errorCheck.data.errors,
+        })
+      );
+    }
+
+    if (options?.isPaginated) {
+      const parseResult = z
+        .object({
+          success: z.literal(true),
+          results: resultsSchema,
+          moreDataAvailable: z.boolean().optional(),
+          nextCursor: z.string().optional(),
+        })
+        .safeParse(rawData);
+      if (!parseResult.success) {
+        logger.error(
+          { endpoint, error: parseResult.error.message },
+          "[Ashby] Invalid API response format"
+        );
+        return new Err(
+          new Error(
+            `Invalid Ashby API response format: ${parseResult.error.message}`
+          )
+        );
+      }
+      const { results, moreDataAvailable, nextCursor } = parseResult.data;
+
+      return new Ok({ results, moreDataAvailable, nextCursor });
+    }
+
+    const parseResult = z
+      .object({ success: z.literal(true), results: resultsSchema })
+      .safeParse(rawData);
+    if (!parseResult.success) {
+      logger.error(
+        { endpoint, error: parseResult.error.message },
+        "[Ashby] Invalid API response format"
+      );
+      return new Err(
+        new Error(
+          `Invalid Ashby API response format: ${parseResult.error.message}`
+        )
+      );
+    }
+
+    return new Ok(parseResult.data.results);
+  }
+
+  async getReportData(request: AshbyReportSynchronousRequest) {
+    return this.postRequest(
+      "report.synchronous",
+      request,
+      AshbyReportSynchronousResponseSchema
+    );
+  }
+
+  async searchCandidates(request: AshbyCandidateSearchRequest) {
+    return this.postRequest(
+      "candidate.search",
+      request,
+      AshbyCandidateSearchResponseSchema
+    );
+  }
+
+  async listApplicationFeedback(
+    request: AshbyApplicationFeedbackListRequest
+  ): Promise<Result<AshbyFeedbackSubmission[], Error>> {
+    return this.postRequest(
+      "applicationFeedback.list",
+      request,
+      AshbyApplicationFeedbackListResponseSchema
+    );
+  }
+
+  async createCandidateNote(request: AshbyCandidateCreateNoteRequest) {
+    return this.postRequest(
+      "candidate.createNote",
+      request,
+      AshbyCandidateCreateNoteResponseSchema
+    );
+  }
+
+  async getApplicationInfo(request: AshbyApplicationInfoRequest) {
+    return this.postRequest(
+      "application.info",
+      request,
+      AshbyApplicationInfoResponseSchema
+    );
+  }
+
+  async listOpenings(request: AshbyOpeningListRequest): Promise<
+    Result<
+      {
+        results: AshbyOpening[];
+        moreDataAvailable?: boolean;
+        nextCursor?: string;
+      },
+      Error
+    >
+  > {
+    return this.postRequest(
+      "opening.list",
+      request,
+      AshbyOpeningListResponseSchema,
+      { isPaginated: true }
+    );
+  }
+
+  async listCandidateNotes(
+    request: AshbyCandidateListNotesRequest
+  ): Promise<Result<AshbyCandidateNote[], Error>> {
+    return this.postRequest(
+      "candidate.listNotes",
+      request,
+      AshbyCandidateListNotesResponseSchema
+    );
+  }
+
+  async searchUser(request: AshbyUserSearchRequest) {
+    return this.postRequest(
+      "user.search",
+      request,
+      AshbyUserSearchResponseSchema
+    );
+  }
+
+  async getReferralFormInfo() {
+    return this.postRequest(
+      "referralForm.info",
+      {},
+      AshbyReferralFormInfoResponseSchema
+    );
+  }
+
+  async createReferral(request: AshbyReferralCreateRequest) {
+    return this.postRequest(
+      "referral.create",
+      request,
+      AshbyReferralCreateResponseSchema
+    );
+  }
+
+  async getJobPostingInfo(request: AshbyJobPostingInfoRequest) {
+    return this.postRequest(
+      "jobPosting.info",
+      request,
+      AshbyJobPostingInfoResponseSchema
+    );
+  }
+
+  async listJobPostings(request: AshbyJobPostingListRequest) {
+    return this.postRequest(
+      "jobPosting.list",
+      request,
+      AshbyJobPostingListResponseSchema
+    );
+  }
+
+  async updateJobPosting(request: AshbyJobPostingUpdateRequest) {
+    return this.postRequest(
+      "jobPosting.update",
+      request,
+      AshbyJobPostingUpdateResponseSchema
+    );
+  }
+
+  async getCandidateInfo(request: AshbyCandidateInfoRequest) {
+    return this.postRequest(
+      "candidate.info",
+      request,
+      AshbyCandidateInfoResponseSchema
+    );
+  }
+
+  async getOfferInfo(request: AshbyOfferInfoRequest) {
+    return this.postRequest(
+      "offer.info",
+      request,
+      AshbyOfferInfoResponseSchema
+    );
+  }
+
+  async listOffers(
+    request: AshbyOfferListRequest
+  ): Promise<Result<AshbyOffer[], Error>> {
+    return this.postRequest(
+      "offer.list",
+      request,
+      AshbyOfferListResponseSchema
+    );
+  }
+
+  async getJobInfo(request: AshbyJobInfoRequest) {
+    return this.postRequest("job.info", request, AshbyJobInfoResponseSchema);
+  }
+
+  async listJobs(): Promise<Result<AshbyJob[], Error>> {
+    const allJobs: AshbyJob[] = [];
+    let cursor: string | undefined;
+
+    do {
+      const response = await this.postRequest(
+        "job.list",
+        { cursor },
+        z.array(AshbyJobSchema),
+        { isPaginated: true }
+      );
+      if (response.isErr()) {
+        return response;
+      }
+      allJobs.push(...response.value.results);
+      cursor = response.value.moreDataAvailable
+        ? response.value.nextCursor
+        : undefined;
+    } while (cursor);
+
+    return new Ok(allJobs);
+  }
+}

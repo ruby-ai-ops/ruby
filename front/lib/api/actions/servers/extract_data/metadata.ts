@@ -1,0 +1,196 @@
+import { ConfigurableToolInputSchemas } from "@app/lib/actions/mcp_internal_actions/input_schemas";
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { TagsInputSchema } from "@app/lib/actions/mcp_internal_actions/types";
+import {
+  FIND_TAGS_BASE_DESCRIPTION,
+  findTagsSchema,
+} from "@app/lib/api/actions/tools/find_tags/metadata";
+import { INTERNAL_MIME_TYPES } from "@ruby-ai/client";
+import { z } from "zod";
+
+export const EXTRACT_DATA_MAIN_TOOL_NAME =
+  "extract_information_from_documents" as const;
+
+const EXTRACT_TOOL_JSON_SCHEMA_ARGUMENT_DESCRIPTION =
+  "A JSON schema that will be embedded in the following JSON schema:" +
+  "\n```\n" +
+  "{\n" +
+  '  "name": "extract_data",\n' +
+  '  "description": "Call this function with an array of extracted data points",\n' +
+  '  "parameters": {\n' +
+  '    "type": "object",\n' +
+  '    "properties": {\n' +
+  '      "data_points": {\n' +
+  '         "type": "array",\n' +
+  '         "items": $SCHEMA,\n' +
+  '          "description": "The data points extracted from provided documents, as many as required to follow instructions."\n' +
+  "        }\n" +
+  "      },\n" +
+  '      "required": ["data_points"]\n' +
+  "    }\n" +
+  "  }\n" +
+  "}\n" +
+  "```\n\n" +
+  "Must be a valid JSON schema. Use only standard JSON Schema 7 core fields (type, properties, required, description) and avoid custom keywords or extensions that are not part of the core specification.\n\n" +
+  "This schema will be used as signature to extract the relevant information based on selected documents to properly follow instructions.";
+
+// JSON Schema for extraction - when not pre-configured by user
+const DynamicJsonSchemaSchema = z
+  .object({})
+  .passthrough()
+  .describe(EXTRACT_TOOL_JSON_SCHEMA_ARGUMENT_DESCRIPTION);
+
+// Time frame schema - when not pre-configured by user
+const DynamicTimeFrameSchema = z
+  .object({
+    duration: z.number(),
+    unit: z.enum(["hour", "day", "week", "month", "year"]),
+  })
+  .describe(
+    "The time frame to use for documents retrieval (e.g. last 7 days, last 2 months). Leave null to search all documents regardless of time."
+  )
+  .optional();
+
+// Common schema fields
+const objectiveSchema = z
+  .string()
+  .describe(
+    "The objective behind the use of the tool based on the conversation state." +
+      " This is used to guide the tool to extract the right data based on the user request."
+  );
+
+function makeBaseExtractSchema({
+  isJsonSchemaConfigured,
+  isTimeFrameConfigured,
+}: {
+  isJsonSchemaConfigured: boolean;
+  isTimeFrameConfigured: boolean;
+}) {
+  return {
+    dataSources:
+      ConfigurableToolInputSchemas[INTERNAL_MIME_TYPES.TOOL_INPUT.DATA_SOURCE],
+    objective: objectiveSchema,
+    jsonSchema: isJsonSchemaConfigured
+      ? ConfigurableToolInputSchemas[INTERNAL_MIME_TYPES.TOOL_INPUT.JSON_SCHEMA]
+      : DynamicJsonSchemaSchema,
+    timeFrame: isTimeFrameConfigured
+      ? ConfigurableToolInputSchemas[INTERNAL_MIME_TYPES.TOOL_INPUT.TIME_FRAME]
+      : DynamicTimeFrameSchema,
+  };
+}
+
+// Tool description
+const TOOL_DESCRIPTION =
+  "Extract structured information from documents in reverse chronological order, according to the needs described by the objective and specified by a" +
+  " JSON schema. This tool retrieves content" +
+  " from data sources already pre-configured by the user, ensuring the latest information is included.";
+
+export function makeExtractDataBaseToolsMetadata({
+  isJsonSchemaConfigured,
+  isTimeFrameConfigured,
+}: {
+  isJsonSchemaConfigured: boolean;
+  isTimeFrameConfigured: boolean;
+}) {
+  const schema = makeBaseExtractSchema({
+    isJsonSchemaConfigured,
+    isTimeFrameConfigured,
+  });
+
+  return [
+    {
+      name: EXTRACT_DATA_MAIN_TOOL_NAME,
+      description: TOOL_DESCRIPTION,
+      schema,
+      stake: "never_ask",
+      displayLabels: {
+        running: "Extracting data from documents",
+        done: "Extract data from documents",
+      },
+      toolCostCategory: "advanced",
+      freeUsage: false,
+    },
+  ] as const;
+}
+
+export function makeExtractDataToolsWithTagsMetadata({
+  isJsonSchemaConfigured,
+  isTimeFrameConfigured,
+}: {
+  isJsonSchemaConfigured: boolean;
+  isTimeFrameConfigured: boolean;
+}) {
+  const baseMetadata = makeExtractDataBaseToolsMetadata({
+    isJsonSchemaConfigured,
+    isTimeFrameConfigured,
+  });
+  const [baseToolMetadata] = baseMetadata;
+
+  return [
+    {
+      ...baseToolMetadata,
+      name: EXTRACT_DATA_MAIN_TOOL_NAME,
+      schema: {
+        ...makeBaseExtractSchema({
+          isJsonSchemaConfigured,
+          isTimeFrameConfigured,
+        }),
+        ...TagsInputSchema.shape,
+      },
+    },
+    {
+      name: "find_tags",
+      description:
+        FIND_TAGS_BASE_DESCRIPTION +
+        ` This tool is meant to be used before the ${EXTRACT_DATA_MAIN_TOOL_NAME} tool.`,
+      schema: findTagsSchema,
+      stake: "never_ask",
+      displayLabels: {
+        running: "Finding tags",
+        done: "Find tags",
+      },
+      toolCostCategory: "advanced",
+      freeUsage: false,
+    },
+  ] as const;
+}
+
+export function makeExtractDataToolsMetadata({
+  areTagsDynamic,
+  isJsonSchemaConfigured,
+  isTimeFrameConfigured,
+}: {
+  areTagsDynamic: boolean;
+  isJsonSchemaConfigured: boolean;
+  isTimeFrameConfigured: boolean;
+}) {
+  if (areTagsDynamic) {
+    return makeExtractDataToolsWithTagsMetadata({
+      isJsonSchemaConfigured,
+      isTimeFrameConfigured,
+    });
+  }
+
+  return makeExtractDataBaseToolsMetadata({
+    isJsonSchemaConfigured,
+    isTimeFrameConfigured,
+  });
+}
+
+const EXTRACT_DATA_BASE_TOOLS_METADATA = makeExtractDataBaseToolsMetadata({
+  isJsonSchemaConfigured: false,
+  isTimeFrameConfigured: false,
+});
+
+// Server metadata - used in constants.ts
+export const EXTRACT_DATA_SERVER = {
+  serverInfo: {
+    name: "extract_data",
+    version: "1.0.0",
+    description: "Parse documents to create structured datasets.",
+    icon: "ActionScanIcon",
+    authorization: null,
+    documentationUrl: null,
+  },
+  tools: EXTRACT_DATA_BASE_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

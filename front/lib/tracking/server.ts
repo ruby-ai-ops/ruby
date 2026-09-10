@@ -1,0 +1,323 @@
+import { PostHogServerSideTracking } from "@app/lib/api/posthog";
+import { countActiveSeatsForWorkspace } from "@app/lib/api/workspace_seats";
+import { FREE_TEST_PLAN_CODE } from "@app/lib/plans/plan_codes";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
+import { CustomerioServerSideTracking } from "@app/lib/tracking/customerio/server";
+import type { UTMParams } from "@app/lib/utils/utm";
+import logger from "@app/logger/logger";
+import type { AgentConfigurationType } from "@app/types/assistant/agent";
+import type {
+  AgentMessageType,
+  UserMessageType,
+} from "@app/types/assistant/conversation";
+import type { DataSourceType } from "@app/types/data_source";
+import type { JobType } from "@app/types/job_type";
+import type { MembershipRoleType } from "@app/types/memberships";
+import type {
+  LightWorkspaceType,
+  UserType,
+  UserTypeWithWorkspaces,
+  WorkspaceType,
+} from "@app/types/user";
+import keyBy from "lodash/keyBy";
+import type { UserResource } from "../resources/user_resource";
+
+export class ServerSideTracking {
+  static trackSignup({
+    user,
+    utmParams,
+    anonymousId,
+    userCreated,
+  }: {
+    user: UserType;
+    utmParams?: UTMParams;
+    anonymousId?: string;
+    userCreated?: boolean;
+  }) {
+    try {
+      CustomerioServerSideTracking.trackSignup({ user, anonymousId });
+    } catch (err) {
+      logger.error(
+        { userId: user.sId, err },
+        "Failed to track signup on Customer.io"
+      );
+    }
+
+    try {
+      PostHogServerSideTracking.trackSignup({
+        user,
+        utmParams,
+        anonymousId,
+        userCreated,
+      });
+    } catch (err) {
+      logger.error(
+        { userId: user.sId, err },
+        "Failed to track signup on PostHog"
+      );
+    }
+  }
+
+  static async trackGetUser({ user }: { user: UserTypeWithWorkspaces }) {
+    try {
+      const subscriptionByWorkspaceModelId =
+        await SubscriptionResource.fetchActiveByWorkspacesModelId(
+          user.workspaces.map((w) => w.id)
+        );
+
+      const seatsByWorkspaceId = keyBy(
+        await Promise.all(
+          user.workspaces.map(async (workspace) => {
+            const seats = await countActiveSeatsForWorkspace(workspace.sId);
+            return { sId: workspace.sId, seats };
+          })
+        ),
+        "sId"
+      );
+
+      const promises: Promise<unknown>[] = [];
+
+      // We identify all of the user's workspaces on Customer.io everytime someone logs in,
+      // so we keep subscription info up to date.
+      // The actual customer.io call is rate limited to 1 call per day with the same data.
+      const workspacesToTrackOnCustomerIo = user.workspaces
+        .map((ws) => {
+          const subscriptionStartInt =
+            subscriptionByWorkspaceModelId[ws.id].startDate;
+          const subscriptionStartAt = subscriptionStartInt
+            ? new Date(subscriptionStartInt)
+            : null;
+
+          const requestCancelAtInt =
+            subscriptionByWorkspaceModelId[ws.id].requestCancelAt;
+          const requestCancelAt = requestCancelAtInt
+            ? new Date(requestCancelAtInt)
+            : null;
+
+          return {
+            ...ws,
+            planCode: subscriptionByWorkspaceModelId[ws.id].getPlan().code,
+            seats: seatsByWorkspaceId[ws.sId].seats,
+            subscriptionStartAt,
+            requestCancelAt,
+          };
+        })
+        .filter((ws) => ws.planCode !== FREE_TEST_PLAN_CODE);
+      if (workspacesToTrackOnCustomerIo.length > 0) {
+        promises.push(
+          CustomerioServerSideTracking.identifyWorkspaces({
+            workspaces: workspacesToTrackOnCustomerIo,
+          }).catch((err) => {
+            logger.error(
+              { userId: user.sId, err },
+              "Failed to identify workspaces on Customer.io"
+            );
+          })
+        );
+      }
+
+      await Promise.all(promises);
+    } catch (err) {
+      logger.error(
+        { userId: user.sId, err },
+        "Failed to track user memberships"
+      );
+    }
+  }
+
+  static trackUserMessage(_: {
+    userMessage: UserMessageType;
+    workspace: WorkspaceType;
+    userId: string;
+    conversationId: string;
+    agentMessages: AgentMessageType[];
+  }) {
+    // Do nothing for now
+  }
+
+  static trackDataSourceCreated(_: {
+    user?: UserResource;
+    workspace?: WorkspaceType;
+    dataSource: DataSourceType;
+  }) {
+    // Do nothing for now
+  }
+
+  static trackDataSourceUpdated(_: {
+    user?: UserResource;
+    workspace?: WorkspaceType;
+    dataSource: DataSourceType;
+  }) {
+    // Do nothing for now
+  }
+
+  static trackAssistantCreated(_: {
+    user?: UserResource;
+    workspace?: WorkspaceType;
+    assistant: AgentConfigurationType;
+  }) {
+    // Do nothing for now
+  }
+
+  static async trackSubscriptionCreated({
+    workspace,
+    planCode,
+    workspaceSeats,
+    subscriptionStartAt,
+  }: {
+    workspace: LightWorkspaceType;
+    planCode: string;
+    workspaceSeats: number;
+    subscriptionStartAt: Date;
+  }) {
+    return CustomerioServerSideTracking.identifyWorkspaces({
+      workspaces: [
+        {
+          ...workspace,
+          planCode,
+          seats: workspaceSeats,
+          subscriptionStartAt,
+        },
+      ],
+    });
+  }
+
+  static async trackSubscriptionRequestCancel({
+    workspace,
+    requestCancelAt,
+  }: {
+    workspace: LightWorkspaceType;
+    requestCancelAt: Date;
+  }) {
+    return CustomerioServerSideTracking.identifyWorkspaces({
+      workspaces: [
+        {
+          ...workspace,
+          requestCancelAt,
+        },
+      ],
+    });
+  }
+
+  static async trackSubscriptionReactivated({
+    workspace,
+  }: {
+    workspace: LightWorkspaceType;
+  }) {
+    return CustomerioServerSideTracking.identifyWorkspaces({
+      workspaces: [
+        {
+          ...workspace,
+          requestCancelAt: null,
+        },
+      ],
+    });
+  }
+
+  static async trackCreateMembership({
+    user,
+    workspace,
+    role,
+    startAt,
+  }: {
+    user: UserType;
+    workspace: LightWorkspaceType;
+    role: MembershipRoleType;
+    startAt: Date;
+  }) {
+    try {
+      await CustomerioServerSideTracking.trackCreateMembership({
+        user,
+        workspace,
+        role,
+        startAt,
+      });
+    } catch (err) {
+      logger.error(
+        { userId: user.sId, workspaceId: workspace.sId, err },
+        "Failed to track create membership on Customer.io"
+      );
+    }
+  }
+
+  static async trackRevokeMembership({
+    user,
+    workspace,
+    role,
+    startAt,
+    endAt,
+  }: {
+    user: UserType;
+    workspace: LightWorkspaceType;
+    role: MembershipRoleType;
+    startAt: Date;
+    endAt: Date;
+  }) {
+    try {
+      await CustomerioServerSideTracking.trackRevokeMembership({
+        user,
+        workspace,
+        role,
+        startAt,
+        endAt,
+      });
+    } catch (err) {
+      logger.error(
+        { userId: user.sId, workspaceId: workspace.sId, err },
+        "Failed to track revoke membership on Customer.io"
+      );
+    }
+  }
+
+  static async trackUpdateMembershipRole({
+    user,
+    workspace,
+    previousRole,
+    role,
+  }: {
+    user: UserType;
+    workspace: LightWorkspaceType;
+    previousRole: MembershipRoleType;
+    role: MembershipRoleType;
+  }) {
+    try {
+      await CustomerioServerSideTracking.trackUpdateMembershipRole({
+        user,
+        workspace,
+        previousRole,
+        role,
+      });
+    } catch (err) {
+      logger.error(
+        { userId: user.sId, workspaceId: workspace.sId, err },
+        "Failed to track update membership role on Customer.io"
+      );
+    }
+  }
+
+  static async trackUpdateUser({
+    user,
+    workspace,
+    role,
+    jobType,
+  }: {
+    user: UserType;
+    workspace: LightWorkspaceType;
+    role: MembershipRoleType;
+    jobType?: JobType;
+  }) {
+    try {
+      await CustomerioServerSideTracking.trackUpdateUser({
+        user,
+        workspace,
+        role,
+        jobType,
+      });
+    } catch (err) {
+      logger.error(
+        { userId: user.sId, workspaceId: workspace.sId, err },
+        "Failed to track update user onboardingInfo on Customer.io"
+      );
+    }
+  }
+}

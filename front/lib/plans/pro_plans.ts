@@ -1,0 +1,189 @@
+import { PlanModel } from "@app/lib/models/plan";
+import {
+  FREE_BYOK_PLAN_CODE,
+  FREE_BYOK_TRANSITIONING_PLAN_CODE,
+  PRO_PLAN_SEAT_29_CODE,
+  PRO_PLAN_SEAT_39_CODE,
+} from "@app/lib/plans/plan_codes";
+import { isDevelopment, isTest } from "@app/types/shared/env";
+import type { Attributes } from "sequelize";
+
+export type PlanAttributes = Omit<
+  Attributes<PlanModel>,
+  "id" | "createdAt" | "updatedAt"
+>;
+
+const LEGACY_PRO_FAIR_USE_AWU_CREDITS = 20_000;
+
+/**
+ * We have 3 categories of plans:
+ * - Free: plans with no paid subscription.
+ * - Pro: plans with a paid subscription, not tailored. -> i.e. the same plan is used by all Pro workspaces.
+ * - Entreprise: plans with a paid subscription, tailored to the needs of the entreprise. -> i.e. we will have one plan per "Entreprise".
+ *
+ * This file about Pro plans.
+ */
+
+/**
+ * Paid plans are stored in the database.
+ * We can update existing plans or add new one but never remove anything from this list.
+ * Entreprise custom plans will be created from Poké.
+ */
+
+const PRO_PLANS_DATA: PlanAttributes[] = [];
+
+if (isDevelopment() || isTest()) {
+  PRO_PLANS_DATA.push({
+    code: PRO_PLAN_SEAT_29_CODE,
+    name: "Pro",
+    maxMessages: -1,
+    maxMessagesTimeframe: "lifetime",
+    maxAwuCredits: LEGACY_PRO_FAIR_USE_AWU_CREDITS,
+    maxAwuCreditsTimeframe: "week",
+    isDeepDiveAllowed: true,
+    maxImagesPerWeek: 100,
+    maxUsersInWorkspace: 1000,
+    maxFreeUsersInWorkspace: -1,
+    maxLifetimeFreeUsersInWorkspace: -1,
+    maxVaultsInWorkspace: 1,
+    isSlackbotAllowed: true,
+    isManagedSlackAllowed: true,
+    isManagedConfluenceAllowed: true,
+    isManagedNotionAllowed: true,
+    isManagedGoogleDriveAllowed: true,
+    isManagedGithubAllowed: true,
+    isManagedIntercomAllowed: true,
+    isManagedWebCrawlerAllowed: true,
+    isManagedSalesforceAllowed: false,
+    isSSOAllowed: false,
+    isSCIMAllowed: false,
+    isAuditLogsAllowed: false,
+    maxConnectionsCount: -1,
+    maxDataSourcesCount: -1,
+    maxDataSourcesDocumentsCount: -1,
+    maxDataSourcesDocumentsSizeMb: 2,
+    trialPeriodDays: 14,
+    canUseProduct: true,
+    isByok: false,
+    hasAdvancedModelAccess: false,
+  });
+  PRO_PLANS_DATA.push({
+    code: PRO_PLAN_SEAT_39_CODE,
+    name: "Pro Business",
+    maxMessages: -1,
+    maxMessagesTimeframe: "lifetime",
+    maxAwuCredits: -1,
+    maxAwuCreditsTimeframe: "lifetime",
+    isDeepDiveAllowed: true,
+    maxImagesPerWeek: 100,
+    maxUsersInWorkspace: 1000,
+    maxFreeUsersInWorkspace: -1,
+    maxLifetimeFreeUsersInWorkspace: -1,
+    maxVaultsInWorkspace: 5,
+    isSlackbotAllowed: true,
+    isManagedSlackAllowed: true,
+    isManagedConfluenceAllowed: true,
+    isManagedNotionAllowed: true,
+    isManagedGoogleDriveAllowed: true,
+    isManagedGithubAllowed: true,
+    isManagedIntercomAllowed: true,
+    isManagedWebCrawlerAllowed: true,
+    isManagedSalesforceAllowed: false,
+    isSSOAllowed: true,
+    isSCIMAllowed: false,
+    isAuditLogsAllowed: false,
+    maxConnectionsCount: -1,
+    maxDataSourcesCount: -1,
+    maxDataSourcesDocumentsCount: -1,
+    maxDataSourcesDocumentsSizeMb: 2,
+    trialPeriodDays: 14,
+    canUseProduct: true,
+    isByok: false,
+    hasAdvancedModelAccess: false,
+  });
+  PRO_PLANS_DATA.push({
+    code: FREE_BYOK_PLAN_CODE,
+    name: "Free (BYOK)",
+    maxMessages: -1,
+    maxMessagesTimeframe: "lifetime",
+    maxAwuCredits: -1,
+    maxAwuCreditsTimeframe: "lifetime",
+    isDeepDiveAllowed: true,
+    maxImagesPerWeek: 50,
+    maxUsersInWorkspace: -1,
+    maxFreeUsersInWorkspace: -1,
+    maxLifetimeFreeUsersInWorkspace: -1,
+    maxVaultsInWorkspace: -1,
+    isSlackbotAllowed: true,
+    isManagedSlackAllowed: true,
+    isManagedConfluenceAllowed: true,
+    isManagedNotionAllowed: true,
+    isManagedGoogleDriveAllowed: true,
+    isManagedGithubAllowed: true,
+    isManagedIntercomAllowed: true,
+    isManagedWebCrawlerAllowed: true,
+    isManagedSalesforceAllowed: true,
+    isSSOAllowed: true,
+    isSCIMAllowed: false,
+    isAuditLogsAllowed: false,
+    maxConnectionsCount: -1,
+    maxDataSourcesCount: -1,
+    maxDataSourcesDocumentsCount: -1,
+    maxDataSourcesDocumentsSizeMb: 2,
+    trialPeriodDays: 0,
+    canUseProduct: true,
+    isByok: true,
+    hasAdvancedModelAccess: false,
+  });
+  PRO_PLANS_DATA.push({
+    code: FREE_BYOK_TRANSITIONING_PLAN_CODE,
+    name: "Free (BYOK Transitioning)",
+    maxMessages: -1,
+    maxMessagesTimeframe: "lifetime",
+    maxAwuCredits: -1,
+    maxAwuCreditsTimeframe: "lifetime",
+    isDeepDiveAllowed: true,
+    maxImagesPerWeek: 50,
+    maxUsersInWorkspace: -1,
+    maxFreeUsersInWorkspace: -1,
+    maxLifetimeFreeUsersInWorkspace: -1,
+    maxVaultsInWorkspace: 30,
+    isSlackbotAllowed: true,
+    isManagedSlackAllowed: true,
+    isManagedConfluenceAllowed: true,
+    isManagedNotionAllowed: true,
+    isManagedGoogleDriveAllowed: true,
+    isManagedGithubAllowed: true,
+    isManagedIntercomAllowed: true,
+    isManagedWebCrawlerAllowed: true,
+    isManagedSalesforceAllowed: true,
+    isSSOAllowed: true,
+    isSCIMAllowed: false,
+    isAuditLogsAllowed: false,
+    maxConnectionsCount: -1,
+    maxDataSourcesCount: -1,
+    maxDataSourcesDocumentsCount: -1,
+    maxDataSourcesDocumentsSizeMb: 2,
+    trialPeriodDays: 0,
+    canUseProduct: true,
+    isByok: true,
+    hasAdvancedModelAccess: false,
+  });
+}
+
+/**
+ * Function to call when we edit something in PRO_PLANS_DATA to update the database. It will create or update the plans.
+ * Uses atomic upsert to avoid race conditions when called concurrently (e.g., in parallel tests).
+ * @param planCode - Optional plan code to upsert. If not provided, all plans are upserted.
+ */
+export const upsertProPlans = async (planCode?: string) => {
+  const plansToUpsert = planCode
+    ? PRO_PLANS_DATA.filter((p) => p.code === planCode)
+    : PRO_PLANS_DATA;
+
+  for (const planData of plansToUpsert) {
+    await PlanModel.upsert(planData, {
+      conflictFields: ["code"],
+    });
+  }
+};

@@ -1,0 +1,18 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+
+// This server has dynamically created tools based on the tool context,
+// so we don't have fixed tools metadata. The tools are created at runtime
+// in the createServer function.
+
+export const MISSING_ACTION_CATCHER_SERVER = {
+  serverInfo: {
+    name: "missing_action_catcher" as const,
+    version: "1.0.0",
+    description: "To be used to catch errors and avoid erroring.",
+    authorization: null,
+    icon: "ActionDocumentTextIcon" as const,
+    documentationUrl: null,
+  },
+  // Tools are created dynamically at runtime based on the tool context.
+  tools: [],
+} as const satisfies ServerMetadata;

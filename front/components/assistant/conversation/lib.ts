@@ -1,0 +1,193 @@
+import type { AgentMessageWithStreaming } from "@app/components/assistant/conversation/types";
+import type { UserMessageType } from "@app/types/assistant/conversation";
+import type { RichMention } from "@app/types/assistant/mentions";
+import { toMentionType } from "@app/types/assistant/mentions";
+import type { ModelSelectionType } from "@app/types/assistant/models/types";
+import type {
+  ContentFragmentsType,
+  ContentFragmentType,
+  FileContentFragmentType,
+  SupportedContentFragmentType,
+} from "@app/types/content_fragment";
+import type { UserType } from "@app/types/user";
+
+export function createPlaceholderUserMessage({
+  input,
+  mentions,
+  user,
+  rank,
+  contentFragments,
+  requestedModel,
+}: {
+  input: string;
+  mentions: RichMention[];
+  user: UserType;
+  rank: number;
+  contentFragments?: ContentFragmentsType;
+  requestedModel?: ModelSelectionType | null;
+}): UserMessageType & { contentFragments: ContentFragmentType[] } {
+  const createdAt = new Date().getTime();
+  const { email, fullName, image, username } = user;
+
+  return {
+    id: -1,
+    content: input,
+    created: createdAt,
+    mentions: mentions.map((mention) => toMentionType(mention)),
+    richMentions: mentions.map((mention) => ({
+      ...mention,
+      dismissed: false,
+      status: "approved",
+    })),
+    user,
+    visibility: "visible",
+    type: "user_message",
+    sId: `placeholder-user-message-${createdAt.toString()}`,
+    version: 0,
+    rank,
+    branchId: null,
+    context: {
+      email,
+      fullName,
+      profilePictureUrl: image,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC",
+      username,
+      origin: "web",
+    },
+    reactions: [],
+    requestedModel: requestedModel ?? null,
+    contentFragments: [
+      ...(contentFragments?.uploaded ?? []).map(
+        (cf) =>
+          ({
+            type: "content_fragment" as const,
+            contentFragmentType: "file" as const,
+            fileId: cf.fileId,
+            path: null,
+            skipFileProcessing: false,
+            title: cf.title,
+            snippet: null,
+            generatedTables: [],
+            textUrl: "",
+            textBytes: null,
+            id: Math.random(),
+            sId: cf.fileId,
+            created: Date.now(),
+            visibility: "visible" as const,
+            version: 0,
+            rank,
+            sourceUrl: null,
+            contentType: cf.contentType,
+            context: {
+              username: user.username,
+              fullName: user.fullName,
+              email: user.email,
+              profilePictureUrl: user.image,
+            },
+            contentFragmentId: "placeholder-content-fragment",
+            contentFragmentVersion: "latest" as const,
+            expiredReason: null,
+            sourceProvider: null,
+            sourceIcon: null,
+            isInProjectContext: false,
+            hidden: false,
+          }) satisfies FileContentFragmentType
+      ),
+      ...(contentFragments?.contentNodes ?? []).map(
+        (cf) =>
+          ({
+            type: "content_fragment" as const,
+            contentFragmentType: "content_node" as const,
+
+            contentType: cf.mimeType as SupportedContentFragmentType,
+
+            title: cf.title,
+            id: Math.random(),
+
+            sId: cf.internalId,
+
+            nodeId: cf.internalId,
+            nodeDataSourceViewId: cf.dataSourceView.sId,
+            nodeType: cf.type,
+            contentNodeData: {
+              nodeId: cf.internalId,
+              nodeDataSourceViewId: cf.dataSourceView.sId,
+              nodeType: cf.type,
+              provider: cf.dataSourceView.dataSource.connectorProvider,
+              spaceName: "myspace",
+            },
+
+            created: Date.now(),
+            visibility: "visible" as const,
+            version: 0,
+            rank,
+            sourceUrl: null,
+
+            context: {
+              username: user.username,
+              fullName: user.fullName,
+              email: user.email,
+              profilePictureUrl: user.image,
+            },
+            contentFragmentId: "placeholder-content-fragment",
+            contentFragmentVersion: "latest" as const,
+            expiredReason: null,
+          }) satisfies ContentFragmentType
+      ),
+    ],
+  };
+}
+
+export function createPlaceholderAgentMessage({
+  userMessage,
+  mention,
+  rank,
+}: {
+  userMessage: UserMessageType;
+  mention: RichMention & { pictureUrl: string };
+  rank: number;
+}): AgentMessageWithStreaming {
+  const createdAt = new Date().getTime();
+  return {
+    sId: `placeholder-agent-message-${createdAt.toString()}`,
+    rank,
+    branchId: null,
+    type: "agent_message",
+    version: 0,
+    created: createdAt,
+    completedTs: null,
+    parentMessageId: userMessage.sId,
+    parentAgentMessageId: null,
+    visibility: "visible",
+    status: "created",
+    content: null,
+    chainOfThought: null,
+    error: null,
+    configuration: {
+      sId: mention.id,
+      name: mention.label,
+      pictureUrl: mention.pictureUrl ?? "",
+      status: "active",
+      canRead: true,
+    },
+    citations: {},
+    generatedFiles: [],
+    activitySteps: [],
+    resolvedModel: null,
+    modelResolutionMethod: null,
+    actions: [],
+    richMentions: [],
+    completionDurationMs: null,
+    reactions: [],
+    costCredits: null,
+
+    streaming: {
+      agentState: "placeholder",
+      inlineActivitySteps: [],
+      isRetrying: false,
+      lastUpdated: new Date(),
+      actionProgress: new Map(),
+      pendingToolCalls: [],
+    },
+  };
+}

@@ -1,0 +1,174 @@
+import { useAgentBuilderContext } from "@app/components/agent_builder/AgentBuilderContext";
+import type { AgentBuilderFormData } from "@app/components/agent_builder/AgentBuilderFormContext";
+import { useDataSourceViewsContext } from "@app/components/agent_builder/DataSourceViewsContext";
+import { useAgentRequestedSpaces } from "@app/components/agent_builder/hooks/useAgentRequestedSpaces";
+import { AgentBuilderAvailabilityMessage } from "@app/components/agent_builder/settings/AgentBuilderAvailabilityMessage";
+import { SlackSettingsSheet } from "@app/components/agent_builder/settings/SlackSettingsSheet";
+import { SettingSectionContainer } from "@app/components/agent_builder/shared/SettingSectionContainer";
+import { ManageUsersPanel } from "@app/components/assistant/conversation/space/ManageUsersPanel";
+import { BecomeEditorButton } from "@app/components/shared/BecomeEditorButton";
+import { useWorkspacePermissions } from "@app/lib/swr/permissions";
+import {
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  Eye,
+  EyeOff,
+  SlackLogo,
+  Users01,
+} from "@ruby-ai/sparkle";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React, { useState } from "react";
+import { useController } from "react-hook-form";
+
+interface AccessSectionProps {
+  initialRequestedSpaceIds?: string[];
+  isEditorGateVisible: boolean;
+  isAddingSelfAsEditor: boolean;
+  onAddSelfAsEditor: () => void;
+}
+
+export function AccessSection({
+  initialRequestedSpaceIds,
+  isEditorGateVisible,
+  isAddingSelfAsEditor,
+  onAddSelfAsEditor,
+}: AccessSectionProps) {
+  const { field: scope } = useController<
+    AgentBuilderFormData,
+    "agentSettings.scope"
+  >({
+    name: "agentSettings.scope",
+  });
+
+  const {
+    field: { value: slackProvider },
+  } = useController<AgentBuilderFormData, "agentSettings.slackProvider">({
+    name: "agentSettings.slackProvider",
+  });
+
+  const {
+    field: { value: editors, onChange: onChangeEditors },
+  } = useController<AgentBuilderFormData, "agentSettings.editors">({
+    name: "agentSettings.editors",
+  });
+
+  const [showSlackSettings, setShowSlackSettings] = useState(false);
+  const [isEditorsOpen, setIsEditorsOpen] = useState(false);
+
+  const { supportedDataSourceViews } = useDataSourceViewsContext();
+  const { owner } = useAgentBuilderContext();
+  const { hasPermission } = useWorkspacePermissions();
+  const { nonGlobalSpacesWithRestrictions } = useAgentRequestedSpaces({
+    initialRequestedSpaceIds,
+  });
+
+  const canPublishAgent = hasPermission("publish", "agent");
+
+  const getDisplayValue = () => {
+    return scope.value === "visible" ? "Published" : "Unpublished";
+  };
+
+  const getDisplayIcon = () => {
+    return scope.value === "visible" ? Eye : EyeOff;
+  };
+
+  const slackDataSource = slackProvider
+    ? supportedDataSourceViews.find(
+        (dsv) => dsv.dataSource.connectorProvider === slackProvider
+      )?.dataSource
+    : null;
+
+  const buttonLabel =
+    editors.length <= 1 ? "Add editors" : `${editors.length} editors`;
+
+  return (
+    <SettingSectionContainer title="Editors & Access">
+      <div className="mt-2 flex w-full flex-row flex-wrap items-center gap-2">
+        {isEditorGateVisible ? (
+          <BecomeEditorButton
+            isLoading={isAddingSelfAsEditor}
+            onClick={onAddSelfAsEditor}
+          />
+        ) : (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              icon={Users01}
+              label={buttonLabel}
+              onClick={() => setIsEditorsOpen(true)}
+              type="button"
+            />
+            <ManageUsersPanel
+              isOpen={isEditorsOpen}
+              setIsOpen={setIsEditorsOpen}
+              owner={owner}
+              mode="editors-only"
+              editors={editors || []}
+              onEditorsChange={onChangeEditors}
+            />
+          </>
+        )}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="outline"
+              size="sm"
+              icon={getDisplayIcon()}
+              label={getDisplayValue()}
+              isSelect
+              type="button"
+              disabled={!canPublishAgent}
+              tooltip={
+                !canPublishAgent
+                  ? "You don’t have permission to publish agents."
+                  : undefined
+              }
+            />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start">
+            <DropdownMenuItem
+              label="Published"
+              description="Visible & usable by all members of the workspace."
+              icon={Eye}
+              onClick={() => scope.onChange("visible")}
+              disabled={!canPublishAgent}
+            />
+            <DropdownMenuItem
+              label="Unpublished"
+              description="Visible & usable by editors only."
+              icon={EyeOff}
+              onClick={() => scope.onChange("hidden")}
+              disabled={!canPublishAgent}
+            />
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        {scope.value === "visible" && slackDataSource && canPublishAgent && (
+          <>
+            <Button
+              variant="outline"
+              label="Slack preferences"
+              icon={SlackLogo}
+              onClick={() => setShowSlackSettings(true)}
+              type="button"
+            />
+            <SlackSettingsSheet
+              isOpen={showSlackSettings}
+              onOpenChange={() => setShowSlackSettings(false)}
+              slackDataSource={slackDataSource}
+            />
+          </>
+        )}
+      </div>
+      <AgentBuilderAvailabilityMessage
+        owner={owner}
+        restrictedSpaces={nonGlobalSpacesWithRestrictions}
+        scope={scope.value}
+      />
+    </SettingSectionContainer>
+  );
+}

@@ -1,0 +1,63 @@
+import { getConnectorManager } from "@connectors/connectors";
+import { errorFromAny } from "@connectors/lib/error";
+import logger from "@connectors/logger/logger";
+import { apiError, withLogging } from "@connectors/logger/withlogging";
+import { ConnectorResource } from "@connectors/resources/connector_resource";
+import type { WithConnectorsAPIErrorReponse } from "@connectors/types";
+import type { Request, Response } from "express";
+
+type ConnectorUnpauseResBody = WithConnectorsAPIErrorReponse<{
+  connectorId: string;
+}>;
+
+const _unpauseConnectorAPIHandler = async (
+  req: Request<{ connector_id: string }, ConnectorUnpauseResBody>,
+  res: Response<ConnectorUnpauseResBody>
+) => {
+  let connector: ConnectorResource | null = null;
+  try {
+    connector = await ConnectorResource.fetchById(req.params.connector_id);
+    if (!connector) {
+      return apiError(req, res, {
+        api_error: {
+          type: "connector_not_found",
+          message: "Connector not found",
+        },
+        status_code: 404,
+      });
+    }
+
+    const unpauseRes = await getConnectorManager({
+      connectorProvider: connector.type,
+      connectorId: connector.id,
+    }).unpauseAndResume();
+
+    if (unpauseRes.isErr()) {
+      return apiError(req, res, {
+        status_code: 500,
+        api_error: {
+          type: "internal_server_error",
+          message: unpauseRes.error.message,
+        },
+      });
+    }
+
+    return res.sendStatus(204);
+  } catch (e) {
+    logger.error(
+      { error: errorFromAny(e), connectorId: connector?.id },
+      "Failed to unpause the connector"
+    );
+    return apiError(req, res, {
+      status_code: 500,
+      api_error: {
+        type: "internal_server_error",
+        message: "Could not unpause the connector",
+      },
+    });
+  }
+};
+
+export const unpauseConnectorAPIHandler = withLogging(
+  _unpauseConnectorAPIHandler
+);

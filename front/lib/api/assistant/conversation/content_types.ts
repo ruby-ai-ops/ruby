@@ -1,0 +1,58 @@
+// All mime types are okay to use from the public API.
+
+import type { SupportedContentFragmentType } from "@app/types/content_fragment";
+import { isSupportedDelimitedTextContentType } from "@app/types/files";
+import {
+  CONTENT_NODE_MIME_TYPES,
+  isRubyMimeType,
+  isIncludableInternalMimeType,
+  isSupportedImageContentType,
+  // biome-ignore lint/plugin/enforceClientTypesInPublicApi: existing usage
+} from "@ruby-ai/client";
+
+export function isConversationIncludableFileContentType(
+  contentType: SupportedContentFragmentType
+): boolean {
+  if (isRubyMimeType(contentType)) {
+    return isIncludableInternalMimeType(contentType);
+  }
+  return true;
+}
+
+export function isQueryableContentType(
+  contentType: SupportedContentFragmentType
+): boolean {
+  // For now we only allow querying tabular files and multi-sheet spreadsheets
+  // from connections.
+  if (
+    isSupportedDelimitedTextContentType(contentType) ||
+    isMultiSheetSpreadsheetContentType(contentType)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function isMultiSheetSpreadsheetContentType(
+  contentType: SupportedContentFragmentType
+): contentType is
+  | typeof CONTENT_NODE_MIME_TYPES.MICROSOFT.SPREADSHEET
+  | typeof CONTENT_NODE_MIME_TYPES.GOOGLE_DRIVE.SPREADSHEET {
+  return (
+    contentType === CONTENT_NODE_MIME_TYPES.MICROSOFT.SPREADSHEET ||
+    contentType === CONTENT_NODE_MIME_TYPES.GOOGLE_DRIVE.SPREADSHEET
+  );
+}
+
+export function isSearchableContentType(
+  contentType: SupportedContentFragmentType
+): boolean {
+  if (isSupportedImageContentType(contentType)) {
+    return false;
+  }
+  if (isSupportedDelimitedTextContentType(contentType)) {
+    return false;
+  }
+  // For now we allow searching everything else.
+  return true;
+}

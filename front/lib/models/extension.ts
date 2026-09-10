@@ -1,0 +1,35 @@
+import { frontSequelize } from "@app/lib/resources/storage";
+import { DataTypes } from "@app/lib/resources/storage/data_types";
+import { WorkspaceAwareModel } from "@app/lib/resources/storage/wrappers/workspace_models";
+import type { CreationOptional } from "sequelize";
+
+export class ExtensionConfigurationModel extends WorkspaceAwareModel<ExtensionConfigurationModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare blacklistedDomains: string[];
+}
+ExtensionConfigurationModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    blacklistedDomains: {
+      type: DataTypes.ARRAY(DataTypes.STRING),
+      allowNull: false,
+      defaultValue: [],
+    },
+  },
+  {
+    modelName: "extension_configuration",
+    sequelize: frontSequelize,
+    indexes: [{ unique: true, fields: ["workspaceId"] }],
+  }
+);

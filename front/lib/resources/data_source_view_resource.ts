@@ -1,0 +1,911 @@
+// Attributes are marked as read-only to reflect the stateless nature of our Resource.
+// This design will be moved up to BaseResource once we transition away from Sequelize.
+
+import config from "@app/lib/api/config";
+import type { Authenticator } from "@app/lib/auth";
+import { isFolder, isWebsite } from "@app/lib/data_sources";
+import { AgentDataSourceConfigurationModel } from "@app/lib/models/agent/actions/data_sources";
+import { AgentMCPServerConfigurationModel } from "@app/lib/models/agent/actions/mcp";
+import { AgentTablesQueryConfigurationTableModel } from "@app/lib/models/agent/actions/tables_query";
+import { SkillDataSourceConfigurationModel } from "@app/lib/models/skill";
+import { DataSourceResource } from "@app/lib/resources/data_source_resource";
+import { GroupResource } from "@app/lib/resources/group_resource";
+import { ResourceWithSpace } from "@app/lib/resources/resource_with_space";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
+import { DataSourceModel } from "@app/lib/resources/storage/models/data_source";
+import { DataSourceViewModel } from "@app/lib/resources/storage/models/data_source_view";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
+import {
+  getResourceIdFromSId,
+  isResourceSId,
+  makeSId,
+} from "@app/lib/resources/string_ids";
+import type { ResourceFindOptions } from "@app/lib/resources/types";
+import { withTransaction } from "@app/lib/utils/sql_utils";
+import logger from "@app/logger/logger";
+import type { DataSourceViewCategory } from "@app/types/api/public/spaces";
+import { CoreAPI } from "@app/types/core/core_api";
+import type { DataSourceViewType } from "@app/types/data_source_view";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type { UserType } from "@app/types/user";
+import { formatUserFullName } from "@app/types/user";
+import assert from "assert";
+import keyBy from "lodash/keyBy";
+import type {
+  Attributes,
+  CreationAttributes,
+  ModelStatic,
+  Transaction,
+  WhereOptions,
+} from "sequelize";
+import { Op } from "sequelize";
+
+import type { UserResource } from "./user_resource";
+
+const getDataSourceCategory = (
+  dataSourceResource: DataSourceResource
+): DataSourceViewCategory => {
+  if (isFolder(dataSourceResource)) {
+    return "folder";
+  }
+
+  if (isWebsite(dataSourceResource)) {
+    return "website";
+  }
+
+  return "managed";
+};
+
+type FetchDataSourceViewOptions = {
+  includeDeleted?: boolean;
+  includeEditedBy?: boolean;
+  limit?: number;
+  order?: [string, "ASC" | "DESC"][];
+};
+
+type AllowedSearchColumns = "vaultId" | "dataSourceId" | "kind" | "vaultKind";
+function isAllowedSearchColumn(column: string): column is AllowedSearchColumns {
+  return (
+    column === "vaultId" ||
+    column === "dataSourceId" ||
+    column === "kind" ||
+    column === "vaultKind"
+  );
+}
+
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface DataSourceViewResource
+  extends ReadonlyAttributesType<DataSourceViewModel> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class DataSourceViewResource extends ResourceWithSpace<DataSourceViewModel> {
+  static model: ModelStatic<DataSourceViewModel> = DataSourceViewModel;
+
+  private ds?: DataSourceResource;
+  readonly editedByUser?: Attributes<UserModel>;
+
+  constructor(
+    model: ModelStatic<DataSourceViewModel>,
+    blob: Attributes<DataSourceViewModel>,
+    space: SpaceResource,
+    { editedByUser }: { editedByUser?: Attributes<UserModel> } = {}
+  ) {
+    super(DataSourceViewModel, blob, space);
+
+    this.editedByUser = editedByUser;
+  }
+
+  // Creation.
+
+  private static async makeNew(
+    blob: Omit<
+      CreationAttributes<DataSourceViewModel>,
+      "editedAt" | "editedByUserId" | "vaultId"
+    >,
+    space: SpaceResource,
+    dataSource: DataSourceResource,
+    editedByUser?: UserType | null,
+    transaction?: Transaction
+  ) {
+    const dataSourceView = await DataSourceViewResource.model.create(
+      {
+        ...blob,
+        editedByUserId: editedByUser?.id ?? null,
+        editedAt: new Date(),
+        vaultId: space.id,
+      },
+      { transaction }
+    );
+
+    const dsv = new this(
+      DataSourceViewResource.model,
+      dataSourceView.get(),
+      space
+    );
+    dsv.ds = dataSource;
+    return dsv;
+  }
+
+  static async createDataSourceAndDefaultView(
+    blob: Omit<CreationAttributes<DataSourceModel>, "editedAt" | "vaultId">,
+    space: SpaceResource,
+    editedByUser?: UserResource | null,
+    transaction?: Transaction
+  ) {
+    return withTransaction(async (t: Transaction) => {
+      const dataSource = await DataSourceResource.makeNew(
+        blob,
+        space,
+        editedByUser?.toJSON(),
+        t
+      );
+      return this.createDefaultViewInSpaceFromDataSourceIncludingAllDocuments(
+        space,
+        dataSource,
+        editedByUser?.toJSON(),
+        t
+      );
+    }, transaction);
+  }
+
+  static async createViewInSpaceFromDataSource(
+    auth: Authenticator,
+    space: SpaceResource,
+    dataSource: DataSourceResource,
+    parentsIn: string[]
+  ): Promise<Result<DataSourceViewResource, Error>> {
+    if (!dataSource.canAdministrate(auth)) {
+      return new Err(
+        new Error(
+          "You do not have the rights to create a view for this data source."
+        )
+      );
+    }
+
+    const editedByUser = auth.user();
+
+    const resource = await this.makeNew(
+      {
+        dataSourceId: dataSource.id,
+        parentsIn,
+        workspaceId: space.workspaceId,
+        kind: "custom",
+      },
+      space,
+      dataSource,
+      editedByUser?.toJSON()
+    );
+
+    return new Ok(resource);
+  }
+
+  // This view has access to all documents, which is represented by null.
+  private static async createDefaultViewInSpaceFromDataSourceIncludingAllDocuments(
+    space: SpaceResource,
+    dataSource: DataSourceResource,
+    editedByUser?: UserType | null,
+    transaction?: Transaction
+  ) {
+    return this.makeNew(
+      {
+        dataSourceId: dataSource.id,
+        parentsIn: null,
+        workspaceId: space.workspaceId,
+        kind: "default",
+      },
+      space,
+      dataSource,
+      editedByUser,
+      transaction
+    );
+  }
+
+  // Fetching.
+
+  private static getOptions(
+    options?: FetchDataSourceViewOptions
+  ): ResourceFindOptions<DataSourceViewModel> {
+    const result: ResourceFindOptions<DataSourceViewModel> = {};
+
+    if (options?.includeEditedBy) {
+      result.includes = [
+        {
+          model: UserModel,
+          as: "editedByUser",
+          required: false,
+        },
+      ];
+    }
+
+    if (options?.limit) {
+      result.limit = options.limit;
+    }
+
+    if (options?.order) {
+      result.order = options.order;
+    }
+
+    return result;
+  }
+
+  private static async baseFetch(
+    auth: Authenticator,
+    fetchDataSourceViewOptions?: FetchDataSourceViewOptions,
+    options?: ResourceFindOptions<DataSourceViewModel>
+  ) {
+    const { includeDeleted } = fetchDataSourceViewOptions ?? {};
+
+    const where: WhereOptions<DataSourceViewModel> = {
+      ...options?.where,
+      workspaceId: auth.getNonNullableWorkspace().id,
+    };
+
+    const dataSourceViews = await this.baseFetchWithAuthorization(auth, {
+      ...this.getOptions(fetchDataSourceViewOptions),
+      ...options,
+      includeDeleted,
+      where,
+    });
+
+    const dataSourceIds = removeNulls(
+      dataSourceViews.map((ds) => ds.dataSourceId)
+    );
+
+    const dataSources = await DataSourceResource.fetchByModelIds(
+      auth,
+      dataSourceIds,
+      {
+        includeEditedBy: fetchDataSourceViewOptions?.includeEditedBy,
+        includeDeleted,
+      }
+    );
+
+    const dataSourceById = keyBy(dataSources, "id");
+
+    for (const dsv of dataSourceViews) {
+      dsv.ds = dataSourceById[dsv.dataSourceId];
+    }
+
+    return dataSourceViews;
+  }
+
+  static async listByWorkspace(
+    auth: Authenticator,
+    fetchDataSourceViewOptions?: FetchDataSourceViewOptions,
+    includeConversationDataSources?: boolean
+  ) {
+    const options: ResourceFindOptions<DataSourceViewModel> = {
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    };
+
+    if (!includeConversationDataSources) {
+      // We make an extra request to fetch the conversation space first.
+      // This allows early filtering of the data source views as there is no way to know
+      // if a datasource view is related to a conversation from it's attributes alone.
+      const conversationSpace =
+        await SpaceResource.fetchWorkspaceConversationsSpace(auth);
+      options.where = {
+        ...options.where,
+        vaultId: {
+          [Op.notIn]: [conversationSpace.id],
+        },
+      };
+    }
+
+    const dataSourceViews = await this.baseFetch(
+      auth,
+      fetchDataSourceViewOptions,
+      options
+    );
+
+    return dataSourceViews.filter((dsv) => dsv.canReadOrAdministrate(auth));
+  }
+
+  static async listBySpace(
+    auth: Authenticator,
+    space: SpaceResource,
+    fetchDataSourceViewOptions?: FetchDataSourceViewOptions
+  ) {
+    return this.listBySpaces(auth, [space], fetchDataSourceViewOptions);
+  }
+
+  static async listBySpaces(
+    auth: Authenticator,
+    spaces: SpaceResource[],
+    fetchDataSourceViewOptions?: FetchDataSourceViewOptions
+  ) {
+    // We inject the auth workspaceId to make sure we rely on the associated index as there is no
+    // cross-workspace data source support at this stage.
+    return this.baseFetch(auth, fetchDataSourceViewOptions, {
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        vaultId: spaces.map((s) => s.id),
+      },
+    });
+  }
+
+  static async listBySpaceIds(
+    auth: Authenticator,
+    spaceIds: string[],
+    { includeGlobalSpace = false }: { includeGlobalSpace?: boolean } = {}
+  ) {
+    // Resolve global space to a vaultId so we can filter with vaultId IN (...)
+    // (index-friendly) instead of joining vaults with (id IN OR kind = 'global').
+    const spaceModelIds = [
+      ...removeNulls(spaceIds.map(getResourceIdFromSId)),
+      ...(includeGlobalSpace
+        ? [(await SpaceResource.fetchWorkspaceGlobalSpace(auth)).id]
+        : []),
+    ];
+
+    if (spaceModelIds.length === 0) {
+      return [];
+    }
+
+    return this.baseFetch(auth, undefined, {
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        vaultId: [...new Set(spaceModelIds)],
+      },
+    });
+  }
+
+  static async listAssistantDefaultSelected(auth: Authenticator) {
+    const globalGroup = await GroupResource.fetchWorkspaceGlobalGroup(auth);
+    assert(globalGroup.isOk(), "Failed to fetch global group");
+
+    const spaces = await SpaceResource.listForGroups(auth, [globalGroup.value]);
+
+    return this.baseFetch(auth, undefined, {
+      includes: [
+        {
+          model: DataSourceModel,
+          as: "dataSourceForView",
+          required: true,
+          where: {
+            assistantDefaultSelected: true,
+          },
+        },
+      ],
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        vaultId: spaces.map((s) => s.id),
+      },
+    });
+  }
+
+  static async listAllInGlobalGroup(auth: Authenticator) {
+    const globalGroup = await GroupResource.fetchWorkspaceGlobalGroup(auth);
+    assert(globalGroup.isOk(), "Failed to fetch global group");
+
+    const spaces = await SpaceResource.listForGroups(auth, [globalGroup.value]);
+
+    return this.baseFetch(auth, undefined, {
+      includes: [
+        {
+          model: DataSourceModel,
+          as: "dataSourceForView",
+          required: true,
+        },
+      ],
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        vaultId: spaces.map((s) => s.id),
+      },
+    });
+  }
+
+  static async listForDataSourcesInSpace(
+    auth: Authenticator,
+    dataSources: DataSourceResource[],
+    space: SpaceResource,
+    fetchDataSourceViewOptions?: FetchDataSourceViewOptions
+  ) {
+    // We inject the auth workspaceId to make sure we rely on the associated index as there is no
+    // cross-workspace data source support at this stage.
+    return this.baseFetch(auth, fetchDataSourceViewOptions, {
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        dataSourceId: dataSources.map((ds) => ds.id),
+        vaultId: space.id,
+      },
+    });
+  }
+
+  static async listForDataSources(
+    auth: Authenticator,
+    dataSources: DataSourceResource[],
+    fetchDataSourceViewOptions?: FetchDataSourceViewOptions
+  ) {
+    // We inject the auth workspaceId to make sure we rely on the associated index as there is no
+    // cross-workspace data source support at this stage.
+    return this.baseFetch(auth, fetchDataSourceViewOptions, {
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        dataSourceId: dataSources.map((ds) => ds.id),
+      },
+    });
+  }
+
+  static async fetchById(
+    auth: Authenticator,
+    id: string,
+    fetchDataSourceViewOptions?: Omit<
+      FetchDataSourceViewOptions,
+      "limit" | "order"
+    >
+  ): Promise<DataSourceViewResource | null> {
+    const [dataSourceView] = await DataSourceViewResource.fetchByIds(
+      auth,
+      [id],
+      fetchDataSourceViewOptions
+    );
+
+    return dataSourceView ?? null;
+  }
+
+  static async fetchByIds(
+    auth: Authenticator,
+    ids: string[],
+    fetchDataSourceViewOptions?: Omit<
+      FetchDataSourceViewOptions,
+      "limit" | "order"
+    >
+  ) {
+    const dataSourceViewModelIds = removeNulls(ids.map(getResourceIdFromSId));
+
+    const dataSourceViews = await this.baseFetch(
+      auth,
+      fetchDataSourceViewOptions,
+      {
+        where: {
+          id: {
+            [Op.in]: dataSourceViewModelIds,
+          },
+        },
+      }
+    );
+
+    return dataSourceViews ?? [];
+  }
+
+  static async fetchByModelIds(auth: Authenticator, ids: ModelId[]) {
+    const dataSourceViews = await this.baseFetch(
+      auth,
+      {},
+      {
+        where: {
+          id: {
+            [Op.in]: ids,
+          },
+        },
+      }
+    );
+
+    return dataSourceViews ?? [];
+  }
+
+  static async fetchByConversationModelIds(
+    auth: Authenticator,
+    conversationModelIds: ModelId[]
+  ): Promise<DataSourceViewResource[]> {
+    if (conversationModelIds.length === 0) {
+      return [];
+    }
+
+    const dataSources = await DataSourceResource.fetchByConversationModelIds(
+      auth,
+      conversationModelIds
+    );
+    if (dataSources.length === 0) {
+      return [];
+    }
+
+    return this.baseFetch(
+      auth,
+      {},
+      {
+        where: {
+          workspaceId: auth.getNonNullableWorkspace().id,
+          kind: "default",
+          dataSourceId: { [Op.in]: dataSources.map((ds) => ds.id) },
+        },
+      }
+    );
+  }
+
+  static async search(
+    auth: Authenticator,
+    searchParams: {
+      [key in AllowedSearchColumns]?: string;
+    }
+  ): Promise<DataSourceViewResource[]> {
+    const owner = auth.workspace();
+    if (!owner) {
+      return [];
+    }
+
+    const whereClause: WhereOptions = {
+      workspaceId: owner.id,
+    };
+
+    for (const [key, value] of Object.entries(searchParams)) {
+      // Security in depth as this parameter could override workspace segmentation if abused.
+      assert(isAllowedSearchColumn(key), "Unexpected search column");
+      if (value) {
+        switch (key) {
+          case "dataSourceId":
+          case "vaultId":
+            const resourceModelId = getResourceIdFromSId(value);
+
+            if (resourceModelId) {
+              whereClause[key] = resourceModelId;
+            } else {
+              return [];
+            }
+            break;
+          case "vaultKind":
+            whereClause["$space.kind$"] = searchParams.vaultKind;
+            break;
+          case "kind":
+            whereClause["kind"] = searchParams.kind;
+            break;
+
+          default:
+            assertNever(key);
+        }
+      }
+    }
+
+    return this.baseFetch(
+      auth,
+      {},
+      {
+        where: whereClause,
+        order: [["updatedAt", "DESC"]],
+      }
+    );
+  }
+
+  // Updating.
+
+  async setEditedBy(auth: Authenticator) {
+    await this.update({
+      editedByUserId: auth.user()?.id ?? null,
+      editedAt: new Date(),
+    });
+  }
+
+  private makeEditedBy(
+    editedByUser: Attributes<UserModel> | undefined,
+    editedAt: Date | undefined
+  ) {
+    if (!editedByUser || !editedAt) {
+      return undefined;
+    }
+
+    return {
+      editedByUser: {
+        editedAt: editedAt.getTime(),
+        fullName: formatUserFullName(editedByUser),
+        imageUrl: editedByUser.imageUrl,
+        email: editedByUser.email,
+        userId: editedByUser.sId,
+      },
+    };
+  }
+
+  async updateParents(
+    parentsToAdd: string[] = [],
+    parentsToRemove: string[] = []
+  ): Promise<Result<undefined, Error>> {
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+    const currentParents = this.parentsIn || [];
+
+    if (this.kind === "default") {
+      return new Err(
+        new Error("`parentsIn` cannot be set for default data source view")
+      );
+    }
+
+    // Check parentsToAdd exist in core as part of this data source view.
+    const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+    const allNodes = [];
+    let nextPageCursor;
+
+    do {
+      const coreRes = await coreAPI.searchNodes({
+        filter: {
+          data_source_views: [
+            {
+              data_source_id: this.dataSource.rubyAPIDataSourceId,
+              view_filter: [],
+            },
+          ],
+          node_ids: parentsToAdd,
+        },
+        options: {
+          cursor: nextPageCursor,
+        },
+      });
+
+      if (coreRes.isErr()) {
+        return new Err(new Error(coreRes.error.message));
+      }
+      allNodes.push(...coreRes.value.nodes);
+      nextPageCursor = coreRes.value.next_page_cursor;
+    } while (nextPageCursor);
+
+    // set to avoid O(n**2) complexity in check below
+    const coreParents = new Set(allNodes.map((node) => node.node_id));
+    if (parentsToAdd.some((parent) => !coreParents.has(parent))) {
+      return new Err(
+        new Error("Some parents do not exist in this data source view.")
+      );
+    }
+
+    // add new parents
+    const newParents = [...new Set(currentParents), ...new Set(parentsToAdd)];
+
+    // remove specified parents
+    const updatedParents = newParents.filter(
+      (parent) => !parentsToRemove.includes(parent)
+    );
+
+    const filteredParents =
+      DataSourceViewResource.removeChildrenIfEnclosedBy(updatedParents);
+
+    await this.update({ parentsIn: filteredParents });
+
+    return new Ok(undefined);
+  }
+
+  static removeChildrenIfEnclosedBy(parentsIn: string[]): string[] {
+    // Parents paths are specified using dot syntax.
+    // Clean-up the list so no children are left if they have enclosing parents already in the list.
+    // Important: Sort by length asc so we start with the potential enclosing parents first.
+    const sortedByLength = [...parentsIn].sort((a, b) => a.length - b.length);
+    const filteredParents: string[] = [];
+    for (const parent of sortedByLength) {
+      let enclosingParentFound = false;
+
+      // No need to check if the parent has no dots, it's a root node.
+      if (parent.indexOf(".") !== -1) {
+        const parts = parent.split(".");
+
+        let potentialEnclosingParentPath = "";
+        for (const part of parts) {
+          potentialEnclosingParentPath += part + ".";
+          const pathWithoutDot = potentialEnclosingParentPath.substring(
+            0,
+            potentialEnclosingParentPath.length - 1
+          );
+          if (filteredParents.some((p) => p === pathWithoutDot)) {
+            // Found an enclosing parent, so we don't add this parent to the list
+            enclosingParentFound = true;
+            break;
+          }
+        }
+      }
+      if (!enclosingParentFound) {
+        // If the parent is not a child of any other parent, add it to the list
+        filteredParents.push(parent);
+      }
+    }
+
+    return filteredParents;
+  }
+
+  async setParents(
+    parentsIn: string[] | null
+  ): Promise<Result<undefined, Error>> {
+    if (this.kind === "default") {
+      return new Err(
+        new Error("`parentsIn` cannot be set for default data source view")
+      );
+    }
+
+    await this.update({ parentsIn });
+    return new Ok(undefined);
+  }
+
+  // Deletion.
+
+  protected async softDelete(
+    auth: Authenticator,
+    transaction?: Transaction
+  ): Promise<Result<number, Error>> {
+    // Mark all content fragments that reference this data source view as expired.
+    await this.expireContentFragments(auth, transaction);
+
+    const deletedCount = await DataSourceViewModel.destroy({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        id: this.id,
+      },
+      transaction,
+      hardDelete: false,
+    });
+
+    return new Ok(deletedCount);
+  }
+
+  async expireContentFragments(
+    auth: Authenticator,
+    transaction?: Transaction
+  ): Promise<void> {
+    // Mark all content fragments that reference this data source view as expired.
+    await ContentFragmentModel.update(
+      {
+        nodeId: null,
+        nodeDataSourceViewId: null,
+        expiredReason: "data_source_deleted",
+      },
+      {
+        where: {
+          nodeDataSourceViewId: this.id,
+          workspaceId: auth.getNonNullableWorkspace().id,
+        },
+        transaction,
+      }
+    );
+  }
+
+  async hardDelete(
+    auth: Authenticator,
+    transaction?: Transaction
+  ): Promise<Result<number, Error>> {
+    // Mark all content fragments that reference this data source view as expired.
+    await this.expireContentFragments(auth, transaction);
+
+    const workspaceId = auth.getNonNullableWorkspace().id;
+
+    const agentDataSourceConfigurations =
+      await AgentDataSourceConfigurationModel.findAll({
+        where: {
+          dataSourceViewId: this.id,
+          workspaceId,
+        },
+      });
+
+    const agentTablesQueryConfigurations =
+      await AgentTablesQueryConfigurationTableModel.findAll({
+        where: {
+          dataSourceViewId: this.id,
+          workspaceId,
+        },
+      });
+
+    const mcpServerConfigurationIds = removeNulls(
+      [...agentDataSourceConfigurations, ...agentTablesQueryConfigurations].map(
+        (a) => a.mcpServerConfigurationId
+      )
+    );
+
+    await AgentDataSourceConfigurationModel.destroy({
+      where: {
+        dataSourceViewId: this.id,
+        workspaceId,
+      },
+      transaction,
+    });
+
+    await AgentTablesQueryConfigurationTableModel.destroy({
+      where: {
+        dataSourceViewId: this.id,
+        workspaceId,
+      },
+      transaction,
+    });
+
+    await SkillDataSourceConfigurationModel.destroy({
+      where: {
+        dataSourceViewId: this.id,
+        workspaceId,
+      },
+      transaction,
+    });
+
+    // Delete associated MCP server configurations.
+    if (mcpServerConfigurationIds.length > 0) {
+      await AgentMCPServerConfigurationModel.destroy({
+        where: {
+          id: {
+            [Op.in]: mcpServerConfigurationIds,
+          },
+          workspaceId,
+        },
+        transaction,
+      });
+    }
+
+    const deletedCount = await DataSourceViewModel.destroy({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        id: this.id,
+      },
+      transaction,
+      // Use 'hardDelete: true' to ensure the record is permanently deleted from the database,
+      // bypassing the soft deletion in place.
+      hardDelete: true,
+    });
+
+    return new Ok(deletedCount);
+  }
+
+  // Getters.
+
+  get dataSource(): DataSourceResource {
+    return this.ds as DataSourceResource;
+  }
+
+  // sId logic.
+
+  get sId(): string {
+    return DataSourceViewResource.modelIdToSId({
+      id: this.id,
+      workspaceId: this.workspaceId,
+    });
+  }
+
+  static modelIdToSId({
+    id,
+    workspaceId,
+  }: {
+    id: ModelId;
+    workspaceId: ModelId;
+  }): string {
+    return makeSId("data_source_view", {
+      id,
+      workspaceId,
+    });
+  }
+
+  static isDataSourceViewSId(sId: string): boolean {
+    return isResourceSId("data_source_view", sId);
+  }
+
+  // Serialization.
+
+  toJSON(): DataSourceViewType {
+    return {
+      category: getDataSourceCategory(this.dataSource),
+      createdAt: this.createdAt.getTime(),
+      dataSource: this.dataSource.toJSON(),
+      id: this.id,
+      kind: this.kind,
+      parentsIn: this.parentsIn,
+      sId: this.sId,
+      updatedAt: this.updatedAt.getTime(),
+      spaceId: this.space.sId,
+      ...this.makeEditedBy(this.editedByUser, this.editedAt),
+    };
+  }
+
+  toTraceJSON() {
+    return {
+      id: this.id,
+      sId: this.sId,
+      kind: this.kind,
+    };
+  }
+
+  toViewFilter() {
+    return {
+      parents: {
+        in: this.parentsIn,
+        not: null,
+      },
+      tags: null,
+      timestamp: null,
+    };
+  }
+}

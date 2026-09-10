@@ -1,0 +1,48 @@
+import { AgentBuilderSectionContainer } from "@app/components/agent_builder/AgentBuilderSectionContainer";
+import { AgentBuilderSimilarAgentsSection } from "@app/components/agent_builder/AgentBuilderSimilarAgentsSection";
+import { AccessSection } from "@app/components/agent_builder/settings/AccessSection";
+import { AgentBuilderAvatarSection } from "@app/components/agent_builder/settings/AgentBuilderAvatarSection";
+import { AgentBuilderDescriptionSection } from "@app/components/agent_builder/settings/AgentBuilderDescriptionSection";
+import { AgentBuilderNameSection } from "@app/components/agent_builder/settings/AgentBuilderNameSection";
+import { TagsSection } from "@app/components/agent_builder/settings/TagsSection";
+
+interface AgentBuilderSettingsBlockProps {
+  agentConfigurationId: string | null;
+  initialRequestedSpaceIds?: string[];
+  isEditorGateVisible: boolean;
+  isAddingSelfAsEditor: boolean;
+  onAddSelfAsEditor: () => void;
+}
+
+export function AgentBuilderSettingsBlock({
+  agentConfigurationId,
+  initialRequestedSpaceIds,
+  isEditorGateVisible,
+  isAddingSelfAsEditor,
+  onAddSelfAsEditor,
+}: AgentBuilderSettingsBlockProps) {
+  const isCreatingNew = !agentConfigurationId;
+  return (
+    <AgentBuilderSectionContainer title="Settings">
+      <div className="space-y-5">
+        <div className="flex items-end gap-8">
+          <div className="flex-grow">
+            <AgentBuilderNameSection isCreatingNew={isCreatingNew} />
+          </div>
+          <AgentBuilderAvatarSection isCreatingNew={isCreatingNew} />
+        </div>
+        <AgentBuilderDescriptionSection isCreatingNew={isCreatingNew} />
+        <AgentBuilderSimilarAgentsSection
+          agentConfigurationId={agentConfigurationId}
+        />
+        <AccessSection
+          initialRequestedSpaceIds={initialRequestedSpaceIds}
+          isEditorGateVisible={isEditorGateVisible}
+          isAddingSelfAsEditor={isAddingSelfAsEditor}
+          onAddSelfAsEditor={onAddSelfAsEditor}
+        />
+        <TagsSection />
+      </div>
+    </AgentBuilderSectionContainer>
+  );
+}

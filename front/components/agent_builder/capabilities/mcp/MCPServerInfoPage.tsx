@@ -1,0 +1,56 @@
+import { ToolsList } from "@app/components/actions/mcp/ToolsList";
+import { useBuilderContext } from "@app/components/shared/useBuilderContext";
+import type { MCPServerViewType } from "@app/lib/api/mcp";
+import { pluralize } from "@app/types/shared/utils/string_utils";
+import { Chip, ContentMessage } from "@ruby-ai/sparkle";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React from "react";
+
+interface MCPServerInfoPageProps {
+  infoMCPServerView: MCPServerViewType;
+}
+
+export function MCPServerInfoPage({
+  infoMCPServerView,
+}: MCPServerInfoPageProps) {
+  const { owner } = useBuilderContext();
+  const nbTools = (infoMCPServerView.server.tools ?? []).length;
+
+  return (
+    <div className="flex h-full flex-col space-y-6 pt-3">
+      <div className="space-y-4">
+        <div className="space-y-3">
+          <div className="flex items-center gap-3">
+            <h3 className="text-lg font-semibold text-foreground">
+              Available Tools
+            </h3>
+            <Chip
+              size="xs"
+              color="info"
+              label={`${nbTools} tool${pluralize(nbTools)}`}
+            />
+          </div>
+
+          {nbTools > 0 ? (
+            <div className="flex flex-col gap-4">
+              <span className="text-md text-muted-foreground">
+                {nbTools > 1 ? "These tools" : "This tool"}&nbsp;will be
+                available to your agent during conversations and can be
+                configured with different permission levels:
+              </span>
+              <ToolsList
+                owner={owner}
+                mcpServerView={infoMCPServerView}
+                disableUpdates
+              />
+            </div>
+          ) : (
+            <ContentMessage variant="primary" size="sm">
+              No tools are currently available for this server.
+            </ContentMessage>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

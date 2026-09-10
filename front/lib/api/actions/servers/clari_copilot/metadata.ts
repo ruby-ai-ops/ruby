@@ -1,0 +1,101 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { z } from "zod";
+
+export const CLARI_COPILOT_TOOLS_METADATA = [
+  {
+    name: "search_calls",
+    description:
+      "Search and list Clari Copilot sales calls, filtering by account or company " +
+      "name, participant email, or date range. " +
+      "Returns matching sales calls that have finished processing (transcript available). " +
+      "Use get_call_details to fetch the AI summary and transcript for one specific call.",
+    schema: {
+      from_date: z
+        .string()
+        .optional()
+        .describe(
+          "Filter calls starting after this date (ISO 8601, e.g. '2024-01-15T00:00:00Z')."
+        ),
+      to_date: z
+        .string()
+        .optional()
+        .describe(
+          "Filter calls starting before this date (ISO 8601, e.g. '2024-01-22T00:00:00Z')."
+        ),
+      account_name: z
+        .string()
+        .optional()
+        .describe(
+          "Filter by account/company name (case-insensitive partial match)."
+        ),
+      user_email: z
+        .string()
+        .optional()
+        .describe(
+          "Filter by internal participant email address (members of your organization)."
+        ),
+      attendee_email: z
+        .string()
+        .optional()
+        .describe(
+          "Filter by external participant email address (prospects or customers who attended the call)."
+        ),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .describe("Maximum number of calls to return (default: 25, max: 100)."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Searching Clari Copilot calls",
+      done: "Search Clari Copilot calls",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "get_call_details",
+    description:
+      "Retrieve details for a specific Clari Copilot call, including the AI summary, " +
+      "topics discussed, action items, competitor mentions, and the turn-by-turn transcript. " +
+      "Set include_transcript to false to omit the transcript and limit context size " +
+      "when only the summary and action items are needed. " +
+      "Requires a call ID from search_calls.",
+    schema: {
+      call_id: z
+        .string()
+        .describe("The Clari Copilot call ID (obtained from search_calls)."),
+      include_transcript: z
+        .boolean()
+        .optional()
+        .describe(
+          "Whether to include the turn-by-turn transcript (default: true). " +
+            "The AI summary, topics, and action items are always included. " +
+            "Set to false to reduce context size when the transcript isn't needed."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Fetching Clari Copilot call details",
+      done: "Fetch Clari Copilot call details",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+] as const;
+
+export const CLARI_COPILOT_SERVER = {
+  serverInfo: {
+    name: "clari_copilot",
+    version: "1.0.0",
+    description:
+      "Access Clari Copilot call transcripts, AI summaries, and action items.",
+    authorization: null,
+    icon: "ClariLogo",
+    documentationUrl: null,
+  },
+  tools: CLARI_COPILOT_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

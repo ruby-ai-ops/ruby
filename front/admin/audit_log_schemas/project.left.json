@@ -1,0 +1,15 @@
+{
+  "action": "project.left",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "space"
+    }
+  ],
+  "metadata": {
+    "space_name": "string",
+    "actor_type": "string"
+  }
+}

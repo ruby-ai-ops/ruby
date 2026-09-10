@@ -1,0 +1,12 @@
+{
+  "action": "sso.connection_deleted",
+  "targets": [
+    {
+      "type": "workspace"
+    }
+  ],
+  "metadata": {
+    "connection_type": "string",
+    "actor_type": "string"
+  }
+}

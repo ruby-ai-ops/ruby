@@ -1,0 +1,1100 @@
+import { useSendNotification } from "@app/hooks/useNotification";
+import type {
+  AnalyticsScopeFilter,
+  AwuUsageAnalyticsResponse,
+} from "@app/lib/api/analytics/awu_usage_analytics";
+import type {
+  GetWorkspaceProgrammaticCostResponse,
+  GroupByType,
+} from "@app/lib/api/analytics/programmatic_cost";
+import type {
+  GetBusinessActivationResponseBody,
+  PostBusinessActivationResponseBody,
+} from "@app/lib/api/checkout/business_activation";
+import type {
+  GetSeatAvailabilityResponseBody,
+  GetWelcomeResponseBody,
+  GetWorkspaceLookupResponseBody,
+  GetWorkspaceResponseBody,
+  GetWorkspaceSeatsCountResponseBody,
+  GetWorkspaceVerifiedDomainsResponseBody,
+} from "@app/lib/api/workspace";
+import { useCellContext } from "@app/lib/auth/CellContext";
+import { clientFetch } from "@app/lib/egress/client";
+import type {
+  GetMetronomeInvoiceLinesResponseBody,
+  GetMetronomeInvoiceResponseBody,
+} from "@app/lib/metronome/invoice";
+import type { GetVerifyResponseBody } from "@app/lib/plans/trial/index";
+import type { GetCouponValidateResponseBody } from "@app/lib/resources/coupon_resource";
+import type {
+  GetSubscriptionPricingResponseBody,
+  GetSubscriptionStatusResponseBody,
+} from "@app/lib/resources/subscription_resource";
+import type { GetJoinResponseBody } from "@app/lib/signup";
+import { emptyArray, useFetcher, useSWRWithDefaults } from "@app/lib/swr/swr";
+import type {
+  GetNoWorkspaceAuthContextResponseType,
+  GetWorkspaceAuthContextResponseType,
+} from "@app/types/api/auth_context";
+import type { GetBillingInfoResponseBody } from "@app/types/api/billing/info";
+import type { GetBillingInvoicesResponseBody } from "@app/types/api/billing/invoices";
+import type { GetPreparePaymentResponseBody } from "@app/types/api/checkout/prepare_payment";
+import type { GetWorkspaceCouponsResponseBody } from "@app/types/api/coupons";
+import type { GetMetronomeContractResponseBody } from "@app/types/api/credits/metronome_contract";
+import type { GetPendingInvitationsLookupResponseBody } from "@app/types/api/invitation";
+import type {
+  GetCheckoutStatusResponseBody,
+  GetSubscriptionsResponseBody,
+  GetSubscriptionTrialInfoResponseBody,
+  PostSubscriptionResponseBody,
+} from "@app/types/api/subscription";
+import type { CellInfo } from "@app/types/cell";
+import type { APIErrorResponse, RegionRedirectError } from "@app/types/error";
+import { isAPIErrorResponse } from "@app/types/error";
+import type { BillingPeriod } from "@app/types/plan";
+import { safeParseJSON } from "@app/types/shared/utils/json_utils";
+import type { LightWorkspaceType } from "@app/types/user";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { Fetcher } from "swr";
+
+export function isCellRedirectError(data: unknown): data is APIErrorResponse & {
+  error: {
+    redirect: CellInfo;
+  };
+} {
+  return (
+    isAPIErrorResponse(data) &&
+    "redirect" in data.error &&
+    typeof data.error.redirect === "object" &&
+    data.error.redirect !== null &&
+    "name" in data.error.redirect &&
+    "region" in data.error.redirect &&
+    "url" in data.error.redirect
+  );
+}
+
+function isRedirectResponse(data: unknown): data is { redirectUrl: string } {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "redirectUrl" in data &&
+    typeof data.redirectUrl === "string"
+  );
+}
+
+export function useWorkspace({
+  owner,
+  disabled,
+}: {
+  owner: LightWorkspaceType;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const workspaceFetcher: Fetcher<GetWorkspaceResponseBody> = fetcher;
+
+  const { data, error, mutate, isValidating } = useSWRWithDefaults(
+    `/api/w/${owner.sId}`,
+    workspaceFetcher,
+    { disabled }
+  );
+
+  return {
+    workspace: data?.workspace,
+    isWorkspaceLoading: !error && !data && !disabled,
+    isWorkspaceValidating: isValidating,
+    isWorkspaceError: error,
+    mutateWorkspace: mutate,
+  };
+}
+
+export function useUpdateWorkspaceRegionalModelsOnly({
+  owner,
+}: {
+  owner: LightWorkspaceType;
+}) {
+  const sendNotification = useSendNotification();
+  const [isUpdating, setIsUpdating] = useState(false);
+  const { mutateWorkspace } = useWorkspace({ owner, disabled: true });
+
+  const updateWorkspaceRegionalModelsOnly = useCallback(
+    async (regionalModelsOnly: boolean): Promise<boolean> => {
+      setIsUpdating(true);
+      try {
+        const res = await clientFetch(`/api/w/${owner.sId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ regionalModelsOnly }),
+        });
+
+        if (!res.ok) {
+          sendNotification({
+            type: "error",
+            title: "Update failed",
+            description:
+              "Some active agents may not be eligible for regional models.",
+          });
+          return false;
+        }
+
+        await mutateWorkspace();
+        sendNotification({
+          type: "success",
+          title: "Regional models setting updated",
+          description: regionalModelsOnly
+            ? "Only regional models are now available in this workspace."
+            : "All models are now available in this workspace.",
+        });
+        return true;
+      } finally {
+        setIsUpdating(false);
+      }
+    },
+    [owner.sId, mutateWorkspace, sendNotification]
+  );
+
+  return {
+    updateWorkspaceRegionalModelsOnly,
+    isUpdatingWorkspaceRegionalModelsOnly: isUpdating,
+  };
+}
+
+export function useWorkspaceSubscriptions({
+  owner,
+  disabled,
+}: {
+  owner: LightWorkspaceType;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const workspaceSubscriptionsFetcher: Fetcher<GetSubscriptionsResponseBody> =
+    fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    `/api/w/${owner.sId}/subscriptions`,
+    workspaceSubscriptionsFetcher,
+    {
+      disabled,
+    }
+  );
+
+  return {
+    subscriptions: data?.subscriptions ?? emptyArray(),
+    isSubscriptionsLoading: !error && !data && !disabled,
+    isSubscriptionsError: error,
+  };
+}
+
+export function useWorkspaceActiveSubscription({
+  owner,
+  disabled,
+}: {
+  owner: LightWorkspaceType | undefined;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const workspaceSubscriptionsFetcher: Fetcher<GetSubscriptionsResponseBody> =
+    fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    owner ? `/api/w/${owner.sId}/subscriptions` : null,
+    workspaceSubscriptionsFetcher,
+    {
+      disabled,
+    }
+  );
+
+  const activeSubscription = useMemo(() => {
+    if (!data) {
+      return null;
+    }
+    const activeSubscriptions = data.subscriptions.filter(
+      (sub) => sub.status === "active"
+    );
+    return activeSubscriptions.length ? activeSubscriptions[0] : null;
+  }, [data]);
+
+  return {
+    activeSubscription,
+    isActiveSubscriptionLoading: !error && !data,
+    isActiveSubscriptionError: error,
+  };
+}
+
+export function useWorkspaceProgrammaticCost({
+  workspaceId,
+  groupBy,
+  groupByCount,
+  selectedPeriod,
+  billingCycleStartDay,
+  filter,
+  disabled,
+}: {
+  workspaceId: string;
+  groupBy?: GroupByType;
+  groupByCount?: number;
+  selectedPeriod?: string;
+  billingCycleStartDay: number;
+  filter?: Partial<Record<GroupByType, string[]>>;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const fetcherFn: Fetcher<GetWorkspaceProgrammaticCostResponse> = fetcher;
+
+  const queryParams = new URLSearchParams();
+  queryParams.set("billingCycleStartDay", billingCycleStartDay.toString());
+  if (selectedPeriod) {
+    queryParams.set("selectedPeriod", selectedPeriod);
+  }
+  if (groupBy) {
+    queryParams.set("groupBy", groupBy);
+  }
+  if (groupByCount !== undefined) {
+    queryParams.set("groupByCount", groupByCount.toString());
+  }
+  if (filter && Object.keys(filter).length > 0) {
+    queryParams.set("filter", JSON.stringify(filter));
+  }
+  const queryString = queryParams.toString();
+  const key = `/api/w/${workspaceId}/analytics/programmatic-cost?${queryString}`;
+
+  const { data, error, isValidating } = useSWRWithDefaults(
+    disabled ? null : key,
+    fetcherFn
+  );
+
+  return {
+    programmaticCostData: data,
+    isProgrammaticCostLoading: !error && !data && !disabled,
+    isProgrammaticCostError: error,
+    isProgrammaticCostValidating: isValidating,
+  };
+}
+
+export function useAwuUsageFromAnalytics({
+  workspaceId,
+  groupBy,
+  groupByCount,
+  granularity,
+  days,
+  filter,
+  disabled,
+  urlPrefix,
+}: {
+  workspaceId: string;
+  groupBy?: "usage_type" | "agent" | "user" | "origin" | "api_key" | "model";
+  groupByCount?: number;
+  granularity?: "day" | "week" | "month";
+  days?: number;
+  filter?: AnalyticsScopeFilter;
+  disabled?: boolean;
+  urlPrefix?: string;
+}) {
+  const { fetcher } = useFetcher();
+  const fetcherFn: Fetcher<AwuUsageAnalyticsResponse> = fetcher;
+
+  const queryParams = new URLSearchParams();
+  if (groupBy) {
+    queryParams.set("groupBy", groupBy);
+  }
+  if (groupByCount !== undefined) {
+    queryParams.set("groupByCount", groupByCount.toString());
+  }
+  if (granularity) {
+    queryParams.set("granularity", granularity);
+  }
+  if (days !== undefined) {
+    queryParams.set("days", days.toString());
+  }
+  if (filter && Object.keys(filter).length > 0) {
+    queryParams.set("filter", JSON.stringify(filter));
+  }
+  const queryString = queryParams.toString();
+  const prefix =
+    urlPrefix ?? `/api/w/${workspaceId}/analytics/awu-usage-analytics`;
+  const key = `${prefix}?${queryString}`;
+
+  const { data, error, isValidating } = useSWRWithDefaults(
+    disabled ? null : key,
+    fetcherFn
+  );
+
+  return {
+    awuUsageData: data,
+    isAwuUsageLoading: !error && !data && !disabled,
+    isAwuUsageError: error,
+    isAwuUsageValidating: isValidating,
+  };
+}
+
+export function useWorkspaceSeatAvailability({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const seatAvailabilityFetcher: Fetcher<GetSeatAvailabilityResponseBody> =
+    fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/seats/availability`,
+    seatAvailabilityFetcher,
+    { disabled }
+  );
+
+  return {
+    hasAvailableSeats: data?.hasAvailableSeats ?? false,
+    isSeatAvailabilityLoading: !error && !data && !disabled,
+    isSeatAvailabilityError: error,
+    mutateSeatAvailability: mutate,
+  };
+}
+
+export function usePerSeatPricing({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const pricingFetcher: Fetcher<GetSubscriptionPricingResponseBody> = fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/subscriptions/pricing`,
+    pricingFetcher,
+    { disabled }
+  );
+
+  return {
+    perSeatPricing: data?.perSeatPricing ?? null,
+    isPerSeatPricingLoading: !error && !data && !disabled,
+    isPerSeatPricingError: error,
+  };
+}
+
+export function useMetronomeContract({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const contractFetcher: Fetcher<GetMetronomeContractResponseBody> = fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/metronome/contract`,
+    contractFetcher,
+    {
+      disabled,
+      revalidateOnFocus: false,
+      dedupingInterval: 60_000,
+    }
+  );
+
+  return {
+    contract: data?.contract ?? null,
+    isMetronomeContractLoading: !error && !data && !disabled,
+    isMetronomeContractError: error,
+    mutateMetronomeContract: mutate,
+  };
+}
+
+export function useMetronomeInvoice({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const invoiceFetcher: Fetcher<GetMetronomeInvoiceResponseBody> = fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/metronome/invoice`,
+    invoiceFetcher,
+    {
+      disabled,
+      revalidateOnFocus: false,
+      dedupingInterval: 60_000,
+    }
+  );
+
+  return {
+    invoice: data?.invoice ?? null,
+    isMetronomeInvoiceLoading: !error && !data && !disabled,
+    isMetronomeInvoiceError: error,
+    mutateMetronomeInvoice: mutate,
+  };
+}
+
+export function useMetronomeInvoiceLines({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const linesFetcher: Fetcher<GetMetronomeInvoiceLinesResponseBody> = fetcher;
+
+  const url = `/api/w/${workspaceId}/metronome/invoice/lines`;
+
+  const { data, error, mutate } = useSWRWithDefaults(url, linesFetcher, {
+    disabled,
+    revalidateOnFocus: false,
+    dedupingInterval: 60_000,
+  });
+
+  return {
+    invoiceLines: data ?? null,
+    isMetronomeInvoiceLinesLoading: !error && !data && !disabled,
+    isMetronomeInvoiceLinesError: error,
+    mutateMetronomeInvoiceLines: mutate,
+  };
+}
+
+export function useBillingInfo({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const billingInfoFetcher: Fetcher<GetBillingInfoResponseBody> = fetcher;
+
+  const { data, error, isValidating, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/billing/info`,
+    billingInfoFetcher,
+    {
+      disabled,
+      revalidateOnFocus: false,
+      dedupingInterval: 60_000,
+    }
+  );
+
+  return {
+    billingInfo: data?.billingInfo ?? null,
+    isBillingInfoLoading: !error && !data && !disabled,
+    isBillingInfoError: error,
+    isBillingInfoValidating: isValidating,
+    mutateBillingInfo: mutate,
+  };
+}
+
+export function useRecentBillingInvoices({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const billingInvoicesFetcher: Fetcher<GetBillingInvoicesResponseBody> =
+    fetcher;
+
+  const { data, error, isValidating, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/billing/invoices`,
+    billingInvoicesFetcher,
+    {
+      disabled,
+      revalidateOnFocus: false,
+      dedupingInterval: 60_000,
+    }
+  );
+
+  return {
+    billingInvoices: data?.billingInvoices ?? emptyArray(),
+    isBillingInvoicesLoading: !error && !data && !disabled,
+    isBillingInvoicesError: error,
+    isBillingInvoicesValidating: isValidating,
+    mutateBillingInvoices: mutate,
+  };
+}
+
+export function useWorkspaceVerifiedDomains({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const verifiedDomainsFetcher: Fetcher<GetWorkspaceVerifiedDomainsResponseBody> =
+    fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/verified-domains`,
+    verifiedDomainsFetcher,
+    { disabled }
+  );
+
+  return {
+    verifiedDomains: data?.verifiedDomains ?? emptyArray(),
+    isVerifiedDomainsLoading: !error && !data && !disabled,
+    isVerifiedDomainsError: error,
+    mutateVerifiedDomains: mutate,
+  };
+}
+
+export function useSubscriptionTrialInfo({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const trialInfoFetcher: Fetcher<GetSubscriptionTrialInfoResponseBody> =
+    fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/subscriptions/trial-info`,
+    trialInfoFetcher,
+    { disabled }
+  );
+
+  return {
+    trialDaysRemaining: data?.trialDaysRemaining ?? null,
+    isTrialInfoLoading: !error && !data && !disabled,
+    isTrialInfoError: error,
+  };
+}
+
+export function useWorkspaceSeatsCount({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const seatsCountFetcher: Fetcher<GetWorkspaceSeatsCountResponseBody> =
+    fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/seats/count`,
+    seatsCountFetcher,
+    { disabled }
+  );
+
+  return {
+    seatsCount: data?.seatsCount ?? 0,
+    isSeatsCountLoading: !error && !data && !disabled,
+    isSeatsCountError: error,
+    mutateSeatsCount: mutate,
+  };
+}
+
+export const workspaceAuthContextUrl = (workspaceId: string) =>
+  `/api/w/${workspaceId}/auth-context`;
+
+interface UseAuthContextResult<T> {
+  authContext: T | undefined;
+  isAuthenticated: boolean;
+  isAuthContextLoading: boolean;
+  authContextError: APIErrorResponse | Error | undefined;
+  mutateAuthContext: () => Promise<T | undefined>;
+}
+
+export function useAuthContext(options?: {
+  disabled?: boolean;
+}): UseAuthContextResult<
+  Exclude<GetNoWorkspaceAuthContextResponseType, RegionRedirectError>
+>;
+
+export function useAuthContext(options: {
+  workspaceId: string;
+  disabled?: boolean;
+}): UseAuthContextResult<
+  Exclude<GetWorkspaceAuthContextResponseType, RegionRedirectError>
+>;
+
+export function useAuthContext(
+  options: { workspaceId?: string; disabled?: boolean } = {}
+) {
+  const { workspaceId, disabled } = options;
+  const { fetcher } = useFetcher();
+  const { setCellInfo } = useCellContext();
+
+  const url = workspaceId
+    ? workspaceAuthContextUrl(workspaceId)
+    : `/api/auth-context`;
+
+  const authContextFetcher: Fetcher<
+    GetNoWorkspaceAuthContextResponseType | GetWorkspaceAuthContextResponseType
+  > = fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(url, authContextFetcher, {
+    disabled,
+  });
+
+  const cellRedirect = isCellRedirectError(error)
+    ? error.error.redirect
+    : undefined;
+  const isFetching = !error && !data && !disabled;
+  const isAuthenticated = !cellRedirect && !!data?.user;
+
+  // Handle cell redirect.
+  useEffect(() => {
+    if (cellRedirect) {
+      setCellInfo(cellRedirect);
+      void mutate();
+    }
+  }, [cellRedirect, mutate, setCellInfo]);
+
+  return {
+    authContext: cellRedirect ? undefined : data,
+    isAuthenticated,
+    isAuthContextLoading: isFetching || !!cellRedirect,
+    authContextError: error,
+    mutateAuthContext: mutate,
+  };
+}
+
+export function useCheckoutStatus({
+  workspaceId,
+  sessionId,
+  planCode,
+  disabled,
+  pollIntervalMs = 0,
+}: {
+  workspaceId: string;
+  sessionId: string;
+  planCode?: string;
+  disabled?: boolean;
+  pollIntervalMs?: number;
+}) {
+  const { fetcher } = useFetcher();
+  const checkoutFetcher: Fetcher<GetCheckoutStatusResponseBody> = fetcher;
+
+  const url = planCode
+    ? `/api/w/${workspaceId}/subscriptions/checkout-status?session_id=${sessionId}&plan_code=${planCode}`
+    : `/api/w/${workspaceId}/subscriptions/checkout-status?session_id=${sessionId}`;
+
+  const { data, error, mutate } = useSWRWithDefaults(url, checkoutFetcher, {
+    disabled,
+    refreshInterval: pollIntervalMs,
+  });
+
+  return {
+    checkoutStatus: data ?? null,
+    isCheckoutStatusLoading: !error && !data && !disabled,
+    isCheckoutStatusError: error,
+    mutateCheckoutStatus: mutate,
+  };
+}
+
+export function useSubscriptionStatus({
+  workspaceId,
+}: {
+  workspaceId: string;
+}) {
+  const { fetcher } = useFetcher();
+  const statusFetcher: Fetcher<GetSubscriptionStatusResponseBody> = fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/subscriptions/status`,
+    statusFetcher
+  );
+
+  return {
+    shouldRedirect: data?.shouldRedirect ?? false,
+    redirectUrl: data?.redirectUrl ?? null,
+    isSubscriptionStatusLoading: !error && !data,
+    isSubscriptionStatusError: error,
+  };
+}
+
+export function useWelcomeData({ workspaceId }: { workspaceId: string }) {
+  const { fetcher } = useFetcher();
+  const welcomeFetcher: Fetcher<GetWelcomeResponseBody> = fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/welcome`,
+    welcomeFetcher
+  );
+
+  return {
+    welcomeData: data ?? null,
+    isFirstAdmin: data?.isFirstAdmin ?? false,
+    emailProvider: data?.emailProvider ?? "other",
+    isWelcomeDataLoading: !error && !data,
+    isWelcomeDataError: error,
+  };
+}
+
+export function useVerifyData({ workspaceId }: { workspaceId: string }) {
+  const { fetcher } = useFetcher();
+  const verifyFetcher: Fetcher<GetVerifyResponseBody> = fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/verify`,
+    verifyFetcher
+  );
+
+  return {
+    verifyData: data ?? null,
+    isEligibleForTrial: data?.isEligibleForTrial ?? false,
+    initialCountryCode: data?.initialCountryCode ?? "US",
+    isVerifyDataLoading: !error && !data,
+    isVerifyDataError: error,
+  };
+}
+
+export function useJoinData({
+  wId,
+  token,
+  conversationId,
+}: {
+  wId: string;
+  token: string | null;
+  conversationId: string | null;
+}) {
+  const { fetcher } = useFetcher();
+  const { setCellInfo } = useCellContext();
+  const joinFetcher: Fetcher<GetJoinResponseBody> = fetcher;
+
+  const params = new URLSearchParams();
+  if (token) {
+    params.set("t", token);
+  }
+  if (conversationId) {
+    params.set("cId", conversationId);
+  }
+  const queryString = params.toString();
+  const url = `/api/w/${wId}/join${queryString ? `?${queryString}` : ""}`;
+
+  const { data, error, mutate } = useSWRWithDefaults(url, joinFetcher);
+
+  const cellRedirect = isCellRedirectError(error)
+    ? error.error.redirect
+    : undefined;
+
+  // Handle cell redirect.
+  useEffect(() => {
+    if (cellRedirect) {
+      setCellInfo(cellRedirect);
+      void mutate();
+    }
+  }, [cellRedirect, mutate, setCellInfo]);
+
+  // The join API returns { redirectUrl: "..." } (e.g. for invalid/expired
+  // tokens). This is not a standard API error response, so the fetcher wraps
+  // it in new Error(jsonText) — we parse it back out here.
+  const redirectUrl = useMemo(() => {
+    if (!error || cellRedirect || !(error instanceof Error)) {
+      return null;
+    }
+    const parsed = safeParseJSON(error.message);
+    if (parsed.isOk() && isRedirectResponse(parsed.value)) {
+      return parsed.value.redirectUrl;
+    }
+    return null;
+  }, [error, cellRedirect]);
+
+  return {
+    joinData: data ?? null,
+    joinDataError: error ?? null,
+    isJoinDataLoading: (!error && !data) || !!cellRedirect || !!redirectUrl,
+    mutateJoinData: mutate,
+    redirectUrl,
+  };
+}
+
+export function usePendingInvitations() {
+  const { fetcher } = useFetcher();
+  const pendingInvitationsFetcher: Fetcher<GetPendingInvitationsLookupResponseBody> =
+    fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    "/api/invitations",
+    pendingInvitationsFetcher
+  );
+
+  return {
+    pendingInvitations: data?.pendingInvitations ?? emptyArray(),
+    isPendingInvitationsLoading: !error && !data,
+  };
+}
+
+export function useWorkspaceLookup({ flow }: { flow: string | null }) {
+  const { fetcher } = useFetcher();
+  const workspaceLookupFetcher: Fetcher<GetWorkspaceLookupResponseBody> =
+    fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    flow ? `/api/workspace-lookup?flow=${encodeURIComponent(flow)}` : null,
+    workspaceLookupFetcher
+  );
+
+  return {
+    workspaceLookup: data ?? null,
+    isWorkspaceLookupLoading: !error && !data && !!flow,
+    isWorkspaceLookupError: error,
+  };
+}
+
+export function useCreateCheckoutSession({
+  workspaceId,
+}: {
+  workspaceId: string;
+}) {
+  const sendNotification = useSendNotification();
+  const [isCreating, setIsCreating] = useState(false);
+
+  const createSession = useCallback(
+    async ({
+      billingPeriod,
+      couponCode,
+      seatType,
+      targetUserId,
+    }: {
+      billingPeriod: BillingPeriod;
+      couponCode?: string;
+      seatType?: "pro" | "max";
+      targetUserId?: string;
+    }): Promise<PostSubscriptionResponseBody | null> => {
+      setIsCreating(true);
+      try {
+        const res = await clientFetch(`/api/w/${workspaceId}/subscriptions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            billingPeriod,
+            couponCode,
+            seatType,
+            targetUserId,
+          }),
+        });
+        if (!res.ok) {
+          sendNotification({
+            type: "error",
+            title: "Checkout failed",
+            description:
+              "Could not initialise the payment form. Please try again.",
+          });
+          return null;
+        }
+        return res.json() as Promise<PostSubscriptionResponseBody>;
+      } finally {
+        setIsCreating(false);
+      }
+    },
+    [workspaceId, sendNotification]
+  );
+
+  return { createSession, isCreating };
+}
+
+// Polls the checkout activation status by Stripe setup session id. The session
+// id is known to the client from the first step, so polling can start while the
+// activation contract is still being provisioned (the contract id only exists
+// once that provisioning completes server-side).
+export function useCheckBusinessActivation({
+  workspaceId,
+  setupSessionId,
+  disabled,
+  pollIntervalMs = 0,
+}: {
+  workspaceId: string;
+  setupSessionId: string | null;
+  disabled?: boolean;
+  pollIntervalMs?: number;
+}) {
+  const { fetcher } = useFetcher();
+  const statusFetcher: Fetcher<GetBusinessActivationResponseBody> = fetcher;
+
+  const url =
+    disabled || !setupSessionId
+      ? null
+      : `/api/w/${workspaceId}/subscriptions/checkout/business-activation?setup_session_id=${setupSessionId}`;
+
+  const { data, error } = useSWRWithDefaults(url, statusFetcher, {
+    refreshInterval: pollIntervalMs,
+    revalidateOnFocus: false,
+  });
+
+  return {
+    checkoutPayment: data?.checkoutPayment ?? null,
+    isCheckoutPaymentLoading: !error && !data && !disabled && !!setupSessionId,
+    isCheckoutPaymentError: !!error,
+  };
+}
+
+// Fetches the Stripe hosted invoice (receipt) URL for a completed checkout. Kept
+// separate from `useCheckBusinessActivation` because the underlying Stripe
+// round-trip is slow (~seconds): the status poll must stay fast so the success
+// screen shows immediately, and this fetches the receipt URL lazily afterwards
+// (only enabled once the checkout has succeeded).
+export function useCheckoutReceiptUrl({
+  workspaceId,
+  setupSessionId,
+  disabled,
+}: {
+  workspaceId: string;
+  setupSessionId: string | null;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const statusFetcher: Fetcher<GetBusinessActivationResponseBody> = fetcher;
+
+  const url =
+    disabled || !setupSessionId
+      ? null
+      : `/api/w/${workspaceId}/subscriptions/checkout/business-activation?setup_session_id=${setupSessionId}&receipt=true`;
+
+  const { data } = useSWRWithDefaults(url, statusFetcher, {
+    revalidateOnFocus: false,
+  });
+
+  return { receiptUrl: data?.invoiceUrl ?? null };
+}
+
+export function useInitiateBusinessActivation({
+  workspaceId,
+}: {
+  workspaceId: string;
+}) {
+  const [isInitiating, setIsInitiating] = useState(false);
+
+  const initiateBusinessActivation = useCallback(
+    async ({
+      setupSessionId,
+    }: {
+      setupSessionId: string;
+    }): Promise<PostBusinessActivationResponseBody | null> => {
+      setIsInitiating(true);
+      try {
+        const res = await clientFetch(
+          `/api/w/${workspaceId}/subscriptions/checkout/business-activation`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ setupSessionId }),
+          }
+        );
+        if (!res.ok) {
+          try {
+            return await res.json();
+          } catch {
+            return null;
+          }
+        }
+        return await res.json();
+      } finally {
+        setIsInitiating(false);
+      }
+    },
+    [workspaceId]
+  );
+
+  return { initiateBusinessActivation, isInitiating };
+}
+
+export function usePreparePayment({
+  workspaceId,
+  setupSessionId,
+  disabled,
+}: {
+  workspaceId: string;
+  setupSessionId: string | null;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const preparePaymentFetcher: Fetcher<GetPreparePaymentResponseBody> = fetcher;
+
+  const url =
+    disabled || !setupSessionId
+      ? null
+      : `/api/w/${workspaceId}/subscriptions/checkout/prepare-payment?setup_session_id=${setupSessionId}`;
+
+  const [pollTimedOut, setPollTimedOut] = useState(false);
+
+  const { data, error } = useSWRWithDefaults(url, preparePaymentFetcher, {
+    revalidateOnFocus: false,
+    revalidateOnReconnect: false,
+    dedupingInterval: 500,
+    refreshInterval: (d) =>
+      d?.status === "pending" && !pollTimedOut ? 500 : 0,
+  });
+
+  const isPending = data?.status === "pending";
+
+  useEffect(() => {
+    if (!isPending) {
+      setPollTimedOut(false);
+      return;
+    }
+    const timer = setTimeout(() => setPollTimedOut(true), 5_000);
+    return () => clearTimeout(timer);
+  }, [isPending]);
+
+  const completeData = data?.status === "success" ? data : null;
+
+  return {
+    preparePayment: completeData,
+    isPreparePaymentLoading:
+      (!error && !data && !disabled && !!setupSessionId) ||
+      (isPending && !pollTimedOut),
+    isPreparePaymentError: !!error || pollTimedOut,
+  };
+}
+
+export function useWorkspaceCoupons({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const couponsFetcher: Fetcher<GetWorkspaceCouponsResponseBody> = fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/coupon/redemptions`,
+    couponsFetcher,
+    {
+      disabled,
+      revalidateOnFocus: false,
+    }
+  );
+
+  return {
+    coupons: data?.coupons ?? emptyArray(),
+    isCouponsLoading: !error && !data && !disabled,
+    isCouponsError: error,
+    mutateCoupons: mutate,
+  };
+}
+
+export function useValidateCoupon({ workspaceId }: { workspaceId: string }) {
+  const validateCoupon = useCallback(
+    async (
+      code: string,
+      context: "subscription" | "credits"
+    ): Promise<
+      | { ok: true; coupon: GetCouponValidateResponseBody["coupon"] }
+      | { ok: false; message: string }
+    > => {
+      const res = await clientFetch(
+        `/api/w/${workspaceId}/coupon/validate?code=${encodeURIComponent(code)}&context=${encodeURIComponent(context)}`
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        const message =
+          body?.error?.message ?? "Invalid or expired coupon code.";
+        return { ok: false, message };
+      }
+      const body = (await res.json()) as GetCouponValidateResponseBody;
+      return { ok: true, coupon: body.coupon };
+    },
+    [workspaceId]
+  );
+
+  return { validateCoupon };
+}

@@ -1,0 +1,572 @@
+import type { Authenticator } from "@app/lib/auth";
+import { BaseResource } from "@app/lib/resources/base_resource";
+import { CreditModel } from "@app/lib/resources/storage/models/credits";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
+import { makeSId } from "@app/lib/resources/string_ids";
+import type { ResourceFindOptions } from "@app/lib/resources/types";
+import type { PokeCreditType } from "@app/types/api/poke/credits";
+import type { CreditDisplayData } from "@app/types/credits";
+import {
+  CREDIT_EXPIRATION_DAYS,
+  CREDIT_TYPES,
+  isCreditType,
+} from "@app/types/credits";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { removeNulls } from "@app/types/shared/utils/general";
+import { formatUserFullName } from "@app/types/user";
+import assert from "assert";
+import type {
+  Attributes,
+  CreationAttributes,
+  ModelStatic,
+  Transaction,
+} from "sequelize";
+import { Op, Sequelize, UniqueConstraintError } from "sequelize";
+
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface CreditResource extends ReadonlyAttributesType<CreditModel> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class CreditResource extends BaseResource<CreditModel> {
+  static model: ModelStatic<CreditModel> = CreditModel;
+
+  readonly boughtByUser?: Attributes<UserModel>;
+
+  constructor(
+    _model: ModelStatic<CreditModel>,
+    blob: Attributes<CreditModel>,
+    { boughtByUser }: { boughtByUser?: Attributes<UserModel> } = {}
+  ) {
+    super(CreditModel, blob);
+
+    this.boughtByUser = boughtByUser;
+  }
+
+  get sId(): string {
+    return makeSId("credit", { id: this.id, workspaceId: this.workspaceId });
+  }
+
+  // Create a new credit line for a workspace.
+  // Note: initialAmountMicroUsd is immutable after creation.
+  // The credit is not consumable until start() is called (startDate is set).
+  static async makeNew(
+    auth: Authenticator,
+    blob: Omit<CreationAttributes<CreditModel>, "boughtByUserId"> & {
+      boughtByUserId?: number | null;
+    },
+    { transaction }: { transaction?: Transaction } = {}
+  ) {
+    // Validate type field using type guard
+    if (!blob.type || !isCreditType(blob.type)) {
+      throw new Error(
+        `Invalid credit type: ${blob.type}. Must be one of: ${CREDIT_TYPES.join(", ")}`
+      );
+    }
+
+    const credit = await this.model.create(
+      {
+        ...blob,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      { transaction }
+    );
+
+    return new this(this.model, credit.get());
+  }
+
+  static async makeNewOrFetchByInvoiceOrLineItemId(
+    auth: Authenticator,
+    blob: Omit<CreationAttributes<CreditModel>, "boughtByUserId"> & {
+      boughtByUserId?: number | null;
+      invoiceOrLineItemId: string;
+    },
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<{ credit: CreditResource; created: boolean }> {
+    try {
+      const credit = await this.makeNew(auth, blob, { transaction });
+      return { credit, created: true };
+    } catch (error) {
+      if (error instanceof UniqueConstraintError) {
+        const existingCredit = await this.fetchByInvoiceOrLineItemId(
+          auth,
+          blob.invoiceOrLineItemId
+        );
+        assert(
+          existingCredit,
+          "Credit not found after duplicate invoiceOrLineItemId create attempt"
+        );
+        return { credit: existingCredit, created: false };
+      }
+      throw error;
+    }
+  }
+
+  private static async baseFetch(
+    auth: Authenticator,
+    options?: ResourceFindOptions<CreditModel>
+  ) {
+    const { where, ...rest } = options ?? {};
+    const rows = await this.model.findAll({
+      where: {
+        ...where,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      ...rest,
+    });
+
+    return rows.map((r) => new this(this.model, r.get()));
+  }
+
+  static async listAll(
+    auth: Authenticator,
+    {
+      includeBuyer = false,
+    }: {
+      includeBuyer?: boolean;
+    } = {}
+  ) {
+    return this.baseFetch(auth, {
+      includes: includeBuyer
+        ? [
+            {
+              model: UserModel,
+              as: "boughtByUser",
+              required: false,
+            },
+          ]
+        : [],
+    });
+  }
+
+  static async listActive(
+    auth: Authenticator,
+    minExpirationDate: Date = new Date()
+  ) {
+    const now = new Date();
+    return this.baseFetch(auth, {
+      where: {
+        // Credit must have remaining balance (consumed < initial)
+        [Op.and]: [
+          Sequelize.where(Sequelize.col("consumedAmountMicroUsd"), {
+            [Op.lt]: Sequelize.col("initialAmountMicroUsd"),
+          }),
+        ],
+
+        // Credit must be started (startDate not null and <= now)
+        startDate: { [Op.ne]: null, [Op.lte]: now },
+        // Credit must not be expired
+        [Op.or]: [
+          { expirationDate: null },
+          { expirationDate: { [Op.gt]: minExpirationDate } },
+        ],
+      },
+    });
+  }
+
+  /**
+   * Return the total remaining balance across all active credits (in microUSD).
+   */
+  static async getRemainingMicroUsd(auth: Authenticator): Promise<number> {
+    const activeCredits = await this.listActive(auth);
+    return activeCredits.reduce(
+      (sum, c) => sum + (c.initialAmountMicroUsd - c.consumedAmountMicroUsd),
+      0
+    );
+  }
+
+  static async fetchByIds(auth: Authenticator, ids: string[]) {
+    return this.baseFetch(auth, {
+      where: {
+        id: removeNulls(
+          ids.map((v) => (typeof v === "string" ? parseInt(v, 10) : v))
+        ),
+      },
+    });
+  }
+
+  static async fetchById(auth: Authenticator, id: string) {
+    const [row] = await this.fetchByIds(auth, [id]);
+    return row ?? null;
+  }
+
+  static async fetchByInvoiceOrLineItemId(
+    auth: Authenticator,
+    invoiceOrLineItemId: string
+  ) {
+    const [row] = await this.baseFetch(auth, {
+      where: {
+        invoiceOrLineItemId,
+      },
+    });
+    return row ?? null;
+  }
+
+  static async fetchByTypeAndDates(
+    auth: Authenticator,
+    type: (typeof CREDIT_TYPES)[number],
+    startDate: Date,
+    expirationDate: Date
+  ) {
+    const [row] = await this.baseFetch(auth, {
+      where: {
+        type,
+        startDate,
+        expirationDate,
+      },
+    });
+    return row ?? null;
+  }
+
+  /**
+   * Returns pending committed credits (not yet paid/started) for the workspace.
+   * Used to block new purchases when there are unpaid invoices.
+   */
+  static async listPendingCommitted(auth: Authenticator) {
+    return this.baseFetch(auth, {
+      where: {
+        type: "committed",
+        startDate: null,
+        invoiceOrLineItemId: { [Op.ne]: null },
+      },
+    });
+  }
+
+  /**
+   * Returns the total amount of committed credits purchased in the given period.
+   * Used to enforce per-billing-cycle purchase limits.
+   */
+  static async sumCommittedCreditsPurchasedInPeriod(
+    auth: Authenticator,
+    periodStart: Date,
+    periodEnd: Date
+  ): Promise<number> {
+    const result = await this.model.findOne({
+      attributes: [
+        [
+          Sequelize.fn(
+            "COALESCE",
+            Sequelize.fn("SUM", Sequelize.col("initialAmountMicroUsd")),
+            0
+          ),
+          "total",
+        ],
+      ],
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        type: "committed",
+        createdAt: {
+          [Op.gte]: periodStart,
+          [Op.lt]: periodEnd,
+        },
+      },
+      raw: true,
+    });
+    return parseInt((result as unknown as { total: string })?.total ?? "0", 10);
+  }
+
+  /**
+   * Returns the sum of excess credits (over-consumption) for the given period.
+   * Excess credits are created when usage exceeds available credits.
+   */
+  static async sumExcessCreditsInPeriod(
+    auth: Authenticator,
+    { periodStart, periodEnd }: { periodStart: Date; periodEnd: Date }
+  ): Promise<number> {
+    const result = await this.model.findOne({
+      attributes: [
+        [
+          Sequelize.fn(
+            "COALESCE",
+            Sequelize.fn("SUM", Sequelize.col("consumedAmountMicroUsd")),
+            0
+          ),
+          "total",
+        ],
+      ],
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        type: "excess",
+        startDate: {
+          [Op.gte]: periodStart,
+          [Op.lt]: periodEnd,
+        },
+      },
+      raw: true,
+    });
+    return parseInt((result as unknown as { total: string })?.total ?? "0", 10);
+  }
+
+  /**
+   * Consume a given amount of credits, allowing for over-consumption.
+   * This is because users consume credits after Ruby has spent the tokens,
+   * so it's not possible to preemptively block consumption.
+   *
+   * Over-consumption should however stay minimal
+   */
+  async consume(
+    { amountInMicroUsd }: { amountInMicroUsd: number },
+    { transaction }: { transaction?: Transaction } = {}
+  ) {
+    if (amountInMicroUsd <= 0) {
+      return new Err(new Error("Amount to consume must be strictly positive."));
+    }
+    const now = new Date();
+
+    // Note: Sequelize's increment() returns [affectedRows[], affectedCount] but
+    // affectedCount is unreliable for PostgreSQL. We check affectedRows.length instead.
+    const [affectedRows] = await this.model.increment(
+      "consumedAmountMicroUsd",
+      {
+        by: amountInMicroUsd,
+        where: {
+          id: this.id,
+          workspaceId: this.workspaceId,
+          // Already-depleted credit should not be consumed.
+          consumedAmountMicroUsd: {
+            [Op.lt]: Sequelize.col("initialAmountMicroUsd"),
+          },
+          // Credit must be started (startDate not null and <= now)
+          startDate: { [Op.ne]: null, [Op.lte]: now },
+          // Credit must not be expired
+          [Op.or]: [
+            { expirationDate: null },
+            { expirationDate: { [Op.gt]: now } },
+          ],
+        },
+        transaction,
+      }
+    );
+    if (!affectedRows || affectedRows.length < 1) {
+      return new Err(
+        new Error(
+          "Credit already consumed, not yet started, or already expired."
+        )
+      );
+    }
+    return new Ok(undefined);
+  }
+
+  async markAsPaid(
+    invoiceOrLineItemId: string,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<void> {
+    await this.model.update(
+      { invoiceOrLineItemId },
+      {
+        where: { id: this.id, workspaceId: this.workspaceId },
+        transaction,
+      }
+    );
+  }
+
+  async start(
+    auth: Authenticator,
+    {
+      startDate,
+      expirationDate,
+      transaction,
+    }: {
+      startDate?: Date;
+      expirationDate?: Date;
+      transaction?: Transaction;
+    } = {}
+  ): Promise<Result<{ startDate: Date; expirationDate: Date }, Error>> {
+    const effectiveStartDate = startDate ?? new Date();
+    const effectiveExpirationDate =
+      expirationDate ??
+      new Date(Date.now() + CREDIT_EXPIRATION_DAYS * 24 * 60 * 60 * 1000);
+
+    try {
+      const [, affectedRows] = await CreditModel.update(
+        {
+          startDate: effectiveStartDate,
+          expirationDate: effectiveExpirationDate,
+        },
+        {
+          where: {
+            id: this.id,
+            workspaceId: this.workspaceId,
+            startDate: null,
+          },
+          transaction,
+          returning: true,
+        }
+      );
+
+      if (affectedRows.length === 0) {
+        return new Err(new Error("Credit already started"));
+      }
+
+      return new Ok({
+        startDate: effectiveStartDate,
+        expirationDate: effectiveExpirationDate,
+      });
+    } catch (error) {
+      if (error instanceof UniqueConstraintError) {
+        return new Err(
+          new Error(
+            "A credit with the same type and dates already exists for this workspace."
+          )
+        );
+      }
+      throw error;
+    }
+  }
+
+  async freeze(
+    auth: Authenticator,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<Result<undefined, Error>> {
+    const [, affectedRows] = await CreditModel.update(
+      {
+        initialAmountMicroUsd: Sequelize.col("consumedAmountMicroUsd"),
+      },
+      {
+        where: {
+          id: this.id,
+          workspaceId: this.workspaceId,
+        },
+        transaction,
+        returning: true,
+      }
+    );
+
+    if (!affectedRows || affectedRows.length === 0) {
+      return new Err(new Error("Credit not found or already frozen"));
+    }
+
+    return new Ok(undefined);
+  }
+
+  async updateInitialAmountMicroUsd(
+    auth: Authenticator,
+    initialAmountMicroUsd: number,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<[affectedCount: number]> {
+    return this.update(
+      {
+        initialAmountMicroUsd,
+      },
+      transaction
+    );
+  }
+
+  async updateExpirationDate(
+    auth: Authenticator,
+    expirationDate: Date,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<[affectedCount: number]> {
+    return this.update(
+      {
+        expirationDate,
+      },
+      transaction
+    );
+  }
+
+  async setMetronomeCreditId(
+    metronomeCreditId: string,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<void> {
+    await this.model.update(
+      { metronomeCreditId },
+      {
+        where: { id: this.id, workspaceId: this.workspaceId },
+        transaction,
+      }
+    );
+  }
+
+  private makeBoughtBy(
+    editedByUser: Attributes<UserModel> | undefined,
+    editedAt: Date | undefined
+  ) {
+    if (!editedByUser || !editedAt) {
+      return null;
+    }
+
+    return {
+      editedAt: editedAt.getTime(),
+      fullName: formatUserFullName(editedByUser),
+      imageUrl: editedByUser.imageUrl,
+      email: editedByUser.email,
+      userId: editedByUser.sId,
+    };
+  }
+
+  toJSON(): CreditDisplayData {
+    return {
+      sId: this.sId,
+      type: this.type,
+      initialAmountMicroUsd: this.initialAmountMicroUsd,
+      remainingAmountMicroUsd:
+        this.initialAmountMicroUsd - this.consumedAmountMicroUsd,
+      consumedAmountMicroUsd: this.consumedAmountMicroUsd,
+      startDate: this.startDate ? this.startDate.getTime() : null,
+      expirationDate: this.expirationDate
+        ? this.expirationDate.getTime()
+        : null,
+      boughtByUser: this.makeBoughtBy(this.boughtByUser, this.updatedAt),
+    };
+  }
+
+  toLogJSON() {
+    return {
+      id: this.id,
+      workspaceId: this.workspaceId,
+      type: this.type,
+      initialAmountMicroUsd: this.initialAmountMicroUsd,
+      consumedAmountMicroUsd: this.consumedAmountMicroUsd,
+      startDate: this.startDate ? this.startDate.toISOString() : null,
+      expirationDate: this.expirationDate
+        ? this.expirationDate.toISOString()
+        : null,
+      invoiceOrLineItemId: this.invoiceOrLineItemId,
+    };
+  }
+
+  toJSONForAdmin(): PokeCreditType {
+    return {
+      id: this.id,
+      createdAt: this.createdAt.toISOString(),
+      type: this.type,
+      initialAmountMicroUsd: this.initialAmountMicroUsd,
+      consumedAmountMicroUsd: this.consumedAmountMicroUsd,
+      remainingAmountMicroUsd:
+        this.initialAmountMicroUsd - this.consumedAmountMicroUsd,
+      startDate: this.startDate ? this.startDate.toISOString() : null,
+      expirationDate: this.expirationDate
+        ? this.expirationDate.toISOString()
+        : null,
+      discount: this.discount,
+      invoiceOrLineItemId: this.invoiceOrLineItemId,
+      metronomeCreditId: this.metronomeCreditId,
+    };
+  }
+
+  static async deleteAllForWorkspace(auth: Authenticator) {
+    await this.model.destroy({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+  }
+
+  async delete(
+    auth: Authenticator,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<Result<number, Error>> {
+    assert(
+      this.startDate === null || this.type === "free",
+      "Cannot delete a credit that has been started. Use freeze() instead."
+    );
+
+    const deletedCount = await CreditModel.destroy({
+      where: { id: this.id, workspaceId: auth.getNonNullableWorkspace().id },
+      transaction,
+    });
+
+    return new Ok(deletedCount);
+  }
+}

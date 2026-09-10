@@ -1,0 +1,1229 @@
+import type { AgentLoopBlockedToolExecution } from "@app/lib/actions/mcp";
+import {
+  createConversation,
+  postNewContentFragment,
+  postUserMessage,
+} from "@app/lib/api/assistant/conversation";
+import { ASSISTANT_EMAIL_SUBDOMAIN } from "@app/lib/api/assistant/email/constants";
+import { config as cellsConfig } from "@app/lib/api/cells/config";
+import config from "@app/lib/api/config";
+import { sendEmail, sendEmailToRecipients } from "@app/lib/api/email";
+import { generateValidationToken } from "@app/lib/api/email/validation_token";
+import { processAndStoreFile } from "@app/lib/api/files/processing";
+import type { RedisUsageTagsType } from "@app/lib/api/redis";
+import { getRedisStreamClient } from "@app/lib/api/redis";
+import type { Authenticator } from "@app/lib/auth";
+import { serializeMention } from "@app/lib/mentions/format";
+import { isFreePlan, isUpgraded } from "@app/lib/plans/plan_codes";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { FileResource } from "@app/lib/resources/file_resource";
+import { MembershipModel } from "@app/lib/resources/storage/models/membership";
+import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { filterAndSortAgents } from "@app/lib/utils";
+import { getConversationRoute } from "@app/lib/utils/router";
+import { renderLightWorkspaceType } from "@app/lib/workspace";
+import logger from "@app/logger/logger";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import type { SupportedFileContentType } from "@app/types/files";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { isString } from "@app/types/shared/utils/general";
+import { asDisplayName } from "@app/types/shared/utils/string_utils";
+import type { LightWorkspaceType } from "@app/types/user";
+import fs from "fs";
+import sanitizeHtml from "sanitize-html";
+import { Op } from "sequelize";
+import { Readable } from "stream";
+import { toFileContentFragment } from "../conversation/content_fragment";
+import type { InboundEmailDkimResult } from "./inbound_auth";
+
+// Redis configuration for email reply context storage.
+const REDIS_ORIGIN: RedisUsageTagsType = "email_context";
+const EMAIL_REPLY_CONTEXT_PREFIX = "email-reply-context";
+const EMAIL_REPLY_CONTEXT_TTL_SECONDS = 3 * 60 * 60; // 3 hours
+// Maps inbound email Message-IDs to conversation sIds so that replies in the same email thread
+// continue the existing conversation. Long TTL: users may reply to an agent email days later.
+const EMAIL_THREAD_CONVERSATION_PREFIX = "email-thread-conversation";
+const EMAIL_THREAD_CONVERSATION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+const EMAIL_THREAD_LOOKUP_MAX_MESSAGE_IDS = 10;
+// Same-email multi-workspace routing is rare and mostly specific to Ruby, so a
+// single hardcoded priority workspace is enough for now.
+const EMAIL_PRIORITY_WORKSPACE_IDS = ["0ec9852c2f"] as const;
+
+/**
+ * Data needed to reply to an email after agent message completion.
+ */
+export type EmailReplyContext = {
+  subject: string;
+  originalText: string;
+  fromEmail: string;
+  fromFull: string;
+  threadingMessageId: string | null;
+  threadingInReplyTo: string | null;
+  threadingReferences: string | null;
+  agentConfigurationId: string;
+  workspaceId: string;
+  conversationId: string;
+};
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || isString(value);
+}
+
+function isEmailReplyContext(value: unknown): value is EmailReplyContext {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  return (
+    "subject" in value &&
+    isString(value.subject) &&
+    "originalText" in value &&
+    isString(value.originalText) &&
+    "fromEmail" in value &&
+    isString(value.fromEmail) &&
+    "fromFull" in value &&
+    isString(value.fromFull) &&
+    "threadingMessageId" in value &&
+    isNullableString(value.threadingMessageId) &&
+    "threadingInReplyTo" in value &&
+    isNullableString(value.threadingInReplyTo) &&
+    "threadingReferences" in value &&
+    isNullableString(value.threadingReferences) &&
+    "agentConfigurationId" in value &&
+    isString(value.agentConfigurationId) &&
+    "workspaceId" in value &&
+    isString(value.workspaceId) &&
+    "conversationId" in value &&
+    isString(value.conversationId)
+  );
+}
+
+function makeEmailReplyContextKey(
+  workspaceId: string,
+  agentMessageId: string
+): string {
+  return `${EMAIL_REPLY_CONTEXT_PREFIX}:${workspaceId}:${agentMessageId}`;
+}
+
+/**
+ * Store email reply context in Redis for later use when agent message completes.
+ */
+export async function storeEmailReplyContext(
+  agentMessageId: string,
+  context: EmailReplyContext
+): Promise<void> {
+  const redis = await getRedisStreamClient({ origin: REDIS_ORIGIN });
+  const key = makeEmailReplyContextKey(context.workspaceId, agentMessageId);
+
+  await redis.set(key, JSON.stringify(context), {
+    EX: EMAIL_REPLY_CONTEXT_TTL_SECONDS,
+  });
+
+  logger.info(
+    { agentMessageId, key },
+    "[email] Stored email reply context in Redis"
+  );
+}
+
+/**
+ * Parse and validate a raw Redis value into an EmailReplyContext.
+ */
+export function parseEmailReplyContext(
+  value: string,
+  agentMessageId: string,
+  key: string
+): EmailReplyContext | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    logger.warn(
+      { agentMessageId, key },
+      "[email] Failed to parse email reply context JSON from Redis"
+    );
+    return null;
+  }
+
+  if (!isEmailReplyContext(parsed)) {
+    logger.warn(
+      { agentMessageId, key },
+      "[email] Invalid email reply context structure from Redis"
+    );
+    return null;
+  }
+
+  return {
+    subject: parsed.subject,
+    originalText: parsed.originalText,
+    fromEmail: parsed.fromEmail,
+    fromFull: parsed.fromFull,
+    threadingMessageId: parsed.threadingMessageId,
+    threadingInReplyTo: parsed.threadingInReplyTo,
+    threadingReferences: parsed.threadingReferences,
+    agentConfigurationId: parsed.agentConfigurationId,
+    workspaceId: parsed.workspaceId,
+    conversationId: parsed.conversationId,
+  };
+}
+
+/**
+ * Retrieve email reply context from Redis without deleting it.
+ * Returns null if not found (expired or never stored).
+ */
+export async function getEmailReplyContext(
+  workspaceId: string,
+  agentMessageId: string
+): Promise<EmailReplyContext | null> {
+  const redis = await getRedisStreamClient({ origin: REDIS_ORIGIN });
+  const key = makeEmailReplyContextKey(workspaceId, agentMessageId);
+
+  const value = await redis.get(key);
+  if (!value) {
+    return null;
+  }
+
+  return parseEmailReplyContext(value, agentMessageId, key);
+}
+
+/**
+ * Delete email reply context from Redis.
+ */
+export async function deleteEmailReplyContext(
+  workspaceId: string,
+  agentMessageId: string
+): Promise<void> {
+  const redis = await getRedisStreamClient({ origin: REDIS_ORIGIN });
+  const key = makeEmailReplyContextKey(workspaceId, agentMessageId);
+  await redis.del(key);
+}
+
+/**
+ * Normalize an RFC 5322 Message-ID to a canonical form (no angle brackets) used for both
+ * storing and looking up thread-to-conversation mappings.
+ */
+function normalizeMessageId(rawMessageId: string): string | null {
+  let messageId = rawMessageId.trim();
+  if (messageId.startsWith("<")) {
+    messageId = messageId.slice(1);
+  }
+  if (messageId.endsWith(">")) {
+    messageId = messageId.slice(0, -1);
+  }
+  return messageId.length > 0 ? messageId : null;
+}
+
+function makeEmailThreadConversationKey(
+  workspaceId: string,
+  messageId: string
+): string {
+  return `${EMAIL_THREAD_CONVERSATION_PREFIX}:${workspaceId}:${messageId}`;
+}
+
+/**
+ * Map an inbound email Message-ID to a conversation sId so later replies in the same email
+ * thread can continue the conversation.
+ */
+async function storeEmailThreadConversation({
+  workspaceId,
+  messageId,
+  conversationId,
+}: {
+  workspaceId: string;
+  messageId: string;
+  conversationId: string;
+}): Promise<void> {
+  const normalizedMessageId = normalizeMessageId(messageId);
+  if (!normalizedMessageId) {
+    return;
+  }
+
+  const redis = await getRedisStreamClient({ origin: REDIS_ORIGIN });
+  const key = makeEmailThreadConversationKey(workspaceId, normalizedMessageId);
+
+  await redis.set(key, conversationId, {
+    EX: EMAIL_THREAD_CONVERSATION_TTL_SECONDS,
+  });
+}
+
+/**
+ * Message-IDs to look up when matching an inbound email to an existing conversation, most
+ * recent first: In-Reply-To, then References reversed (References is oldest-first per RFC 5322).
+ */
+export function getThreadingLookupMessageIds(
+  threadingHeaders: EmailThreadingHeaders
+): string[] {
+  const referenceTokens = (threadingHeaders.references ?? "")
+    .split(/\s+/)
+    .reverse();
+  const candidates = [threadingHeaders.inReplyTo ?? "", ...referenceTokens];
+
+  const seen = new Set<string>();
+  const messageIds: string[] = [];
+  for (const candidate of candidates) {
+    const messageId = normalizeMessageId(candidate);
+    if (!messageId || seen.has(messageId)) {
+      continue;
+    }
+    seen.add(messageId);
+    messageIds.push(messageId);
+    if (messageIds.length >= EMAIL_THREAD_LOOKUP_MAX_MESSAGE_IDS) {
+      break;
+    }
+  }
+
+  return messageIds;
+}
+
+/**
+ * Find the conversation associated with the email thread an inbound email belongs to, if any.
+ */
+async function findConversationIdFromThreadingHeaders(
+  workspaceId: string,
+  threadingHeaders: EmailThreadingHeaders
+): Promise<string | null> {
+  const messageIds = getThreadingLookupMessageIds(threadingHeaders);
+  if (messageIds.length === 0) {
+    return null;
+  }
+
+  const redis = await getRedisStreamClient({ origin: REDIS_ORIGIN });
+  for (const messageId of messageIds) {
+    const conversationId = await redis.get(
+      makeEmailThreadConversationKey(workspaceId, messageId)
+    );
+    if (conversationId) {
+      return conversationId;
+    }
+  }
+
+  return null;
+}
+
+export { ASSISTANT_EMAIL_SUBDOMAIN } from "@app/lib/api/assistant/email/constants";
+
+export type EmailAttachment = {
+  filepath: string; // Temp file path from formidable
+  filename: string; // Original filename
+  contentType: string; // MIME type
+  size: number; // File size in bytes
+};
+
+export type EmailThreadingHeaders = {
+  messageId: string | null;
+  inReplyTo: string | null;
+  references: string | null;
+};
+
+export type InboundEmail = {
+  subject: string;
+  text: string;
+  rawHeaders?: string | null;
+  auth: { SPF: string; dkim: InboundEmailDkimResult[]; dkimRaw: string };
+  threadingHeaders: EmailThreadingHeaders;
+  // Human-visible RFC 5322 From header.
+  sender: {
+    email: string;
+    full: string;
+  };
+  // SMTP envelope sender (MAIL FROM / return-path).
+  envelope: {
+    to: string[];
+    cc: string[];
+    bcc: string[];
+    from: string;
+  };
+  attachments: EmailAttachment[];
+};
+
+export type EmailTriggerError = {
+  type:
+    | "unexpected_error"
+    | "unauthenticated_error"
+    | "user_not_found"
+    | "workspace_not_found"
+    | "email_agents_disabled"
+    | "invalid_email_error"
+    | "invalid_email_blacklist_metadata"
+    | "assistant_not_found"
+    | "assistant_email_blacklisted"
+    | "message_creation_error";
+  message: string;
+};
+
+const EMAIL_BLACKLISTED_AGENT_IDS_METADATA_KEY = "emailBlacklistedAgentIds";
+
+// Error factories shared between the local lookup and the cross-region relay
+// reply resolution, so both paths reply with the same message for a given type.
+export function makeUserNotFoundEmailTriggerError(
+  email: string
+): EmailTriggerError {
+  return {
+    type: "user_not_found",
+    message:
+      `Failed to match a valid Ruby user for email: ${email}. ` +
+      `Please sign up for Ruby at https://ruby.ad to interact with assistants over email.`,
+  };
+}
+
+export function makeWorkspaceNotFoundEmailTriggerError(
+  email: string
+): EmailTriggerError {
+  return {
+    type: "workspace_not_found",
+    message:
+      `Failed to match a valid Ruby workspace associated with email: ${email}. ` +
+      `Please sign up for Ruby at https://ruby.ad to interact with agents over email.`,
+  };
+}
+
+export function makeEmailAgentsDisabledEmailTriggerError(): EmailTriggerError {
+  return {
+    type: "email_agents_disabled",
+    message:
+      "Email agents are disabled for all workspaces associated with your email. " +
+      "Ask a workspace admin to enable Email Agents in workspace settings before interacting with agents over email.",
+  };
+}
+
+function normalizeEmailAddress(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function deduplicateEmailAddresses(emails: string[]): string[] {
+  const seen = new Set<string>();
+  const deduplicated: string[] = [];
+
+  for (const email of emails) {
+    const normalizedEmail = normalizeEmailAddress(email);
+    if (normalizedEmail.length === 0) {
+      continue;
+    }
+    if (seen.has(normalizedEmail)) {
+      continue;
+    }
+    seen.add(normalizedEmail);
+    deduplicated.push(email.trim());
+  }
+
+  return deduplicated;
+}
+
+function isAssistantRecipient(email: string): boolean {
+  return normalizeEmailAddress(email).endsWith(`@${ASSISTANT_EMAIL_SUBDOMAIN}`);
+}
+
+function formatEmailRecipients(recipients: string[]): string {
+  return recipients.length > 0 ? recipients.join(", ") : "(none)";
+}
+
+function formatEmailHeaderValue(value: string): string {
+  return value.replace(/\s*\n+\s*/g, " ").trim();
+}
+
+function escapeTagContent(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function buildEmailAdditionalContext({
+  hasThreadHistory,
+  attachmentCount,
+}: {
+  hasThreadHistory: boolean;
+  attachmentCount: number;
+}): string[] {
+  const additionalContext: string[] = [];
+
+  if (!hasThreadHistory && attachmentCount === 0) {
+    return additionalContext;
+  }
+
+  if (hasThreadHistory) {
+    additionalContext.push(
+      "<email_thread_history_may_be_available_in_conversation>true</email_thread_history_may_be_available_in_conversation>"
+    );
+  }
+
+  if (attachmentCount > 0) {
+    additionalContext.push(
+      `<email_attachment_count_may_be_available_in_conversation>${attachmentCount}</email_attachment_count_may_be_available_in_conversation>`
+    );
+  }
+
+  return additionalContext;
+}
+
+function buildReferencesHeaderValue({
+  inReplyTo,
+  references,
+}: {
+  inReplyTo: string | null;
+  references: string | null;
+}): string | null {
+  if (!inReplyTo) {
+    return references;
+  }
+  if (!references) {
+    return inReplyTo;
+  }
+
+  const referenceTokens = references.split(/\s+/).filter((token) => token);
+  if (referenceTokens.includes(inReplyTo)) {
+    return references;
+  }
+
+  return [...referenceTokens, inReplyTo].join(" ");
+}
+
+export function buildReplyThreadingHeaders(email: InboundEmail): {
+  inReplyTo: string | null;
+  references: string | null;
+} {
+  const inReplyTo =
+    email.threadingHeaders.messageId ?? email.threadingHeaders.inReplyTo;
+  const references = buildReferencesHeaderValue({
+    inReplyTo,
+    references: email.threadingHeaders.references,
+  });
+
+  return { inReplyTo, references };
+}
+
+function buildSendgridThreadingHeaders(
+  email: InboundEmail
+): Record<string, string> {
+  const threadingHeaders = buildReplyThreadingHeaders(email);
+  return {
+    ...(threadingHeaders.inReplyTo
+      ? { "In-Reply-To": threadingHeaders.inReplyTo }
+      : {}),
+    ...(threadingHeaders.references
+      ? { References: threadingHeaders.references }
+      : {}),
+  };
+}
+
+export function buildEmailUserMessage({
+  email,
+  userMessage,
+  hasThreadHistory,
+  attachmentCount,
+}: {
+  email: InboundEmail;
+  userMessage: string;
+  hasThreadHistory: boolean;
+  attachmentCount: number;
+}): string {
+  const assistantRecipients = deduplicateEmailAddresses(
+    [...email.envelope.to, ...email.envelope.cc, ...email.envelope.bcc].filter(
+      isAssistantRecipient
+    )
+  );
+  const toRecipients = deduplicateEmailAddresses(email.envelope.to);
+  const ccRecipients = deduplicateEmailAddresses(email.envelope.cc);
+  const additionalContext = buildEmailAdditionalContext({
+    hasThreadHistory,
+    attachmentCount,
+  });
+
+  return [
+    "I sent the following email:",
+    "",
+    "<email_message>",
+    `  <email_from>${escapeTagContent(
+      formatEmailHeaderValue(email.sender.full)
+    )}</email_from>`,
+    `  <email_subject>${escapeTagContent(
+      formatEmailHeaderValue(email.subject)
+    )}</email_subject>`,
+    `  <email_to>${escapeTagContent(
+      formatEmailRecipients(toRecipients)
+    )}</email_to>`,
+    ...(ccRecipients.length > 0
+      ? [
+          `  <email_cc>${escapeTagContent(
+            formatEmailRecipients(ccRecipients)
+          )}</email_cc>`,
+        ]
+      : []),
+    `  <ruby_agent_recipients>${escapeTagContent(
+      formatEmailRecipients(assistantRecipients)
+    )}</ruby_agent_recipients>`,
+    "  <email_body>",
+    escapeTagContent(userMessage),
+    "  </email_body>",
+    ...additionalContext.map((line) => `  ${line}`),
+    `  <email_response_to>${escapeTagContent(email.sender.email)}</email_response_to>`,
+    "</email_message>",
+    "",
+    "You are in the recipients. Answer appropriately. Your full response will be emailed automatically as-is only to me, the sender above.",
+  ].join("\n");
+}
+
+export function getEmailBlacklistedAgentIds({
+  sId: workspaceId,
+  metadata,
+}: Pick<LightWorkspaceType, "metadata" | "sId">): Result<
+  Set<string>,
+  EmailTriggerError
+> {
+  if (!metadata || !(EMAIL_BLACKLISTED_AGENT_IDS_METADATA_KEY in metadata)) {
+    return new Ok(new Set());
+  }
+
+  const value = metadata[EMAIL_BLACKLISTED_AGENT_IDS_METADATA_KEY];
+
+  if (!Array.isArray(value) || !value.every(isString)) {
+    logger.error(
+      {
+        workspaceId,
+        metadataKey: EMAIL_BLACKLISTED_AGENT_IDS_METADATA_KEY,
+        metadataValueType: typeof value,
+        isArray: Array.isArray(value),
+      },
+      "[email] Invalid Email Agents blacklist metadata"
+    );
+
+    return new Err({
+      type: "invalid_email_blacklist_metadata",
+      message:
+        "Email interactions with agents are temporarily unavailable for this workspace. " +
+        "Please contact Ruby support.",
+    });
+  }
+
+  return new Ok(new Set(value));
+}
+
+export async function userAndWorkspaceFromEmail({
+  email,
+}: {
+  email: string;
+}): Promise<
+  Result<
+    {
+      workspace: LightWorkspaceType;
+      user: UserResource;
+    },
+    EmailTriggerError
+  >
+> {
+  const user = await UserResource.fetchByEmail(email);
+
+  if (!user) {
+    return new Err(makeUserNotFoundEmailTriggerError(email));
+  }
+  const workspaceModels = await WorkspaceModel.findAll({
+    include: [
+      {
+        model: MembershipModel,
+        where: {
+          userId: user.id,
+          endAt: {
+            [Op.or]: [{ [Op.is]: null }, { [Op.gte]: new Date() }],
+          },
+        },
+      },
+    ],
+    order: [["id", "DESC"]],
+  });
+
+  if (workspaceModels.length === 0) {
+    return new Err(makeWorkspaceNotFoundEmailTriggerError(email));
+  }
+
+  const eligibleWorkspaceModels = workspaceModels.filter(
+    (workspaceModel) =>
+      renderLightWorkspaceType({ workspace: workspaceModel }).metadata
+        ?.allowEmailAgents === true
+  );
+
+  if (eligibleWorkspaceModels.length === 0) {
+    // The user exists locally without an enabled workspace, but they may have an
+    // enabled workspace in the other region: the error is relay-eligible and the
+    // relayed region resolves the final reply (see resolveRelayedErrorReply).
+    return new Err(makeEmailAgentsDisabledEmailTriggerError());
+  }
+
+  // Pick the best workspace: prefer priority workspaces, then paying plans,
+  // then upgraded free plans, then fall back to the most recently created workspace.
+  const priorityWorkspace = EMAIL_PRIORITY_WORKSPACE_IDS.map((workspaceId) =>
+    eligibleWorkspaceModels.find(
+      (workspaceModel) => workspaceModel.sId === workspaceId
+    )
+  ).find((workspaceModel) => workspaceModel !== undefined);
+
+  if (priorityWorkspace) {
+    return new Ok({
+      workspace: renderLightWorkspaceType({ workspace: priorityWorkspace }),
+      user,
+    });
+  }
+
+  const subscriptionsByWorkspaceId =
+    await SubscriptionResource.fetchActiveByWorkspacesModelId(
+      eligibleWorkspaceModels.map((w) => w.id)
+    );
+
+  const payingWorkspace = eligibleWorkspaceModels.find((w) => {
+    const sub = subscriptionsByWorkspaceId[w.id];
+    return sub && !isFreePlan(sub.getPlan().code);
+  });
+
+  const upgradedWorkspace = eligibleWorkspaceModels.find((w) => {
+    const sub = subscriptionsByWorkspaceId[w.id];
+    return sub && isUpgraded(sub.getPlan());
+  });
+
+  // Ordered by id DESC, so first = most recently created.
+  const mostRecentWorkspace = eligibleWorkspaceModels[0];
+
+  const selectedWorkspace =
+    payingWorkspace ?? upgradedWorkspace ?? mostRecentWorkspace;
+
+  return new Ok({
+    workspace: renderLightWorkspaceType({ workspace: selectedWorkspace }),
+    user,
+  });
+}
+
+export function emailAssistantMatcher({
+  targetEmail,
+  allAgentConfigurations,
+  emailBlacklistedAgentIds,
+}: {
+  targetEmail: string;
+  allAgentConfigurations: LightAgentConfigurationType[];
+  emailBlacklistedAgentIds: Set<string>;
+}): Result<
+  {
+    agentConfiguration: LightAgentConfigurationType;
+  },
+  EmailTriggerError
+> {
+  const agentPrefix = targetEmail.split("@")[0];
+
+  const matchingAgents = filterAndSortAgents(
+    allAgentConfigurations,
+    agentPrefix
+  );
+  if (matchingAgents.length === 0) {
+    return new Err({
+      type: "assistant_not_found",
+      message: `Failed to match a valid agent with name prefix: '${agentPrefix}'.`,
+    });
+  }
+  const agentConfiguration = matchingAgents[0];
+
+  if (emailBlacklistedAgentIds.has(agentConfiguration.sId)) {
+    return new Err({
+      type: "assistant_email_blacklisted",
+      message: `The agent '${agentConfiguration.name}' cannot be reached over email.`,
+    });
+  }
+
+  return new Ok({
+    agentConfiguration,
+  });
+}
+
+export async function splitThreadContent(content: string) {
+  const separators = [
+    /\n\s*On\s+[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s+[AP]M/,
+    /\n\s*[-]+\s*Forwarded message\s*[-]+/,
+  ];
+
+  let firstSeparatorIndex = -1;
+
+  for (const separator of separators) {
+    const match = content.match(separator);
+    if (
+      match &&
+      match.index &&
+      (firstSeparatorIndex === -1 || match.index < firstSeparatorIndex)
+    ) {
+      firstSeparatorIndex = match.index;
+    }
+  }
+  const newMessage =
+    firstSeparatorIndex > -1
+      ? content.slice(0, firstSeparatorIndex).trim()
+      : content.trim();
+  const thread =
+    firstSeparatorIndex > -1 ? content.slice(firstSeparatorIndex).trim() : "";
+
+  return { userMessage: newMessage, restOfThread: thread };
+}
+
+/**
+ * Trigger an email-based conversation without waiting for agent completion.
+ * Stores email context in Redis and the reply is sent by the agent loop
+ * finalization activity when the message completes.
+ */
+export async function triggerFromEmail(
+  auth: Authenticator,
+  {
+    agentConfigurations,
+    email,
+  }: {
+    agentConfigurations: LightAgentConfigurationType[];
+    email: InboundEmail;
+  }
+): Promise<
+  Result<
+    {
+      conversation: ConversationWithoutContentType;
+    },
+    EmailTriggerError
+  >
+> {
+  const localLogger = logger.child({});
+  const user = auth.user();
+  const workspace = auth.workspace();
+  if (!user || !workspace) {
+    return new Err({
+      type: "unexpected_error",
+      message:
+        "An unexpected error occurred. Please try again or contact us at support@ruby.ad.",
+    });
+  }
+
+  const { userMessage, restOfThread } = await splitThreadContent(email.text);
+
+  const threadConversationId = await findConversationIdFromThreadingHeaders(
+    workspace.sId,
+    email.threadingHeaders
+  );
+
+  let conversationResource: ConversationResource | null = null;
+  if (threadConversationId) {
+    const threadConversation = await ConversationResource.fetchById(
+      auth,
+      threadConversationId
+    );
+    if (threadConversation) {
+      conversationResource = threadConversation;
+    } else {
+      localLogger.warn(
+        {
+          conversationId: threadConversationId,
+        },
+        "[email] Cannot access conversation matching inbound email, creating a new one."
+      );
+    }
+  }
+  if (!conversationResource) {
+    conversationResource = await createConversation(auth, {
+      title: `Email: ${email.subject}`,
+      visibility: "unlisted",
+      spaceId: null,
+    });
+  }
+
+  const conversation = conversationResource.toJSON();
+
+  // Map this email's Message-ID to the conversation (on create and on continue) so any later
+  // reply in the thread keeps routing to it.
+  if (email.threadingHeaders.messageId) {
+    await storeEmailThreadConversation({
+      workspaceId: workspace.sId,
+      messageId: email.threadingHeaders.messageId,
+      conversationId: conversation.sId,
+    });
+  }
+
+  if (restOfThread.length > 0) {
+    const cfRes = await toFileContentFragment(auth, {
+      conversation,
+      contentFragment: {
+        title: `Email thread: ${email.subject}`,
+        content: restOfThread,
+        contentType: "text/plain",
+        url: null,
+      },
+      fileName: `email-thread.txt`,
+    });
+    if (cfRes.isErr()) {
+      return new Err({
+        type: "message_creation_error",
+        message:
+          `Error creating file for content fragment: ` + cfRes.error.message,
+      });
+    }
+
+    const contentFragmentRes = await postNewContentFragment(
+      auth,
+      conversation,
+      cfRes.value,
+      {
+        username: user.username,
+        fullName: user.fullName(),
+        email: user.email,
+        profilePictureUrl: user.imageUrl,
+      }
+    );
+    if (contentFragmentRes.isErr()) {
+      return new Err({
+        type: "message_creation_error",
+        message:
+          `Error creating file for content fragment: ` +
+          contentFragmentRes.error.message,
+      });
+    }
+  }
+
+  // Process email attachments as content fragments.
+  let attachedContentCount = 0;
+  for (const attachment of email.attachments) {
+    try {
+      const file = await FileResource.makeNew({
+        contentType: attachment.contentType as SupportedFileContentType,
+        fileName: attachment.filename,
+        fileSize: attachment.size,
+        userId: user.id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+        useCase: "conversation",
+        useCaseMetadata: null,
+      });
+
+      const fileStream = fs.createReadStream(attachment.filepath);
+      const processRes = await processAndStoreFile(auth, {
+        file,
+        content: {
+          type: "readable",
+          value: Readable.from(fileStream),
+        },
+      });
+
+      if (processRes.isErr()) {
+        localLogger.warn(
+          {
+            filename: attachment.filename,
+            contentType: attachment.contentType,
+            error: processRes.error.message,
+          },
+          "[email] Failed to process attachment, skipping."
+        );
+        continue;
+      }
+
+      const contentFragmentRes = await postNewContentFragment(
+        auth,
+        conversation,
+        {
+          title: attachment.filename,
+          fileId: file.sId,
+        },
+        {
+          username: user.username,
+          fullName: user.fullName(),
+          email: user.email,
+          profilePictureUrl: user.imageUrl,
+        }
+      );
+
+      if (contentFragmentRes.isErr()) {
+        localLogger.warn(
+          {
+            filename: attachment.filename,
+            error: contentFragmentRes.error.message,
+          },
+          "[email] Failed to create content fragment for attachment, skipping."
+        );
+        continue;
+      }
+
+      attachedContentCount += 1;
+      localLogger.info(
+        { filename: attachment.filename },
+        "[email] Added attachment as content fragment."
+      );
+    } catch (err) {
+      localLogger.warn(
+        {
+          filename: attachment.filename,
+          error: err instanceof Error ? err.message : "Unknown error",
+        },
+        "[email] Error processing attachment, skipping."
+      );
+    }
+  }
+
+  const content =
+    agentConfigurations
+      .map((agent) => {
+        return serializeMention(agent);
+      })
+      .join(" ") +
+    " " +
+    buildEmailUserMessage({
+      email,
+      userMessage,
+      hasThreadHistory: restOfThread.length > 0,
+      attachmentCount: attachedContentCount,
+    });
+
+  const mentions = agentConfigurations.map((agent) => {
+    return { configurationId: agent.sId };
+  });
+
+  // Post message WITHOUT waiting for completion - the reply will be sent
+  // by the agent loop finalization activity.
+  const messageRes = await postUserMessage(auth, {
+    conversationResource,
+    content,
+    mentions,
+    context: {
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC",
+      username: user.username,
+      fullName: user.fullName(),
+      email: user.email,
+      profilePictureUrl: user.imageUrl,
+      origin: "email",
+    },
+    // Tool validation is now handled via email with signed approval links.
+    skipToolsValidation: false,
+  });
+
+  if (messageRes.isErr()) {
+    return new Err({
+      type: "message_creation_error",
+      message:
+        `Error interacting with agent: ` + messageRes.error.api_error.message,
+    });
+  }
+
+  const { agentMessages } = messageRes.value;
+
+  // Store email reply context in Redis for each agent message.
+  // The finalization activity will use this to send the reply.
+  // O(n²) acceptable: both arrays are small (typically 1-3 agents matching an email prefix).
+  for (const agentMessage of agentMessages) {
+    const agentConfig = agentConfigurations.find(
+      (ac) => ac.sId === agentMessage.configuration.sId
+    );
+    if (agentConfig) {
+      await storeEmailReplyContext(agentMessage.sId, {
+        subject: email.subject,
+        originalText: email.text,
+        fromEmail: email.sender.email,
+        fromFull: email.sender.full,
+        threadingMessageId: email.threadingHeaders.messageId,
+        threadingInReplyTo: email.threadingHeaders.inReplyTo,
+        threadingReferences: email.threadingHeaders.references,
+        agentConfigurationId: agentConfig.sId,
+        workspaceId: workspace.sId,
+        conversationId: conversation.sId,
+      });
+    }
+  }
+
+  localLogger.info(
+    {
+      conversation: {
+        sId: conversation.sId,
+      },
+      agentMessageCount: agentMessages.length,
+    },
+    "[email] Created conversation and posted message (async mode)."
+  );
+
+  return new Ok({ conversation });
+}
+
+/**
+ * Sends an email with tool approval links for blocked actions.
+ */
+export async function sendToolValidationEmail({
+  email,
+  agentConfiguration,
+  blockedActions,
+  conversation,
+  workspace,
+}: {
+  email: InboundEmail;
+  agentConfiguration: LightAgentConfigurationType;
+  blockedActions: AgentLoopBlockedToolExecution[];
+  conversation: { sId: string };
+  workspace: LightWorkspaceType;
+}): Promise<void> {
+  const localLogger = logger.child({
+    conversationId: conversation.sId,
+    agentName: agentConfiguration.name,
+  });
+
+  const name = `${agentConfiguration.name} (Ruby agent)`;
+  const sender = `${agentConfiguration.name}@${ASSISTANT_EMAIL_SUBDOMAIN}`;
+
+  const subject = email.subject
+    .toLowerCase()
+    .replaceAll(" ", "")
+    .startsWith("re:")
+    ? email.subject
+    : `Re: ${email.subject}`;
+
+  const baseUrl = config.getAppUrl();
+  const currentCell = cellsConfig.getCurrentCell();
+  const conversationUrl = getConversationRoute(
+    workspace.sId,
+    conversation.sId,
+    undefined,
+    config.getAppUrl()
+  );
+
+  // Build HTML for each blocked action.
+  const actionBlocks = blockedActions.map((action) => {
+    const approveToken = generateValidationToken(action.actionId, "approved");
+    const rejectToken = generateValidationToken(action.actionId, "rejected");
+
+    const approveUrl = new URL("/email/validation", baseUrl);
+    approveUrl.searchParams.set("token", approveToken);
+    approveUrl.searchParams.set("cell", currentCell.name);
+
+    const rejectUrl = new URL("/email/validation", baseUrl);
+    rejectUrl.searchParams.set("token", rejectToken);
+    rejectUrl.searchParams.set("cell", currentCell.name);
+
+    const inputsJson = JSON.stringify(action.inputs, null, 2)
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+    const toolName = sanitizeHtml(asDisplayName(action.metadata.toolName), {
+      allowedTags: [],
+      allowedAttributes: {},
+    });
+    const serverName = sanitizeHtml(
+      asDisplayName(action.metadata.mcpServerName),
+      { allowedTags: [], allowedAttributes: {} }
+    );
+
+    return `
+      <div style="border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 12px 0; background-color: #f9f9f9;">
+        <h3 style="margin: 0 0 8px 0; color: #333;">Allow ${serverName} to ${toolName}?</h3>
+        <pre style="background-color: #fff; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #eee;">${inputsJson}</pre>
+        <div style="margin-top: 12px;">
+          <a href="${approveUrl.toString()}" style="display: inline-block; padding: 10px 20px; background-color: #22c55e; color: white; text-decoration: none; border-radius: 4px; margin-right: 8px; font-weight: 500;">Allow</a>
+          <a href="${rejectUrl.toString()}" style="display: inline-block; padding: 10px 20px; background-color: #ef4444; color: white; text-decoration: none; border-radius: 4px; font-weight: 500;">Decline</a>
+        </div>
+      </div>
+    `;
+  });
+
+  const htmlContent = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+      <p><strong>@${sanitizeHtml(agentConfiguration.name, { allowedTags: [], allowedAttributes: {} })}</strong> needs permission to use the following tool(s):</p>
+      ${actionBlocks.join("")}
+      <p style="color: #666; margin-top: 16px;">Links expire in 24 hours.</p>
+      <p><a href="${conversationUrl}" style="color: #2563eb;">View conversation in Ruby</a></p>
+    </div>
+  `;
+
+  const quote = email.text
+    .replaceAll(">", "&gt;")
+    .replaceAll("<", "&lt;")
+    .split("\n")
+    .join("<br/>\n");
+
+  const html =
+    "<div>\n" +
+    htmlContent +
+    `<br/><br/>` +
+    `On ${new Date().toUTCString()} ${sanitizeHtml(email.sender.full, { allowedTags: [], allowedAttributes: {} })} wrote:<br/>\n` +
+    `<blockquote class="quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">\n` +
+    `${quote}` +
+    `</blockquote>\n` +
+    "<div>\n";
+
+  const headers = buildSendgridThreadingHeaders(email);
+
+  const msg = {
+    from: {
+      name,
+      email: sender,
+    },
+    reply_to: sender,
+    subject,
+    html,
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  };
+
+  try {
+    await sendEmail(email.sender.email, msg);
+    localLogger.info(
+      { actionsCount: blockedActions.length },
+      "[email] Sent tool validation email."
+    );
+  } catch (error) {
+    localLogger.error(
+      { error },
+      "[email] Failed to send tool validation email."
+    );
+  }
+}
+
+export async function replyToEmail({
+  email,
+  agentConfiguration,
+  htmlContent,
+  recipient,
+}: {
+  email: InboundEmail;
+  agentConfiguration?: LightAgentConfigurationType;
+  htmlContent: string;
+  recipient: string;
+}) {
+  const name = agentConfiguration
+    ? `${agentConfiguration.name} (Ruby agent)`
+    : "Ruby agent";
+  const sender = agentConfiguration
+    ? `${agentConfiguration.name}@${ASSISTANT_EMAIL_SUBDOMAIN}`
+    : `assistants@${ASSISTANT_EMAIL_SUBDOMAIN}`;
+
+  // subject: if Re: is there, we don't add it.
+  const subject = email.subject
+    .toLowerCase()
+    .replaceAll(" ", "")
+    .startsWith("re:")
+    ? email.subject
+    : `Re: ${email.subject}`;
+
+  const quote = email.text
+    .replaceAll(">", "&gt;")
+    .replaceAll("<", "&lt;")
+    .split("\n")
+    .join("<br/>\n");
+
+  const html =
+    "<div>\n" +
+    htmlContent +
+    `<br/><br/>` +
+    `On ${new Date().toUTCString()} ${sanitizeHtml(email.sender.full, { allowedTags: [], allowedAttributes: {} })} wrote:<br/>\n` +
+    `<blockquote class="quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">\n` +
+    `${quote}` +
+    `</blockquote>\n` +
+    "<div>\n";
+
+  const headers = buildSendgridThreadingHeaders(email);
+
+  const msg = {
+    from: {
+      name,
+      email: sender,
+    },
+    reply_to: sender,
+    subject,
+    html,
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  };
+
+  await sendEmailToRecipients({
+    to: [recipient],
+    cc: [],
+    message: msg,
+  });
+}

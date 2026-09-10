@@ -1,0 +1,164 @@
+import { buildReinforcedSkillsLLMParams } from "@app/lib/reinforcement/run_reinforced_analysis";
+import { TOOL_SCHEMAS } from "@app/lib/reinforcement/types";
+import { describe, expect, it } from "vitest";
+
+describe("buildReinforcedSkillsLLMParams", () => {
+  it("places the system prompt in the prompt field", () => {
+    const params = buildReinforcedSkillsLLMParams(
+      {
+        systemPrompt: "You are a skill analyst.",
+        userMessage: "Analyze this skill.",
+      },
+      "reinforcement_analyze_conversation"
+    );
+
+    expect(params.prompt).toBe("You are a skill analyst.");
+  });
+
+  it("places the user message as a single user message in the conversation", () => {
+    const params = buildReinforcedSkillsLLMParams(
+      { systemPrompt: "System.", userMessage: "User content here." },
+      "reinforcement_analyze_conversation"
+    );
+
+    expect(params.conversation.messages).toHaveLength(1);
+    const msg = params.conversation.messages[0];
+    expect(msg.role).toBe("user");
+    expect(msg.content).toEqual([{ type: "text", text: "User content here." }]);
+  });
+
+  it("includes tool specifications for the skill suggestion tools", () => {
+    const params = buildReinforcedSkillsLLMParams(
+      { systemPrompt: "System.", userMessage: "User." },
+      "reinforcement_analyze_conversation"
+    );
+
+    const toolNames = params.specifications?.map((s) => s.name) ?? [];
+    expect(toolNames).toContain("edit_skill");
+    expect(toolNames).toContain("get_available_tools");
+  });
+
+  it("each specification has a non-empty description and inputSchema", () => {
+    const params = buildReinforcedSkillsLLMParams(
+      { systemPrompt: "System.", userMessage: "User." },
+      "reinforcement_analyze_conversation"
+    );
+
+    for (const spec of params.specifications ?? []) {
+      expect(spec.description).toBeTruthy();
+      expect(spec.inputSchema).toBeTruthy();
+    }
+  });
+});
+
+describe("TOOL_SCHEMAS.edit_skill title validation", () => {
+  const baseArgs = {
+    skillId: "skl_abc",
+    instructionEdits: [
+      {
+        targetBlockId: "abc12345",
+        content: "<p>Updated.</p>",
+        type: "replace" as const,
+      },
+    ],
+  };
+
+  it("accepts a title of exactly 25 characters", () => {
+    const title = "a".repeat(25);
+    const parsed = TOOL_SCHEMAS.edit_skill.safeParse({ ...baseArgs, title });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("rejects a title longer than 25 characters", () => {
+    const title = "a".repeat(26);
+    const parsed = TOOL_SCHEMAS.edit_skill.safeParse({ ...baseArgs, title });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("accepts a missing title (title is optional for drafts)", () => {
+    const parsed = TOOL_SCHEMAS.edit_skill.safeParse(baseArgs);
+    expect(parsed.success).toBe(true);
+  });
+});
+
+describe("TOOL_SCHEMAS.edit_skill agentFacingDescriptionEdit", () => {
+  it("accepts a description-only edit (no instruction edits)", () => {
+    const parsed = TOOL_SCHEMAS.edit_skill.safeParse({
+      skillId: "skl_abc",
+      agentFacingDescriptionEdit: {
+        content: "Use this skill when answering pricing questions.",
+      },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("accepts a description edit alongside instruction edits", () => {
+    const parsed = TOOL_SCHEMAS.edit_skill.safeParse({
+      skillId: "skl_abc",
+      instructionEdits: [
+        {
+          targetBlockId: "abc12345",
+          content: "<p>Updated.</p>",
+          type: "replace",
+        },
+      ],
+      agentFacingDescriptionEdit: { content: "New description." },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("rejects an empty description content", () => {
+    const parsed = TOOL_SCHEMAS.edit_skill.safeParse({
+      skillId: "skl_abc",
+      agentFacingDescriptionEdit: { content: "" },
+    });
+    expect(parsed.success).toBe(false);
+  });
+});
+
+describe("buildReinforcedSkillsLLMParams edit_skill spec", () => {
+  it("exposes agentFacingDescriptionEdit on the analyze edit_skill input schema", () => {
+    const params = buildReinforcedSkillsLLMParams(
+      { systemPrompt: "System.", userMessage: "User." },
+      "reinforcement_analyze_conversation"
+    );
+    const editSkillSpec = params.specifications?.find(
+      (s) => s.name === "edit_skill"
+    );
+    expect(editSkillSpec).toBeDefined();
+    // The JSON schema goes to the LLM verbatim — make sure the new field is
+    // discoverable by name.
+    expect(JSON.stringify(editSkillSpec?.inputSchema)).toContain(
+      "agentFacingDescriptionEdit"
+    );
+  });
+
+  it("exposes agentFacingDescriptionEdit on the aggregate edit_skill input schema", () => {
+    const params = buildReinforcedSkillsLLMParams(
+      { systemPrompt: "System.", userMessage: "User." },
+      "reinforcement_aggregate_suggestions"
+    );
+    const editSkillSpec = params.specifications?.find(
+      (s) => s.name === "edit_skill"
+    );
+    expect(editSkillSpec).toBeDefined();
+    expect(JSON.stringify(editSkillSpec?.inputSchema)).toContain(
+      "agentFacingDescriptionEdit"
+    );
+  });
+
+  it("does not expose legacy toolEdits", () => {
+    const params = buildReinforcedSkillsLLMParams(
+      { systemPrompt: "System.", userMessage: "User." },
+      "reinforcement_analyze_conversation"
+    );
+    const editSkillSpec = params.specifications?.find(
+      (s) => s.name === "edit_skill"
+    );
+
+    expect(editSkillSpec).toBeDefined();
+    expect(JSON.stringify(editSkillSpec?.inputSchema)).not.toContain(
+      "toolEdits"
+    );
+  });
+});

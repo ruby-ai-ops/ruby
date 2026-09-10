@@ -1,0 +1,49 @@
+import { useConversationSidePanelContext } from "@app/components/assistant/conversation/ConversationSidePanelContext";
+import { ConversationSidePanelHeader } from "@app/components/assistant/conversation/ConversationSidePanelHeader";
+import { CenteredState } from "@app/components/assistant/conversation/interactive_content/CenteredState";
+import { AlertCircle, ContentMessage } from "@ruby-ai/sparkle";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React from "react";
+
+interface UnsupportedContentRendererProps {
+  contentType: string;
+  fileName?: string;
+}
+
+export function UnsupportedContentRenderer({
+  contentType,
+  fileName,
+}: UnsupportedContentRendererProps) {
+  const { closePanel } = useConversationSidePanelContext();
+
+  return (
+    <div className="flex h-full flex-col">
+      <ConversationSidePanelHeader onClose={closePanel} />
+
+      <div className="flex-1 overflow-hidden">
+        <CenteredState>
+          <ContentMessage
+            icon={AlertCircle}
+            size="md"
+            title="Unsupported Content Type"
+            variant="warning"
+          >
+            <div className="space-y-2">
+              <p>This content type is not yet supported in the Frame drawer.</p>
+              <div className="text-xs opacity-75">
+                <p>
+                  <strong>Content Type:</strong> {contentType}
+                </p>
+                {fileName && (
+                  <p>
+                    <strong>File:</strong> {fileName}
+                  </p>
+                )}
+              </div>
+            </div>
+          </ContentMessage>
+        </CenteredState>
+      </div>
+    </div>
+  );
+}

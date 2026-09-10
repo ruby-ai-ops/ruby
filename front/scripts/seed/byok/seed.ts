@@ -1,0 +1,83 @@
+import { PlanModel } from "@app/lib/models/plan";
+import type { PlanAttributes } from "@app/lib/plans/free_plans";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { makeScript } from "@app/scripts/helpers";
+import { WORKSPACE_SID } from "@app/scripts/seed/factories/seedContext";
+
+const BYOK_PLAN_CODE = "FREE_BYOK";
+
+// Based on FREE_UPGRADED_PLAN with isByok = true.
+const FREE_BYOK_PLAN_DATA: PlanAttributes = {
+  code: BYOK_PLAN_CODE,
+  name: "Free (BYOK)",
+  maxMessages: -1,
+  maxMessagesTimeframe: "lifetime",
+  maxAwuCredits: -1,
+  maxAwuCreditsTimeframe: "lifetime",
+  maxUsersInWorkspace: -1,
+  maxFreeUsersInWorkspace: -1,
+  maxLifetimeFreeUsersInWorkspace: -1,
+  maxVaultsInWorkspace: -1,
+  maxImagesPerWeek: 50,
+  isDeepDiveAllowed: true,
+  isSlackbotAllowed: true,
+  isManagedConfluenceAllowed: true,
+  isManagedSlackAllowed: true,
+  isManagedNotionAllowed: true,
+  isManagedGoogleDriveAllowed: true,
+  isManagedGithubAllowed: true,
+  isManagedIntercomAllowed: true,
+  isManagedWebCrawlerAllowed: true,
+  isManagedSalesforceAllowed: true,
+  isSSOAllowed: true,
+  isSCIMAllowed: false,
+  isAuditLogsAllowed: false,
+  maxConnectionsCount: -1,
+  maxDataSourcesCount: -1,
+  maxDataSourcesDocumentsCount: -1,
+  maxDataSourcesDocumentsSizeMb: 2,
+  trialPeriodDays: 0,
+  canUseProduct: true,
+  isByok: true,
+  hasAdvancedModelAccess: false,
+};
+
+makeScript({}, async ({ execute }, logger) => {
+  const workspace = await WorkspaceResource.fetchById(WORKSPACE_SID);
+  if (!workspace) {
+    throw new Error(
+      `Workspace ${WORKSPACE_SID} not found. Make sure ruby-hive seed has run first.`
+    );
+  }
+
+  // Step 1: Upsert the FREE_BYOK plan.
+  if (execute) {
+    await PlanModel.upsert(FREE_BYOK_PLAN_DATA, { conflictFields: ["code"] });
+    logger.info(`Upserted plan ${BYOK_PLAN_CODE}.`);
+  } else {
+    logger.info(`[DRYRUN]: Would upsert plan ${BYOK_PLAN_CODE}.`);
+  }
+
+  // Step 2: Switch DevWkSpace subscription to the FREE_BYOK plan.
+  const activeSubscription =
+    await SubscriptionResource.fetchActiveByWorkspaceModelId(workspace.id);
+  if (activeSubscription?.getPlan().code === BYOK_PLAN_CODE) {
+    logger.info(
+      `Workspace ${WORKSPACE_SID} already on ${BYOK_PLAN_CODE} — skipping.`
+    );
+    return;
+  }
+
+  if (execute) {
+    await SubscriptionResource.internalSubscribeWorkspaceToFreePlan({
+      workspaceId: WORKSPACE_SID,
+      planCode: BYOK_PLAN_CODE,
+      endDate: null,
+    });
+  }
+
+  logger.info(
+    `${execute ? "" : "[DRYRUN]: "}Switched ${WORKSPACE_SID} subscription to ${BYOK_PLAN_CODE}.`
+  );
+});

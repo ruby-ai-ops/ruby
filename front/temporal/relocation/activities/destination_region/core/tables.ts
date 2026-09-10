@@ -1,0 +1,124 @@
+import config from "@app/lib/api/config";
+import { UNTITLED_TITLE } from "@app/lib/api/content_nodes";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import type {
+  CoreTableAPIRelocationBlob,
+  CreateDataSourceProjectResult,
+} from "@app/temporal/relocation/activities/types";
+import { CORE_API_CONCURRENCY_LIMIT } from "@app/temporal/relocation/activities/types";
+import {
+  deleteFromRelocationStorage,
+  readFromRelocationStorage,
+} from "@app/temporal/relocation/lib/file_storage/relocation";
+import { CoreAPI } from "@app/types/core/core_api";
+import type { RegionType } from "@app/types/region";
+
+export async function processDataSourceTables({
+  destIds,
+  dataPath,
+  destRegion,
+  sourceRegion,
+  sourceRegionApiBaseUrl,
+  workspaceId,
+}: {
+  destIds: CreateDataSourceProjectResult;
+  dataPath: string;
+  destRegion: RegionType;
+  sourceRegion: RegionType;
+  sourceRegionApiBaseUrl: string;
+  workspaceId: string;
+}) {
+  const localLogger = logger.child({
+    destRegion,
+    sourceRegion,
+    workspaceId,
+  });
+
+  localLogger.info("[Core] Processing data source tables");
+
+  const data =
+    await readFromRelocationStorage<CoreTableAPIRelocationBlob>(dataPath);
+
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), localLogger);
+
+  const destRegionApiBaseUrl = config.getApiBaseUrl();
+
+  const res = await concurrentExecutor(
+    data.blobs.tables,
+    async (d) => {
+      // If the source URL starts with the source region Ruby URL, replace it with the destination region Ruby URL.
+      const sourceUrl =
+        d.source_url && d.source_url.startsWith(sourceRegionApiBaseUrl)
+          ? d.source_url.replace(sourceRegionApiBaseUrl, destRegionApiBaseUrl)
+          : d.source_url;
+
+      // There are some issues with the parents field.
+      // parents[0] should be the table_id, but it's not always the case.
+      // If we change the parents[0] to the table_id, then parents[1] should be the parent_id.
+      let parents: string[];
+      let parentId: string | null = d.parent_id ?? null;
+      if (d.parents.length > 0) {
+        if (d.parents[0] !== d.table_id) {
+          parents = [d.table_id, ...d.parents];
+          parentId = parents[1];
+        } else {
+          parents = d.parents;
+        }
+      } else {
+        parents = [d.table_id];
+      }
+
+      const title = d.title.trim() || d.name.trim() || UNTITLED_TITLE;
+
+      // 1) Upsert the table.
+      const upsertRes = await coreAPI.upsertTable({
+        projectId: destIds.rubyAPIProjectId,
+        dataSourceId: destIds.rubyAPIDataSourceId,
+        tableId: d.table_id,
+        name: d.name,
+        description: d.description,
+        timestamp: d.timestamp,
+        tags: d.tags,
+        parentId,
+        parents,
+        remoteDatabaseTableId: d.remote_database_table_id,
+        remoteDatabaseSecretId: d.remote_database_secret_id,
+        title,
+        mimeType: d.mime_type,
+        sourceUrl: sourceUrl ?? null,
+      });
+
+      if (upsertRes.isErr()) {
+        localLogger.error(
+          {
+            error: upsertRes.error,
+            tableId: d.table_id,
+          },
+          "[Core] Failed to upsert table"
+        );
+        return upsertRes;
+      }
+
+      // Note that we call upsertTable here, and we don't insert any rows. This is because we rely on
+      // separately copying the GCS blobs directly, rather than going through Core API for that.
+
+      return upsertRes;
+    },
+    { concurrency: CORE_API_CONCURRENCY_LIMIT }
+  );
+
+  const failed = res.filter((r) => r.isErr());
+  if (failed.length > 0) {
+    localLogger.error(
+      { failed },
+      "[Core] Failed to process data source tables"
+    );
+
+    throw new Error("Failed to process data source tables");
+  }
+
+  localLogger.info("[Core] Processed data source tables");
+
+  await deleteFromRelocationStorage(dataPath);
+}

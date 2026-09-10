@@ -1,0 +1,614 @@
+import config from "@app/lib/file_storage/config";
+import type { GCSAPIError } from "@app/lib/file_storage/types";
+import { isGCSNotFoundError } from "@app/lib/file_storage/types";
+import { setTimeoutAsync, withRetry } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import type { AllSupportedFileContentType } from "@app/types/files";
+import { frameContentType } from "@app/types/files";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { isString } from "@app/types/shared/utils/general";
+import { stripNullBytes } from "@app/types/shared/utils/string_utils";
+import type { Bucket, File, SaveOptions } from "@google-cloud/storage";
+import { RETRYABLE_ERR_FN_DEFAULT, Storage } from "@google-cloud/storage";
+import type formidable from "formidable";
+import fs from "fs";
+import isNumber from "lodash/isNumber";
+import { pipeline } from "stream/promises";
+
+const GCS_TRANSIENT_RETRY_MAX_ATTEMPTS = 3;
+const GCS_TRANSIENT_RETRY_BASE_DELAY_MS = 500;
+// Preserves the 500ms, 2000ms backoff curve of the copyFile retry loop
+// (delayMs = base * attempt²).
+const GCS_TRANSIENT_RETRY_BACKOFF_MULTIPLIER = 4;
+const GCS_MAX_RETRIES = 3; // Same as the SDK default.
+const GCS_EXTRA_RETRYABLE_ERROR_MESSAGE_REGEX = /socket hang up/i;
+// GCS generations are object versions. Matching generation 0 means "create only
+// if the object does not already exist", which makes the create safe to retry.
+export const GCS_OBJECT_DOES_NOT_EXIST_GENERATION_MATCH = 0;
+
+export const DEFAULT_SIGNED_URL_EXPIRATION_DELAY_MS = 5 * 60 * 1000; // 5 minutes.
+
+// Threshold above which file uploads switch from a single multipart POST to a
+// resumable upload (see FileResource.getWriteStream). Below it, uploads are
+// buffered in memory and written with retry (see parseUploadRequest). Chunk
+// size must be a multiple of 256 KiB; GCS recommends at least 8 MiB for
+// performance.
+export const GCS_RESUMABLE_UPLOAD_THRESHOLD_BYTES = 8 * 1024 * 1024;
+export const GCS_RESUMABLE_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
+
+interface FileStorageOptions {
+  useServiceAccount?: boolean;
+}
+
+type RawContentUpload = {
+  content: string;
+  contentType: AllSupportedFileContentType;
+  filePath: string;
+};
+
+type RawContentSaveOptions = Pick<
+  SaveOptions,
+  "preconditionOpts" | "resumable"
+>;
+
+function isRetryableGCSError(err: unknown): boolean {
+  // ApiError only adds optional fields on top of Error, so a normalized Error
+  // is safe to hand to the SDK's default retryable check.
+  const error = normalizeError(err);
+
+  return (
+    RETRYABLE_ERR_FN_DEFAULT(error) ||
+    GCS_EXTRA_RETRYABLE_ERROR_MESSAGE_REGEX.test(error.message)
+  );
+}
+
+/**
+ * Retry an operation that fails with a transient GCS error ("socket hang up"
+ * and other errors the SDK considers retryable).
+ *
+ * Needed for streamed uploads, which bypass the SDK's built-in retryOptions.
+ * Only use when the operation can safely be re-run from scratch (e.g. the
+ * source stream can be re-created on each attempt).
+ */
+export async function withRetryOnTransientGCSError<T>(
+  operation: () => Promise<T>,
+  {
+    operationName,
+    logContext,
+  }: { operationName: string; logContext: Record<string, unknown> }
+): Promise<T> {
+  const result = await withRetry(operation, {
+    maxRetries: GCS_TRANSIENT_RETRY_MAX_ATTEMPTS - 1,
+    initialDelayMs: GCS_TRANSIENT_RETRY_BASE_DELAY_MS,
+    backoffMultiplier: GCS_TRANSIENT_RETRY_BACKOFF_MULTIPLIER,
+    shouldRetry: (err, attempt) => {
+      if (!isRetryableGCSError(err)) {
+        return false;
+      }
+
+      logger.warn(
+        {
+          err: normalizeError(err),
+          ...logContext,
+          attempt: attempt + 1,
+          maxAttempts: GCS_TRANSIENT_RETRY_MAX_ATTEMPTS,
+        },
+        `GCS ${operationName} failed, retrying.`
+      );
+
+      return true;
+    },
+  });
+
+  if (result.isErr()) {
+    throw result.error;
+  }
+
+  return result.value;
+}
+
+export class FileStorage {
+  private readonly bucket: Bucket;
+  private readonly storage: Storage;
+
+  constructor(
+    bucketKey: string,
+    { useServiceAccount }: FileStorageOptions = { useServiceAccount: true }
+  ) {
+    this.storage = new Storage({
+      keyFilename: useServiceAccount ? config.getServiceAccount() : undefined,
+      retryOptions: {
+        maxRetries: GCS_MAX_RETRIES,
+        retryableErrorFn: isRetryableGCSError,
+      },
+    });
+
+    this.bucket = this.storage.bucket(bucketKey);
+  }
+
+  /**
+   * Upload functions.
+   */
+
+  async uploadFileToBucket(file: formidable.File, destPath: string) {
+    // Stream-based uploads via pipeline() + createWriteStream() bypass the
+    // SDK's built-in retryOptions, so we need application-level retry.
+    // Since the source is a local file we can safely re-create the read stream.
+    await withRetryOnTransientGCSError(
+      async () => {
+        const gcsFile = this.file(destPath);
+        const fileStream = fs.createReadStream(file.filepath);
+
+        await pipeline(
+          fileStream,
+          gcsFile.createWriteStream({
+            metadata: {
+              contentType: file.mimetype ?? undefined,
+            },
+          })
+        );
+      },
+      {
+        operationName: "file upload (stream)",
+        logContext: { destPath },
+      }
+    );
+  }
+
+  async uploadBufferToBucket({
+    buffer,
+    contentType,
+    filePath,
+  }: {
+    buffer: Buffer;
+    contentType: AllSupportedFileContentType;
+    filePath: string;
+  }) {
+    // A single-request upload without preconditions is not retried by the
+    // SDK (conditional idempotency), so retry transient errors at the
+    // application level: the buffer is replayable.
+    await withRetryOnTransientGCSError(
+      () => this.file(filePath).save(buffer, { contentType, resumable: false }),
+      {
+        operationName: "file upload (buffer)",
+        logContext: { filePath },
+      }
+    );
+  }
+
+  async uploadRawContentToBucket({
+    content,
+    contentType,
+    filePath,
+  }: RawContentUpload) {
+    await this.saveRawContentToBucket({ content, contentType, filePath });
+  }
+
+  async uploadSmallRawContentToBucketAsNewFile({
+    content,
+    contentType,
+    filePath,
+  }: RawContentUpload) {
+    await this.saveRawContentToBucket(
+      { content, contentType, filePath },
+      {
+        resumable: false,
+        preconditionOpts: {
+          ifGenerationMatch: GCS_OBJECT_DOES_NOT_EXIST_GENERATION_MATCH,
+        },
+      }
+    );
+  }
+
+  private async saveRawContentToBucket(
+    { content, contentType, filePath }: RawContentUpload,
+    saveOptions?: RawContentSaveOptions
+  ) {
+    const gcsFile = this.file(filePath);
+
+    const contentToSave = Buffer.from(stripNullBytes(content), "utf8");
+
+    await gcsFile.save(contentToSave, {
+      contentType,
+      ...saveOptions,
+    });
+  }
+
+  /**
+   * Download functions.
+   */
+
+  async fetchFileContent(filePath: string) {
+    const gcsFile = this.file(filePath);
+
+    const [content] = await gcsFile.download();
+    const [metadata] = await gcsFile.getMetadata();
+    const contentType = metadata.contentType;
+
+    if (this.isTextBasedContentType(contentType)) {
+      return stripNullBytes(content.toString());
+    }
+
+    return content.toString();
+  }
+
+  async fetchFileBuffer(filePath: string): Promise<Uint8Array<ArrayBuffer>> {
+    const [buffer] = await this.file(filePath).download();
+    return Uint8Array.from(buffer);
+  }
+
+  private isTextBasedContentType(contentType?: string): boolean {
+    if (!contentType) {
+      return true;
+    }
+
+    const textTypes = [
+      frameContentType,
+      "text/",
+      "application/json",
+      "application/xml",
+      "image/svg+xml",
+    ];
+
+    return textTypes.some((type) => contentType.startsWith(type));
+  }
+
+  async getFileContentType(
+    filename: string
+  ): Promise<Result<string | undefined, GCSAPIError>> {
+    try {
+      const gcsFile = this.file(filename);
+
+      const [metadata] = await gcsFile.getMetadata();
+
+      return new Ok(metadata.contentType);
+    } catch (error) {
+      if (isGCSNotFoundError(error)) {
+        return new Err(error);
+      }
+
+      throw error;
+    }
+  }
+
+  async getSignedUrl(
+    filename: string,
+    {
+      expirationDelayMs,
+      promptSaveAs,
+    }: { expirationDelayMs: number; promptSaveAs?: string } = {
+      expirationDelayMs: DEFAULT_SIGNED_URL_EXPIRATION_DELAY_MS,
+    }
+  ): Promise<string> {
+    const gcsFile = this.file(filename);
+
+    const signedUrl = await gcsFile.getSignedUrl({
+      version: "v4",
+      action: "read",
+      expires: new Date().getTime() + expirationDelayMs,
+      promptSaveAs,
+    });
+
+    return signedUrl.toString();
+  }
+
+  async getSignedUploadUrl(
+    filename: string,
+    {
+      contentType,
+      expirationDelayMs,
+      extensionHeaders,
+    }: {
+      contentType: string;
+      expirationDelayMs: number;
+      extensionHeaders?: Record<string, string>;
+    }
+  ): Promise<string> {
+    const [signedUrl] = await this.file(filename).getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: Date.now() + expirationDelayMs,
+      contentType,
+      extensionHeaders,
+    });
+
+    return signedUrl;
+  }
+
+  file(filename: string) {
+    return this.bucket.file(filename);
+  }
+
+  async getFiles({
+    maxResults,
+    prefix,
+  }: {
+    prefix?: string;
+    maxResults: number;
+  }) {
+    const [files] = await this.bucket.getFiles({ prefix, maxResults });
+
+    return files;
+  }
+
+  /**
+   * Lists all objects under `prefix` by following GCS list pagination.
+   */
+  async getAllFilesByPrefix({
+    prefix,
+    pageSize = 1000,
+  }: {
+    prefix: string;
+    pageSize?: number;
+  }): Promise<{ files: File[]; pageFetchCount: number }> {
+    const allFiles: File[] = [];
+    let pageToken: string | undefined;
+    let pageFetchCount = 0;
+
+    do {
+      const [files, nextQuery] = await this.bucket.getFiles({
+        prefix,
+        maxResults: pageSize,
+        pageToken,
+        autoPaginate: false,
+      });
+      pageFetchCount++;
+      allFiles.push(...files);
+
+      const nextToken =
+        nextQuery &&
+        typeof nextQuery === "object" &&
+        "pageToken" in nextQuery &&
+        nextQuery.pageToken
+          ? String(nextQuery.pageToken)
+          : undefined;
+      pageToken = nextToken || undefined;
+    } while (pageToken);
+
+    return { files: allFiles, pageFetchCount };
+  }
+
+  /**
+   * The `prefixes` of a delimited list response, i.e. the common prefixes GCS rolled up. The Node
+   * client types the raw API response as `{}`, so read the field defensively rather than asserting a
+   * shape the types do not promise.
+   */
+  private extractCommonPrefixes(apiResponse: unknown): string[] {
+    if (
+      !apiResponse ||
+      typeof apiResponse !== "object" ||
+      !("prefixes" in apiResponse)
+    ) {
+      return [];
+    }
+
+    const { prefixes } = apiResponse;
+
+    return Array.isArray(prefixes) ? prefixes.filter(isString) : [];
+  }
+
+  /**
+   * Names of the immediate "subdirectories" under `prefix`, using a GCS delimited list so the
+   * objects inside them are never enumerated. Use this instead of `getAllFilesByPrefix` whenever the
+   * directory names are all you need and the subtrees can be large.
+   */
+  async listSubdirectoryNames({
+    prefix,
+    pageSize = 1000,
+  }: {
+    prefix: string;
+    pageSize?: number;
+  }): Promise<string[]> {
+    const normalizedPrefix = prefix.endsWith("/") ? prefix : `${prefix}/`;
+    const names: string[] = [];
+    let pageToken: string | undefined;
+
+    do {
+      const [, nextQuery, apiResponse] = await this.bucket.getFiles({
+        prefix: normalizedPrefix,
+        delimiter: "/",
+        maxResults: pageSize,
+        pageToken,
+        autoPaginate: false,
+      });
+
+      for (const commonPrefix of this.extractCommonPrefixes(apiResponse)) {
+        const name = commonPrefix
+          .slice(normalizedPrefix.length)
+          .replace(/\/$/, "");
+        if (name) {
+          names.push(name);
+        }
+      }
+
+      const nextToken =
+        nextQuery &&
+        typeof nextQuery === "object" &&
+        "pageToken" in nextQuery &&
+        nextQuery.pageToken
+          ? String(nextQuery.pageToken)
+          : undefined;
+      pageToken = nextToken || undefined;
+    } while (pageToken);
+
+    return names;
+  }
+
+  async getSortedFileVersions({
+    filePath,
+    maxResults,
+  }: {
+    filePath: string;
+    maxResults?: number;
+  }): Promise<Result<File[], Error>> {
+    try {
+      const [files] = await this.bucket.getFiles({
+        prefix: filePath,
+        versions: true,
+        maxResults,
+      });
+
+      // Filter to only the exact file path and sort by generation (newest first)
+      // Generation represents the version order in GCS
+      // can be string or number per GCS types, though in practice it seems to always be a number
+      return new Ok(
+        files
+          .filter((file) => file.name === filePath)
+          .sort((a, b) => {
+            const genA = isNumber(a.metadata.generation)
+              ? a.metadata.generation
+              : Number(a.metadata.generation ?? 0);
+            const genB = isNumber(b.metadata.generation)
+              ? b.metadata.generation
+              : Number(b.metadata.generation ?? 0);
+            return genB - genA;
+          })
+      );
+    } catch (err) {
+      return new Err(normalizeError(err));
+    }
+  }
+
+  get name() {
+    return this.bucket.name;
+  }
+
+  /**
+   * Delete functions.
+   */
+
+  async delete(
+    filePath: string,
+    { ignoreNotFound }: { ignoreNotFound?: boolean } = {}
+  ) {
+    try {
+      return await this.file(filePath).delete();
+    } catch (err) {
+      if (ignoreNotFound && isGCSNotFoundError(err)) {
+        return;
+      }
+
+      throw err;
+    }
+  }
+
+  /**
+   * Copy a file within Cloud Storage with retry logic.
+   *
+   * The GCS SDK's built-in autoRetry is effectively disabled for copy operations and
+   * "socket hang up" errors aren't in the SDK's retryable error list anyway.
+   * Since copy is idempotent (same source, same destination), retrying is safe.
+   */
+  async copyFile(
+    srcPath: string,
+    destPath: string,
+    destinationStorage: FileStorage = this,
+    { sourceGeneration }: { sourceGeneration?: string } = {}
+  ): Promise<void> {
+    const destinationFile = destinationStorage.file(destPath);
+    const sourceFile = sourceGeneration
+      ? this.bucket.file(srcPath, { generation: sourceGeneration })
+      : this.file(srcPath);
+
+    for (
+      let attempt = 1;
+      attempt <= GCS_TRANSIENT_RETRY_MAX_ATTEMPTS;
+      attempt++
+    ) {
+      try {
+        await sourceFile.copy(destinationFile);
+        return;
+      } catch (err) {
+        if (attempt === GCS_TRANSIENT_RETRY_MAX_ATTEMPTS) {
+          throw err;
+        }
+
+        const delayMs = GCS_TRANSIENT_RETRY_BASE_DELAY_MS * attempt ** 2;
+
+        logger.warn(
+          {
+            error: normalizeError(err),
+            srcBucket: this.name,
+            srcPath,
+            destBucket: destinationStorage.name,
+            destPath,
+            attempt,
+            maxRetries: GCS_TRANSIENT_RETRY_MAX_ATTEMPTS,
+            delayMs,
+          },
+          "GCS copy failed, retrying."
+        );
+
+        await setTimeoutAsync(delayMs);
+      }
+    }
+  }
+
+  async deleteByPrefix(prefix: string): Promise<void> {
+    await this.bucket.deleteFiles({ prefix });
+  }
+
+  /**
+   * Concatenates `sourcePaths` (in order) into `destinationPath`, entirely server-side: no
+   * bytes are downloaded to or uploaded from this process. GCS caps a single compose call
+   * at `GCS_COMPOSE_MAX_SOURCES` source objects; callers with more sources than that must
+   * batch across multiple calls themselves (e.g. composing into intermediate objects first).
+   *
+   * Not retried by the SDK's built-in autoRetry (no precondition is set), so retried at the
+   * application level instead: since the same sources produce the same destination bytes,
+   * retrying from scratch is safe.
+   */
+  async composeFiles(
+    sourcePaths: string[],
+    destinationPath: string
+  ): Promise<void> {
+    await withRetryOnTransientGCSError(
+      () => this.bucket.combine(sourcePaths, this.file(destinationPath)),
+      {
+        operationName: "file compose",
+        logContext: { destinationPath, sourceCount: sourcePaths.length },
+      }
+    );
+  }
+}
+
+// GCS hard limit: https://cloud.google.com/storage/docs/json_api/v1/objects/compose
+export const GCS_COMPOSE_MAX_SOURCES = 32;
+
+const bucketInstances = new Map();
+
+export const getBucketInstance: (
+  bucketConfig: string,
+  options?: FileStorageOptions
+) => FileStorage = (bucketConfig, options) => {
+  if (!bucketInstances.has(bucketConfig)) {
+    bucketInstances.set(bucketConfig, new FileStorage(bucketConfig, options));
+  }
+  return bucketInstances.get(bucketConfig);
+};
+
+export const getPrivateUploadBucket = (options?: FileStorageOptions) =>
+  getBucketInstance(config.getGcsPrivateUploadsBucket(), options);
+
+export const getPublicUploadBucket = (options?: FileStorageOptions) =>
+  getBucketInstance(config.getGcsPublicUploadBucket(), options);
+
+export const getUpsertQueueBucket = (options?: FileStorageOptions) =>
+  getBucketInstance(config.getGcsUpsertQueueBucket(), options);
+
+export const getTmpWorkloadsBucket = (options?: FileStorageOptions) =>
+  getBucketInstance(config.getGcsTmpWorkloadsBucket(), options);
+
+export const getRubyDataSourcesBucket = (options?: FileStorageOptions) =>
+  getBucketInstance(config.getRubyDataSourcesBucket(), options);
+
+export const getWebhookRequestsBucket = (options?: FileStorageOptions) =>
+  getBucketInstance(config.getWebhookRequestsBucket(), options);
+
+export const getLLMTracesBucket = (options?: FileStorageOptions) =>
+  getBucketInstance(config.getLLMTracesBucket(), options);
+
+export const getPokeUserConfigBucket = (options?: FileStorageOptions) =>
+  getBucketInstance(config.getPokeUserConfigBucket(), options);

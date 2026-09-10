@@ -1,0 +1,1924 @@
+import { sendProactiveTrialCancelledEmail } from "@app/lib/api/email";
+import { getOrCreateWorkOSOrganization } from "@app/lib/api/workos/organization";
+import { getWorkspaceInfos } from "@app/lib/api/workspace";
+import { countActiveSeatsForWorkspace } from "@app/lib/api/workspace_seats";
+import type { Authenticator } from "@app/lib/auth";
+import type { RubyError } from "@app/lib/error";
+import {
+  scheduleMetronomeContractEnd,
+  setMetronomeContractCustomFields,
+} from "@app/lib/metronome/client";
+import { PLAN_CODE_CUSTOM_FIELD_KEY } from "@app/lib/metronome/constants";
+import {
+  ensureMetronomeCustomerForWorkspace,
+  provisionMetronomeContract,
+  resolveCurrencyForExistingMetronomeCustomer,
+} from "@app/lib/metronome/contracts";
+import { invalidateContractCache } from "@app/lib/metronome/plan_type";
+import { syncSeatCount } from "@app/lib/metronome/seats";
+import { LEGACY_BUSINESS_PACKAGE_ALIAS } from "@app/lib/metronome/types";
+import { AgentConfigurationModel } from "@app/lib/models/agent/agent";
+import { ConversationModel } from "@app/lib/models/agent/conversation";
+import { PlanModel, SubscriptionModel } from "@app/lib/models/plan";
+import { resolvePackageAliasForCurrency } from "@app/lib/plans/billing_currency";
+import type { PlanAttributes } from "@app/lib/plans/free_plans";
+import { FREE_NO_PLAN_DATA } from "@app/lib/plans/free_plans";
+import type { PokeNonFreePlanTypeFilter } from "@app/lib/plans/plan_codes";
+import {
+  FREE_TEST_PLAN_CODE,
+  isEnterprisePlanPrefix,
+  isFreePlan,
+  isProOrBusinessPlanCode,
+  isProPlanPrefix,
+  isUpgraded,
+  isWhitelistedBusinessPlan,
+  POKE_PLAN_CODE_MATCHERS,
+  POKE_PLAN_TYPE_FILTERS,
+  PRO_PLAN_SEAT_39_CODE,
+} from "@app/lib/plans/plan_codes";
+import type { PlanLimitOverride } from "@app/lib/plans/plan_limit_overrides";
+import { applyPlanLimitOverrides } from "@app/lib/plans/plan_limit_overrides";
+import { renderPlanFromModel } from "@app/lib/plans/renderers";
+import {
+  cancelSubscriptionImmediately,
+  createStripeBusinessSubscription,
+  getBusinessProPlanProductId,
+  getProPlanProductId,
+  getStripeSubscription,
+} from "@app/lib/plans/stripe";
+import { getTrialVersionForPlan, isTrial } from "@app/lib/plans/trial/limits";
+import { REPORT_USAGE_METADATA_KEY } from "@app/lib/plans/usage/types";
+import { BaseResource } from "@app/lib/resources/base_resource";
+import { DataSourceResource } from "@app/lib/resources/data_source_resource";
+import { MembershipResource } from "@app/lib/resources/membership_resource";
+import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
+import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
+import type { ModelStaticWorkspaceAware } from "@app/lib/resources/storage/wrappers/workspace_models";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { WorkspaceSeatLimitResource } from "@app/lib/resources/workspace_seat_limit_resource";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import {
+  cacheWithRedis,
+  invalidateCacheAfterCommit,
+  invalidateCacheWithRedis,
+} from "@app/lib/utils/cache";
+import { withTransaction } from "@app/lib/utils/sql_utils";
+import {
+  getWorkspaceFirstAdmin,
+  renderLightWorkspaceType,
+} from "@app/lib/workspace";
+import logger from "@app/logger/logger";
+import type {
+  EnterpriseUpgradeFormType,
+  PlanType,
+  SubscriptionPerSeatPricing,
+  SubscriptionStatusType,
+  SubscriptionType,
+} from "@app/types/plan";
+import { isSubscriptionMetronomeBilled } from "@app/types/plan";
+import { SUBSCRIPTION_CACHE_KEY_VERSION } from "@app/types/shared/cache_resource_registry";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { sendUserOperationMessage } from "@app/types/shared/user_operation";
+import type { LightWorkspaceType, WorkspaceType } from "@app/types/user";
+import keyBy from "lodash/keyBy";
+import type {
+  Attributes,
+  CreationAttributes,
+  Transaction,
+  WhereOptions,
+} from "sequelize";
+import { Op } from "sequelize";
+import type Stripe from "stripe";
+
+export type GetSubscriptionPricingResponseBody = {
+  perSeatPricing: SubscriptionPerSeatPricing | null;
+};
+
+export type GetSubscriptionStatusResponseBody = {
+  shouldRedirect: boolean;
+  redirectUrl: string | null;
+};
+
+const DEFAULT_PLAN_WHEN_NO_SUBSCRIPTION: PlanAttributes = FREE_NO_PLAN_DATA;
+const FREE_NO_PLAN_SUBSCRIPTION_ID = -1;
+
+// Builds the Sequelize where-clause matching a poke plan-type bucket's plan
+// codes (see POKE_PLAN_CODE_MATCHERS).
+export function buildPokePlanCodeWhere(
+  bucket: PokeNonFreePlanTypeFilter
+): WhereOptions<PlanModel> {
+  const matcher = POKE_PLAN_CODE_MATCHERS[bucket];
+  if (matcher.type === "exact") {
+    return { code: { [Op.in]: matcher.values } };
+  }
+  return {
+    [Op.or]: matcher.values.map((prefix) => ({
+      code: { [Op.like]: `${prefix}%` },
+    })),
+  };
+}
+
+type CachedSubscription = {
+  id: number;
+  planId: number;
+  sId: string;
+  status: SubscriptionStatusType;
+  trialing: boolean;
+  stripeSubscriptionId: string | null;
+  metronomeContractId: string | null;
+  startDate: number;
+  endDate: number | null;
+  paymentFailingSince: number | null;
+  plan: PlanType;
+  requestCancelAt: number | null;
+};
+
+// Attributes are marked as read-only to reflect the stateless nature of our Resource.
+// This design will be moved up to BaseResource once we transition away from Sequelize.
+
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface SubscriptionResource
+  extends ReadonlyAttributesType<SubscriptionModel> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class SubscriptionResource extends BaseResource<SubscriptionModel> {
+  static model: ModelStaticWorkspaceAware<SubscriptionModel> =
+    SubscriptionModel;
+  private readonly plan: PlanType;
+
+  constructor(
+    model: ModelStaticWorkspaceAware<SubscriptionModel>,
+    blob: Attributes<SubscriptionModel>,
+    plan: PlanType
+  ) {
+    super(SubscriptionModel, blob);
+    this.plan = plan;
+  }
+
+  get isBilled(): boolean {
+    if (this.status !== "active") {
+      return false;
+    }
+
+    return !!this.stripeSubscriptionId || !!this.metronomeContractId;
+  }
+
+  /**
+   * Shadow-billed: Stripe owns billing, Metronome runs in parallel for invoice comparison.
+   * Both stripeSubscriptionId and metronomeContractId are set.
+   */
+  get isMetronomeShadowBilled(): boolean {
+    return !!this.stripeSubscriptionId && !!this.metronomeContractId;
+  }
+
+  get isMetronomeOnlyBilled(): boolean {
+    return !!this.metronomeContractId && !this.stripeSubscriptionId;
+  }
+
+  // True once a cancellation is scheduled (immediate `endDate` or a deferred
+  // `requestCancelAt`), whether or not that date has passed yet. Mirrors
+  // `isSubscriptionCancellationScheduled` in `types/plan.ts` (the front-end
+  // serialized-type equivalent).
+  get isCancellationScheduled(): boolean {
+    return this.endDate !== null || this.requestCancelAt !== null;
+  }
+
+  /**
+   * Terminal status to use when `swapMetronomeContract` ends this subscription
+   * (the in-place swap path, with no pre-staged pending row). `activatePending`
+   * does NOT use this — it finalizes directly to `ended` (see the note there).
+   *
+   * A subscription backed by a Stripe subscription converges via Stripe's
+   * `customer.subscription.deleted` webhook, so it is ended as
+   * `ended_backend_only` and only becomes `ended` once Stripe confirms.
+   *
+   * A Metronome-only (no Stripe) or free subscription has no such follow-up: in
+   * a swap the converging `contract.end` for the old contract fires
+   * concurrently with the `contract.start` that triggers the swap, and may be
+   * processed *before* we set the status. When that happens `contract.end`
+   * takes the "active + successor → skip" branch and is ack'd, so no later
+   * webhook is left to converge the sub — stranding it in `ended_backend_only`
+   * (see lib/api/metronome/process_webhook.ts). Finalize these directly to
+   * `ended`.
+   */
+  private get swapEndedStatus(): "ended" | "ended_backend_only" {
+    return this.stripeSubscriptionId ? "ended_backend_only" : "ended";
+  }
+
+  static async makeNew(
+    blob: CreationAttributes<SubscriptionModel>,
+    plan: PlanType,
+    transaction?: Transaction
+  ) {
+    const subscription = await SubscriptionModel.create(
+      { ...blob },
+      { transaction }
+    );
+    const workspaceId = subscription.workspaceId;
+    invalidateCacheAfterCommit(transaction, () =>
+      SubscriptionResource.invalidateSubscriptionCache(workspaceId)
+    );
+    return new SubscriptionResource(
+      SubscriptionModel,
+      subscription.get(),
+      plan
+    );
+  }
+
+  static async createSubscriptionFromCheckout({
+    workspaceModelId,
+    plan,
+    metronomeContractId,
+    now,
+  }: {
+    workspaceModelId: ModelId;
+    plan: PlanModel;
+    metronomeContractId: string;
+    now: Date;
+  }): Promise<Result<void, RubyError>> {
+    return withTransaction(async (t) => {
+      const activeSubscription =
+        await SubscriptionResource.fetchActiveByWorkspaceModelId(
+          workspaceModelId,
+          t
+        );
+
+      // Make sure subscription switch has not been called yet
+      // Can happen if metronome contract.start webhook is triggered first.
+      if (activeSubscription?.metronomeContractId === metronomeContractId) {
+        return new Ok(undefined);
+      }
+
+      await activeSubscription?.markAsEnded("ended", t);
+      await SubscriptionResource.makeNew(
+        {
+          sId: generateRandomModelSId(),
+          workspaceId: workspaceModelId,
+          planId: plan.id,
+          status: "active",
+          trialing: false,
+          startDate: now,
+          metronomeContractId,
+        },
+        renderPlanFromModel({ plan }),
+        t
+      );
+
+      return new Ok(undefined);
+    });
+  }
+
+  private static readonly subscriptionCacheKeyResolver = (
+    workspaceModelId: ModelId
+  ) =>
+    `subscription:active:workspaceId:${workspaceModelId}:v${SUBSCRIPTION_CACHE_KEY_VERSION}`;
+
+  private static async _fetchActiveByWorkspaceModelIdUncached(
+    workspaceModelId: ModelId
+  ): Promise<CachedSubscription> {
+    const res = await SubscriptionResource.fetchActiveByWorkspacesModelId([
+      workspaceModelId,
+    ]);
+    const subscription = res[workspaceModelId];
+    return {
+      id: subscription.id,
+      planId: subscription.planId,
+      sId: subscription.sId,
+      status: subscription.status,
+      trialing: subscription.trialing ?? false,
+      stripeSubscriptionId: subscription.stripeSubscriptionId,
+      metronomeContractId: subscription.metronomeContractId ?? null,
+      startDate: subscription.startDate?.getTime() ?? Date.now(),
+      endDate: subscription.endDate?.getTime() ?? null,
+      paymentFailingSince: subscription.paymentFailingSince?.getTime() ?? null,
+      plan: subscription.getPlan(),
+      requestCancelAt: subscription.requestCancelAt?.getTime() ?? null,
+    };
+  }
+
+  private static _invalidateSubscriptionCache = invalidateCacheWithRedis(
+    SubscriptionResource._fetchActiveByWorkspaceModelIdUncached,
+    SubscriptionResource.subscriptionCacheKeyResolver
+  );
+
+  static invalidateSubscriptionCache = async (workspaceModelId: ModelId) => {
+    logger.info(
+      {
+        workspaceModelId,
+        method: "SubscriptionResource.invalidateSubscriptionCache",
+      },
+      "Invalidating auth resource cache"
+    );
+    return SubscriptionResource._invalidateSubscriptionCache(workspaceModelId);
+  };
+
+  // The Metronome contract cache (`getActiveContract`) is keyed by workspace
+  // `sId` with no TTL, so it must be flushed whenever the active subscription's
+  // contract changes. We only hold the workspace model id here, so resolve the
+  // `sId` first.
+  private static async invalidateContractCacheByWorkspaceModelId(
+    workspaceModelId: ModelId
+  ): Promise<void> {
+    const workspace = await WorkspaceModel.findOne({
+      attributes: ["sId"],
+      where: { id: workspaceModelId },
+    });
+    if (workspace) {
+      await invalidateContractCache(workspace.sId);
+    }
+  }
+
+  /**
+   * Invalidate subscription caches for all workspaces on a given plan.
+   * Should be called when plan attributes are updated (e.g., via Poke).
+   */
+  static async invalidateSubscriptionCacheForPlan(
+    planId: number
+  ): Promise<void> {
+    const subscriptions = await SubscriptionResource.model.findAll({
+      attributes: ["workspaceId"],
+      where: { planId, status: "active" },
+      // WORKSPACE_ISOLATION_BYPASS: We need to invalidate caches across all workspaces on this plan.
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+    });
+
+    await concurrentExecutor(
+      subscriptions,
+      (sub) =>
+        SubscriptionResource.invalidateSubscriptionCache(sub.workspaceId),
+      { concurrency: 8 }
+    );
+  }
+
+  private static fromCachedData(
+    workspaceModelId: ModelId,
+    data: CachedSubscription
+  ): SubscriptionResource {
+    const now = new Date();
+    const blob: Attributes<SubscriptionModel> = {
+      id: data.id,
+      sId: data.sId,
+      status: data.status,
+      workspaceId: workspaceModelId,
+      createdAt: now,
+      updatedAt: now,
+      startDate: data.startDate ? new Date(data.startDate) : now,
+      endDate: data.endDate ? new Date(data.endDate) : null,
+      trialing: data.trialing,
+      paymentFailingSince: data.paymentFailingSince
+        ? new Date(data.paymentFailingSince)
+        : null,
+      planId: data.planId,
+      stripeSubscriptionId: data.stripeSubscriptionId,
+      metronomeContractId: data.metronomeContractId ?? null,
+      hubspotDealId: null,
+      requestCancelAt: data.requestCancelAt
+        ? new Date(data.requestCancelAt)
+        : null,
+    };
+    return new SubscriptionResource(SubscriptionModel, blob, data.plan);
+  }
+
+  // Cache eviction is handled by Redis's allkeys-lfu eviction policy.
+  private static fetchActiveByWorkspaceModelIdCached = cacheWithRedis(
+    SubscriptionResource._fetchActiveByWorkspaceModelIdUncached,
+    SubscriptionResource.subscriptionCacheKeyResolver,
+    { cacheNullValues: false }
+  );
+
+  static async fetchActiveByWorkspaceModelId(
+    workspaceModelId: ModelId,
+    transaction?: Transaction
+  ): Promise<SubscriptionResource> {
+    // Bypass cache when transaction is provided for transactional consistency
+    if (transaction) {
+      logger.info(
+        {
+          workspaceModelId,
+          method: "SubscriptionResource.fetchActiveByWorkspaceModelId",
+        },
+        "Skipping auth resource cache: transaction provided"
+      );
+      const res = await SubscriptionResource.fetchActiveByWorkspacesModelId(
+        [workspaceModelId],
+        transaction
+      );
+      return res[workspaceModelId];
+    }
+
+    const cached =
+      await this.fetchActiveByWorkspaceModelIdCached(workspaceModelId);
+
+    return this.fromCachedData(workspaceModelId, cached);
+  }
+
+  static async fetchLastByWorkspace(
+    workspace: LightWorkspaceType,
+    transaction?: Transaction
+  ): Promise<SubscriptionResource | null> {
+    const lastSubscription = await this.model.findOne({
+      where: {
+        workspaceId: workspace.id,
+      },
+      include: [
+        {
+          model: PlanModel,
+          as: "plan",
+          required: true,
+        },
+      ],
+      order: [
+        ["startDate", "DESC"],
+        ["createdAt", "DESC"],
+      ],
+      transaction,
+    });
+
+    if (!lastSubscription) {
+      return null;
+    }
+
+    const planLimitOverride = await WorkspaceResource.fetchPlanLimitOverride(
+      workspace.id,
+      transaction
+    );
+
+    const plan = this.determinePlanFromSubscription(
+      lastSubscription,
+      workspace.sId,
+      planLimitOverride
+    );
+
+    return new SubscriptionResource(
+      SubscriptionModel,
+      lastSubscription.get(),
+      renderPlanFromModel({ plan })
+    );
+  }
+
+  static async fetchActiveByWorkspaces(
+    workspaces: LightWorkspaceType[],
+    transaction?: Transaction
+  ): Promise<Record<string, SubscriptionResource>> {
+    const byModelId = await this.fetchActiveByWorkspacesModelId(
+      workspaces.map((w) => w.id),
+      transaction
+    );
+    const result: Record<string, SubscriptionResource> = {};
+    for (const workspace of workspaces) {
+      const sub = byModelId[workspace.id];
+      if (sub) {
+        result[workspace.sId] = sub;
+      }
+    }
+    return result;
+  }
+
+  static async fetchActiveByWorkspacesModelId(
+    workspaceModelIds: ModelId[],
+    transaction?: Transaction
+  ): Promise<Record<ModelId, SubscriptionResource>> {
+    const activeSubscriptionByWorkspaceModelId = keyBy(
+      await this.model.findAll({
+        attributes: [
+          "endDate",
+          "id",
+          "metronomeContractId",
+          "paymentFailingSince",
+          "sId",
+          "startDate",
+          "status",
+          "stripeSubscriptionId",
+          "trialing",
+          "workspaceId",
+        ],
+        where: {
+          workspaceId: workspaceModelIds,
+          status: "active",
+        },
+        // WORKSPACE_ISOLATION_BYPASS: workspaceId is filtered just above, but the check is refusing more than 1 elements in the array. It's ok here to have more than 1 element.
+        // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+        dangerouslyBypassWorkspaceIsolationSecurity: true,
+        include: [
+          {
+            model: PlanModel,
+            as: "plan",
+            required: true,
+          },
+        ],
+        transaction,
+      }),
+      "workspaceId"
+    );
+
+    const planLimitOverrideByWorkspaceModelId =
+      await WorkspaceResource.fetchPlanLimitOverridesByWorkspaceModelIds(
+        workspaceModelIds,
+        transaction
+      );
+
+    const subscriptionResourceByWorkspaceModelId: Record<
+      ModelId,
+      SubscriptionResource
+    > = {};
+
+    for (const workspaceModelId of workspaceModelIds) {
+      const activeSubscription =
+        activeSubscriptionByWorkspaceModelId[workspaceModelId.toString()];
+
+      const plan = this.determinePlanFromSubscription(
+        activeSubscription ?? null,
+        workspaceModelId.toString(),
+        planLimitOverrideByWorkspaceModelId.get(workspaceModelId) ?? null
+      );
+
+      subscriptionResourceByWorkspaceModelId[workspaceModelId] =
+        new SubscriptionResource(
+          SubscriptionModel,
+          activeSubscription?.get() ||
+            this.createFreeNoPlanSubscription(workspaceModelId),
+          renderPlanFromModel({ plan })
+        );
+    }
+
+    return subscriptionResourceByWorkspaceModelId;
+  }
+
+  static async fetchByAuthenticator(
+    auth: Authenticator
+  ): Promise<SubscriptionResource[]> {
+    const owner = auth.getNonNullableWorkspace();
+
+    const subscriptions = await SubscriptionModel.findAll({
+      where: { workspaceId: owner.id },
+      include: [PlanModel],
+    });
+
+    return subscriptions.map(
+      (s) =>
+        new SubscriptionResource(
+          SubscriptionModel,
+          s.get(),
+          renderPlanFromModel({ plan: s.plan })
+        )
+    );
+  }
+
+  static async fetchByStripeId(
+    stripeSubscriptionId: string
+  ): Promise<SubscriptionResource | null> {
+    const res = await this.model.findOne({
+      where: { stripeSubscriptionId },
+      include: [PlanModel],
+      order: [["createdAt", "DESC"]],
+
+      // WORKSPACE_ISOLATION_BYPASS: Used to check if a subscription is not attached to a workspace.
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+    });
+
+    if (!res) {
+      return null;
+    }
+
+    return new SubscriptionResource(
+      SubscriptionModel,
+      res.get(),
+      renderPlanFromModel({ plan: res.plan })
+    );
+  }
+
+  static async fetchByMetronomeContractId(
+    workspace: WorkspaceResource,
+    metronomeContractId: string
+  ): Promise<SubscriptionResource | null> {
+    const res = await this.model.findOne({
+      where: { workspaceId: workspace.id, metronomeContractId },
+      include: [PlanModel],
+      order: [["createdAt", "DESC"]],
+    });
+
+    if (!res) {
+      return null;
+    }
+
+    return new this(
+      SubscriptionModel,
+      res.get(),
+      renderPlanFromModel({ plan: res.plan })
+    );
+  }
+
+  static async fetchPendingByWorkspaceModelId(
+    workspaceModelId: ModelId
+  ): Promise<SubscriptionResource | null> {
+    const res = await this.model.findOne({
+      where: {
+        workspaceId: workspaceModelId,
+        status: "created_backend_only",
+      },
+      include: [PlanModel],
+      order: [["createdAt", "DESC"]],
+    });
+    if (!res) {
+      return null;
+    }
+    return new this(
+      SubscriptionModel,
+      res.get(),
+      renderPlanFromModel({ plan: res.plan })
+    );
+  }
+
+  /**
+   * Persist a pending (created_backend_only) subscription for a workspace that
+   * is provisioning a new Metronome contract via a future-effective swap. If a
+   * prior pending sub exists it is ended (status: "ended") within the same
+   * transaction — the prior contract is ended on Metronome's side either by the
+   * RENEWAL transition (when the switch passes `fromContractId`) or by the
+   * overlap-sunset pass in `provisionMetronomeContract`.
+   *
+   * The row flips to "active" when the matching `contract.start` webhook
+   * fires (`activatePending`).
+   */
+  static async createPendingMetronomeContract({
+    workspaceModelId,
+    planCode,
+    metronomeContractId,
+    startDate,
+    hubspotDealId,
+  }: {
+    workspaceModelId: ModelId;
+    planCode: string;
+    metronomeContractId: string;
+    startDate: Date;
+    hubspotDealId?: string | null;
+  }): Promise<SubscriptionResource> {
+    const plan = await this.findPlanOrThrow(planCode);
+    return withTransaction(async (t) => {
+      const existing = await this.model.findOne({
+        where: {
+          workspaceId: workspaceModelId,
+          status: "created_backend_only",
+        },
+        transaction: t,
+      });
+      if (existing) {
+        await existing.update(
+          { status: "ended", endDate: new Date() },
+          { transaction: t }
+        );
+      }
+      return this.makeNew(
+        {
+          sId: generateRandomModelSId(),
+          workspaceId: workspaceModelId,
+          planId: plan.id,
+          status: "created_backend_only",
+          trialing: false,
+          startDate,
+          endDate: null,
+          stripeSubscriptionId: null,
+          metronomeContractId,
+          hubspotDealId: hubspotDealId ?? null,
+        },
+        renderPlanFromModel({ plan }),
+        t
+      );
+    });
+  }
+
+  static async isStripeIdAlreadyUsed(
+    stripeSubscriptionId: string
+  ): Promise<boolean> {
+    const res = await this.model.findOne({
+      where: { stripeSubscriptionId },
+
+      // WORKSPACE_ISOLATION_BYPASS: Used to check across all workspaces.
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+    });
+
+    return res !== null;
+  }
+
+  static async isMetronomeContractIdAlreadyUsed(
+    metronomeContractId: string
+  ): Promise<boolean> {
+    const res = await this.model.findOne({
+      where: { metronomeContractId },
+      // WORKSPACE_ISOLATION_BYPASS: Used to check across all workspaces.
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+    });
+
+    return res !== null;
+  }
+
+  static async internalFetchWorkspacesWithFreeEndedSubscriptions({
+    limit,
+  }: {
+    limit?: number;
+  } = {}): Promise<{
+    workspaces: LightWorkspaceType[];
+  }> {
+    const freeEndedSubscriptions = await SubscriptionModel.findAll({
+      where: {
+        status: "active",
+        stripeSubscriptionId: null,
+        endDate: {
+          [Op.lt]: new Date(),
+        },
+      },
+      include: [WorkspaceModel],
+      // Oldest expiry first, so a capped run drains the backlog deterministically.
+      order: [["endDate", "ASC"]],
+      limit,
+    });
+
+    const workspaces = freeEndedSubscriptions.map((s) =>
+      renderLightWorkspaceType({ workspace: s.workspace })
+    );
+
+    return {
+      workspaces,
+    };
+  }
+
+  /**
+   * Get all active subscription that are not FREE_TEST_PLAN_CODE
+   */
+  static async internalListAllActiveNoFreeTestPlan(): Promise<
+    SubscriptionResource[]
+  > {
+    const subscriptions = await this.model.findAll({
+      where: {
+        status: "active",
+      },
+      // WORKSPACE_ISOLATION_BYPASS: Internal use to actively down the callstack get the list
+      // of workspaces that are active
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+      include: [
+        {
+          model: PlanModel,
+          as: "plan",
+          where: {
+            code: {
+              [Op.ne]: FREE_TEST_PLAN_CODE,
+            },
+          },
+        },
+      ],
+    });
+
+    return subscriptions.map(
+      (sub) =>
+        new SubscriptionResource(
+          this.model,
+          sub.get(),
+          renderPlanFromModel({ plan: sub.plan })
+        )
+    );
+  }
+
+  /**
+   * Get workspace ids with an active subscription matching ANY non-free poke
+   * plan-type bucket (enterprise, legacy_enterprise, legacy_pro, business,
+   * friends_and_family, ruby).
+   *
+   * Used to implement the "free" plan-type filter on the poke workspaces
+   * list as an exclude-list: a workspace counts as "free" if it has no
+   * active subscription at all, or one that isn't in one of the other
+   * buckets — there's no plan-code pattern to match "free" directly. This
+   * set is expected to stay in the low thousands (paying + legacy + F&F/ruby
+   * tenants) even as the free-tier population grows into the hundreds of
+   * thousands, since it excludes free plans entirely.
+   */
+  static async listActiveWorkspaceIdsWithNonFreePlanType(): Promise<ModelId[]> {
+    const nonFreeBuckets = POKE_PLAN_TYPE_FILTERS.filter(
+      (filter): filter is PokeNonFreePlanTypeFilter => filter !== "free"
+    );
+
+    const subscriptions = await this.model.findAll({
+      where: { status: "active" },
+      attributes: ["workspaceId"],
+      // WORKSPACE_ISOLATION_BYPASS: Internal use to compute the (small,
+      // non-free) workspace id set to exclude for poke's "free" plan-type
+      // filter, across all workspaces.
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+      include: [
+        {
+          model: PlanModel,
+          as: "plan",
+          attributes: [],
+          where: {
+            [Op.or]: nonFreeBuckets.map((bucket) =>
+              buildPokePlanCodeWhere(bucket)
+            ),
+          },
+          required: true,
+        },
+      ],
+    });
+
+    return subscriptions.map((s) => s.workspaceId);
+  }
+
+  static async internalListEndedBackendOnly(): Promise<SubscriptionResource[]> {
+    const subscriptions = await this.model.findAll({
+      where: {
+        status: "ended_backend_only",
+      },
+      // WORKSPACE_ISOLATION_BYPASS: Internal maintenance script that reconciles
+      // stranded subscriptions across all workspaces.
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+      include: [PlanModel],
+    });
+
+    return subscriptions.map(
+      (sub) =>
+        new SubscriptionResource(
+          this.model,
+          sub.get(),
+          renderPlanFromModel({ plan: sub.plan })
+        )
+    );
+  }
+
+  /**
+   * Internal function to subscribe to the FREE_NO_PLAN.
+   * This is the only plan without a database entry: no need to create a subscription, we just end the active one if any.
+   * @param params.workspaceId - The ID of the workspace to subscribe to the free plan
+   * @returns The subscription resource
+   * @throws Error if workspace not found
+   */
+  static async internalSubscribeWorkspaceToFreeNoPlan({
+    workspaceId,
+  }: {
+    workspaceId: string;
+  }): Promise<SubscriptionResource> {
+    const workspace = await this.findWorkspaceOrThrow(workspaceId);
+
+    await this.endActiveSubscription(workspace);
+
+    // No plan anymore: clear billed seat assignments, plan-level seat caps and
+    // any negotiated plan-limit override.
+    await withTransaction(async (t) => {
+      await MembershipResource.resetAllSeatsToNoneForWorkspace({
+        workspace,
+        transaction: t,
+      });
+      await WorkspaceSeatLimitResource.deleteAllForWorkspace({
+        workspace,
+        transaction: t,
+      });
+      await WorkspaceResource.deleteAllPlanLimitOverridesForWorkspace(
+        workspace.id,
+        t
+      );
+    });
+
+    await SubscriptionResource.invalidateSubscriptionCache(workspace.id);
+
+    return new SubscriptionResource(
+      SubscriptionModel,
+      this.createFreeNoPlanSubscription(workspace.id),
+      renderPlanFromModel({ plan: FREE_NO_PLAN_DATA })
+    );
+  }
+
+  /**
+   * Internal function to subscribe to a new Plan.
+   * @param params.workspaceId - The ID of the workspace to subscribe to the plan
+   * @param params.planCode - The code of the plan to subscribe to
+   * @param params.stripeSubscriptionId - Optional Stripe subscription ID
+   * @returns The subscription resource
+   * @throws Error if workspace not found, plan not found, or already subscribed to the plan
+   */
+  static async internalSubscribeWorkspaceToFreePlan({
+    workspaceId,
+    planCode,
+    stripeSubscriptionId,
+    endDate,
+  }: {
+    workspaceId: string;
+    planCode: string;
+    stripeSubscriptionId?: string;
+    endDate: Date | null;
+  }): Promise<SubscriptionResource> {
+    const workspace = await this.findWorkspaceOrThrow(workspaceId);
+    const newPlan = await this.findPlanOrThrow(planCode);
+    const now = new Date();
+
+    // Find active subscription
+    const activeSubscription =
+      await SubscriptionResource.fetchActiveByWorkspaceModelId(workspace.id);
+
+    // Prevent subscribing to the same plan
+    if (activeSubscription && activeSubscription.planId === newPlan.id) {
+      throw new Error(
+        `Cannot subscribe to plan ${planCode}: already subscribed.`
+      );
+    }
+
+    // Prevent subscribing if the new plan has less users allowed then the current one on the
+    // workspace. The workspace's own plan-limit overrides apply to the new plan too, so compare
+    // against the effective cap.
+    const { maxUsersInWorkspace } = applyPlanLimitOverrides(
+      newPlan.get(),
+      await WorkspaceResource.fetchPlanLimitOverride(workspace.id)
+    );
+    if (maxUsersInWorkspace !== -1) {
+      const activeSeats = await countActiveSeatsForWorkspace(workspace.sId);
+      if (activeSeats > maxUsersInWorkspace) {
+        throw new Error(
+          `Cannot subscribe to plan ${planCode}: new plan has less users allowed than currently in workspace.`
+        );
+      }
+    }
+
+    // Proceed to the termination of the active subscription (if any) and creation of the new one
+    const newSubscription = await withTransaction(async (t) => {
+      if (activeSubscription) {
+        const endedStatus = activeSubscription.isBilled
+          ? "ended_backend_only"
+          : "ended";
+        await activeSubscription.markAsEnded(endedStatus, t);
+      }
+
+      return SubscriptionResource.makeNew(
+        {
+          sId: generateRandomModelSId(),
+          workspaceId: workspace.id,
+          planId: newPlan.id,
+          status: "active",
+          startDate: now,
+          stripeSubscriptionId: stripeSubscriptionId ?? null,
+          endDate: endDate,
+        },
+        renderPlanFromModel({ plan: newPlan }),
+        t
+      );
+    });
+
+    // Check if the workspace is switching to a new Stripe subscription ID.
+    const isNewStripeSubscriptionId =
+      activeSubscription &&
+      activeSubscription.stripeSubscriptionId !== stripeSubscriptionId;
+
+    // If the workspace is switching to a new Stripe subscription ID and the
+    // previous subscription was paid, notify Stripe to cancel the subscription
+    // immediately.
+    if (activeSubscription?.stripeSubscriptionId && isNewStripeSubscriptionId) {
+      await cancelSubscriptionImmediately({
+        stripeSubscriptionId: activeSubscription.stripeSubscriptionId,
+      });
+    }
+
+    // End Metronome contract on the previous subscription.
+    if (
+      activeSubscription?.metronomeContractId &&
+      workspace.metronomeCustomerId
+    ) {
+      const result = await scheduleMetronomeContractEnd({
+        metronomeCustomerId: workspace.metronomeCustomerId,
+        contractId: activeSubscription.metronomeContractId,
+      });
+      if (result.isErr() && !activeSubscription.isMetronomeShadowBilled) {
+        throw result.error;
+      }
+    }
+
+    // Ensure a Metronome customer exists for the workspace.
+    const ensureCustomerResult = await ensureMetronomeCustomerForWorkspace({
+      workspace,
+    });
+    if (ensureCustomerResult.isErr()) {
+      logger.error(
+        {
+          workspaceId: workspace.sId,
+          error: ensureCustomerResult.error.message,
+        },
+        "[Subscription] Failed to ensure Metronome customer on free-plan subscription"
+      );
+    }
+
+    await SubscriptionResource.invalidateSubscriptionCache(workspace.id);
+
+    return newSubscription;
+  }
+
+  static async pokeUpgradeWorkspaceToEnterprise(
+    auth: Authenticator,
+    enterpriseDetails: EnterpriseUpgradeFormType,
+    metronome?: {
+      metronomeCustomerId: string;
+      metronomeContractId: string;
+      startingAt: string;
+    }
+  ) {
+    const owner = auth.getNonNullableWorkspace();
+
+    if (!auth.isRubySuperUser()) {
+      throw new Error("Cannot upgrade workspace to plan: not allowed.");
+    }
+
+    const plan = await this.findPlanOrThrow(enterpriseDetails.planCode);
+    if (!isEnterprisePlanPrefix(plan.code)) {
+      throw new Error(`Plan ${plan.code} is not an enterprise plan.`);
+    }
+    // End the current subscription if any.
+    const newSubscription = await this.internalSubscribeWorkspaceToFreePlan({
+      workspaceId: owner.sId,
+      planCode: plan.code,
+      stripeSubscriptionId: enterpriseDetails.stripeSubscriptionId,
+      endDate: null,
+    });
+
+    // Provision Metronome customer + contract with enterprise overrides.
+    const workspaceResource = await WorkspaceResource.fetchById(owner.sId);
+    if (!workspaceResource) {
+      throw new Error(`Workspace not found: ${owner.sId}`);
+    }
+
+    if (metronome) {
+      if (!workspaceResource.metronomeCustomerId) {
+        await WorkspaceResource.updateMetronomeCustomerId(
+          workspaceResource.id,
+          metronome.metronomeCustomerId
+        );
+      }
+
+      await SubscriptionResource.updateMetronomeContractId(
+        newSubscription.id,
+        metronome.metronomeContractId
+      );
+
+      const syncResult = await syncSeatCount({
+        metronomeCustomerId: metronome.metronomeCustomerId,
+        contractId: metronome.metronomeContractId,
+        workspace: renderLightWorkspaceType({ workspace: workspaceResource }),
+        startingAt: metronome.startingAt,
+        planCode: plan.code,
+      });
+
+      if (syncResult.isErr()) {
+        logger.error(
+          {
+            workspaceId: owner.sId,
+            error: syncResult.error.message,
+          },
+          "Failed to sync initial seat/MAU quantities on Metronome contract"
+        );
+      }
+    }
+  }
+
+  /**
+   * Internal function to create a PlanInvitation for the workspace.
+   */
+  static async pokeUpgradeWorkspaceToPlan({
+    auth,
+    planCode,
+    endDate,
+  }: {
+    auth: Authenticator;
+    planCode: string;
+    endDate: Date | null;
+  }): Promise<Result<undefined, Error>> {
+    const owner = auth.getNonNullableWorkspace();
+
+    if (!auth.isRubySuperUser()) {
+      throw new Error("Cannot upgrade workspace to plan: not allowed.");
+    }
+
+    const newPlan = await this.findPlanOrThrow(planCode);
+
+    // We search for an active subscription for this workspace
+    const activeSubscription = auth.subscriptionResource();
+    if (activeSubscription && activeSubscription.plan.code === newPlan.code) {
+      const hasSameEndDate =
+        activeSubscription.endDate && endDate
+          ? activeSubscription.endDate.getTime() === endDate.getTime()
+          : activeSubscription.endDate === endDate;
+      // If you are already on this free plan and you want to change the end date, we let you do it.
+      if (isFreePlan(newPlan.code) && !hasSameEndDate) {
+        await SubscriptionModel.update(
+          { endDate },
+          {
+            where: { sId: activeSubscription.sId },
+          }
+        );
+        await SubscriptionResource.invalidateSubscriptionCache(owner.id);
+        return new Ok(undefined);
+      }
+      return new Err(
+        new Error(`Cannot subscribe to plan ${planCode}: already subscribed.`)
+      );
+    }
+
+    // Ugrade to Enterprise is not allowed through this function.
+    if (isEnterprisePlanPrefix(newPlan.code)) {
+      return new Err(
+        new Error(
+          `Cannot subscribe to plan ${planCode}: Enterprise Plans requires a special process.`
+        )
+      );
+    }
+
+    // Upgrade to Pro is allowed only if the workspace is already subscribed to a Pro plan.
+    // This is a way to change the plan limitations but stay on Pro.
+    if (isProPlanPrefix(newPlan.code)) {
+      if (
+        !activeSubscription ||
+        !activeSubscription.sId ||
+        !activeSubscription.stripeSubscriptionId
+      ) {
+        return new Err(
+          new Error(
+            `Cannot subscribe to ${planCode}: Workspace has no subscription. It needs to be on Pro Plan already (stripe checkout session must be done on the product).`
+          )
+        );
+      }
+
+      const isAlreadyOnProPlan =
+        await activeSubscription.isSubscriptionOnProOrBusinessPlan(owner);
+
+      if (!isAlreadyOnProPlan) {
+        return new Err(
+          new Error(
+            `Cannot subscribe to ${planCode}: Workspace has a subscription but it's not a Pro Plan.`
+          )
+        );
+      }
+
+      await SubscriptionModel.update(
+        { planId: newPlan.id },
+        {
+          where: {
+            sId: activeSubscription.sId,
+          },
+        }
+      );
+
+      await SubscriptionResource.invalidateSubscriptionCache(owner.id);
+      return new Ok(undefined);
+    }
+
+    const newSubscription = await this.internalSubscribeWorkspaceToFreePlan({
+      workspaceId: owner.sId,
+      planCode: newPlan.code,
+      endDate,
+    });
+
+    if (isUpgraded(newSubscription.getPlan())) {
+      await getOrCreateWorkOSOrganization(owner);
+    }
+
+    return new Ok(undefined);
+  }
+
+  /**
+   * Low-level plan change for Poke: repoints the active subscription row to a
+   * different plan, mirrors the new plan code onto the Metronome contract (when
+   * the workspace is Metronome-billed) and flushes the subscription + contract
+   * caches. Unlike `pokeUpgradeWorkspaceToPlan` this does not create or end any
+   * subscription, touch Stripe, or run any plan-family guardrails — it is a raw
+   * override for fixing up a workspace's plan.
+   */
+  static async pokeChangePlan({
+    auth,
+    planCode,
+  }: {
+    auth: Authenticator;
+    planCode: string;
+  }): Promise<
+    Result<
+      { previousPlanCode: string; metronomeContractUpdated: boolean },
+      Error
+    >
+  > {
+    const owner = auth.getNonNullableWorkspace();
+
+    if (!auth.isRubySuperUser()) {
+      throw new Error("Cannot change workspace plan: not allowed.");
+    }
+
+    const newPlan = await this.findPlanOrThrow(planCode);
+
+    const activeSubscription = auth.subscriptionResource();
+    if (!activeSubscription) {
+      return new Err(
+        new Error("Workspace has no active subscription to change.")
+      );
+    }
+
+    const previousPlanCode = activeSubscription.plan.code;
+    if (previousPlanCode === newPlan.code) {
+      return new Err(
+        new Error(`Workspace is already on plan ${newPlan.code}.`)
+      );
+    }
+
+    // Repoint the subscription row to the new plan.
+    await SubscriptionModel.update(
+      { planId: newPlan.id },
+      {
+        where: { sId: activeSubscription.sId },
+      }
+    );
+
+    // Mirror the plan code onto the Metronome contract when the workspace is
+    // Metronome-billed, so billing stays consistent with the DB.
+    let metronomeContractUpdated = false;
+    const { metronomeContractId } = activeSubscription;
+    if (metronomeContractId) {
+      const res = await setMetronomeContractCustomFields({
+        contractId: metronomeContractId,
+        customFields: { [PLAN_CODE_CUSTOM_FIELD_KEY]: newPlan.code },
+      });
+      if (res.isErr()) {
+        return res;
+      }
+      metronomeContractUpdated = true;
+    }
+
+    // Flush both the active-subscription cache and the Metronome contract cache.
+    await SubscriptionResource.invalidateSubscriptionCache(owner.id);
+    await invalidateContractCache(owner.sId);
+
+    logger.info(
+      {
+        workspaceId: owner.sId,
+        previousPlanCode,
+        newPlanCode: newPlan.code,
+        metronomeContractUpdated,
+        method: "SubscriptionResource.pokeChangePlan",
+      },
+      "Changed workspace subscription plan via Poke"
+    );
+
+    return new Ok({ previousPlanCode, metronomeContractUpdated });
+  }
+
+  /**
+   * Upgrades a Pro subscription to Business plan.
+   * Only allowed for workspaces that are whitelisted for Business (metadata.isBusiness = true).
+   */
+  async upgradeToBusinessPlan(
+    owner: WorkspaceType
+  ): Promise<Result<undefined, Error>> {
+    if (!isWhitelistedBusinessPlan(owner)) {
+      return new Err(
+        new Error("Workspace is not whitelisted for Business plan")
+      );
+    }
+    const isOnProPlan = await this.isSubscriptionOnProOrBusinessPlan(owner);
+    if (!isOnProPlan) {
+      return new Err(new Error("Workspace is not on a Pro plan"));
+    }
+
+    const businessPlan = await SubscriptionResource.findPlanOrThrow(
+      PRO_PLAN_SEAT_39_CODE
+    );
+
+    const oldStripeSubscriptionId = this.stripeSubscriptionId;
+    let newStripeSubscriptionId: string | null = null;
+    if (oldStripeSubscriptionId) {
+      const stripeResult = await createStripeBusinessSubscription({
+        stripeSubscriptionId: oldStripeSubscriptionId,
+        owner,
+        planCode: PRO_PLAN_SEAT_39_CODE,
+      });
+      if (stripeResult.isErr()) {
+        return new Err(stripeResult.error);
+      }
+      newStripeSubscriptionId = stripeResult.value.stripeSubscriptionId;
+    }
+
+    // Switch Metronome contract to Business package.
+    let newMetronomeContractId: string | null = null;
+    if (this.metronomeContractId && owner.metronomeCustomerId) {
+      const billingCurrencyResult =
+        await resolveCurrencyForExistingMetronomeCustomer({
+          metronomeCustomerId: owner.metronomeCustomerId,
+          stripeSubscriptionId: newStripeSubscriptionId,
+        });
+      if (billingCurrencyResult.isErr()) {
+        return new Err(billingCurrencyResult.error);
+      }
+
+      const packageAlias = resolvePackageAliasForCurrency(
+        LEGACY_BUSINESS_PACKAGE_ALIAS,
+        billingCurrencyResult.value
+      );
+      const result = await provisionMetronomeContract({
+        metronomeCustomerId: owner.metronomeCustomerId,
+        workspace: owner,
+        packageAlias,
+        uniquenessKey: `switch:${this.metronomeContractId}`,
+        startingAt: new Date(),
+        // Business is seat-based — swap at the current hour boundary so the
+        // new contract is active immediately and the sync DB flip below is
+        // consistent with Metronome.
+        swapAt: "current-hour",
+        enableStripeBilling: isSubscriptionMetronomeBilled(this.toJSON()),
+        planCode: PRO_PLAN_SEAT_39_CODE,
+        fromContractId: this.metronomeContractId,
+      });
+      if (result.isErr() && !this.isMetronomeShadowBilled) {
+        return new Err(result.error);
+      }
+      if (result.isOk()) {
+        newMetronomeContractId = result.value.metronomeContractId;
+      }
+    }
+
+    await withTransaction(async (t) => {
+      await this.markAsEnded("ended_backend_only", t);
+      await SubscriptionResource.makeNew(
+        {
+          sId: generateRandomModelSId(),
+          workspaceId: this.workspaceId,
+          planId: businessPlan.id,
+          status: "active",
+          trialing: false,
+          startDate: new Date(),
+          endDate: null,
+          stripeSubscriptionId: newStripeSubscriptionId,
+          metronomeContractId: newMetronomeContractId,
+        },
+        renderPlanFromModel({ plan: businessPlan }),
+        t
+      );
+    });
+
+    // Cancel after DB flip so the webhook finds ended_backend_only and does not scrub.
+    if (oldStripeSubscriptionId) {
+      await cancelSubscriptionImmediately({
+        stripeSubscriptionId: oldStripeSubscriptionId,
+      });
+    }
+
+    return new Ok(undefined);
+  }
+
+  static async maybeCancelInactiveTrials(
+    auth: Authenticator,
+    eventStripeSubscription: Stripe.Subscription
+  ) {
+    const { id: stripeSubscriptionId } = eventStripeSubscription;
+
+    const subscription = await SubscriptionModel.findOne({
+      where: { stripeSubscriptionId },
+      include: [WorkspaceModel],
+    });
+
+    // Bail early if the DB subscription is not in trial mode.
+    if (!subscription || !subscription.trialing) {
+      return;
+    }
+
+    const { workspace } = subscription;
+
+    // This function can get called if the subscription is upgraded before the end of the trial.
+    // Ensure that the Stripe subscription still has a status set to `trialing`.
+    const stripeSubscription =
+      await getStripeSubscription(stripeSubscriptionId);
+    if (!stripeSubscription || stripeSubscription.status !== "trialing") {
+      logger.info(
+        { action: "cancelling-trial", workspaceId: workspace.sId },
+        "Proactive trial cancellation skipped due to active subscription."
+      );
+
+      return;
+    }
+
+    const isWorkspaceActive = await checkWorkspaceActivity(auth);
+
+    if (!isWorkspaceActive) {
+      logger.info(
+        { action: "cancelling-trial", workspaceId: workspace.sId },
+        "Cancelling inactive trial."
+      );
+
+      await cancelSubscriptionImmediately({
+        stripeSubscriptionId,
+      });
+
+      const firstAdmin = await getWorkspaceFirstAdmin(workspace);
+      if (!firstAdmin) {
+        logger.info(
+          { action: "cancelling-trial", workspaceId: auth.workspace()?.sId },
+          "No first adming found -- skipping email."
+        );
+
+        return;
+      } else {
+        await sendProactiveTrialCancelledEmail(firstAdmin.email);
+      }
+
+      await sendUserOperationMessage({
+        logger,
+        message: `Trial for workspace ${workspace.sId} cancelled proactively!`,
+      });
+    }
+  }
+
+  async delete(
+    auth: Authenticator,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<Result<undefined, Error>> {
+    await this.model.destroy({
+      where: {
+        id: this.id,
+        workspaceId: this.workspaceId,
+      },
+      transaction,
+    });
+    return new Ok(undefined);
+  }
+
+  static async updateMetronomeContractId(
+    subscriptionModelId: ModelId,
+    metronomeContractId: string
+  ): Promise<void> {
+    const subscription = await SubscriptionResource.model.findOne({
+      where: { id: subscriptionModelId },
+      include: [WorkspaceModel],
+      // subscription ID is already trusted.
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+    });
+    if (!subscription) {
+      throw new Error(`Subscription not found: ${subscriptionModelId}`);
+    }
+
+    await subscription.update({ metronomeContractId });
+
+    await SubscriptionResource.invalidateSubscriptionCache(
+      subscription.workspaceId
+    );
+    await invalidateContractCache(subscription.workspace.sId);
+  }
+
+  /**
+   * End the current subscription and create a new active subscription on a
+   * different Metronome contract and plan code. Used by the contract.start
+   * webhook when an admin-scheduled upgrade activates — preserves the
+   * plan-change history rather than mutating the existing subscription in
+   * place. The current sub is ended via `swapEndedStatus`: Stripe-backed subs
+   * as `ended_backend_only` (Stripe converges them), Metronome-only and free
+   * subs directly as `ended` (no follow-up webhook to rely on). The old
+   * `contract.end` then no-ops on the already-`ended` sub instead of scrubbing.
+   */
+  async swapMetronomeContract({
+    metronomeContractId,
+    planCode,
+  }: {
+    metronomeContractId: string;
+    planCode: string;
+  }): Promise<void> {
+    const newPlan = await SubscriptionResource.findPlanOrThrow(planCode);
+    const endedStatus = this.swapEndedStatus;
+
+    await withTransaction(async (t) => {
+      await this.markAsEnded(endedStatus, t);
+
+      await SubscriptionResource.makeNew(
+        {
+          sId: generateRandomModelSId(),
+          workspaceId: this.workspaceId,
+          planId: newPlan.id,
+          status: "active",
+          trialing: false,
+          startDate: new Date(),
+          endDate: null,
+          stripeSubscriptionId: null,
+          metronomeContractId,
+        },
+        renderPlanFromModel({ plan: newPlan }),
+        t
+      );
+      // The active contract changed → flush the Metronome contract cache too
+      // (no TTL), otherwise `getActiveContract` keeps serving the old contract.
+      invalidateCacheAfterCommit(t, () =>
+        SubscriptionResource.invalidateContractCacheByWorkspaceModelId(
+          this.workspaceId
+        )
+      );
+    });
+    // `makeNew` registers invalidation via invalidateCacheAfterCommit (fire-and-
+    // forget). Await it explicitly here so callers that immediately read the
+    // subscription cache (e.g. syncMetronomeSeatCountForWorkspace after a
+    // checkout activation) see the new subscription rather than the stale one.
+    await SubscriptionResource.invalidateSubscriptionCache(this.workspaceId);
+  }
+
+  /**
+   * Flip this pending (created_backend_only) subscription to active, while
+   * ending whatever active subscription currently holds the workspace's seat.
+   * Mirrors `swapMetronomeContract` but for the pre-provisioned pending-row
+   * model — used by the `contract.start` webhook when the new contract was
+   * created up-front (e.g. by the poke switch_contract flow).
+   *
+   * `this` must be in `created_backend_only` state.
+   */
+  async activatePending(): Promise<void> {
+    if (this.status !== "created_backend_only") {
+      throw new Error(
+        `Cannot activate subscription ${this.sId}: status is ${this.status}, expected created_backend_only.`
+      );
+    }
+    await withTransaction(async (t) => {
+      const currentActive =
+        await SubscriptionResource.fetchActiveByWorkspaceModelId(
+          this.workspaceId,
+          t
+        );
+      if (currentActive && !currentActive.isLegacyFreeNoPlan()) {
+        // Finalize directly to `ended`, even for a Stripe-backed (shadow-billed)
+        // sub. This `contract.start` and Stripe's `customer.subscription.deleted`
+        // (the scheduled `cancel_at` reaching the cutover) fire at the same
+        // instant. When the Stripe event is processed first it takes the
+        // "active + pending → skip" branch (see lib/api/stripe/webhook_handler.ts)
+        // and is ack'd without converging, so no later webhook is left to flip an
+        // `ended_backend_only` sub to `ended` — stranding it. The deleted
+        // handler's pending guard and the Metronome `contract.end` shadow guard
+        // already prevent a scrub in every ordering, so ending directly is safe.
+        await currentActive.markAsEnded("ended", t);
+      }
+      await this.update({ status: "active" }, t);
+      const workspaceId = this.workspaceId;
+      invalidateCacheAfterCommit(t, () =>
+        SubscriptionResource.invalidateSubscriptionCache(workspaceId)
+      );
+      // The active contract changed → flush the Metronome contract cache too
+      // (no TTL), otherwise `getActiveContract` keeps serving the old contract.
+      invalidateCacheAfterCommit(t, () =>
+        SubscriptionResource.invalidateContractCacheByWorkspaceModelId(
+          workspaceId
+        )
+      );
+    });
+  }
+
+  async getPerSeatPricing(): Promise<SubscriptionPerSeatPricing | null> {
+    if (!this.stripeSubscriptionId) {
+      return null;
+    }
+
+    const stripeSubscription = await getStripeSubscription(
+      this.stripeSubscriptionId,
+      { expandPriceCurrencyOptions: true }
+    );
+    if (!stripeSubscription) {
+      return null;
+    }
+
+    const { items, currency } = stripeSubscription;
+    if (!items) {
+      return null;
+    }
+
+    const [item] = items.data;
+    if (!item || !item.price) {
+      return null;
+    }
+    const { recurring, metadata } = item.price;
+
+    if (
+      !item.price.currency_options ||
+      !item.price.currency_options[currency]
+    ) {
+      return null;
+    }
+    const { unit_amount: unitAmount } = item.price.currency_options[currency];
+
+    const isPricedPerSeat = unitAmount !== null;
+    if (!isPricedPerSeat) {
+      return null;
+    }
+
+    if (
+      !item.quantity ||
+      !recurring ||
+      (metadata && metadata[REPORT_USAGE_METADATA_KEY] !== "PER_SEAT")
+    ) {
+      return null;
+    }
+
+    return {
+      seatPrice: unitAmount,
+      seatCurrency: currency,
+      billingPeriod: recurring.interval === "year" ? "yearly" : "monthly",
+      quantity: item.quantity,
+      currentPeriodEndMs: stripeSubscription.current_period_end * 1000,
+    };
+  }
+
+  getPlan(): PlanType {
+    return Object.freeze({ ...this.plan });
+  }
+
+  isLegacyFreeNoPlan(): boolean {
+    return this.id === FREE_NO_PLAN_SUBSCRIPTION_ID;
+  }
+
+  toJSON(): SubscriptionType {
+    return {
+      status: this.status ?? "active",
+      trialing: this.trialing === true,
+      sId: this.sId || null,
+      // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+      stripeSubscriptionId: this.stripeSubscriptionId || null,
+      metronomeContractId: this.metronomeContractId ?? null,
+      startDate: this.startDate?.getTime() || null,
+      // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+      endDate: this.endDate?.getTime() || null,
+      // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+      paymentFailingSince: this.paymentFailingSince?.getTime() || null,
+      plan: this.getPlan(),
+      requestCancelAt: this.requestCancelAt?.getTime() ?? null,
+    };
+  }
+
+  private static createFreeNoPlanSubscription(
+    workspaceModelId: ModelId
+  ): Attributes<SubscriptionModel> {
+    const now = new Date();
+    return {
+      id: FREE_NO_PLAN_SUBSCRIPTION_ID,
+      sId: generateRandomModelSId(),
+      status: "ended",
+      workspaceId: workspaceModelId,
+      createdAt: now,
+      updatedAt: now,
+      startDate: now,
+      endDate: now,
+      trialing: false,
+      paymentFailingSince: null,
+      planId: -1,
+      stripeSubscriptionId: null,
+      metronomeContractId: null,
+      hubspotDealId: null,
+      requestCancelAt: null,
+    };
+  }
+
+  private static async isStripeSubscriptionOnProOrBusinessPlan(
+    owner: LightWorkspaceType,
+    stripeSubscription: Stripe.Subscription
+  ): Promise<boolean> {
+    const { data: subscriptionItems } = stripeSubscription.items;
+    const proPlanProductId = getProPlanProductId();
+    const businessProPlanStripeProductId = getBusinessProPlanProductId();
+
+    return subscriptionItems.some(
+      (item) =>
+        item.plan.product === proPlanProductId ||
+        item.plan.product === businessProPlanStripeProductId
+    );
+  }
+
+  private static async findWorkspaceOrThrow(
+    workspaceId: string
+  ): Promise<LightWorkspaceType> {
+    const workspace = await getWorkspaceInfos(workspaceId);
+
+    if (!workspace) {
+      throw new Error(`Cannot find workspace ${workspaceId}`);
+    }
+
+    return workspace;
+  }
+
+  private static determinePlanFromSubscription(
+    subscription: SubscriptionModel | null,
+    workspaceId: string,
+    planLimitOverride: PlanLimitOverride | null
+  ): PlanAttributes {
+    let plan: PlanAttributes = DEFAULT_PLAN_WHEN_NO_SUBSCRIPTION;
+
+    if (subscription) {
+      // If the subscription is in trial, temporarily override the plan until the FREE_TEST_PLAN is phased out.
+      if (isTrial(subscription)) {
+        plan = getTrialVersionForPlan(subscription.plan);
+      } else if (subscription.plan) {
+        // `.get()` so that `plan` is always plain attributes: spreading a
+        // Sequelize instance would drop every attribute.
+        plan = subscription.plan.get();
+      } else {
+        logger.error(
+          {
+            workspaceId,
+            subscription,
+          },
+          "Cannot find plan for subscription. Will use limits of FREE_TEST_PLAN instead. Please check and fix."
+        );
+      }
+    }
+
+    // Applied last: a per-workspace override wins over the plan value and over
+    // the trial limits above.
+    return applyPlanLimitOverrides(plan, planLimitOverride);
+  }
+
+  private static async findPlanOrThrow(planCode: string): Promise<PlanModel> {
+    const newPlan = await PlanModel.findOne({
+      where: { code: planCode },
+    });
+    if (!newPlan) {
+      throw new Error(`Cannot subscribe to plan ${planCode}: not found.`);
+    }
+
+    return newPlan;
+  }
+
+  async markAsEnded(
+    endedStatus: "ended" | "ended_backend_only",
+    transaction?: Transaction
+  ) {
+    const now = new Date();
+
+    await this.update(
+      {
+        status: endedStatus,
+        endDate: now,
+      },
+      transaction
+    );
+    const workspaceId = this.workspaceId;
+    invalidateCacheAfterCommit(transaction, () =>
+      SubscriptionResource.invalidateSubscriptionCache(workspaceId)
+    );
+  }
+
+  // Payment status.
+
+  async clearPaymentFailingStatus(transaction?: Transaction): Promise<void> {
+    await this.update(
+      {
+        paymentFailingSince: null,
+      },
+      transaction
+    );
+    const workspaceId = this.workspaceId;
+    invalidateCacheAfterCommit(transaction, () =>
+      SubscriptionResource.invalidateSubscriptionCache(workspaceId)
+    );
+  }
+
+  async setPaymentFailingStatus(
+    { paymentFailingSince }: { paymentFailingSince: Date },
+    transaction?: Transaction
+  ): Promise<void> {
+    await this.update(
+      {
+        paymentFailingSince,
+      },
+      transaction
+    );
+    const workspaceId = this.workspaceId;
+    invalidateCacheAfterCommit(transaction, () =>
+      SubscriptionResource.invalidateSubscriptionCache(workspaceId)
+    );
+  }
+
+  async markAsCanceled(
+    { endDate }: { endDate: Date | null },
+    transaction?: Transaction
+  ): Promise<void> {
+    await this.update(
+      {
+        endDate,
+        // If the subscription is canceled, we set the requestCancelAt date to now.
+        // If the subscription is reactivated, we unset the requestCancelAt date.
+        requestCancelAt: endDate ? new Date() : null,
+      },
+      transaction
+    );
+    const workspaceId = this.workspaceId;
+    invalidateCacheAfterCommit(transaction, () =>
+      SubscriptionResource.invalidateSubscriptionCache(workspaceId)
+    );
+  }
+
+  async markAsActive(
+    { trialing }: { trialing: boolean },
+    transaction?: Transaction
+  ): Promise<void> {
+    await this.update({ status: "active", trialing }, transaction);
+    const workspaceId = this.workspaceId;
+    invalidateCacheAfterCommit(transaction, () =>
+      SubscriptionResource.invalidateSubscriptionCache(workspaceId)
+    );
+  }
+
+  /**
+   * Helper method to end an active subscription if it exists
+   * @param workspaceId The ID of the workspace
+   * @returns The active subscription that was ended, or null if none existed
+   */
+  static async endActiveSubscription(workspace: LightWorkspaceType) {
+    // Find active subscription.
+    const activeSubscription =
+      await SubscriptionResource.fetchActiveByWorkspaceModelId(workspace.id);
+
+    if (!activeSubscription) {
+      return null;
+    }
+
+    // End the subscription. Billed subscriptions use "ended_backend_only" so the
+    // external webhook (Stripe or Metronome) performs the final "ended" transition.
+    const endedStatus = activeSubscription.isBilled
+      ? "ended_backend_only"
+      : "ended";
+    await activeSubscription.markAsEnded(endedStatus);
+
+    // Notify Stripe.
+    if (activeSubscription.stripeSubscriptionId) {
+      await cancelSubscriptionImmediately({
+        stripeSubscriptionId: activeSubscription.stripeSubscriptionId,
+      });
+    }
+
+    if (
+      !activeSubscription.metronomeContractId ||
+      !workspace.metronomeCustomerId
+    ) {
+      return activeSubscription;
+    }
+
+    const res = await scheduleMetronomeContractEnd({
+      metronomeCustomerId: workspace.metronomeCustomerId,
+      contractId: activeSubscription.metronomeContractId,
+    });
+    if (res.isErr() && !activeSubscription.isMetronomeShadowBilled) {
+      throw res.error;
+    }
+
+    return activeSubscription;
+  }
+
+  async isSubscriptionOnProOrBusinessPlan(
+    owner: WorkspaceType
+  ): Promise<boolean> {
+    // Check Stripe first (shadow-billed subscriptions have both IDs).
+    if (this.stripeSubscriptionId) {
+      const stripeSubscription = await getStripeSubscription(
+        this.stripeSubscriptionId
+      );
+      if (!stripeSubscription) {
+        return false;
+      }
+
+      return SubscriptionResource.isStripeSubscriptionOnProOrBusinessPlan(
+        owner,
+        stripeSubscription
+      );
+    }
+
+    // Metronome-billed subscription: trust the DB plan code, which we own and
+    // keep in sync with Metronome contract changes.
+    if (this.metronomeContractId) {
+      return isProOrBusinessPlanCode(this.plan);
+    }
+
+    return false;
+  }
+}
+
+/**
+ * Check if a workspace is active during a trial based on the following conditions:
+ *   - Existence of a connected data source
+ *   - Existence of a custom agent
+ *   - A conversation occurred within the past 7 days
+ */
+async function checkWorkspaceActivity(auth: Authenticator) {
+  const sevenDaysAgo = new Date();
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+  const hasDataSource =
+    (await DataSourceResource.listByWorkspace(auth, { limit: 1 })).length > 0;
+
+  const hasCreatedAssistant = await AgentConfigurationModel.findOne({
+    where: { workspaceId: auth.getNonNullableWorkspace().id },
+  });
+
+  const hasRecentConversation = !!(await ConversationModel.findOne({
+    where: {
+      workspaceId: auth.getNonNullableWorkspace().id,
+      visibility: { [Op.ne]: "deleted" },
+      updatedAt: { [Op.gte]: sevenDaysAgo },
+    },
+  }));
+
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+  return hasDataSource || hasCreatedAssistant || hasRecentConversation;
+}

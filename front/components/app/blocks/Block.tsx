@@ -1,0 +1,203 @@
+import NewBlock from "@app/components/app/NewBlock";
+import { classNames } from "@app/lib/utils";
+import type {
+  AppType,
+  SpecificationBlockType,
+  SpecificationType,
+} from "@app/types/app";
+import type { BlockType, RunType } from "@app/types/run";
+import type { WorkspaceType } from "@app/types/user";
+import {
+  Button,
+  ChevronDown,
+  ChevronUp,
+  Chip,
+  Input,
+  LayersThree01,
+  RefreshCw02,
+  Spinner,
+  Trash01,
+} from "@ruby-ai/sparkle";
+import { useEffect, useState } from "react";
+
+import Output from "./Output";
+
+export default function Block({
+  owner,
+  app,
+  spec,
+  run,
+  block,
+  status,
+  running,
+  readOnly,
+  showOutputs,
+  children,
+  canUseCache,
+  onBlockUpdate,
+  onBlockDelete,
+  onBlockUp,
+  onBlockDown,
+  onBlockNew,
+}: React.PropsWithChildren<{
+  owner: WorkspaceType;
+  app: AppType;
+  spec: SpecificationType;
+  run: RunType | null;
+  block: SpecificationBlockType;
+  status: any;
+  running: boolean;
+  readOnly: boolean;
+  showOutputs: boolean;
+  canUseCache: boolean;
+  onBlockUpdate: (block: SpecificationBlockType) => void;
+  onBlockDelete: () => void;
+  onBlockUp: () => void;
+  onBlockDown: () => void;
+  onBlockNew: (blockType: BlockType | "map_reduce" | "while_end") => void;
+}>) {
+  const handleNameChange = (name: string) => {
+    const b = Object.assign({}, block);
+    b.name = name;
+    onBlockUpdate(b);
+  };
+
+  const handleUseCacheChange = (useCache: boolean) => {
+    const b = Object.assign({}, block);
+    b.config.use_cache = useCache;
+    onBlockUpdate(b);
+  };
+
+  const [nameError, setNameError] = useState("");
+
+  const nameValidation = (name: string) => {
+    let valid = true;
+    if (!name.match(/^[A-Z0-9_]+$/)) {
+      setNameError(
+        "Block name must only contain uppercase letters, numbers, and the character `_`."
+      );
+      valid = false;
+    } else {
+      setNameError("");
+    }
+    return valid;
+  };
+
+  useEffect(() => {
+    nameValidation(block.name);
+    if (canUseCache && block.config.use_cache === undefined) {
+      handleUseCacheChange(true);
+    }
+  });
+
+  return (
+    <div>
+      <div
+        className={classNames(
+          block.indent == 1 ? "ml-8" : "ml-0",
+          "border-border-dark",
+          "flex flex-col rounded-2xl border px-4 py-4"
+        )}
+      >
+        <div className="flex w-full flex-row items-start justify-between pb-2">
+          <div className="flex flex-row items-start gap-2">
+            <Chip label={block.type} size="sm" />
+            <Input
+              placeholder="BLOCK_NAME"
+              readOnly={readOnly}
+              value={block.name}
+              messageStatus={nameError != "" ? "error" : undefined}
+              message={nameError}
+              onChange={(e) => handleNameChange(e.target.value.toUpperCase())}
+            />
+          </div>
+
+          <div className="flex flex-row items-start gap-1">
+            {!readOnly && canUseCache && (
+              <Button
+                tooltip={
+                  block.config && block.config.use_cache
+                    ? "Results are cached (faster)"
+                    : "Results are computed at each run"
+                }
+                variant="ghost-secondary"
+                size="icon"
+                icon={
+                  block.config && block.config.use_cache
+                    ? LayersThree01
+                    : RefreshCw02
+                }
+                onClick={() => handleUseCacheChange(!block.config?.use_cache)}
+              />
+            )}
+
+            {!readOnly && (
+              <>
+                <NewBlock
+                  disabled={readOnly}
+                  onClick={onBlockNew}
+                  spec={spec}
+                  small={true}
+                />
+                <Button
+                  variant="ghost-secondary"
+                  icon={ChevronUp}
+                  onClick={onBlockUp}
+                  size="icon"
+                />
+                <Button
+                  variant="ghost-secondary"
+                  icon={ChevronDown}
+                  onClick={onBlockDown}
+                  size="icon"
+                />
+                <Button
+                  variant="ghost-secondary"
+                  icon={Trash01}
+                  onClick={onBlockDelete}
+                  size="icon"
+                />
+              </>
+            )}
+          </div>
+        </div>
+        <div className="flex">{children}</div>
+      </div>
+
+      <div className={classNames(block.indent == 1 ? "ml-8" : "ml-0", "py-1")}>
+        {status &&
+        status.status == "running" &&
+        !["map", "reduce", "end"].includes(block.type) ? (
+          <div
+            className={classNames(
+              "flex flex-row items-center text-sm",
+              "text-primary-500"
+            )}
+          >
+            <div className="ml-2 mr-2">
+              <Spinner size="xs" />
+            </div>
+            {` ${status.success_count} successes ${status.error_count} errors`}
+          </div>
+        ) : running && !(status && status.status != "running") ? (
+          <div
+            className={classNames(
+              "flex flex-row items-center text-sm",
+              "text-primary-500"
+            )}
+          >
+            <div role="status">
+              <div className="ml-2 mr-2">
+                <Spinner size="xs" />
+              </div>
+            </div>
+            {` 0 successes 0 errors`}
+          </div>
+        ) : null}
+        {status && status.status != "running" && run && showOutputs ? (
+          <Output owner={owner} runId={run.run_id} block={block} app={app} />
+        ) : null}
+      </div>
+    </div>
+  );
+}

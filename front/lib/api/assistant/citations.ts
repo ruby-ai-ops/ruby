@@ -1,0 +1,206 @@
+import {
+  isDataSourceNodeContentType,
+  isRunAgentResultResourceType,
+  isSearchResultResourceType,
+  isWebsearchResultResourceType,
+} from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import { rand } from "@app/lib/utils/seeded_random";
+import type { AgentMCPActionWithOutputType } from "@app/types/actions";
+import type {
+  AgentMessageType,
+  CitationType,
+  LightAgentMessageType,
+} from "@app/types/assistant/conversation";
+import type { AllSupportedFileContentType } from "@app/types/files";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+
+let REFS: string[] | null = null;
+const getRand = rand("chawarma");
+
+export function getRefs() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789".split("");
+  if (REFS === null) {
+    REFS = [];
+    for (const c1 of alphabet) {
+      for (const c2 of alphabet) {
+        for (const c3 of alphabet) {
+          REFS.push(`${c1}${c2}${c3}`);
+        }
+      }
+    }
+    // Randomize.
+    REFS.sort(() => (getRand() > 0.5 ? 1 : -1));
+  }
+  return REFS;
+}
+
+/**
+ * Prompt to remind agents how to cite documents or web pages.
+ */
+export function citationMetaPrompt(isUsingRunAgent: boolean) {
+  return (
+    "## CITING DOCUMENTS\n" +
+    "Documents and web pages are automatically assigned a 3-character REFERENCE. " +
+    "When referring to a document or a web page, use the markdown directive :cite[REFERENCE] " +
+    "(eg :cite[xxx] or :cite[xxx,xxx] but not :cite[xxx][xxx]). " +
+    "After retrieving information from documents or web pages, include citations for " +
+    "all information you are using in your answer. " +
+    "Ensure citations are placed as close as possible to the related information." +
+    (isUsingRunAgent
+      ? " If you use information from a run_agent that is related to a document or a web page, you MUST include the citation markers exactly as they appear."
+      : "")
+  );
+}
+
+export function getCitationsFromActions(
+  actions: Omit<
+    AgentMCPActionWithOutputType,
+    "internalMCPServerName" | "toolName" | "status" | "displayLabels"
+  >[]
+): Record<string, CitationType> {
+  // Prefer persisted citations when present (backfilled/new rows).
+  const persistedRefs: Record<string, CitationType> = {};
+  let hasAnyPersisted = false;
+  for (const action of actions) {
+    if (action.citations !== undefined && action.citations !== null) {
+      hasAnyPersisted = true;
+      Object.assign(persistedRefs, action.citations);
+    }
+  }
+  if (hasAnyPersisted) {
+    return persistedRefs;
+  }
+
+  // Legacy fallback: compute citations from the tool output.
+  return actions.reduce<Record<string, CitationType>>((acc, action) => {
+    return {
+      ...acc,
+      ...getCitationsFromToolOutput(action.output ?? null),
+    };
+  }, {});
+}
+
+export function getCitationsFromToolOutput(
+  output: CallToolResult["content"] | null
+): Record<string, CitationType> {
+  if (!output || output.length === 0) {
+    return {};
+  }
+
+  const searchResultsWithDocs = removeNulls(
+    output.filter(isSearchResultResourceType).map((o) => o.resource)
+  );
+  const searchRefs: Record<string, CitationType> = {};
+  searchResultsWithDocs.forEach((d) => {
+    searchRefs[d.ref] = {
+      href: d.uri,
+      title: d.text,
+      provider: d.source.provider ?? "document",
+      contentType: d.mimeType,
+    };
+  });
+
+  const websearchResultsWithDocs = removeNulls(
+    output.filter(isWebsearchResultResourceType)
+  );
+  const websearchRefs: Record<string, CitationType> = {};
+  websearchResultsWithDocs.forEach((d) => {
+    websearchRefs[d.resource.reference] = {
+      href: d.resource.uri,
+      title: d.resource.title,
+      provider: "webcrawler",
+      contentType: d.resource.mimeType,
+    };
+  });
+
+  const runAgentResultsWithRefs = removeNulls(
+    output.filter(isRunAgentResultResourceType)
+  );
+  const runAgentRefs: Record<string, CitationType> = {};
+  runAgentResultsWithRefs.forEach((result) => {
+    if (result.resource.refs) {
+      Object.entries(result.resource.refs).forEach(([ref, citation]) => {
+        runAgentRefs[ref] = {
+          href: citation.href,
+          title: citation.title,
+          provider: citation.provider,
+          contentType: citation.contentType as AllSupportedFileContentType,
+        };
+      });
+    }
+  });
+
+  const dataSourceNodeContentResults = removeNulls(
+    output.filter(isDataSourceNodeContentType).map((o) => o.resource)
+  );
+  const dataSourceNodeContentRefs: Record<string, CitationType> = {};
+  dataSourceNodeContentResults.forEach((d) => {
+    if (!d.ref) {
+      return;
+    }
+    dataSourceNodeContentRefs[d.ref] = {
+      href: d.uri,
+      title: d.metadata.title,
+      provider: d.metadata.connectorProvider ?? "document",
+      contentType: d.mimeType,
+    };
+  });
+
+  return {
+    ...searchRefs,
+    ...websearchRefs,
+    ...runAgentRefs,
+    ...dataSourceNodeContentRefs,
+  };
+}
+
+export function getLightAgentMessageFromAgentMessage(
+  agentMessage: AgentMessageType
+): LightAgentMessageType {
+  return {
+    type: "agent_message",
+    sId: agentMessage.sId,
+    created: agentMessage.created,
+    completedTs: agentMessage.completedTs,
+    version: agentMessage.version,
+    rank: agentMessage.rank,
+    branchId: null,
+    parentMessageId: agentMessage.parentMessageId,
+    parentAgentMessageId: agentMessage.parentAgentMessageId,
+    visibility: agentMessage.visibility,
+    content: agentMessage.content,
+    chainOfThought: agentMessage.chainOfThought,
+    error: agentMessage.error,
+    status: agentMessage.status,
+    configuration: {
+      sId: agentMessage.configuration.sId,
+      name: agentMessage.configuration.name,
+      pictureUrl: agentMessage.configuration.pictureUrl,
+      status: agentMessage.configuration.status,
+      canRead: agentMessage.configuration.canRead,
+    },
+    citations: getCitationsFromActions(agentMessage.actions),
+    generatedFiles: agentMessage.actions
+      .flatMap((a) => a.generatedFiles)
+      .map((f) => ({
+        fileId: f.fileId,
+        filePath: f.filePath,
+        title: f.title,
+        contentType: f.contentType,
+        isInProjectContext: f.isInProjectContext,
+        createdAt: f.createdAt,
+        updatedAt: f.updatedAt,
+        hidden: f.hidden,
+      })),
+    richMentions: agentMessage.richMentions,
+    completionDurationMs: agentMessage.completionDurationMs,
+    reactions: agentMessage.reactions,
+    prunedContext: agentMessage.prunedContext,
+    costCredits: agentMessage.costCredits,
+    subAgentCostCredits: agentMessage.subAgentCostCredits,
+    activitySteps: [],
+    resolvedModel: agentMessage.resolvedModel,
+    modelResolutionMethod: agentMessage.modelResolutionMethod,
+  };
+}

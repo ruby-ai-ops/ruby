@@ -1,0 +1,95 @@
+import { workspaceIdFromConnectionId } from "@connectors/connectors/notion";
+import { NotionConnectorStateModel } from "@connectors/lib/models/notion";
+import { ConnectorResource } from "@connectors/resources/connector_resource";
+import { concurrentExecutor } from "@connectors/types";
+import type { Logger } from "@connectors/logger/logger";
+import { makeScript } from "scripts/helpers";
+
+async function updateConnector(
+  connector: ConnectorResource,
+  logger: Logger,
+  execute: boolean
+) {
+  const notionState = await NotionConnectorStateModel.findOne({
+    where: { connectorId: connector.id },
+  });
+  if (!notionState) {
+    logger.info(
+      { connectorId: connector.id },
+      "Notion connector state not found."
+    );
+
+    throw new Error("Notion connector state not found.");
+  }
+
+  if (notionState.notionWorkspaceId) {
+    logger.info(
+      { connectorId: connector.id },
+      "Notion workspace ID already exists."
+    );
+    return;
+  }
+
+  const workspaceIdRes = await workspaceIdFromConnectionId(
+    connector.connectionId
+  );
+
+  if (workspaceIdRes.isErr()) {
+    logger.error(
+      { connectorId: connector.id, error: workspaceIdRes.error },
+      "Error getting workspace ID from connection ID"
+    );
+
+    throw new Error("Error getting workspace ID from connection ID");
+  }
+
+  logger.info(
+    {
+      connectorId: connector.id,
+      notionWorkspaceId: workspaceIdRes.value,
+    },
+    "Updating Notion connector state..."
+  );
+
+  if (!execute) {
+    return;
+  }
+
+  await NotionConnectorStateModel.update(
+    {
+      notionWorkspaceId: workspaceIdRes.value,
+    },
+    { where: { connectorId: connector.id } }
+  );
+}
+
+async function backfillConnectorStates(logger: Logger, execute: boolean) {
+  const connectors = await ConnectorResource.listByType("notion", {});
+
+  await concurrentExecutor(
+    connectors,
+    async (connector) => updateConnector(connector, logger, execute),
+    {
+      concurrency: 10,
+    }
+  );
+}
+
+makeScript(
+  {
+    connectorId: { type: "number", required: false },
+  },
+  async ({ connectorId, execute }, logger) => {
+    if (connectorId) {
+      const connectors = await ConnectorResource.fetchByIds("notion", [
+        connectorId,
+      ]);
+      const connector = connectors[0];
+      if (connector) {
+        await updateConnector(connector, logger, execute);
+      }
+    } else {
+      await backfillConnectorStates(logger, execute);
+    }
+  }
+);

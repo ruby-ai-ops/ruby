@@ -1,0 +1,1263 @@
+import { useSendNotification } from "@app/hooks/useNotification";
+import {
+  getMcpServerDisplayName,
+  getMcpServerViewDisplayName,
+  mcpServersSortingFn,
+  mcpServerViewSortingFn,
+} from "@app/lib/actions/mcp_helper";
+import type { MCPServerAvailability } from "@app/lib/actions/mcp_internal_actions/constants";
+import type {
+  CreateMCPServerResponseBody,
+  DeleteMCPServerResponseBody,
+  GetJITMCPServerViewsListResponseBody,
+  GetMCPServerResponseBody,
+  GetMCPServersResponseBody,
+  GetMCPServersUsageResponseBody,
+  GetMCPServerViewsListResponseBody,
+  GetMCPServerViewsNotActivatedResponseBody,
+  MCPServerType,
+  MCPServerTypeWithViews,
+  MCPServerViewNameConflict,
+  MCPServerViewType,
+  SyncMCPServerResponseBody,
+} from "@app/lib/api/mcp";
+import type {
+  PatchMCPServerViewBody,
+  PatchMCPServerViewResponseBody,
+} from "@app/lib/api/mcp/views";
+import { useCellContext } from "@app/lib/auth/CellContext";
+import { clientFetch } from "@app/lib/egress/client";
+import type {
+  GetConnectionsResponseBody,
+  MCPServerConnectionConnectionType,
+  MCPServerConnectionType,
+  PostConnectionResponseBody,
+} from "@app/lib/resources/mcp_server_connection_resource";
+import type { GetMCPServerViewsResponseBody } from "@app/lib/resources/mcp_server_view_resource";
+import { emptyArray, useFetcher, useSWRWithDefaults } from "@app/lib/swr/swr";
+import type { DiscoverOAuthMetadataResponseBody } from "@app/types/api/oauth/providers/mcp";
+import type { WithAPIErrorResponse } from "@app/types/error";
+import { isAPIErrorResponse } from "@app/types/error";
+import { setupOAuthConnection } from "@app/types/oauth/client/setup";
+import type {
+  MCPOAuthUseCase,
+  OAuthProvider,
+  OAuthUseCase,
+} from "@app/types/oauth/lib";
+import { isSupportedOAuthCredential } from "@app/types/oauth/lib";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type { SpaceType } from "@app/types/space";
+import type { LightWorkspaceType } from "@app/types/user";
+import { useCallback, useMemo, useState } from "react";
+import type { Fetcher, SWRConfiguration } from "swr";
+import { useSWRConfig } from "swr";
+
+export type MCPConnectionType = {
+  useCase: MCPOAuthUseCase;
+  connectionId: string;
+};
+
+export function useMutateMCPServersViewsForAdmin(owner: LightWorkspaceType) {
+  const { mutate: globalMutate } = useSWRConfig();
+  const { mutateMCPServers } = useMCPServers({
+    disabled: true,
+    owner,
+  });
+
+  return {
+    mutate: useCallback(async () => {
+      await globalMutate(
+        (key) =>
+          typeof key === "string" &&
+          key.startsWith(`/api/w/${owner.sId}/spaces/`) &&
+          key.includes("/mcp_views")
+      );
+      await mutateMCPServers();
+    }, [owner.sId, globalMutate, mutateMCPServers]),
+  };
+}
+
+/**
+ * Hook to fetch a specific remote MCP server by ID
+ */
+export function useMCPServer({
+  disabled,
+  owner,
+  serverId,
+}: {
+  disabled?: boolean;
+  owner: LightWorkspaceType;
+  serverId: string;
+}) {
+  const { fetcher } = useFetcher();
+  const serverFetcher: Fetcher<GetMCPServerResponseBody> = fetcher;
+
+  const url = serverId ? `/api/w/${owner.sId}/mcp/${serverId}` : null;
+
+  const { data, error, mutate } = useSWRWithDefaults(url, serverFetcher, {
+    disabled,
+    revalidateOnFocus: false,
+  });
+
+  if (!serverId) {
+    return {
+      server: null,
+      isMCPServerLoading: false,
+      isMCPServerError: true,
+      mutateMCPServer: () => {},
+    };
+  }
+
+  return {
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+    server: data?.server || null,
+    isMCPServerLoading: !error && !data && !disabled,
+    isMCPServerError: !!error,
+    mutateMCPServer: mutate,
+  };
+}
+
+export function useAvailableMCPServers({
+  owner,
+  space,
+  disabled = false,
+  swrOptions,
+}: {
+  owner: LightWorkspaceType;
+  space?: SpaceType;
+  disabled?: boolean;
+  swrOptions?: SWRConfiguration;
+}) {
+  const { fetcher } = useFetcher();
+  const configFetcher: Fetcher<GetMCPServersResponseBody> = fetcher;
+
+  const url = space
+    ? `/api/w/${owner.sId}/spaces/${space.sId}/mcp/available`
+    : `/api/w/${owner.sId}/mcp/available`;
+
+  const { data, error, mutate } = useSWRWithDefaults(url, configFetcher, {
+    ...swrOptions,
+    disabled,
+  });
+
+  const availableMCPServers = useMemo(
+    () =>
+      data
+        ? data.servers.sort((a, b) =>
+            mcpServersSortingFn({ mcpServer: a }, { mcpServer: b })
+          )
+        : emptyArray<MCPServerTypeWithViews>(),
+    [data]
+  );
+
+  return {
+    availableMCPServers,
+    isAvailableMCPServersLoading: !disabled && !error && !data,
+    isAvailableMCPServersError: error,
+    mutateAvailableMCPServers: mutate,
+  };
+}
+
+export function useMCPServers({
+  owner,
+  disabled,
+  revalidateIfStale,
+}: {
+  owner: LightWorkspaceType;
+  disabled?: boolean;
+  revalidateIfStale?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const configFetcher: Fetcher<GetMCPServersResponseBody> = fetcher;
+
+  const url = `/api/w/${owner.sId}/mcp`;
+
+  const { data, error, mutateRegardlessOfQueryParams } = useSWRWithDefaults(
+    url,
+    configFetcher,
+    {
+      disabled,
+      ...(revalidateIfStale !== undefined ? { revalidateIfStale } : {}),
+    }
+  );
+
+  const mcpServers = data?.servers ?? emptyArray();
+
+  return {
+    mcpServers,
+    isMCPServersLoading: !error && !data && !disabled,
+    isMCPServersError: error,
+    mutateMCPServers: mutateRegardlessOfQueryParams,
+  };
+}
+
+/**
+ * Hook to delete an MCP server
+ */
+export function useDeleteMCPServer(owner: LightWorkspaceType) {
+  const sendNotification = useSendNotification();
+  const { mutate } = useMutateMCPServersViewsForAdmin(owner);
+
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  const deleteServer = useCallback(
+    async (server: MCPServerType): Promise<boolean> => {
+      setIsDeleting(true);
+      try {
+        const response = await clientFetch(
+          `/api/w/${owner.sId}/mcp/${server.sId}`,
+          {
+            method: "DELETE",
+          }
+        );
+
+        if (!response.ok) {
+          const body = await response.json();
+          sendNotification({
+            title: `Failure`,
+            type: "error",
+            description:
+              // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+              body.error?.message ||
+              `Failed to delete ${getMcpServerDisplayName(server)}`,
+          });
+          return false;
+        }
+
+        const result: WithAPIErrorResponse<DeleteMCPServerResponseBody> =
+          await response.json();
+
+        if (isAPIErrorResponse(result)) {
+          sendNotification({
+            title: `Failure`,
+            type: "error",
+            description:
+              result.error?.message ||
+              `Failed to delete ${getMcpServerDisplayName(server)}`,
+          });
+          return false;
+        }
+
+        if (!result.deleted) {
+          sendNotification({
+            title: `Failure`,
+            type: "error",
+            description: `Failed to delete ${getMcpServerDisplayName(server)}`,
+          });
+          return false;
+        }
+
+        sendNotification({
+          title: `Success`,
+          type: "success",
+          description: `Successfully deleted ${getMcpServerDisplayName(server)}`,
+        });
+        await mutate();
+        return result.deleted;
+      } finally {
+        setIsDeleting(false);
+      }
+    },
+    [mutate, owner.sId, sendNotification]
+  );
+
+  return { deleteServer, isDeleting };
+}
+
+export function useCreateInternalMCPServer(owner: LightWorkspaceType) {
+  const { mutate } = useMutateMCPServersViewsForAdmin(owner);
+
+  const createInternalMCPServer = async ({
+    name,
+    oauthConnection,
+    useCase,
+    includeGlobal,
+    sharedSecret,
+    customHeaders,
+    viewName,
+    oauthScope,
+  }: {
+    name: string;
+    includeGlobal: boolean;
+    sharedSecret?: string;
+    customHeaders?: Array<{ key: string; value: string }>;
+    viewName?: string;
+    oauthScope?: string;
+  } & (
+    | { oauthConnection: MCPConnectionType; useCase?: never }
+    | { oauthConnection?: never; useCase: MCPOAuthUseCase }
+    | { oauthConnection?: never; useCase?: never }
+  )): Promise<Result<CreateMCPServerResponseBody, Error>> => {
+    const response = await clientFetch(`/api/w/${owner.sId}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        serverType: "internal",
+        useCase: oauthConnection?.useCase ?? useCase,
+        connectionId: oauthConnection?.connectionId,
+        includeGlobal,
+        ...(sharedSecret !== undefined ? { sharedSecret } : {}),
+        ...(customHeaders !== undefined ? { customHeaders } : {}),
+        ...(viewName !== undefined ? { viewName } : {}),
+        ...(oauthScope !== undefined ? { oauthScope } : {}),
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.json();
+      return new Err(
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+        new Error(body.error?.message || "Failed to create server")
+      );
+    }
+
+    await mutate();
+    return new Ok(await response.json());
+  };
+
+  return { createInternalMCPServer };
+}
+
+/**
+ * Hook to discover the OAuth metadata for a remote MCP server.
+ * It is used to check if the server requires OAuth authentication.
+ * If it does, it returns the OAuth connection metadata with the oauthRequired set to true.
+ * If it does not, it returns the oauthRequired set to false.
+ *
+ * Note: this hook should not be called too frequently, as it is likely rate limited by the mcp server provider.
+ */
+export function useDiscoverOAuthMetadata(owner: LightWorkspaceType) {
+  const discoverOAuthMetadata = useCallback(
+    async (
+      url: string,
+      customHeaders?: { key: string; value: string }[]
+    ): Promise<Result<DiscoverOAuthMetadataResponseBody, Error>> => {
+      const response = await clientFetch(
+        `/api/w/${owner.sId}/mcp/discover_oauth_metadata`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url, customHeaders }),
+        }
+      );
+
+      if (!response.ok) {
+        const body = await response.json();
+        return new Err(
+          // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+          new Error(body.error.message || "Failed to check OAuth connection")
+        );
+      }
+
+      return new Ok(await response.json());
+    },
+    [owner.sId]
+  );
+
+  return { discoverOAuthMetadata };
+}
+
+class MCPCreateServerError extends Error {
+  readonly isRemoteServerError: boolean;
+  constructor(message: string, isRemoteServerError: boolean) {
+    super(message);
+    this.isRemoteServerError = isRemoteServerError;
+  }
+}
+
+export function isMCPCreateServerError(
+  error: Error
+): error is MCPCreateServerError {
+  return error instanceof MCPCreateServerError;
+}
+
+/**
+ * Hook to create a new MCP server from a URL
+ */
+export function useCreateRemoteMCPServer(owner: LightWorkspaceType) {
+  const { mutate } = useMutateMCPServersViewsForAdmin(owner);
+
+  const { mutateConnections } = useMCPServerConnections({
+    disabled: true,
+    connectionType: "workspace",
+    owner,
+  });
+
+  const createWithURL = useCallback(
+    async ({
+      url,
+      defaultServerId,
+      includeGlobal,
+      sharedSecret,
+      oauthConnection,
+      customHeaders,
+      viewName,
+    }: {
+      url: string;
+      defaultServerId?: number;
+      includeGlobal: boolean;
+      sharedSecret?: string;
+      oauthConnection?: MCPConnectionType;
+      customHeaders?: { key: string; value: string }[];
+      viewName?: string;
+    }): Promise<
+      Result<CreateMCPServerResponseBody, Error | MCPServerViewNameConflict>
+    > => {
+      const body: any = { url, serverType: "remote", includeGlobal };
+      if (defaultServerId !== undefined) {
+        body.defaultServerId = defaultServerId;
+      }
+      if (sharedSecret) {
+        body.sharedSecret = sharedSecret;
+      }
+
+      if (oauthConnection) {
+        body.connectionId = oauthConnection.connectionId;
+        body.useCase = oauthConnection.useCase;
+      }
+      if (customHeaders) {
+        body.customHeaders = customHeaders;
+      }
+      if (viewName !== undefined) {
+        body.viewName = viewName;
+      }
+      const response = await clientFetch(`/api/w/${owner.sId}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const body = await response.json();
+        if (body.nameConflict?.name) {
+          return new Err({
+            nameConflict: body.nameConflict.name,
+            ...(body.nameConflict.conflictDetails
+              ? { conflictDetails: body.nameConflict.conflictDetails }
+              : {}),
+          });
+        }
+        return new Err(
+          new MCPCreateServerError(
+            // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+            body.error?.message || "Failed to create server",
+            body.isRemoteServerError === true
+          )
+        );
+      }
+      await mutate();
+      if (oauthConnection?.connectionId) {
+        await mutateConnections();
+      }
+      const r = await response.json();
+      return new Ok(r);
+    },
+    [mutate, mutateConnections, owner.sId]
+  );
+
+  return { createWithURL };
+}
+
+/**
+ * Hook to synchronize with a remote MCP server
+ */
+export function useSyncRemoteMCPServer(
+  owner: LightWorkspaceType,
+  serverId: string
+) {
+  const sendNotification = useSendNotification();
+
+  const { mutateMCPServer } = useMCPServer({
+    disabled: true,
+    owner,
+    serverId: serverId || "",
+  });
+
+  const { mutate } = useMutateMCPServersViewsForAdmin(owner);
+
+  const syncServer = async (): Promise<boolean> => {
+    const response = await clientFetch(
+      `/api/w/${owner.sId}/mcp/${serverId}/sync`,
+      {
+        method: "POST",
+      }
+    );
+
+    if (!response.ok) {
+      const body = await response.json();
+      sendNotification({
+        title: `Error synchronizing server`,
+        type: "error",
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+        description: body.error?.message || "An error occurred",
+      });
+      return false;
+    }
+
+    const result: WithAPIErrorResponse<SyncMCPServerResponseBody> =
+      await response.json();
+
+    if (isAPIErrorResponse(result)) {
+      sendNotification({
+        title: `Error synchronizing server`,
+        type: "error",
+        description: result.error.message || "An error occurred",
+      });
+      return false;
+    }
+
+    sendNotification({
+      title: "Success",
+      type: "success",
+      description: `${getMcpServerDisplayName(result.server)} synchronized successfully.`,
+    });
+
+    void mutateMCPServer();
+    void mutate();
+    return true;
+  };
+
+  return { syncServer };
+}
+
+/**
+ * Hook to update an MCP server
+ */
+/**
+ * Hook to update an MCP serverView
+ */
+export function useUpdateMCPServerView(
+  owner: LightWorkspaceType,
+  mcpServerView: MCPServerViewType
+) {
+  const sendNotification = useSendNotification();
+  const { mutateMCPServer } = useMCPServer({
+    disabled: true,
+    owner,
+    serverId: mcpServerView.server.sId,
+  });
+
+  const { mutate } = useMutateMCPServersViewsForAdmin(owner);
+
+  const updateServerView = async (
+    data: PatchMCPServerViewBody
+  ): Promise<boolean> => {
+    const response = await clientFetch(
+      `/api/w/${owner.sId}/mcp/views/${mcpServerView.sId}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      }
+    );
+
+    if (!response.ok) {
+      const body = await response.json();
+      sendNotification({
+        title: `Error updating server`,
+        type: "error",
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+        description: body.error?.message || "An error occurred",
+      });
+
+      return false;
+    }
+
+    const result: WithAPIErrorResponse<PatchMCPServerViewResponseBody> =
+      await response.json();
+    if (isAPIErrorResponse(result)) {
+      sendNotification({
+        title: `Error updating server`,
+        type: "error",
+        description: result.error?.message || "An error occurred",
+      });
+      return false;
+    }
+
+    const serverView = result.serverView;
+    sendNotification({
+      title: `${getMcpServerViewDisplayName(serverView)} updated`,
+      type: "success",
+      description: `${getMcpServerViewDisplayName(serverView)} has been successfully updated.`,
+    });
+
+    void mutateMCPServer();
+    void mutate();
+    return true;
+  };
+
+  return { updateServerView };
+}
+
+export function useMCPServerConnections({
+  owner,
+  connectionType,
+  disabled,
+}: {
+  owner: LightWorkspaceType;
+  connectionType: MCPServerConnectionConnectionType;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const connectionsFetcher: Fetcher<GetConnectionsResponseBody> = fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${owner.sId}/mcp/connections/${connectionType}`,
+    connectionsFetcher,
+    {
+      disabled,
+    }
+  );
+
+  return {
+    connections: data?.connections ?? emptyArray(),
+    isConnectionsLoading: !error && !data && !disabled,
+    isConnectionsError: error,
+    mutateConnections: mutate,
+  };
+}
+
+export function useCreateMCPServerConnection({
+  owner,
+  connectionType,
+}: {
+  owner: LightWorkspaceType;
+  connectionType: MCPServerConnectionConnectionType;
+}) {
+  const { mutateConnections } = useMCPServerConnections({
+    disabled: true,
+    connectionType,
+    owner,
+  });
+
+  const { mutate } = useMutateMCPServersViewsForAdmin(owner);
+
+  const sendNotification = useSendNotification();
+  const createMCPServerConnection = async ({
+    connectionId,
+    credentialId,
+    mcpServerId,
+    mcpServerDisplayName,
+    provider,
+  }: {
+    mcpServerId: string;
+    mcpServerDisplayName: string;
+    provider: OAuthProvider;
+  } & (
+    | { connectionId: string; credentialId?: never }
+    | { connectionId?: never; credentialId: string }
+  )): Promise<PostConnectionResponseBody | null> => {
+    const response = await clientFetch(
+      `/api/w/${owner.sId}/mcp/connections/${connectionType}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          connectionId,
+          credentialId,
+          mcpServerId,
+          provider,
+        }),
+      }
+    );
+    if (response.ok) {
+      sendNotification({
+        type: "success",
+        title: `${mcpServerDisplayName} connected`,
+        description: `Successfully connected to ${mcpServerDisplayName}.`,
+      });
+      void mutateConnections();
+      if (connectionType === "workspace") {
+        void mutate();
+      }
+      return response.json();
+    } else {
+      sendNotification({
+        type: "error",
+        title: `Failed to connect ${mcpServerDisplayName}`,
+        description: `Could not connect to ${mcpServerDisplayName}. Please try again.`,
+      });
+      return null;
+    }
+  };
+
+  return { createMCPServerConnection };
+}
+
+export function useDeleteMCPServerConnection({
+  owner,
+}: {
+  owner: LightWorkspaceType;
+}) {
+  const { mutateConnections: mutateWorkspaceConnections } =
+    useMCPServerConnections({
+      disabled: true,
+      connectionType: "workspace",
+      owner,
+    });
+
+  const { mutateConnections: mutatePersonalConnections } =
+    useMCPServerConnections({
+      disabled: true,
+      connectionType: "personal",
+      owner,
+    });
+
+  const { mutate } = useMutateMCPServersViewsForAdmin(owner);
+
+  const sendNotification = useSendNotification();
+
+  const deleteMCPServerConnection = useCallback(
+    async ({
+      connection,
+      mcpServer,
+    }: {
+      connection: MCPServerConnectionType;
+      mcpServer: MCPServerType;
+    }): Promise<{ success: boolean }> => {
+      const response = await clientFetch(
+        `/api/w/${owner.sId}/mcp/connections/${connection.connectionType}/${connection.sId}`,
+        {
+          method: "DELETE",
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      if (response.ok) {
+        sendNotification({
+          type: "success",
+          title: `${getMcpServerDisplayName(mcpServer)} disconnected`,
+          description: `Successfully disconnected from ${getMcpServerDisplayName(mcpServer)}.`,
+        });
+        if (connection.connectionType === "workspace") {
+          void mutateWorkspaceConnections();
+          void mutate();
+        } else if (connection.connectionType === "personal") {
+          void mutatePersonalConnections();
+        }
+      } else {
+        sendNotification({
+          type: "error",
+          title: `Failed to disconnect ${getMcpServerDisplayName(mcpServer)}`,
+          description: `Could not disconnect from ${getMcpServerDisplayName(mcpServer)}. Please try again.`,
+        });
+      }
+
+      return response.json();
+    },
+    [
+      owner.sId,
+      sendNotification,
+      mutateWorkspaceConnections,
+      mutatePersonalConnections,
+      mutate,
+    ]
+  );
+
+  return { deleteMCPServerConnection };
+}
+
+export function useCreatePersonalConnection(owner: LightWorkspaceType) {
+  const { createMCPServerConnection } = useCreateMCPServerConnection({
+    owner,
+    connectionType: "personal",
+  });
+  const cellContext = useCellContext();
+
+  const createPersonalConnection = async ({
+    mcpServerId,
+    mcpServerDisplayName,
+    authorization,
+    provider,
+    useCase,
+    scope,
+    overriddenCredentials,
+  }: {
+    mcpServerId: string;
+    mcpServerDisplayName: string;
+    authorization?: MCPServerType["authorization"];
+    provider: OAuthProvider;
+    useCase: OAuthUseCase;
+    scope?: string;
+    overriddenCredentials?: Record<string, string>;
+  }): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const workspaceConnectionRequirement =
+        authorization?.workspace_connection;
+      if (
+        useCase === "personal_actions" &&
+        workspaceConnectionRequirement?.required &&
+        !workspaceConnectionRequirement.satisfied
+      ) {
+        return {
+          success: false,
+          error:
+            `A workspace admin must first connect ${mcpServerDisplayName} at the workspace level before users can connect their personal accounts. ` +
+            "Please contact your workspace administrator to set up the workspace connection.",
+        };
+      }
+
+      const extraConfig: Record<string, string> = {
+        mcp_server_id: mcpServerId,
+      };
+
+      if (scope) {
+        extraConfig.scope = scope;
+      }
+
+      if (overriddenCredentials) {
+        for (const [key, value] of Object.entries(overriddenCredentials)) {
+          const trimmedValue = value.trim();
+          if (trimmedValue && isSupportedOAuthCredential(key)) {
+            extraConfig[key] = trimmedValue;
+          }
+        }
+      }
+
+      const cRes = await setupOAuthConnection({
+        owner,
+        provider,
+        useCase,
+        extraConfig,
+        cellInfo: cellContext.cellInfo,
+      });
+
+      if (cRes.isErr()) {
+        return { success: false, error: cRes.error.message };
+      }
+
+      const result = await createMCPServerConnection({
+        connectionId: cRes.value.connection_id,
+        mcpServerId,
+        mcpServerDisplayName,
+        provider,
+      });
+
+      return { success: result !== null };
+    } catch {
+      return {
+        success: false,
+        error:
+          "Unexpected error trying to connect to your provider. Please try again.",
+      };
+    }
+  };
+
+  return { createPersonalConnection };
+}
+
+function getMCPServerViewsKey(
+  owner: LightWorkspaceType,
+  space?: SpaceType,
+  availability?: MCPServerAvailability | "all"
+) {
+  return space
+    ? `/api/w/${owner.sId}/spaces/${space.sId}/mcp_views${
+        availability ? `?availability=${availability}` : ""
+      }`
+    : null;
+}
+
+export function useMCPServerViews({
+  owner,
+  space,
+  availability,
+  disabled,
+}: {
+  owner: LightWorkspaceType;
+  space?: SpaceType;
+  availability?: MCPServerAvailability | "all";
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const configFetcher: Fetcher<GetMCPServerViewsResponseBody> = fetcher;
+  const url = getMCPServerViewsKey(owner, space, availability);
+  const { data, error, mutate } = useSWRWithDefaults(url, configFetcher, {
+    disabled,
+  });
+  const serverViews = useMemo(
+    () => (data ? data.serverViews.sort(mcpServerViewSortingFn) : []),
+    [data]
+  );
+  return {
+    serverViews,
+    isMCPServerViewsLoading: !error && !data && !disabled,
+    isMCPServerViewsError: error,
+    mutateMCPServerViews: mutate,
+  };
+}
+
+const getOptimisticDataForCreate = (
+  data: GetMCPServersResponseBody | undefined,
+  server: MCPServerType,
+  space: SpaceType
+) => {
+  if (!data) {
+    return { servers: [], success: true as const };
+  }
+  const mcpServerWithViews = data.servers.find((s) => s.sId === server.sId);
+
+  if (mcpServerWithViews) {
+    return {
+      ...data,
+      servers: [
+        ...data.servers.filter((v) => v.sId !== server.sId),
+        {
+          ...mcpServerWithViews,
+          views: [
+            ...mcpServerWithViews.views,
+            {
+              id: -1, // The ID is not known at optimistic data creation time.
+              sId: "global",
+              name: null,
+              description: null,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              serverType: "internal" as const,
+              server,
+              editedByUser: null,
+              isRestrictedToSkills: false,
+              spaceId: space.sId,
+              oAuthUseCase: null,
+            },
+          ],
+        },
+      ],
+    };
+  }
+  return data;
+};
+
+const getOptimisticDataForRemove = (
+  data: GetMCPServersResponseBody | undefined,
+  serverView: MCPServerViewType
+) => {
+  if (!data) {
+    return { servers: [], success: true as const };
+  }
+
+  const mcpServerWithViews = data.servers.find(
+    (s) => s.sId === serverView.server.sId
+  );
+
+  if (mcpServerWithViews) {
+    return {
+      ...data,
+      servers: [
+        ...data.servers.filter((v) => v.sId !== serverView.server.sId),
+        {
+          ...mcpServerWithViews,
+          views: mcpServerWithViews.views.filter(
+            (v) => v.sId !== serverView.sId
+          ),
+        },
+      ],
+    };
+  }
+  return data;
+};
+
+export function useMCPServersUsage({
+  owner,
+  disabled,
+}: {
+  owner: LightWorkspaceType;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const configFetcher: Fetcher<GetMCPServersUsageResponseBody> = fetcher;
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${owner.sId}/mcp/usage`,
+    configFetcher,
+    {
+      disabled,
+    }
+  );
+  return {
+    usage: data?.usage ?? null,
+    isLoading: !error && !data && !disabled,
+    isError: error,
+    mutate,
+  };
+}
+
+export function useMCPServerViewsNotActivated({
+  owner,
+  space,
+  disabled,
+}: {
+  owner: LightWorkspaceType;
+  space: SpaceType;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const configFetcher: Fetcher<GetMCPServerViewsNotActivatedResponseBody> =
+    fetcher;
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${owner.sId}/spaces/${space.sId}/mcp_views/not_activated`,
+    configFetcher,
+    {
+      disabled,
+    }
+  );
+  const serverViews = useMemo(
+    () => (data ? data.serverViews.sort(mcpServerViewSortingFn) : []),
+    [data]
+  );
+  return {
+    serverViews,
+    isMCPServerViewsLoading: !error && !data && !disabled,
+    isMCPServerViewsError: error,
+    mutateMCPServerViews: mutate,
+  };
+}
+
+export function useAddMCPServerToSpace(
+  owner: LightWorkspaceType,
+  options?: { skipNotification?: boolean }
+) {
+  const sendNotification = useSendNotification();
+  const { mutateMCPServers } = useMCPServers({
+    owner,
+  });
+
+  const createView = useCallback(
+    async (server: MCPServerType, space: SpaceType): Promise<void> => {
+      await mutateMCPServers(
+        async (data) => {
+          const response = await clientFetch(
+            `/api/w/${owner.sId}/spaces/${space.sId}/mcp_views`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ mcpServerId: server.sId }),
+            }
+          );
+
+          if (!response.ok) {
+            const body = await response.json();
+            // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+            throw new Error(body.error?.message || "Unknown error");
+          }
+
+          if (!options?.skipNotification) {
+            if (response.ok) {
+              sendNotification({
+                type: "success",
+                title: `Actions added to space ${space.name}`,
+                description: `${getMcpServerDisplayName(server)} has been added to the ${space.name} space successfully.`,
+              });
+            } else {
+              sendNotification({
+                type: "error",
+                title: `Failed to add actions to space ${space.name}`,
+                description: `Could not add ${getMcpServerDisplayName(server)} to the ${space.name} space. Please try again.`,
+              });
+            }
+          }
+          return getOptimisticDataForCreate(data, server, space);
+        },
+        {
+          optimisticData: (data) => {
+            return getOptimisticDataForCreate(data, server, space);
+          },
+          revalidate: true,
+        }
+      );
+    },
+    [sendNotification, owner, mutateMCPServers, options?.skipNotification]
+  );
+
+  return { addToSpace: createView };
+}
+
+export function useRemoveMCPServerViewFromSpace(
+  owner: LightWorkspaceType,
+  options?: { skipNotification?: boolean }
+) {
+  const sendNotification = useSendNotification();
+  const { mutateMCPServers } = useMCPServers({
+    owner,
+  });
+
+  const deleteView = useCallback(
+    async (serverView: MCPServerViewType, space: SpaceType): Promise<void> => {
+      await mutateMCPServers(
+        async (data) => {
+          const response = await clientFetch(
+            `/api/w/${owner.sId}/spaces/${space.sId}/mcp_views/${serverView.sId}`,
+            {
+              method: "DELETE",
+            }
+          );
+
+          if (!options?.skipNotification) {
+            if (response.ok) {
+              sendNotification({
+                type: "success",
+                title:
+                  space.kind === "system"
+                    ? "Action removed from workspace"
+                    : "Action removed from space",
+                description: `${getMcpServerDisplayName(serverView.server)} has been removed from the ${space.name} space successfully.`,
+              });
+            } else {
+              const res = await response.json();
+              sendNotification({
+                type: "error",
+                title: "Failed to remove action",
+                description:
+                  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+                  res.error?.message ||
+                  `Could not remove ${getMcpServerDisplayName(serverView.server)} from the ${space.name} space. Please try again.`,
+              });
+            }
+          }
+
+          return getOptimisticDataForRemove(data, serverView);
+        },
+        {
+          optimisticData: (data) => {
+            return getOptimisticDataForRemove(data, serverView);
+          },
+          revalidate: true,
+        }
+      );
+    },
+    [sendNotification, owner, mutateMCPServers, options?.skipNotification]
+  );
+
+  return { removeFromSpace: deleteView };
+}
+
+function useMCPServerViewsFromSpacesBase(
+  owner: LightWorkspaceType,
+  spaces: SpaceType[],
+  availabilities: MCPServerAvailability[],
+  options?: SWRConfiguration & {
+    includeRestrictedToSkills?: boolean;
+  }
+) {
+  const { fetcher } = useFetcher();
+  const configFetcher: Fetcher<GetMCPServerViewsListResponseBody> = fetcher;
+  const { includeRestrictedToSkills = false, ...swrOptions } = options ?? {};
+
+  const queryParams = new URLSearchParams({
+    spaceIds: spaces.map((s) => s.sId).join(","),
+    availabilities: availabilities.join(","),
+  });
+  if (includeRestrictedToSkills) {
+    queryParams.set("includeRestrictedToSkills", "true");
+  }
+
+  const url = `/api/w/${owner.sId}/mcp/views?${queryParams.toString()}`;
+  const { data, error, mutate } = useSWRWithDefaults(url, configFetcher, {
+    ...swrOptions,
+    ...(!spaces.length ? { disabled: true } : {}),
+  });
+
+  return {
+    serverViews: data?.serverViews ?? emptyArray(),
+    isLoading: !error && !data && spaces.length !== 0,
+    isError: error,
+    mutateServerViews: mutate,
+  };
+}
+
+export function useMCPServerViewsFromSpaces(
+  owner: LightWorkspaceType,
+  spaces: SpaceType[],
+  options?: SWRConfiguration & {
+    disabled?: boolean;
+    includeRestrictedToSkills?: boolean;
+  }
+) {
+  return useMCPServerViewsFromSpacesBase(
+    owner,
+    spaces,
+    ["manual", "auto"],
+    options
+  );
+}
+
+/**
+ * JIT-attachable server views only (tools requiring configuration are filtered out
+ * server-side), in a light serialization without tool input schemas nor authorization.
+ * This is the cheap variant for always-mounted surfaces (conversation capabilities
+ * picker, slash menu).
+ */
+export function useJITMCPServerViewsFromSpaces(
+  owner: LightWorkspaceType,
+  spaces: SpaceType[],
+  swrOptions?: SWRConfiguration & { disabled?: boolean }
+) {
+  const { fetcher } = useFetcher();
+  const configFetcher: Fetcher<GetJITMCPServerViewsListResponseBody> = fetcher;
+
+  const spaceIds = spaces.map((s) => s.sId).join(",");
+
+  const url = `/api/w/${owner.sId}/mcp/views/jit?spaceIds=${spaceIds}`;
+  const { data, error, mutate } = useSWRWithDefaults(url, configFetcher, {
+    ...swrOptions,
+    ...(!spaces.length ? { disabled: true } : {}),
+  });
+
+  return {
+    serverViews: data?.serverViews ?? emptyArray(),
+    isLoading: !error && !data && spaces.length !== 0,
+    isError: error,
+    mutateServerViews: mutate,
+  };
+}
+
+export function useMCPServerViewsWithPersonalConnections({
+  owner,
+  mcpServerViewToCheckIds,
+  mcpServerViews,
+}: {
+  owner: LightWorkspaceType;
+  mcpServerViewToCheckIds: string[];
+  mcpServerViews: MCPServerViewType[];
+}): {
+  mcpServerView: MCPServerViewType;
+  isAlreadyConnected: boolean;
+}[] {
+  const mcpServerViewsMap = new Map(mcpServerViews.map((v) => [v.sId, v]));
+
+  const mcpServerViewsWithPersonalConnections = removeNulls(
+    mcpServerViewToCheckIds.map((id) => {
+      const mcpServerView = mcpServerViewsMap.get(id);
+      if (mcpServerView?.oAuthUseCase === "personal_actions") {
+        return mcpServerView;
+      }
+      return null;
+    })
+  );
+
+  const { connections } = useMCPServerConnections({
+    owner,
+    connectionType: "personal",
+    disabled: mcpServerViewsWithPersonalConnections.length === 0,
+  });
+
+  return useMemo(
+    () =>
+      mcpServerViewsWithPersonalConnections.length === 0
+        ? emptyArray()
+        : mcpServerViewsWithPersonalConnections.map((mcpServerView) => {
+            const isAlreadyConnected = connections.some(
+              (c) =>
+                c.internalMCPServerId === mcpServerView.server.sId ||
+                c.remoteMCPServerId === mcpServerView.server.sId
+            );
+            return { mcpServerView, isAlreadyConnected };
+          }),
+    [connections, mcpServerViewsWithPersonalConnections]
+  );
+}

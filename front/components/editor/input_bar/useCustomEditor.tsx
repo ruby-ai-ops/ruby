@@ -1,0 +1,743 @@
+import { CodeExtension } from "@app/components/editor/extensions/CodeExtension";
+import { createEmojiExtension } from "@app/components/editor/extensions/EmojiExtension";
+import { DataSourceLinkExtension } from "@app/components/editor/extensions/input_bar/DataSourceLinkExtension";
+import { FilePreviewExtension } from "@app/components/editor/extensions/input_bar/FilePreviewExtension";
+import {
+  InputBarSlashSuggestionExtension,
+  inputBarSlashSuggestionPluginKey,
+} from "@app/components/editor/extensions/input_bar/InputBarSlashSuggestionExtension";
+import type { InputBarSlashCommand } from "@app/components/editor/extensions/input_bar/InputBarSlashSuggestionTypes";
+import { KeyboardShortcutsExtension } from "@app/components/editor/extensions/input_bar/KeyboardShortcutsExtension";
+import { PastedAttachmentExtension } from "@app/components/editor/extensions/input_bar/PastedAttachmentExtension";
+import { SkillNode } from "@app/components/editor/extensions/input_bar/SkillNode";
+import { URLDetectionExtension } from "@app/components/editor/extensions/input_bar/URLDetectionExtension";
+import { URLStorageExtension } from "@app/components/editor/extensions/input_bar/URLStorageExtension";
+import { MentionExtension } from "@app/components/editor/extensions/MentionExtension";
+import type { SlashCommand } from "@app/components/editor/extensions/shared/slash_suggestion/SlashCommandDropdown";
+import { VoicePartialNode } from "@app/components/editor/extensions/VoicePartialExtension";
+import { BlockquoteExtension } from "@app/components/editor/input_bar/BlockquoteExtension";
+import { cleanupPastedHTML } from "@app/components/editor/input_bar/cleanupPastedHTML";
+import { emojiPluginKey } from "@app/components/editor/input_bar/emojiSuggestion";
+import { LinkExtension } from "@app/components/editor/input_bar/LinkExtension";
+import {
+  createMentionSuggestion,
+  mentionPluginKey,
+} from "@app/components/editor/input_bar/mentionSuggestion";
+import type { Selection } from "@app/components/model_picker/modelPickerUtils";
+import type { NodeCandidate, UrlCandidate } from "@app/lib/connectors";
+import { isSubmitMessageKey } from "@app/lib/keymaps";
+import { extractFromEditorJSON } from "@app/lib/mentions/format";
+import { useIsMobile } from "@app/lib/swr/useIsMobile";
+import { isMobile } from "@app/lib/utils";
+import type { RichMention } from "@app/types/assistant/mentions";
+import type { DataSourceViewContentNode } from "@app/types/data_source_view";
+import type { WorkspaceType } from "@app/types/user";
+import { markdownStyles } from "@ruby-ai/sparkle";
+import { Placeholder } from "@tiptap/extensions";
+import { Markdown } from "@tiptap/markdown";
+import type { Editor } from "@tiptap/react";
+import { useEditor } from "@tiptap/react";
+import { StarterKit } from "@tiptap/starter-kit";
+import { useEffect, useMemo, useRef } from "react";
+
+const DEFAULT_LONG_TEXT_PASTE_CHARS_THRESHOLD = 16000;
+const SUBMIT_COOLDOWN_MS = 750;
+export const INPUT_BAR_DEFAULT_PLACEHOLDER = "Get work done";
+// Matches the sidebar conversation title TypingAnimation cadence.
+const PLACEHOLDER_TYPING_INTERVAL_MS = 32;
+
+function isLongTextPaste(text: string, maxCharThreshold?: number) {
+  const maxChars = maxCharThreshold ?? DEFAULT_LONG_TEXT_PASTE_CHARS_THRESHOLD;
+  return text.length > maxChars;
+}
+
+const useEditorService = (editor: Editor | null, isMobileViewport: boolean) => {
+  return useMemo(() => {
+    // Return the service object with utility functions.
+    return {
+      // Insert text helper function.
+      insertText: (text: string) => {
+        editor?.chain().focus().insertContent(text).run();
+      },
+      // Append text at the end of the document (always at the end, regardless of cursor position).
+      appendText: (text: string) => {
+        editor?.chain().focus("end").insertContent(text).run();
+      },
+      // Insert or update the animated voicePartial node at the end of the document.
+      // Called on each partial transcript while voice recording is active.
+      setVoicePartialText: (text: string) => {
+        if (!editor) {
+          return;
+        }
+        const shouldFocus = !isMobileViewport;
+        let partialPos: number | null = null;
+        editor.state.doc.descendants((node, pos) => {
+          if (node.type.name === "voicePartial" && partialPos === null) {
+            partialPos = pos;
+            return false;
+          }
+          return true;
+        });
+        if (partialPos !== null) {
+          const p = partialPos;
+          editor
+            .chain()
+            .command(({ tr }) => {
+              tr.setNodeMarkup(p, undefined, { text });
+              return true;
+            })
+            .run();
+        } else {
+          const content = { type: "voicePartial", attrs: { text } };
+          if (shouldFocus) {
+            editor.chain().focus("end").insertContent(content).run();
+          } else {
+            editor
+              .chain()
+              .insertContentAt(editor.state.doc.content.size - 1, content, {
+                updateSelection: false,
+              })
+              .run();
+          }
+        }
+      },
+      // Replace the voicePartial node with the committed plain text.
+      // Called when the transcription engine finalizes a segment.
+      commitVoicePartialText: (committedText: string) => {
+        if (!editor) {
+          return;
+        }
+        const shouldFocus = !isMobileViewport;
+        let found = false;
+        editor.state.doc.descendants((node, pos) => {
+          if (node.type.name === "voicePartial" && !found) {
+            found = true;
+            const nodeSize = node.nodeSize;
+            editor
+              .chain()
+              .command(({ tr }) => {
+                if (committedText) {
+                  tr.replaceWith(
+                    pos,
+                    pos + nodeSize,
+                    editor.schema.text(committedText)
+                  );
+                } else {
+                  tr.delete(pos, pos + nodeSize);
+                }
+                return true;
+              })
+              .run();
+            return false;
+          }
+          return true;
+        });
+        if (!found && committedText) {
+          if (shouldFocus) {
+            editor.chain().focus("end").insertContent(committedText).run();
+          } else {
+            editor
+              .chain()
+              .insertContentAt(
+                editor.state.doc.content.size - 1,
+                committedText,
+                { updateSelection: false }
+              )
+              .run();
+          }
+        }
+      },
+      // Convert any pending voicePartial node to plain text in place.
+      // Called when recording stops to finalize whatever partial was last shown.
+      finalizeVoicePartial: () => {
+        if (!editor) {
+          return;
+        }
+        editor.state.doc.descendants((node, pos) => {
+          if (node.type.name === "voicePartial") {
+            const text = node.attrs.text as string;
+            const nodeSize = node.nodeSize;
+            editor
+              .chain()
+              .command(({ tr }) => {
+                if (text) {
+                  tr.replaceWith(pos, pos + nodeSize, editor.schema.text(text));
+                } else {
+                  tr.delete(pos, pos + nodeSize);
+                }
+                return true;
+              })
+              .run();
+            return false;
+          }
+          return true;
+        });
+      },
+      // Insert mention helper function.
+      insertMention: ({
+        type,
+        id,
+        label,
+        description,
+        pictureUrl,
+      }: {
+        type: "agent" | "user";
+        id: string;
+        label: string;
+        description?: string;
+        pictureUrl?: string;
+      }) => {
+        const shouldAddSpaceBeforeMention =
+          !editor?.isEmpty &&
+          editor?.getText()[editor?.getText().length - 1] !== " ";
+        editor
+          ?.chain()
+          .focus()
+          .insertContent(shouldAddSpaceBeforeMention ? " " : "") // Add an extra space before the mention.
+          .insertContent({
+            type: "mention",
+            attrs: { type, id, label, description, pictureUrl },
+          })
+          .insertContent(" ") // Add an extra space after the mention.
+          .run();
+      },
+      setContent: (
+        content: string,
+        { focus = true }: { focus?: boolean } = {}
+      ) => {
+        const chain = editor
+          ?.chain()
+          .setContent(content, { contentType: "markdown" });
+        if (focus) {
+          chain?.focus();
+        }
+        chain?.run();
+      },
+      resetWithMentions: (
+        mentions: RichMention[],
+        disableAutoFocus: boolean
+      ) => {
+        const chainCommands = editor?.chain();
+
+        if (!disableAutoFocus) {
+          chainCommands?.focus();
+        }
+
+        chainCommands?.clearContent();
+
+        mentions.forEach(
+          (m) =>
+            chainCommands
+              ?.insertContent({
+                type: "mention",
+                attrs: m,
+              })
+              .insertContent(" ") // Add an extra space after the mention.
+        );
+
+        chainCommands?.run();
+      },
+
+      focusEnd() {
+        editor?.commands.focus("end");
+      },
+
+      isEmpty() {
+        return editor?.isEmpty ?? true;
+      },
+
+      getMarkdownAndMentions() {
+        if (!editor?.state.doc) {
+          return {
+            markdown: "",
+            mentions: [],
+            skills: [],
+          };
+        }
+
+        const { mentions, skills } = extractFromEditorJSON(editor?.getJSON());
+
+        return {
+          markdown: editor.getMarkdown(),
+          mentions,
+          skills,
+        };
+      },
+
+      hasMention(mention: RichMention) {
+        const { mentions } = extractFromEditorJSON(editor?.getJSON());
+        return mentions.some(
+          (m) => m.id === mention.id && m.type === mention.type
+        );
+      },
+
+      getTrimmedText() {
+        return editor?.getText().trim();
+      },
+
+      blur() {
+        return editor?.commands.blur();
+      },
+
+      clearEditor() {
+        return editor?.commands.clearContent();
+      },
+
+      setLoading(loading: boolean) {
+        if (loading) {
+          editor?.view.dom.classList.add("loading-text");
+        } else {
+          editor?.view.dom.classList.remove("loading-text");
+        }
+        return editor?.setEditable(!loading);
+      },
+    };
+  }, [editor, isMobileViewport]);
+};
+
+export type EditorService = ReturnType<typeof useEditorService>;
+
+export interface CustomEditorProps {
+  onEnterKeyDown: (
+    isEmpty: boolean,
+    markdownAndMentions: ReturnType<
+      ReturnType<typeof useEditorService>["getMarkdownAndMentions"]
+    >,
+    clearEditor: () => void,
+    setLoading: (loading: boolean) => void
+  ) => void;
+  disableAutoFocus: boolean;
+  disableUserMentions?: boolean;
+  onUrlDetected?: (candidate: UrlCandidate | NodeCandidate | null) => void;
+  onAgentSelect?: (mention: RichMention) => void;
+  owner: WorkspaceType;
+  conversationId?: string | null;
+  spaceId?: string;
+  // If provided, large pasted text will be routed to this callback along with selection bounds
+  onLongTextPaste?: (payload: {
+    text: string;
+    from: number;
+    to: number;
+  }) => void;
+  longTextPasteCharsThreshold?: number;
+  onInlineText?: (fileId: string, textContent: string) => void;
+  // When true, agent suggestions are fully disabled (e.g. edit mode).
+  disableAgentMentions?: boolean;
+  // When true, agent mention nodes are stripped from the document (converted
+  // back to plain text). Combined with disableAgentMentions, this locks the
+  // editor to a single agent. Do not set in edit mode, where the original
+  // message's agent mentions must be preserved.
+  stripAgentMentions?: boolean;
+  onFirstAgentMentionPasteRef?: React.RefObject<
+    ((agentId: string) => void) | undefined
+  >;
+  slashSuggestion?: {
+    // The conversation may only exist after the editor is initialized, hence the ref.
+    conversationIdRef?: React.RefObject<string | null>;
+    enabledRef: React.RefObject<boolean>;
+    onSelectRef: React.RefObject<((item: SlashCommand) => void) | undefined>;
+    onDetailsRef?: React.RefObject<((item: SlashCommand) => void) | undefined>;
+    onSkillDetails?: (skillId: string) => void;
+    selectedMCPServerViewIdsRef: React.RefObject<Set<string>>;
+    slashCommandsRef: React.RefObject<InputBarSlashCommand[]>;
+    includeAttachKnowledgeRef: React.RefObject<boolean>;
+    includePickModelRef: React.RefObject<boolean>;
+    attachedNodesRef: React.RefObject<DataSourceViewContentNode[]>;
+    onModelSelectRef: React.RefObject<
+      ((selection: Selection) => void) | undefined
+    >;
+    onNodeSelectRef: React.RefObject<
+      ((node: DataSourceViewContentNode) => void) | undefined
+    >;
+    spaceIdRef: React.RefObject<string | null | undefined>;
+  };
+  // Override the default editor placeholder (e.g. to show a blocked-state reason).
+  placeholderOverride?: string | null;
+  // When true, placeholder changes are typed character by character.
+  animatePlaceholder?: boolean;
+  onSuggestionActiveChangeRef?: React.RefObject<
+    ((active: boolean) => void) | undefined
+  >;
+}
+
+export const buildEditorExtensions = ({
+  owner,
+  conversationId,
+  spaceId,
+  disableUserMentions,
+  disableAgentMentions,
+  stripAgentMentions,
+  onInlineText,
+  onUrlDetected,
+  onAgentSelect,
+  onFirstAgentMentionPasteRef,
+  slashSuggestion,
+  placeholderRef,
+  onSuggestionActiveChangeRef,
+}: {
+  owner: WorkspaceType;
+  conversationId?: string | null;
+  spaceId?: string;
+  disableUserMentions?: boolean;
+  disableAgentMentions?: boolean;
+  stripAgentMentions?: boolean;
+  onInlineText?: (fileId: string, textContent: string) => void;
+  onUrlDetected?: (candidate: UrlCandidate | NodeCandidate | null) => void;
+  onAgentSelect?: (mention: RichMention) => void;
+  onFirstAgentMentionPasteRef?: React.RefObject<
+    ((agentId: string) => void) | undefined
+  >;
+  slashSuggestion?: CustomEditorProps["slashSuggestion"];
+  placeholderRef?: React.RefObject<string>;
+  onSuggestionActiveChangeRef?: CustomEditorProps["onSuggestionActiveChangeRef"];
+}) => {
+  const notifySuggestionActiveChange = (active: boolean) => {
+    onSuggestionActiveChangeRef?.current?.(active);
+  };
+
+  const extensions = [
+    KeyboardShortcutsExtension,
+    StarterKit.configure({
+      hardBreak: false, // Disable the built-in Shift+Enter. We handle it ourselves in the keymap extension
+      strike: false,
+      link: false, // Disable built-in Link extension, using custom LinkExtension instead
+      paragraph: {
+        HTMLAttributes: {
+          class: markdownStyles.paragraph(),
+        },
+      },
+      heading: {
+        levels: [1],
+      },
+      blockquote: false, // Disable default blockquote, we use a custom one
+      orderedList: {
+        HTMLAttributes: {
+          class: markdownStyles.orderedList(),
+        },
+      },
+      listItem: {
+        HTMLAttributes: {
+          class: markdownStyles.list(),
+        },
+      },
+      // Disable built-in code extension; we use CodeExtension which handles
+      // backslash-escaped backticks (e.g. `\`identifier\``).
+      code: false,
+      codeBlock: {
+        HTMLAttributes: {
+          class: markdownStyles.codeBlock(),
+        },
+      },
+      bulletList: {
+        HTMLAttributes: {
+          class: markdownStyles.unorderedList(),
+        },
+      },
+    }),
+    CodeExtension.configure({
+      HTMLAttributes: {
+        class: markdownStyles.codeInline(),
+      },
+    }),
+    BlockquoteExtension.configure({
+      HTMLAttributes: {
+        class: markdownStyles.blockquote(),
+      },
+    }),
+    Markdown,
+    DataSourceLinkExtension,
+    LinkExtension.configure({
+      HTMLAttributes: {
+        class: "text-blue-600 hover:underline hover:text-blue-800",
+      },
+      autolink: false,
+      openOnClick: false,
+    }),
+    MentionExtension.configure({
+      owner,
+      onFirstAgentMentionPasteRef,
+      stripAgentMentions,
+      HTMLAttributes: {
+        class:
+          "min-w-0 px-0 py-0 border-none outline-hidden focus:outline-hidden focus:border-none ring-0 focus:ring-0 text-highlight-500 font-semibold",
+      },
+      suggestion: createMentionSuggestion({
+        owner,
+        conversationId,
+        spaceId,
+        select: {
+          agents: !disableAgentMentions,
+          users: !disableUserMentions,
+        },
+        onAgentSelect,
+        onActiveChange: notifySuggestionActiveChange,
+      }),
+    }),
+    SkillNode.configure({
+      onSkillDetails: slashSuggestion?.onSkillDetails,
+    }),
+    VoicePartialNode,
+    createEmojiExtension({ onActiveChange: notifySuggestionActiveChange }),
+    Placeholder.configure({
+      placeholder: ({ node }) => {
+        if (node.type.name !== "paragraph") {
+          return "";
+        }
+        return placeholderRef?.current ?? INPUT_BAR_DEFAULT_PLACEHOLDER;
+      },
+      emptyNodeClass:
+        "first:before:text-faint dark:first:before:text-stone-400 first:before:content-[attr(data-placeholder)] first:before:pointer-events-none first:before:absolute",
+    }),
+    PastedAttachmentExtension.configure({
+      onInlineText,
+    }),
+    FilePreviewExtension,
+    URLStorageExtension,
+  ];
+
+  if (slashSuggestion) {
+    extensions.push(
+      InputBarSlashSuggestionExtension.configure({
+        attachedNodesRef: slashSuggestion.attachedNodesRef,
+        owner,
+        conversationIdRef: slashSuggestion.conversationIdRef,
+        enabledRef: slashSuggestion.enabledRef,
+        onSelectRef: slashSuggestion.onSelectRef,
+        onDetailsRef: slashSuggestion.onDetailsRef,
+        onModelSelectRef: slashSuggestion.onModelSelectRef,
+        onNodeSelectRef: slashSuggestion.onNodeSelectRef,
+        onActiveChangeRef: onSuggestionActiveChangeRef,
+        slashCommandsRef: slashSuggestion.slashCommandsRef,
+        includeAttachKnowledgeRef: slashSuggestion.includeAttachKnowledgeRef,
+        includePickModelRef: slashSuggestion.includePickModelRef,
+        spaceIdRef: slashSuggestion.spaceIdRef,
+      })
+    );
+  }
+
+  if (onUrlDetected) {
+    extensions.push(
+      URLDetectionExtension.configure({
+        onUrlDetected,
+      })
+    );
+  }
+
+  return extensions;
+};
+
+const useCustomEditor = ({
+  onEnterKeyDown,
+  disableAutoFocus,
+  disableUserMentions,
+  onUrlDetected,
+  onAgentSelect,
+  owner,
+  conversationId,
+  spaceId,
+  onLongTextPaste,
+  longTextPasteCharsThreshold,
+  onInlineText,
+  disableAgentMentions,
+  stripAgentMentions,
+  onFirstAgentMentionPasteRef,
+  slashSuggestion,
+  placeholderOverride,
+  animatePlaceholder,
+  onSuggestionActiveChangeRef,
+}: CustomEditorProps) => {
+  // Read through a ref so placeholder changes don't rebuild the editor.
+  const placeholderRef = useRef(
+    placeholderOverride ?? INPUT_BAR_DEFAULT_PLACEHOLDER
+  );
+
+  const editor = useEditor(
+    {
+      autofocus: disableAutoFocus ? false : "end",
+      extensions: buildEditorExtensions({
+        owner,
+        conversationId,
+        spaceId,
+        disableUserMentions,
+        disableAgentMentions,
+        stripAgentMentions,
+        onInlineText,
+        onUrlDetected,
+        onAgentSelect,
+        onFirstAgentMentionPasteRef,
+        slashSuggestion,
+        placeholderRef,
+        onSuggestionActiveChangeRef,
+      }),
+      shouldRerenderOnTransaction: true, // necessary to update the editor state (and so the toolbar icons "activation") in real time
+      editorProps: {
+        attributes: {
+          class:
+            "border-0 outline-hidden overflow-y-auto h-full scrollbar-hide [&_h1]:text-2xl [&_h1]:font-semibold [&_h1]:my-2 [&_a]:cursor-text",
+        },
+        // cleans up incoming HTML to remove all style that could mess up with our theme
+        transformPastedHTML(html: string) {
+          return cleanupPastedHTML(html);
+        },
+        handlePaste: (view, event) => {
+          const text = event.clipboardData?.getData("text/plain") ?? "";
+          if (!text || !onLongTextPaste) {
+            return false;
+          }
+          if (isLongTextPaste(text, longTextPasteCharsThreshold)) {
+            const { from, to } = view.state.selection;
+            onLongTextPaste({ text, from, to });
+            return true;
+          }
+          return false;
+        },
+      },
+      immediatelyRender: false,
+    },
+    // Important to watch for conversationId changes to reset the editor state when switching conversations.
+    [conversationId]
+  );
+
+  // Apply placeholder changes. With animatePlaceholder, type the new
+  // placeholder character by character, like the sidebar conversation titles.
+  // The Placeholder extension only re-reads placeholderRef on a state update,
+  // so dispatch an empty transaction for each change. Skipped on mount since
+  // the ref starts in sync with the override.
+  useEffect(() => {
+    const target = placeholderOverride ?? INPUT_BAR_DEFAULT_PLACEHOLDER;
+    if (!editor || editor.isDestroyed || placeholderRef.current === target) {
+      return;
+    }
+
+    if (!animatePlaceholder) {
+      placeholderRef.current = target;
+      editor.view.dispatch(editor.state.tr);
+      return;
+    }
+
+    // Start at one character, like TypingAnimation.
+    let length = 1;
+    placeholderRef.current = target.substring(0, length);
+    editor.view.dispatch(editor.state.tr);
+
+    const typingEffect = setInterval(() => {
+      if (editor.isDestroyed || length >= target.length) {
+        clearInterval(typingEffect);
+        return;
+      }
+      length += 1;
+      placeholderRef.current = target.substring(0, length);
+      editor.view.dispatch(editor.state.tr);
+    }, PLACEHOLDER_TYPING_INTERVAL_MS);
+
+    return () => clearInterval(typingEffect);
+  }, [editor, placeholderOverride, animatePlaceholder]);
+
+  const isMobileViewport = useIsMobile();
+  const editorService = useEditorService(editor, isMobileViewport);
+  const lastSubmitTimestampMsRef = useRef(0);
+
+  // Set keydown handler after editor is initialized to avoid synchronous updates during render.
+  useEffect(() => {
+    if (!editor) {
+      return;
+    }
+    editor.setOptions({
+      editorProps: {
+        handleKeyDown: (view, event) => {
+          const submitMessageKey = localStorage.getItem("submitMessageKey");
+          const isCmdEnterForSubmission =
+            isSubmitMessageKey(submitMessageKey) &&
+            submitMessageKey === "cmd+enter";
+          const isEnterForSubmission = !isCmdEnterForSubmission;
+
+          // Check if this is a submission key combination based on user preferences
+          const isSubmissionKey =
+            (isEnterForSubmission &&
+              event.key === "Enter" &&
+              !event.shiftKey &&
+              !event.ctrlKey &&
+              !event.metaKey &&
+              !event.altKey) ||
+            (isCmdEnterForSubmission &&
+              event.key === "Enter" &&
+              (event.metaKey || event.ctrlKey));
+
+          if (isSubmissionKey) {
+            const mentionPluginState = mentionPluginKey.getState(view.state);
+            // Let the mention extension handle the event if its dropdown is currently opened.
+            if (mentionPluginState?.active) {
+              return false;
+            }
+
+            const emojiPluginState = emojiPluginKey.getState(view.state);
+            // Let the emoji extension handle the event if its dropdown is currently opened.
+            if (emojiPluginState?.active) {
+              return false;
+            }
+
+            const inputBarSlashSuggestionPluginState =
+              inputBarSlashSuggestionPluginKey.getState(view.state);
+            if (inputBarSlashSuggestionPluginState?.active) {
+              return false;
+            }
+
+            // On mobile, we want to let the user go to the next line and not immediately send
+            if (isMobile(navigator)) {
+              return false;
+            }
+
+            if (event.repeat) {
+              event.preventDefault();
+              return true;
+            }
+
+            const nowMs = Date.now();
+            if (nowMs - lastSubmitTimestampMsRef.current < SUBMIT_COOLDOWN_MS) {
+              event.preventDefault();
+              return true;
+            }
+            lastSubmitTimestampMsRef.current = nowMs;
+
+            // Prevent the default Enter key behavior
+            event.preventDefault();
+
+            const clearEditor = () => {
+              editor.commands.clearContent();
+            };
+
+            const setLoading = (loading: boolean) => {
+              if (loading) {
+                editor?.view.dom.classList.add("loading-text");
+              } else {
+                editor?.view.dom.classList.remove("loading-text");
+              }
+              return editor?.setEditable(!loading);
+            };
+
+            onEnterKeyDown(
+              editor.isEmpty,
+              editorService.getMarkdownAndMentions(),
+              clearEditor,
+              setLoading
+            );
+
+            // Return true to indicate that this key event has been handled.
+            return true;
+          }
+
+          // Return false to let other keydown handlers or TipTap's default behavior process the event.
+          return false;
+        },
+      },
+    });
+  }, [editor, editorService, onEnterKeyDown]);
+
+  // Expose the editor instance and the editor service.
+  return {
+    editor,
+    editorService,
+  };
+};
+
+export default useCustomEditor;

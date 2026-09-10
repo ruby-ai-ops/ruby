@@ -1,0 +1,93 @@
+import { frontSequelize } from "@app/lib/resources/storage";
+import { DataTypes } from "@app/lib/resources/storage/data_types";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import { BaseModel } from "@app/lib/resources/storage/wrappers/base";
+import type { CouponDiscountType } from "@app/types/coupon";
+import type { CreationOptional, ForeignKey, NonAttribute } from "sequelize";
+
+export class CouponModel extends BaseModel<CouponModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare code: string;
+  declare description: string | null;
+  declare discountType: CouponDiscountType;
+  declare amount: number;
+  declare durationMonths: number | null;
+  declare maxRedemptions: number | null;
+  declare redemptionCount: CreationOptional<number>;
+  declare expirationDate: Date | null;
+  declare archivedAt: Date | null;
+  declare createdByUserId: ForeignKey<UserModel["id"]> | null;
+
+  declare createdByUser: NonAttribute<UserModel>;
+}
+
+CouponModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    code: {
+      type: DataTypes.STRING(64),
+      allowNull: false,
+      unique: true,
+    },
+    description: {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+    },
+    discountType: {
+      type: DataTypes.STRING(32),
+      allowNull: false,
+    },
+    amount: {
+      type: DataTypes.FLOAT,
+      allowNull: false,
+    },
+    durationMonths: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    },
+    maxRedemptions: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    },
+    redemptionCount: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    expirationDate: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    archivedAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
+    },
+  },
+  {
+    modelName: "coupon",
+    sequelize: frontSequelize,
+    indexes: [
+      { fields: ["createdByUserId"], name: "coupons_created_by_user_idx" },
+    ],
+  }
+);
+
+CouponModel.belongsTo(UserModel, {
+  as: "createdByUser",
+  foreignKey: { name: "createdByUserId", allowNull: true },
+});

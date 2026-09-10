@@ -1,0 +1,193 @@
+import config from "@app/lib/api/config";
+import type { Authenticator } from "@app/lib/auth";
+import { getFeatureFlags } from "@app/lib/auth";
+import { isByokTransitioningPlan } from "@app/lib/plans/plan_codes";
+import { ProviderCredentialResource } from "@app/lib/resources/provider_credential_resource";
+import type { ByokModelProviderIdType } from "@app/types/assistant/models/types";
+import type {
+  ApiKeyCredentialContentSchema,
+  LLMCredentialsType,
+  ProviderCredentialKey,
+} from "@app/types/provider_credential";
+import { PROVIDER_TO_CREDENTIAL_KEY } from "@app/types/provider_credential";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { EnvironmentConfig } from "@app/types/shared/utils/config";
+import assert from "assert";
+import type { z } from "zod";
+
+// Fraction of requests that use BYOK credentials during the transition period.
+const BYOK_TRANSITION_BYOK_KEYS_RATIO = 1; // 100%
+
+export const MISSING_EMBEDDING_API_KEY_ERROR_MESSAGE =
+  "An OpenAI API key is required to perform this action. Please configure it in your workspace settings or contact an admin.";
+
+const env = (key: string) =>
+  EnvironmentConfig.getOptionalEnvVariable(key) ?? "";
+
+function rubyManagedByokProviderKeys(): Record<ProviderCredentialKey, string> {
+  return {
+    ANTHROPIC_API_KEY: env("RUBY_MANAGED_ANTHROPIC_API_KEY"),
+    OPENAI_API_KEY: env("RUBY_MANAGED_OPENAI_API_KEY"),
+    GOOGLE_AI_STUDIO_API_KEY: env("RUBY_MANAGED_GOOGLE_AI_STUDIO_API_KEY"),
+  };
+}
+
+function rubyManagedOtherProviderKeys() {
+  return {
+    AZURE_OPENAI_API_KEY: env("RUBY_MANAGED_AZURE_OPENAI_API_KEY"),
+    AZURE_OPENAI_ENDPOINT: env("RUBY_MANAGED_AZURE_OPENAI_ENDPOINT"),
+    MISTRAL_API_KEY: env("RUBY_MANAGED_MISTRAL_API_KEY"),
+    TEXTSYNTH_API_KEY: env("RUBY_MANAGED_TEXTSYNTH_API_KEY"),
+    GOOGLE_AI_STUDIO_API_KEY: env("RUBY_MANAGED_GOOGLE_AI_STUDIO_API_KEY"),
+    DEEPSEEK_API_KEY: env("RUBY_MANAGED_DEEPSEEK_API_KEY"),
+    FIREWORKS_API_KEY: env("RUBY_MANAGED_FIREWORKS_API_KEY"),
+    XAI_API_KEY: env("RUBY_MANAGED_XAI_API_KEY"),
+  };
+}
+
+// Safer to always point to the same hosting region while we handle US first,
+// avoid region switching issues when welcoming EU BYOK workspaces later.
+function baseCredentialVariables() {
+  return {
+    OPENAI_USE_EU_ENDPOINT:
+      config.getRegion() === "europe-west1" ? "true" : "false",
+    OPENAI_BASE_URL: env("RUBY_MANAGED_OPENAI_BASE_URL"),
+    AGENT_PLATFORM_PROJECT_ID: config.getVertexAiProjectId(),
+  };
+}
+
+/**
+ * The Ruby-managed keys, resolved from the environment alone.
+ *
+ * This is what a non-BYOK workspace gets, factored out so callers that have no
+ * `Authenticator` at all -- the model health probe running in a Temporal worker
+ * -- can reach Ruby's own credentials without inventing a workspace.
+ *
+ * Dangerous because it answers for no workspace: it skips `plan.isByok`, so a
+ * BYOK workspace's inference would run on Ruby's keys, in Ruby's provider
+ * accounts. If you hold an `Authenticator`, call `getLlmCredentials(auth)`.
+ */
+export function dangerouslyGetRubyManagedLlmCredentials(): LLMCredentialsType {
+  return {
+    ...baseCredentialVariables(),
+    ...rubyManagedOtherProviderKeys(),
+    ...rubyManagedByokProviderKeys(),
+  };
+}
+
+/**
+ * Returns LLM credentials for the workspace.
+ *
+ * - Non-BYOK workspaces: returns Ruby-managed keys from environment variables.
+ * - BYOK workspaces: resolves customer-provided keys from OAuth credentials.
+ *   - For BYOK_TRANSITIONING plan, fallback on Ruby-managed keys if customer keys are not provided.
+ *   - For all others, do not fallback.
+ *
+ * `OPENAI_EMBEDDING_API_KEY` is set separately from `OPENAI_API_KEY` so Ruby apps
+ * don't accidentally use the customer's LLM key for embeddings.
+ *
+ * By default, BYOK workspaces must have `OPENAI_EMBEDDING_API_KEY` configured
+ * (used by search, upsert, data source creation).
+ * Pass `skipEmbeddingApiKeyRequirement: true` for call sites that only need LLM
+ * keys (agent loop, token counting, image generation, etc.).
+ */
+export async function getLlmCredentials(
+  auth: Authenticator,
+  { skipEmbeddingApiKeyRequirement } = {
+    skipEmbeddingApiKeyRequirement: false,
+  }
+): Promise<LLMCredentialsType> {
+  const plan = auth.getNonNullablePlan();
+
+  const RUBY_MANAGED_BYOK_PROVIDERS_API_KEYS = rubyManagedByokProviderKeys();
+  const BASE_VARIABLES = baseCredentialVariables();
+
+  if (!plan.isByok) {
+    return dangerouslyGetRubyManagedLlmCredentials();
+  }
+
+  const featureFlags = await getFeatureFlags(auth);
+
+  if (featureFlags.includes("use_ruby_keys")) {
+    return {
+      ...BASE_VARIABLES,
+      ...RUBY_MANAGED_BYOK_PROVIDERS_API_KEYS,
+    };
+  }
+
+  const providerCredentials =
+    await ProviderCredentialResource.listByWorkspace(auth);
+
+  // Use healthy keys only and fallback on Ruby keys for this specific plan only
+  if (isByokTransitioningPlan(plan)) {
+    const healthyCredentials = mapOauthCredentialsToLlmCredentials(
+      providerCredentials
+        .filter(({ isHealthy }) => isHealthy)
+        .map((cred) => ({
+          providerId: cred.providerId,
+          content: cred.credentials,
+        }))
+    );
+
+    const shouldUseByokKeys = Math.random() < BYOK_TRANSITION_BYOK_KEYS_RATIO;
+
+    return shouldUseByokKeys
+      ? {
+          ...BASE_VARIABLES,
+          ...RUBY_MANAGED_BYOK_PROVIDERS_API_KEYS,
+          ...healthyCredentials,
+        }
+      : { ...BASE_VARIABLES, ...RUBY_MANAGED_BYOK_PROVIDERS_API_KEYS };
+  }
+
+  const credentials = mapOauthCredentialsToLlmCredentials(
+    providerCredentials.map((cred) => ({
+      providerId: cred.providerId,
+      content: cred.credentials,
+    }))
+  );
+
+  if (!skipEmbeddingApiKeyRequirement) {
+    assert(
+      credentials.OPENAI_EMBEDDING_API_KEY,
+      "[BYOK] This action requires OPENAI_EMBEDDING_API_KEY to be configured."
+    );
+  }
+
+  return {
+    ...BASE_VARIABLES,
+    ...credentials,
+  };
+}
+
+function mapOauthCredentialsToLlmCredentials(
+  oauthCredentials: {
+    providerId: ByokModelProviderIdType;
+    content: z.infer<typeof ApiKeyCredentialContentSchema>;
+  }[]
+): LLMCredentialsType {
+  const result: LLMCredentialsType = {};
+
+  for (const { providerId, content } of oauthCredentials) {
+    switch (providerId) {
+      case "openai": {
+        result.OPENAI_API_KEY = content.api_key;
+        result.OPENAI_EMBEDDING_API_KEY = content.api_key;
+        // TODO(BYOK): add support openai EU host
+        break;
+      }
+      case "anthropic": {
+        result[PROVIDER_TO_CREDENTIAL_KEY[providerId]] = content.api_key;
+        break;
+      }
+      case "google_ai_studio": {
+        result[PROVIDER_TO_CREDENTIAL_KEY[providerId]] = content.api_key;
+        break;
+      }
+      default:
+        assertNever(providerId);
+    }
+  }
+
+  return result;
+}

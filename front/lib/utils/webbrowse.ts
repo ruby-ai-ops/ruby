@@ -1,0 +1,717 @@
+import { extractTextFromBuffer } from "@app/lib/actions/mcp_internal_actions/utils/attachment_processing";
+import { clientFetch } from "@app/lib/egress/client";
+import { untrustedFetch } from "@app/lib/egress/server";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import { rubyManagedServiceCredentials } from "@app/types/api/credentials";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type {
+  ErrorResponse,
+  ScrapeParams,
+  ScrapeResponse,
+} from "@mendable/firecrawl-js";
+import FirecrawlApp, { FirecrawlError } from "@mendable/firecrawl-js";
+import Exa from "exa-js";
+
+const credentials = rubyManagedServiceCredentials();
+
+const SPIDER_API_BASE_URL = "https://api.spider.cloud";
+
+const BINARY_CONTENT_TYPE_PREFIXES = [
+  "image/",
+  "audio/",
+  "video/",
+  "font/",
+  "application/zip",
+  "application/gzip",
+  "application/x-tar",
+  "application/octet-stream",
+  "application/vnd.ms-",
+  "application/vnd.openxmlformats-",
+  "application/x-rar",
+  "application/x-7z",
+  "application/x-bzip",
+  "application/epub",
+  "application/wasm",
+];
+
+/**
+ * Checks if a content type represents binary (non-text) content
+ */
+const isBinaryContent = (contentType: string | null): boolean => {
+  if (!contentType) {
+    return false;
+  }
+
+  return BINARY_CONTENT_TYPE_PREFIXES.some((type) =>
+    contentType.toLowerCase().startsWith(type)
+  );
+};
+
+const HEAD_FETCH_TIMEOUT_MS = 5000;
+const PDF_DOWNLOAD_TIMEOUT_MS = 60_000;
+const PDF_MAX_DOWNLOAD_SIZE_BYTES = 50 * 1024 * 1024;
+
+const isPdfContent = (contentType: string | null, url: string): boolean => {
+  if (contentType?.toLowerCase().startsWith("application/pdf")) {
+    return true;
+  }
+  if (!contentType || contentType.startsWith("application/octet-stream")) {
+    try {
+      return new URL(url).pathname.toLowerCase().endsWith(".pdf");
+    } catch {
+      return false;
+    }
+  }
+  return false;
+};
+
+const fetchPdf = async (
+  url: string
+): Promise<BrowseScrapeSuccessResponse | BrowseScrapeErrorResponse> => {
+  try {
+    const response = await untrustedFetch(url, {
+      signal: AbortSignal.timeout(PDF_DOWNLOAD_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      return {
+        error: `Failed to download PDF: HTTP ${response.status}`,
+        status: response.status,
+        url,
+      };
+    }
+
+    const contentLengthHeader = response.headers.get("content-length");
+    if (contentLengthHeader) {
+      const contentLength = parseInt(contentLengthHeader, 10);
+      if (contentLength > PDF_MAX_DOWNLOAD_SIZE_BYTES) {
+        const sizeMB = Math.round(contentLength / 1024 / 1024);
+        return {
+          error: `PDF too large (${sizeMB}MB). Maximum supported size is ${Math.round(PDF_MAX_DOWNLOAD_SIZE_BYTES / 1024 / 1024)}MB.`,
+          status: 413,
+          url,
+        };
+      }
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > PDF_MAX_DOWNLOAD_SIZE_BYTES) {
+      const sizeMB = Math.round(buffer.length / 1024 / 1024);
+      return {
+        error: `PDF too large (${sizeMB}MB). Maximum supported size is ${Math.round(PDF_MAX_DOWNLOAD_SIZE_BYTES / 1024 / 1024)}MB.`,
+        status: 413,
+        url,
+      };
+    }
+
+    const extractionResult = await extractTextFromBuffer(
+      buffer,
+      "application/pdf"
+    );
+
+    if (extractionResult.isErr()) {
+      logger.error(
+        { url, error: extractionResult.error },
+        "[Firecrawl] Text extraction failed"
+      );
+      return {
+        error: `Failed to extract text from PDF: ${extractionResult.error}`,
+        status: 500,
+        url,
+      };
+    }
+
+    logger.info(
+      { url, textLength: extractionResult.value.length },
+      "[Firecrawl] Successfully extracted text from PDF"
+    );
+
+    return {
+      markdown: extractionResult.value,
+      title: undefined,
+      description: undefined,
+      status: 200,
+      url,
+    };
+  } catch (error) {
+    logger.error({ url, error }, "[Firecrawl] Unexpected error");
+    return {
+      error: normalizeError(error).message,
+      status: 500,
+      url,
+    };
+  }
+};
+
+/**
+ * Makes a HEAD request to check if the URL points to binary content
+ * Returns null if the check fails (to allow proceeding with scraping)
+ */
+const checkForBinaryContent = async (
+  url: string
+): Promise<{
+  isBinary: boolean;
+  contentType: string | null;
+  status: number;
+} | null> => {
+  try {
+    const response = await untrustedFetch(url, {
+      method: "HEAD",
+      signal: AbortSignal.timeout(HEAD_FETCH_TIMEOUT_MS),
+    });
+
+    const contentType = response.headers.get("content-type");
+    return {
+      isBinary: isBinaryContent(contentType),
+      contentType,
+      status: response.status,
+    };
+  } catch (error) {
+    logger.warn(
+      { error, url },
+      "Failed to check for binary content with HEAD request"
+    );
+    // Return null to allow proceeding with scraping if HEAD request fails
+    return null;
+  }
+};
+
+// Firecrawl scrape options we use locally: require formats only
+type ScrapeOptionsMinimal = Required<Pick<ScrapeParams, "formats">>;
+
+type BrowserScrapeMetadata = {
+  status: number;
+  url: string;
+};
+
+type BrowseScrapeSuccessResponse = BrowserScrapeMetadata & {
+  markdown?: string;
+  html?: string;
+  screenshots?: string[];
+  links?: string[];
+  title: string | undefined;
+  description: string | undefined;
+};
+
+type BrowseScrapeErrorResponse = BrowserScrapeMetadata & {
+  error: string;
+};
+
+export function isBrowseScrapeSuccessResponse(
+  response: BrowseScrapeSuccessResponse | BrowseScrapeErrorResponse
+): response is BrowseScrapeSuccessResponse {
+  return "markdown" in response || "html" in response;
+}
+
+type SpiderScrapeResultMetadata = {
+  title?: string;
+  description?: string;
+  status?: number;
+};
+
+type SpiderScrapeResult = {
+  url?: string;
+  status?: number;
+  content?: string;
+  error?: string | null;
+  metadata?: SpiderScrapeResultMetadata | null;
+  links?: string[] | null;
+  page_links?: string[] | null;
+};
+
+type SpiderScrapeResponse = SpiderScrapeResult | SpiderScrapeResult[];
+
+const normalizeSpiderScrapeResult = (
+  json: SpiderScrapeResponse
+): SpiderScrapeResult | null => {
+  if (Array.isArray(json)) {
+    if (json.length === 0) {
+      return null;
+    }
+    return json[0] ?? null;
+  }
+  return json;
+};
+
+/**
+ * Fetches the content of a URL and returns it as markdown, HTML, or extracted data using Firecrawl
+ */
+const browseUrlFirecrawl = async (
+  url: string,
+  format: "markdown" | "html" = "markdown",
+  options?: {
+    screenshotMode?: "none" | "viewport" | "fullPage";
+    links?: boolean;
+  }
+): Promise<BrowseScrapeSuccessResponse | BrowseScrapeErrorResponse> => {
+  if (!credentials.FIRECRAWL_API_KEY) {
+    throw new Error(
+      "util/webbrowse: a RUBY_MANAGED_FIRECRAWL_API_KEY is required"
+    );
+  }
+
+  // Check if the URL points to binary content before attempting to scrape
+  const binaryCheck = await checkForBinaryContent(url);
+  if (!binaryCheck) {
+    return {
+      error: `Unable to check url's content type before scraping, skipping.`,
+      status: 500,
+      url,
+    };
+  }
+  if (binaryCheck.isBinary) {
+    logger.info(
+      {
+        url,
+        binaryCheck,
+      },
+      "[Firecrawl] Skipping binary content"
+    );
+
+    return {
+      error: `Scrapping: Binary content detected (Content-Type: ${binaryCheck.contentType}), not supported.`,
+      status: binaryCheck.status,
+      url,
+    };
+  }
+
+  if (isPdfContent(binaryCheck.contentType, url)) {
+    logger.info(
+      { url },
+      "[Firecrawl] PDF detected, extracting directly via Tika"
+    );
+    return fetchPdf(url);
+  }
+
+  const fc = new FirecrawlApp({
+    apiKey: credentials.FIRECRAWL_API_KEY,
+  });
+
+  let scrapeResult: ScrapeResponse | ErrorResponse;
+  try {
+    const formats: ScrapeOptionsMinimal["formats"] = [];
+
+    if (format === "html") {
+      formats.push("rawHtml");
+    } else {
+      formats.push("markdown");
+    }
+
+    if (options?.screenshotMode && options.screenshotMode !== "none") {
+      // Firecrawl requires choosing exactly one screenshot format
+      if (options.screenshotMode === "fullPage") {
+        formats.push("screenshot@fullPage");
+      } else {
+        formats.push("screenshot");
+      }
+    }
+
+    if (options?.links) {
+      formats.push("links");
+    }
+
+    const scrapeOptions: ScrapeOptionsMinimal = { formats };
+
+    scrapeResult = await fc.scrapeUrl(url, scrapeOptions);
+  } catch (error) {
+    if (isUnsupportedWebsiteError(error)) {
+      logger.warn(
+        {
+          error,
+          url: url,
+        },
+        "[Firecrawl] Unsupported website (probably social media)"
+      );
+
+      return {
+        error:
+          "Website couldn't be crawled, it is no longer supported by Firecrawl.",
+        status: 403,
+        url: url,
+      };
+    }
+
+    logger.error(
+      {
+        error,
+        url: url,
+      },
+      "[Firecrawl] Error scraping URL"
+    );
+    return {
+      error: normalizeError(error).message,
+      status: 500,
+      url: url,
+    };
+  }
+
+  if (!scrapeResult.success) {
+    const errorMessage = scrapeResult.error || "Unknown error.";
+    logger.error(
+      {
+        url,
+        format,
+        error: errorMessage,
+      },
+      "[Firecrawl] Scrape request failed"
+    );
+    return {
+      error: errorMessage,
+      status: 500,
+      url: url,
+    };
+  }
+
+  let actionsScreenshots: string[] | undefined = undefined;
+  if (
+    scrapeResult.actions &&
+    typeof scrapeResult.actions === "object" &&
+    "screenshots" in (scrapeResult.actions as Record<string, unknown>)
+  ) {
+    const v = (scrapeResult.actions as { screenshots?: unknown }).screenshots;
+    if (Array.isArray(v) && v.every((x) => typeof x === "string")) {
+      actionsScreenshots = v as string[];
+    }
+  }
+
+  if (format === "html" && scrapeResult.rawHtml) {
+    const screenshots: string[] = [];
+    if (typeof scrapeResult.screenshot === "string") {
+      screenshots.push(scrapeResult.screenshot);
+    }
+    if (Array.isArray(actionsScreenshots)) {
+      screenshots.push(...actionsScreenshots);
+    }
+    return {
+      html: scrapeResult.rawHtml,
+      screenshots: screenshots.length ? screenshots : undefined,
+      links: scrapeResult.links,
+      title: scrapeResult.metadata?.title,
+      description: scrapeResult.metadata?.description,
+      status: scrapeResult.metadata?.statusCode ?? 200,
+      url: url,
+    };
+  } else if (format === "markdown" && scrapeResult.markdown) {
+    const screenshots: string[] = [];
+    if (typeof scrapeResult.screenshot === "string") {
+      screenshots.push(scrapeResult.screenshot);
+    }
+    if (Array.isArray(actionsScreenshots)) {
+      screenshots.push(...actionsScreenshots);
+    }
+    return {
+      markdown: scrapeResult.markdown,
+      screenshots: screenshots.length ? screenshots : undefined,
+      links: scrapeResult.links,
+      title: scrapeResult.metadata?.title,
+      description: scrapeResult.metadata?.description,
+      status: scrapeResult.metadata?.statusCode ?? 200,
+      url: url,
+    };
+  }
+
+  // If no primary format matched, but we asked for screenshots, still return them if present
+  if (options?.screenshotMode && options.screenshotMode !== "none") {
+    const screenshots: string[] = [];
+    if (typeof scrapeResult.screenshot === "string") {
+      screenshots.push(scrapeResult.screenshot);
+    }
+    if (Array.isArray(actionsScreenshots)) {
+      screenshots.push(...actionsScreenshots);
+    }
+    if (screenshots.length) {
+      return {
+        screenshots,
+        title: scrapeResult.metadata?.title,
+        description: scrapeResult.metadata?.description,
+        status: scrapeResult.metadata?.statusCode ?? 200,
+        url,
+      };
+    }
+  }
+
+  return {
+    error: "Unknown error: No content found in the response",
+    status: scrapeResult.metadata?.statusCode ?? 500,
+    url: url,
+  };
+};
+
+/**
+ * Spider-based alternative to browse a single URL.
+ *
+ * This uses Spider's /scrape endpoint and maps its response to the
+ * same BrowseScrape*Response types used by the Firecrawl implementation.
+ *
+ * NOTE: Screenshot capture is currently not implemented for Spider and
+ * screenshotMode is ignored.
+ */
+const browseUrlSpider = async (
+  url: string,
+  format: "markdown" | "html" = "markdown",
+  options?: {
+    // Currently ignored for Spider; kept for signature parity.
+    screenshotMode?: "none" | "viewport" | "fullPage";
+    links?: boolean;
+  }
+): Promise<BrowseScrapeSuccessResponse | BrowseScrapeErrorResponse> => {
+  if (!credentials.SPIDER_API_KEY) {
+    throw new Error(
+      "util/webbrowse: a RUBY_MANAGED_SPIDER_API_KEY is required"
+    );
+  }
+
+  const returnFormat = format === "html" ? "raw" : "markdown";
+
+  let res: Response;
+  try {
+    res = await clientFetch(`${SPIDER_API_BASE_URL}/scrape`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credentials.SPIDER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url,
+        return_format: returnFormat,
+        request: "smart",
+        metadata: true,
+        return_page_links: options?.links ?? false,
+      }),
+    });
+  } catch (error) {
+    logger.error(
+      {
+        error,
+        url,
+      },
+      "[Spider] Network or fetch error while scraping URL"
+    );
+
+    return {
+      error: normalizeError(error).message,
+      status: 500,
+      url,
+    };
+  }
+
+  let json: unknown;
+  try {
+    json = await res.json();
+  } catch (error) {
+    logger.error(
+      {
+        error,
+        url,
+        statusCode: res.status,
+      },
+      "[Spider] Failed to parse JSON response"
+    );
+    return {
+      error: normalizeError(error).message,
+      status: res.status || 500,
+      url,
+    };
+  }
+
+  const normalized = normalizeSpiderScrapeResult(json as SpiderScrapeResponse);
+
+  if (!normalized) {
+    logger.error(
+      {
+        url,
+        statusCode: res.status,
+      },
+      "[Spider] Empty scrape response"
+    );
+    return {
+      error: "Unknown error: Empty response from Spider",
+      status: res.status || 500,
+      url,
+    };
+  }
+
+  const { content, error, status, metadata, links, page_links } = normalized;
+
+  const effectiveStatus = status ?? metadata?.status ?? res.status;
+
+  if (error) {
+    logger.error(
+      {
+        url,
+        statusCode: effectiveStatus,
+        error,
+      },
+      "[Spider] Scrape request failed"
+    );
+    return {
+      error,
+      status: effectiveStatus || 500,
+      url,
+    };
+  }
+
+  if (!content) {
+    logger.error(
+      {
+        url,
+        statusCode: effectiveStatus,
+      },
+      "[Spider] No content field in scrape response"
+    );
+    return {
+      error: "Unknown error: No content found in the Spider response",
+      status: effectiveStatus || 500,
+      url,
+    };
+  }
+
+  const outLinks =
+    Array.isArray(links) && links.length > 0
+      ? links
+      : Array.isArray(page_links) && page_links.length > 0
+        ? page_links
+        : undefined;
+
+  if (format === "html") {
+    return {
+      html: content,
+      links: outLinks,
+      title: metadata?.title,
+      description: metadata?.description,
+      status: effectiveStatus || 200,
+      url,
+    };
+  }
+
+  return {
+    markdown: content,
+    links: outLinks,
+    title: metadata?.title,
+    description: metadata?.description,
+    status: effectiveStatus || 200,
+    url,
+  };
+};
+
+/**
+ * Exa-based alternative to browse a single URL.
+ *
+ * This uses Exa's /contents endpoint and maps its response to the
+ * same BrowseScrape*Response types used by the Firecrawl implementation.
+ *
+ * NOTE: Screenshot capture is not supported by Exa and screenshotMode is ignored.
+ */
+const browseUrlExa = async (
+  url: string,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  format: "markdown" | "html" = "markdown",
+  options?: {
+    screenshotMode?: "none" | "viewport" | "fullPage";
+    links?: boolean;
+  }
+): Promise<BrowseScrapeSuccessResponse | BrowseScrapeErrorResponse> => {
+  if (!credentials.EXA_API_KEY) {
+    throw new Error("util/webbrowse: a RUBY_MANAGED_EXA_API_KEY is required");
+  }
+
+  const exa = new Exa(credentials.EXA_API_KEY);
+
+  let result;
+  try {
+    result = await exa.getContents([url], {
+      text: true,
+      extras: { links: options?.links ? 10 : 0 },
+    });
+  } catch (error) {
+    logger.error(
+      { error, url },
+      "[Exa] Network or fetch error while scraping URL"
+    );
+    return {
+      error: normalizeError(error).message,
+      status: 500,
+      url,
+    };
+  }
+
+  const content = result.results?.[0];
+
+  if (!content) {
+    logger.error({ url }, "[Exa] Empty scrape response");
+    return {
+      error: "No content found in Exa response",
+      status: 500,
+      url,
+    };
+  }
+
+  if (!content.text) {
+    logger.error({ url }, "[Exa] No text content in response");
+    return {
+      error: "No text content found in Exa response",
+      status: 500,
+      url,
+    };
+  }
+
+  return {
+    markdown: content.text,
+    title: content.title ?? undefined,
+    description: undefined,
+    status: 200,
+    url: content.url ?? url,
+    links: options?.links ? content.extras?.links : undefined,
+  };
+};
+
+/**
+ * Processes multiple URLs concurrently in chunks
+ */
+export const browseUrls = async (
+  urls: string[],
+  chunkSize = 8,
+  format: "markdown" | "html" = "markdown",
+  options?: {
+    screenshotMode?: "none" | "viewport" | "fullPage";
+    links?: boolean;
+    provider?: "firecrawl" | "spider" | "exa";
+  }
+): Promise<Array<BrowseScrapeSuccessResponse | BrowseScrapeErrorResponse>> => {
+  const provider = options?.provider ?? "firecrawl";
+
+  logger.info(
+    { count: urls.length, urls, provider },
+    "Starting to browse URLs"
+  );
+  const startTime = Date.now();
+  const results = await concurrentExecutor(
+    urls,
+    async (url) => {
+      logger.info({ url, provider }, "Browsing URL");
+      if (provider === "spider") {
+        return browseUrlSpider(url, format, options);
+      }
+      if (provider === "exa") {
+        return browseUrlExa(url, format, options);
+      }
+      return browseUrlFirecrawl(url, format, options);
+    },
+    { concurrency: chunkSize }
+  );
+  logger.info(
+    { urls, format, options, provider, duration: Date.now() - startTime },
+    "Browsed URLs"
+  );
+
+  return results;
+};
+
+const isUnsupportedWebsiteError = (error: unknown): boolean => {
+  return (
+    error instanceof FirecrawlError &&
+    error.statusCode === 403 &&
+    error.message.includes("This website is no longer supported")
+  );
+};

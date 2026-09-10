@@ -1,0 +1,44 @@
+import { frontSequelize } from "@app/lib/resources/storage";
+import { DataTypes } from "@app/lib/resources/storage/data_types";
+import { WorkspaceAwareModel } from "@app/lib/resources/storage/wrappers/workspace_models";
+import type { WhitelistableFeature } from "@app/types/shared/feature_flags";
+import type { CreationOptional } from "sequelize";
+
+export class FeatureFlagModel extends WorkspaceAwareModel<FeatureFlagModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare name: WhitelistableFeature;
+}
+
+FeatureFlagModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    name: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+  },
+  {
+    sequelize: frontSequelize,
+    modelName: "feature_flags",
+    indexes: [
+      {
+        unique: true,
+        fields: ["workspaceId", "name"],
+      },
+      {
+        fields: ["workspaceId"],
+      },
+    ],
+  }
+);

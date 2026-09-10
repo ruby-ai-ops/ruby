@@ -1,0 +1,59 @@
+import type { MCPServerFormValues } from "@app/components/actions/mcp/forms/mcpServerFormSchema";
+import { MCPServerHeaders } from "@app/components/actions/mcp/MCPServerHeaders";
+import { getTokenFieldLabel } from "@app/lib/actions/mcp_internal_actions/server_token_labels";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  Input,
+} from "@ruby-ai/sparkle";
+import { useFormContext, useWatch } from "react-hook-form";
+
+interface InternalMCPBearerTokenFormProps {
+  serverName?: string;
+}
+
+export function InternalMCPBearerTokenForm({
+  serverName,
+}: InternalMCPBearerTokenFormProps) {
+  const form = useFormContext<MCPServerFormValues>();
+  const customHeaders = useWatch<MCPServerFormValues, "customHeaders">({
+    name: "customHeaders",
+  });
+
+  const { label, placeholder, tooltip } = getTokenFieldLabel(serverName);
+
+  return (
+    <div className="space-y-5 text-foreground">
+      <Collapsible>
+        <CollapsibleTrigger className="pb-2">
+          <div className="heading-lg">Authorization</div>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="space-y-2">
+            <Input
+              {...form.register("sharedSecret")}
+              label={label}
+              isError={!!form.formState.errors.sharedSecret}
+              message={form.formState.errors.sharedSecret?.message}
+              placeholder={placeholder}
+            />
+            <p className="text-xs text-primary-500">{tooltip}</p>
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+      <Collapsible>
+        <CollapsibleTrigger className="pb-2">
+          <div className="heading-lg">
+            Headers ({(customHeaders ?? []).length})
+          </div>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="space-y-2">
+            <MCPServerHeaders />
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+    </div>
+  );
+}

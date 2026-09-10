@@ -1,0 +1,873 @@
+import type { InternalMCPServerNameType } from "@app/lib/actions/mcp_internal_actions/constants";
+import type { ActionGeneratedFileType } from "@app/lib/actions/types";
+import type { AgentMessageFeedbackDirection } from "@app/lib/api/assistant/conversation/feedbacks";
+import type { AgentMCPActionWithOutputType } from "@app/types/actions";
+import type { AgentContentItemType } from "@app/types/assistant/agent_message_content";
+import moment from "moment";
+import type { ContentFragmentType } from "../content_fragment";
+import type { AllSupportedWithRubySpecificFileContentType } from "../files";
+import type { ModelId } from "../shared/model_id";
+import { assertNeverAndIgnore } from "../shared/utils/assert_never";
+import type { EnrichedSpaceType } from "../space";
+import type { UserType, WorkspaceType } from "../user";
+import type {
+  AgentConfigurationStatus,
+  GenericErrorContent,
+  LightAgentConfigurationType,
+} from "./agent";
+import type { MentionType, RichMention } from "./mentions";
+import type {
+  ModelResolutionMethodType,
+  ModelSelectionType,
+  ResolvedRequestedModel,
+} from "./models/types";
+
+export type MessageVisibility = "visible" | "deleted" | "pending";
+
+export type ConversationMessageReactions = {
+  messageId: string;
+  reactions: MessageReactionType[];
+}[];
+
+/**
+ * @swaggerschema PrivateReaction (swagger_private_schemas.ts)
+ */
+export type MessageReactionType = {
+  emoji: string;
+  users: {
+    userId: string | null;
+    username: string;
+    fullName: string | null;
+  }[];
+};
+
+export type MessageFeedback = {
+  thumbDirection: AgentMessageFeedbackDirection;
+  content: string | null;
+};
+
+export type MessageType =
+  | AgentMessageType
+  | UserMessageType
+  | ContentFragmentType
+  | CompactionMessageType;
+
+// This is the old format where content fragments are separated from the user messages.
+export type LegacyLightMessageType =
+  | LightAgentMessageType
+  | UserMessageType
+  | ContentFragmentType
+  | CompactionMessageType;
+
+// This is the new format where content fragments are attached to the user messages.
+export type LightMessageType =
+  | LightAgentMessageType
+  | UserMessageTypeWithContentFragments
+  | CompactionMessageType;
+
+/**
+ * User messages
+ */
+
+/**
+ * User message origins indicate which means the user (be it human or program)
+ * used to send the message.
+ *
+ * They should be mutually exclusive and commonly exhaustive, i.e. any new
+ * origin here should not overlap with another existing origin and all user
+ * messages should have an origin.
+ *
+ * Please do not add an origin that:
+ * - is not directly linked to how the original user sent the message;
+ * - overlaps with existing origins (e.g. "linux" and "mac-os" would be terrible
+ *   orgins in that respect, overlapping with almost all origins).
+ *
+ * Origins are also used for programmatic usage tracking, so ideally a new
+ * origin should be easily categorizable as either "programmatic" or "user".
+ *
+ */
+
+// Origins set explicitly by front-end clients (web app, extension, etc.). This
+// is the allow-list the internal message endpoints validate against (see
+// `types/api/assistant.ts`), so anything absent here cannot be claimed by a
+// client.
+export const CLIENT_MESSAGE_ORIGINS = [
+  "web",
+  "project_kickoff",
+  "extension",
+  "agent_sidekick",
+  "reinforced_skill_notification",
+] as const;
+
+export type ClientMessageOrigin = (typeof CLIENT_MESSAGE_ORIGINS)[number];
+
+export type UserMessageOrigin =
+  // "api" is Custom API usage, while e.g. extension, gsheets and many other origins
+  // below are API usages dedicated to standard product features.
+  | ClientMessageOrigin
+  | "api"
+  | "cli"
+  | "cli_programmatic"
+  | "email"
+  | "excel"
+  | "gsheet"
+  | "make"
+  | "n8n"
+  | "powerpoint"
+  | "raycast"
+  | "slack"
+  | "slack_workflow"
+  | "teams"
+  | "transcript"
+  | "triggered_programmatic"
+  | "triggered"
+  | "wakeup"
+  | "zapier"
+  | "zendesk"
+  // TODO onboarding_conversation, agent_sidekick, and project_kickoff aren't message origins. They
+  // have been used as a hack but should be removed and most likely handled as message metadata
+  // (to be created).
+  | "onboarding_conversation"
+  // for internal use, for reinforced agent batch LLM operations
+  | "reinforcement"
+  // Opening message of an Activation Pod nudge, authored by the system on the
+  // user's behalf. Server-only: it is not in `CLIENT_MESSAGE_ORIGINS` and
+  // `isUserMessageContextValid` rejects it on /v1/ for anything but a
+  // Ruby-internal system key. It keeps nudges out of analytics and prices them
+  // as free usage (`FREE_ORIGINS`), which holds only because nothing else can
+  // ever carry it: the nudge has no author, so it can be neither edited nor
+  // retried, and user replies come back as `web`.
+  | "system_activation";
+
+export const ACTIVATION_NUDGE_ORIGIN = "system_activation" as const;
+
+export const HIDDEN_MESSAGE_ORIGINS: UserMessageOrigin[] = [
+  "onboarding_conversation",
+  "project_kickoff",
+  "reinforced_skill_notification",
+  "system_activation",
+  "wakeup",
+];
+
+/**
+ * @swaggerschema Context (swagger_schemas.ts), PrivateUserMessageContext (swagger_private_schemas.ts)
+ */
+export type UserMessageContext = {
+  username: string;
+  fullName: string | null;
+  email: string | null;
+  profilePictureUrl: string | null;
+  timezone: string;
+  origin: UserMessageOrigin;
+  lastTriggerRunAt?: number | null;
+  clientSideMCPServerIds?: string[];
+  selectedMCPServerViewIds?: string[];
+  selectedSpaceIds?: string[];
+  apiKeyId?: number | null;
+  authMethod?: string | null;
+};
+
+export type AgenticMessageData = {
+  type: "run_agent" | "agent_handover";
+  originMessageId: string;
+};
+
+/**
+ * @swaggerschema PrivateRichMentionWithStatus (swagger_private_schemas.ts)
+ */
+export type RichMentionWithStatus =
+  | (RichMention & {
+      dismissed: boolean;
+      status: "pending_conversation_access";
+    })
+  | (RichMention & { dismissed: boolean; status: "pending_project_membership" })
+  | (RichMention & { dismissed: boolean; status: "approved" })
+  | (RichMention & { dismissed: boolean; status: "rejected" })
+  | (RichMention & {
+      dismissed: boolean;
+      status: "user_restricted_by_conversation_access";
+    })
+  | (RichMention & {
+      dismissed: boolean;
+      status: "agent_restricted_by_space_usage";
+    });
+
+/**
+ * @swaggerschema PrivateUserMessage (swagger_private_schemas.ts)
+ */
+export type UserMessageType = {
+  id: ModelId;
+  created: number;
+  type: "user_message";
+  sId: string;
+  visibility: MessageVisibility;
+  version: number;
+  rank: number;
+  // Legacy: branches were removed, this is always null. The browser extension ships on its own
+  // release cycle and versions still in the wild compare `message.branchId` against `undefined`,
+  // treating every message as pending branch approval when the field is missing. Keep emitting it
+  // until those extension versions have cycled out.
+  branchId: null;
+  user: UserType | null;
+  mentions: MentionType[];
+  richMentions: RichMentionWithStatus[];
+  content: string;
+  context: UserMessageContext;
+  agenticMessageData?: AgenticMessageData;
+  reactions: MessageReactionType[];
+  // Model's triplet requested by the user manually when running the agent. Null when the user did not request a specific model.
+  requestedModel: ModelSelectionType | null;
+};
+
+export type UserMessageTypeWithoutMentions = Omit<
+  UserMessageType,
+  "richMentions" | "mentions"
+>;
+
+export type UserMessageTypeWithContentFragments = UserMessageType & {
+  contentFragments: ContentFragmentType[];
+};
+
+export function isUserMessageType(
+  arg: MessageType | LegacyLightMessageType | LightMessageType
+): arg is UserMessageType {
+  return arg.type === "user_message";
+}
+
+export function isUserMessageTypeWithContentFragments(
+  arg: MessageType | LightMessageType
+): arg is UserMessageTypeWithContentFragments {
+  return arg.type === "user_message" && "contentFragments" in arg;
+}
+
+/**
+ * A user message with no author was posted by Ruby on someone's behalf rather
+ * than written by them, which only server code can do (`postUserMessage`'s
+ * `doNotAssociateUser`). Such a message is nobody's to edit, its answer nobody's
+ * to retry, and it never runs on anyone's personal tool credentials.
+ */
+export function isUserMessageWithoutConcreteUser(
+  message: Pick<UserMessageType, "user">
+): boolean {
+  return message.user === null;
+}
+
+export function isHiddenMessageOrigin(origin: UserMessageOrigin): boolean {
+  return HIDDEN_MESSAGE_ORIGINS.includes(origin);
+}
+
+export function isVisibleMessage(m: LightMessageType): boolean {
+  return (
+    m.visibility !== "deleted" &&
+    !(
+      isUserMessageTypeWithContentFragments(m) &&
+      isHiddenMessageOrigin(m.context.origin)
+    ) &&
+    // Compaction message will possibly be first messages of a conversation (forking) but they are
+    // not "visible" per se. `firstVisibleMessage` should null until a first user message is posted.
+    !isCompactionMessageType(m)
+  );
+}
+
+/**
+ * Agent messages
+ */
+export type AgentMessageStatus =
+  | "created"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "gracefully_stopped";
+
+export const AGENT_MESSAGE_STATUSES_TO_TRACK: AgentMessageStatus[] = [
+  // Message can be in "created" status when we stop the loop to ask for user permission for instance.
+  "created",
+  "succeeded",
+  "cancelled",
+  "interrupted",
+  "gracefully_stopped",
+];
+
+// Terminal statuses from which an agent message can never resume. Tools of such a message that
+// are still blocked on user input (e.g. a manual tool approval that was skipped when the message
+// got interrupted or gracefully stopped) are not actionable anymore. "gracefully_stopped" is
+// treated like "succeeded" in most places, but it belongs here for resumption: a graceful stop
+// ends the loop in place, so resolving a leftover approval would relaunch a direction the loop
+// already stopped (and that steering, if any, has since superseded via a newly promoted message).
+export const UNRESUMABLE_AGENT_MESSAGE_STATUSES: AgentMessageStatus[] = [
+  "failed",
+  "cancelled",
+  "interrupted",
+  "gracefully_stopped",
+];
+
+export function isTerminalAgentMessageStatus(
+  status: AgentMessageStatus
+): boolean {
+  switch (status) {
+    case "succeeded":
+    case "failed":
+    case "cancelled":
+    case "interrupted":
+    case "gracefully_stopped":
+      return true;
+    case "created":
+      return false;
+    default:
+      assertNeverAndIgnore(status);
+      return false;
+  }
+}
+
+export interface CitationType {
+  description?: string;
+  href?: string;
+  title: string;
+  provider: string;
+  contentType: AllSupportedWithRubySpecificFileContentType;
+}
+
+/**
+ * Both `action` and `message` are optional (we could have a no-op agent basically).
+ *
+ * Since `action` and `message` are bundled together, it means that we will only be able to retry
+ * them together in case of error of either. We store an error only here whether it's an error
+ * coming from the action or from the message generation.
+ */
+export type BaseAgentMessageType = {
+  type: "agent_message";
+  sId: string;
+  version: number;
+  rank: number;
+  // Legacy: see the note on `UserMessageType.branchId`.
+  branchId: null;
+  created: number;
+  completedTs: number | null;
+  parentMessageId: string;
+  parentAgentMessageId: string | null; // If handover, this is the agent message that summoned this agent.
+  status: AgentMessageStatus;
+  content: string | null;
+  chainOfThought: string | null;
+  error: GenericErrorContent | null;
+  visibility: MessageVisibility;
+  richMentions: RichMentionWithStatus[];
+  completionDurationMs: number | null;
+  reactions: MessageReactionType[];
+  prunedContext?: boolean;
+  costCredits: number | null;
+  // Aggregated credit cost of all sub-agents (run_agent / agent_handover) spawned
+  // (recursively) by this message, separate from `costCredits` (this message's own
+  // intelligence + tools). Computed lazily on single-message fetches only, so it is
+  // `null` everywhere else (e.g. conversation list rendering). Optional during
+  // rollout. See [api-backward-compatibility].
+  subAgentCostCredits?: number | null;
+};
+
+// `step` is the agent-loop step a given activity step was produced in. It lets
+// the streaming client discard the steps it built for a step that Temporal
+// re-ran (activity retry re-emits the step's events with a fresh traceId),
+// rebuilding it instead of appending duplicates. Optional: absent on the
+// server-rendered terminal view, which is already canonical.
+export type InlineActivityStep =
+  | { type: "thinking"; content: string; id: string; step?: number }
+  | { type: "content"; content: string; id: string; step?: number }
+  | {
+      type: "action";
+      label: string;
+      id: string;
+      actionId: string;
+      internalMCPServerName: InternalMCPServerNameType | null;
+      toolName: string | null;
+      step?: number;
+    };
+
+export type ParsedContentItem =
+  | { kind: "reasoning"; content: string }
+  | { kind: "action"; action: AgentMCPActionWithOutputType };
+
+/**
+ * @swaggerschema PrivateAgentMessage (swagger_private_schemas.ts)
+ */
+export type AgentMessageType = BaseAgentMessageType & {
+  id: ModelId;
+  agentMessageId: ModelId;
+  created: number;
+  visibility: MessageVisibility;
+  configuration: LightAgentConfigurationType;
+  skipToolsValidation: boolean;
+  actions: AgentMCPActionWithOutputType[];
+  contents: Array<{ step: number; content: AgentContentItemType }>;
+  modelInteractionDurationMs: number | null;
+  // Model's triplet used to generate the message. Legacy: null, the agent ran its own configured model.
+  resolvedModel: ResolvedRequestedModel | null;
+  // How `resolvedModel` was chosen: "agent" (agent's configured model), "user"
+  // (per-message model picked from the input-bar picker), or "auto" (routed
+  // through the auto model). Legacy: null.
+  modelResolutionMethod: ModelResolutionMethodType | null;
+};
+
+export type AgentMessageTypeWithoutMentions = Omit<
+  AgentMessageType,
+  "richMentions"
+>;
+
+/**
+ * @swaggerschema PrivateLightAgentMessage (swagger_private_schemas.ts)
+ */
+export type LightAgentMessageType = BaseAgentMessageType & {
+  configuration: {
+    sId: string;
+    name: string;
+    pictureUrl: string;
+    status: AgentConfigurationStatus;
+    canRead: boolean;
+  };
+  citations: Record<string, CitationType>;
+  generatedFiles: Omit<ActionGeneratedFileType, "snippet">[];
+  activitySteps: InlineActivityStep[];
+  // Model's triplet used to generate the message, and how it was chosen. Used to
+  // label messages that ran on a per-message picker override. Legacy: null.
+  resolvedModel: ResolvedRequestedModel | null;
+  modelResolutionMethod: ModelResolutionMethodType | null;
+};
+
+// This type represents the agent message we can reconstruct by accumulating streaming events
+// in a conversation.
+export type LightAgentMessageWithActionsType = LightAgentMessageType & {
+  actions: AgentMCPActionWithOutputType[];
+};
+
+export function isLightAgentMessageWithActionsType(
+  message: LightAgentMessageType | LightAgentMessageWithActionsType
+): message is LightAgentMessageWithActionsType {
+  // This check relies on the fact that `message` is already either a LightAgentMessageType or a
+  // LightAgentMessageWithActionsType; message.actions can therefore only be a AgentMCPActionType[].
+  return "actions" in message;
+}
+
+// An agent message enriched with user feedback
+export type AgentMessageWithFeedbackType = (
+  | AgentMessageType
+  | LightAgentMessageType
+) & {
+  feedback: MessageFeedback[];
+};
+
+export function isAgentMessageType(arg: MessageType): arg is AgentMessageType {
+  return arg.type === "agent_message";
+}
+
+// This guard is used to distinguish (light) agent message from the messages on the content of a
+// LightConversationType.
+export function isLightAgentMessageType(
+  message: LightMessageType
+): message is LightAgentMessageType {
+  return message.type === "agent_message";
+}
+
+/**
+ * Compaction messages
+ */
+export type CompactionMessageStatus = "created" | "succeeded" | "failed";
+
+/**
+ * @swaggerschema PrivateCompactionMessage (swagger_private_schemas.ts)
+ */
+export type CompactionMessageType = {
+  type: "compaction_message";
+  id: ModelId;
+  compactionMessageId: ModelId;
+  sId: string;
+  created: number;
+  visibility: MessageVisibility;
+  version: number;
+  rank: number;
+  // Legacy: see the note on `UserMessageType.branchId`.
+  branchId: null;
+  sourceConversationId?: string | null;
+  status: CompactionMessageStatus; // Lifecycle: created → succeeded | failed.
+  content: string | null; // null while status is "created".
+};
+
+export function isCompactionMessageType(
+  arg: MessageType | LegacyLightMessageType | LightMessageType
+): arg is CompactionMessageType {
+  return arg.type === "compaction_message";
+}
+
+/**
+ * Conversations
+ */
+
+/**
+ * Visibility of a conversation.
+ *  - 'unlisted' default value
+ *  - 'deleted' conversations are soft-deleted and not visible to any user.
+ *  - 'test' for conversations happening when a user 'tests' an agent not in their list using the "test" button: those conversations do not show in users' histories.
+ *
+ * :warning: test is also used for conversations created by the platform (like the journal entry generation)
+ *
+ * TODO:
+ *  - rename unlisted to visible
+ *  - test to hidden
+ */
+export type ConversationVisibility = "unlisted" | "deleted" | "test";
+
+export const CONVERSATION_URL_ACCESS_MODES = [
+  "participants_only",
+  "workspace_members",
+] as const;
+
+export type ConversationUrlAccessMode =
+  (typeof CONVERSATION_URL_ACCESS_MODES)[number];
+
+const CONVERSATION_METADATA_URL_ACCESS_MODE_KEY = "urlAccessMode";
+
+export type ConversationMetadata = Record<string, unknown> & {
+  urlAccessMode?: ConversationUrlAccessMode;
+  projectTaskId?: string;
+  useFileSystem?: boolean;
+  /** Selects the database-backed filesystem for a fresh standalone conversation. */
+  useDatabaseFileSystem?: boolean;
+};
+
+function isConversationUrlAccessMode(
+  value: unknown
+): value is ConversationUrlAccessMode {
+  return value === "participants_only" || value === "workspace_members";
+}
+
+export function getConversationUrlAccessMode(
+  metadata: ConversationMetadata | null | undefined
+): ConversationUrlAccessMode | null {
+  const accessMode = metadata?.[CONVERSATION_METADATA_URL_ACCESS_MODE_KEY];
+  return isConversationUrlAccessMode(accessMode) ? accessMode : null;
+}
+
+export function isReinforcedSkillNotificationMetadata(
+  value: unknown
+): value is { skillName: string; skillId: string } {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  return (
+    "skillName" in value &&
+    typeof value.skillName === "string" &&
+    "skillId" in value &&
+    typeof value.skillId === "string"
+  );
+}
+
+/**
+ * @swaggerschema PrivateConversationForkedFrom (swagger_private_schemas.ts)
+ */
+export type ConversationForkedFromType = {
+  parentConversationId: string;
+  parentConversationTitle: string | null;
+  sourceMessageId: string;
+  branchedAt: number;
+  user: UserType;
+  fileCopyStatus: "pending" | "done";
+};
+
+/**
+ * @swaggerschema PrivateConversationForkedChild (swagger_private_schemas.ts)
+ */
+export type ConversationForkedChildType = {
+  childConversationId: string;
+  childConversationTitle: string | null;
+  sourceMessageId: string;
+  branchedAt: number;
+  user: UserType;
+};
+
+/**
+ * Fields needed to render a conversation row in the sidebar list. Served
+ * directly from Elasticsearch. No DB hydration required.
+ */
+export type ConversationListItemType = {
+  actionRequired: boolean;
+  created: number;
+  hasError: boolean;
+  lastReadMs: number | null;
+  metadata: ConversationMetadata;
+  nextWakeupAt?: number | null;
+  requestedSpaceIds: string[];
+  sId: string;
+  spaceId: string | null;
+  title: string | null;
+  triggerId: string | null;
+  unread: boolean;
+  updated: number;
+  isRunningAgentLoop: boolean;
+  isParticipant: boolean;
+};
+
+/**
+ * @swaggerschema PrivateConversationForkingData (swagger_private_schemas.ts)
+ */
+export type ConversationForkingDataType = {
+  forkedFrom?: ConversationForkedFromType;
+  forkedChildren?: ConversationForkedChildType[];
+};
+
+/**
+ * A lighter version of Conversation without the content (for menu display).
+ * Extends ConversationListItemType with DB-layer fields used when the full conversation context is
+ * available (individual conversation pages, mutations).
+ *
+ * @swaggerschema PrivateConversation (swagger_private_schemas.ts)
+ */
+export type ConversationWithoutContentType = ConversationListItemType & {
+  id: ModelId;
+  depth: number;
+  forkingData?: ConversationForkingDataType;
+};
+
+export type SelectableConversationSpaceType = EnrichedSpaceType & {
+  selected: boolean;
+};
+
+export type ConversationSelectedSpacesResponse = {
+  selectedSpaces: SelectableConversationSpaceType[];
+  effectiveAcl: {
+    spaceIds: string[];
+    viewerMustHaveAll: true;
+  };
+};
+
+type ConversationDisplayTitleInput = Pick<
+  ConversationWithoutContentType,
+  "created" | "title" | "forkingData"
+>;
+export function getConversationDisplayTitle(
+  conversation: ConversationDisplayTitleInput,
+  now = new Date()
+): string {
+  if (conversation.title) {
+    return conversation.title;
+  }
+
+  const forkedFrom = conversation.forkingData?.forkedFrom;
+  if (forkedFrom) {
+    return forkedFrom.parentConversationTitle
+      ? `Branched from '${forkedFrom.parentConversationTitle}'`
+      : "Branched conversation";
+  }
+
+  return moment(conversation.created).isSame(now, "day")
+    ? "New Conversation"
+    : `Conversation from ${new Date(conversation.created).toLocaleDateString()}`;
+}
+
+/**
+ * content [][] structure is intended to allow retries (of agent messages) or edits (of user
+ * messages).
+ *
+ * @swaggerschema Conversation (swagger_schemas.ts), PrivateFullConversation (swagger_private_schemas.ts)
+ */
+export type ConversationType = ConversationWithoutContentType & {
+  owner: WorkspaceType;
+  visibility: ConversationVisibility;
+  content: (
+    | UserMessageType[]
+    | AgentMessageType[]
+    | ContentFragmentType[]
+    | CompactionMessageType[]
+  )[];
+};
+
+/**
+ * Same as ConversationType but with light agent messages and user messages with content fragments inside.
+ * Only keep the last version of each message.
+ */
+export type LightConversationType = ConversationWithoutContentType & {
+  owner: WorkspaceType;
+  visibility: ConversationVisibility;
+  content: (
+    | LightAgentMessageType
+    | UserMessageTypeWithContentFragments
+    | CompactionMessageType
+  )[];
+};
+
+export function isLightConversationType(
+  conversation: ConversationType | LightConversationType
+): conversation is LightConversationType {
+  // Content is not an array of arrays of messages, it's an array of messages.
+  // Just check that the item 0 is not an
+  return "content" in conversation && !Array.isArray(conversation.content[0]);
+}
+
+export const isPodConversation = <T extends ConversationListItemType>(
+  conversation: T
+): conversation is T & { spaceId: string } => !!conversation.spaceId;
+
+export type ParticipantActionType = "posted" | "reacted" | "subscribed";
+
+/**
+ * Conversation participants.
+ */
+
+export interface AgentParticipantType {
+  configurationId: string;
+  name: string;
+  pictureUrl: string;
+  lastActivityAt?: number;
+}
+
+export interface UserParticipantType {
+  sId: string;
+  fullName: string | null;
+  pictureUrl: string | null;
+  username: string;
+  action: ParticipantActionType;
+  lastActivityAt?: number;
+  isCreator?: boolean;
+}
+
+export interface ConversationParticipantsType {
+  agents: AgentParticipantType[];
+  users: UserParticipantType[];
+}
+
+export const CONVERSATION_ERROR_TYPES = [
+  "conversation_not_found",
+  "conversation_access_restricted",
+  "conversation_agent_running",
+  "conversation_with_unavailable_agent",
+  "user_already_participant",
+  "message_not_found",
+  "message_deletion_not_authorized",
+  "conversation_context_usage_not_found",
+] as const;
+
+export type ConversationErrorType = (typeof CONVERSATION_ERROR_TYPES)[number];
+
+export class ConversationError extends Error {
+  readonly type: ConversationErrorType;
+
+  constructor(type: ConversationErrorType) {
+    super(`Cannot access conversation: ${type}`);
+    this.type = type;
+  }
+}
+
+export type SubmitMessageError = {
+  type:
+    | "user_not_found"
+    | "attachment_upload_error"
+    | "message_send_error"
+    | "plan_limit_reached_error"
+    | "credits_exhausted_error"
+    | "user_cap_reached_error"
+    | "no_seat_error"
+    | "content_too_large";
+  title: string;
+  message: string;
+};
+
+/**
+ * Conversation events.
+ */
+
+// Event sent when the user message is created.
+export type UserMessageNewEvent = {
+  type: "user_message_new";
+  created: number;
+  messageId: string;
+  message: UserMessageTypeWithContentFragments;
+};
+
+// Event sent when a pending user message is promoted to visible from pending.
+export type UserMessagePromotedEvent = {
+  type: "user_message_promoted";
+  created: number;
+  messageId: string;
+};
+
+// Event sent when the user message is created.
+export type UserMessageErrorEvent = {
+  type: "user_message_error";
+  created: number;
+  error: {
+    code: string;
+    message: string;
+  };
+};
+
+// Event sent when a new message is created (empty) and the agent is about to be executed.
+export type AgentMessageNewEvent = {
+  type: "agent_message_new";
+  created: number;
+  configurationId: string;
+  messageId: string;
+  message: AgentMessageType;
+};
+
+// Event sent when a new compaction message is created (compaction is starting).
+export type CompactionMessageNewEvent = {
+  type: "compaction_message_new";
+  created: number;
+  messageId: string;
+  message: CompactionMessageType;
+};
+
+// Event sent when compaction completes or fails.
+export type CompactionMessageDoneEvent = {
+  type: "compaction_message_done";
+  created: number;
+  messageId: string;
+  message: CompactionMessageType;
+};
+
+// Event sent when the conversation title is updated.
+export type ConversationTitleEvent = {
+  type: "conversation_title";
+  created: number;
+  title: string;
+};
+
+export type ConversationForkPreparedEvent = {
+  type: "conversation_fork_prepared";
+  created: number;
+};
+
+// Event sent when the conversation's plan.md is created, edited, or closed. A refetch signal: the
+// UI re-reads the plan content via the plan_mode GET endpoint on receipt. `isClosed` lets the UI
+// close the plan panel.
+export type PlanUpdatedEvent = {
+  type: "plan_updated";
+  created: number;
+  conversationId: string;
+  isClosed: boolean;
+};
+
+// Event sent when a wake-up in the conversation is created or changes status. Thin payload: the
+// client refetches /wakeups on receipt, so the banner always reflects the committed state
+// regardless of when the event arrives.
+export type WakeUpUpdatedEvent = {
+  type: "wake_up_updated";
+  created: number;
+  conversationId: string;
+  wakeUpId: string;
+  userId: string;
+};
+
+type BaseConversationMCPServerViewType = {
+  id: ModelId;
+  workspaceId: ModelId;
+  conversationId: ModelId;
+  mcpServerViewId: ModelId;
+  userId: ModelId | null;
+  enabled: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type ConversationMCPServerViewType = BaseConversationMCPServerViewType &
+  (
+    | { source: "agent_enabled"; agentConfigurationId: string }
+    | { source: "conversation"; agentConfigurationId: null }
+  );

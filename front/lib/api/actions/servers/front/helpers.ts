@@ -1,0 +1,489 @@
+import { MCPError } from "@app/lib/actions/mcp_errors";
+import type { ToolHandlerExtra } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { marked } from "marked";
+import sanitizeHtml from "sanitize-html";
+import { z } from "zod";
+
+const FRONT_API_BASE_URL = "https://api2.frontapp.com";
+
+export const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 10000;
+const FRONT_API_CONCURRENCY = 5;
+
+interface FrontAPIOptions {
+  method: string;
+  endpoint: string;
+  apiToken: string;
+  body?: Record<string, unknown>;
+  params?: Record<string, unknown>;
+}
+
+export const convertMarkdownToHTML = async (text: string): Promise<string> => {
+  marked.setOptions({
+    breaks: true,
+    gfm: true,
+  });
+
+  const html = await marked.parse(text);
+
+  const sanitized = sanitizeHtml(html, {
+    allowedTags: sanitizeHtml.defaults.allowedTags.concat(["img"]),
+  });
+
+  return sanitized.replace(
+    /<a href="(.*?)">/g,
+    '<a href="$1" target="_blank">'
+  );
+};
+
+export const makeFrontAPIRequest = async (
+  options: FrontAPIOptions,
+  retryCount = 0
+): Promise<unknown> => {
+  const { method, endpoint, apiToken, body, params } = options;
+
+  const url = new URL(`${FRONT_API_BASE_URL}/${endpoint}`);
+
+  if (params) {
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) {
+        if (Array.isArray(value)) {
+          value.forEach((v) => url.searchParams.append(key, String(v)));
+        } else {
+          url.searchParams.append(key, String(value));
+        }
+      }
+    });
+  }
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${apiToken}`,
+    "Content-Type": "application/json",
+  };
+
+  // eslint-disable-next-line no-restricted-globals
+  const response = await fetch(url.toString(), {
+    method,
+    headers,
+    ...(body && { body: JSON.stringify(body) }),
+  });
+
+  if (response.status === 429 && retryCount < MAX_RETRIES) {
+    const retryAfter = response.headers.get("Retry-After");
+    const delay = retryAfter
+      ? parseInt(retryAfter, 10) * 1000
+      : Math.min(
+          INITIAL_RETRY_DELAY_MS * Math.pow(2, retryCount),
+          MAX_RETRY_DELAY_MS
+        );
+
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    return makeFrontAPIRequest(options, retryCount + 1);
+  }
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    if (response.status === 401) {
+      throw new MCPError(
+        "Invalid Front API token. Please check your API token configuration.",
+        { code: 401 }
+      );
+    } else if (response.status === 403) {
+      throw new MCPError(
+        "Insufficient permissions. Please check your Front API token permissions.",
+        { code: 403 }
+      );
+    } else if (response.status === 404) {
+      throw new MCPError(`Resource not found: ${endpoint}`, { code: 404 });
+    } else if (response.status === 409) {
+      throw new MCPError(
+        "Version conflict: the resource has been modified. Retrieve the latest version and retry.",
+        { code: 409 }
+      );
+    } else if (response.status === 429) {
+      throw new MCPError(
+        "Front API rate limit exceeded after retries. Please try again later.",
+        { code: 429 }
+      );
+    }
+    throw new MCPError(`Front API error (${response.status}): ${errorBody}`, {
+      code: response.status,
+    });
+  }
+
+  if (
+    response.status === 204 ||
+    response.headers.get("content-length") === "0"
+  ) {
+    return null;
+  }
+
+  return response.json();
+};
+
+export function getFrontAPITokenFromExtra(extra: ToolHandlerExtra): string {
+  const apiToken = extra.authInfo?.token;
+  if (!apiToken) {
+    throw new MCPError(
+      "Front API token not configured. Please configure the API key in the MCP server settings."
+    );
+  }
+
+  return apiToken;
+}
+
+const FrontConversationSchema = z.object({
+  id: z.string(),
+  status: z.string(),
+  subject: z.string().optional(),
+  assignee: z.object({ email: z.string() }).nullable().optional(),
+  inbox: z
+    .object({ name: z.string(), address: z.string().optional() })
+    .optional(),
+  tags: z.array(z.object({ name: z.string() })).optional(),
+  created_at: z.number().optional(),
+  last_message: z
+    .object({ received_at: z.number().optional() })
+    .nullable()
+    .optional(),
+  recipient: z
+    .object({ handle: z.string(), name: z.string().nullable() })
+    .nullable()
+    .optional(),
+});
+
+const FrontConversationsResponseSchema = z.object({
+  _results: z.array(FrontConversationSchema),
+});
+
+export type FrontConversation = z.infer<typeof FrontConversationSchema>;
+
+export function parseFrontConversation(data: unknown): FrontConversation {
+  return FrontConversationSchema.parse(data);
+}
+
+export function parseFrontConversations(data: unknown): FrontConversation[] {
+  return FrontConversationsResponseSchema.parse(data)._results;
+}
+
+const FrontInboxesResponseSchema = z.object({
+  _results: z.array(z.object({ name: z.string() })),
+});
+
+export async function getConversationInboxes(
+  apiToken: string,
+  conversationId: string
+) {
+  let data: unknown;
+  try {
+    data = await makeFrontAPIRequest({
+      method: "GET",
+      endpoint: `conversations/${conversationId}/inboxes`,
+      apiToken,
+    });
+  } catch (error) {
+    if (error instanceof MCPError && error.code === 403) {
+      return null;
+    }
+    throw error;
+  }
+
+  return FrontInboxesResponseSchema.parse(data)._results;
+}
+
+export function formatConversationForLLM(
+  conversation: FrontConversation,
+  inboxes: Array<{ name: string }> | null | undefined
+): string {
+  const assigneeEmail = conversation.assignee
+    ? conversation.assignee.email
+    : "Unassigned";
+  let inboxNames: string;
+  if (inboxes === null) {
+    inboxNames = "Unknown (Front token needs inboxes:read)";
+  } else if (inboxes === undefined) {
+    inboxNames = "Unknown (Front inboxes could not be loaded)";
+  } else {
+    inboxNames =
+      inboxes.length > 0 ? inboxes.map(({ name }) => name).join(", ") : "None";
+  }
+  const tagNames = conversation.tags?.map((t) => t.name).join(", ") ?? "None";
+  const createdAt = conversation.created_at
+    ? new Date(conversation.created_at * 1000).toISOString()
+    : "Unknown";
+  const lastMessageAt = conversation.last_message?.received_at
+    ? new Date(conversation.last_message.received_at * 1000).toISOString()
+    : "None";
+  const recipient = conversation.recipient
+    ? (conversation.recipient.handle ?? conversation.recipient.name)
+    : "Unknown";
+
+  const metadata = `<conversation id="${conversation.id}" status="${conversation.status}">
+  SUBJECT: ${conversation.subject ?? "(No subject)"}
+  STATUS: ${conversation.status}
+  ASSIGNEE: ${assigneeEmail}
+  INBOX: ${inboxNames}
+  TAGS: ${tagNames}
+  CREATED: ${createdAt}
+  LAST_MESSAGE: ${lastMessageAt}
+  RECIPIENT: ${recipient}
+  </conversation>`;
+
+  return metadata;
+}
+
+async function loadInboxes(apiToken: string, conversation: FrontConversation) {
+  try {
+    return await getConversationInboxes(apiToken, conversation.id);
+  } catch (error) {
+    logger.warn(
+      {
+        conversationId: conversation.id,
+        error: normalizeError(error),
+      },
+      "[FrontMCP] Failed to load conversation inboxes"
+    );
+    return undefined;
+  }
+}
+
+export async function formatConversationsForLLM(
+  apiToken: string,
+  conversations: FrontConversation[]
+) {
+  const [firstConversation, ...remainingConversations] = conversations;
+  if (!firstConversation) {
+    return [];
+  }
+
+  const firstInboxes = await loadInboxes(apiToken, firstConversation);
+  if (firstInboxes === null) {
+    return conversations.map((conversation) =>
+      formatConversationForLLM(conversation, null)
+    );
+  }
+
+  const remainingFormatted = await concurrentExecutor(
+    remainingConversations,
+    async (conversation) =>
+      formatConversationForLLM(
+        conversation,
+        await loadInboxes(apiToken, conversation)
+      ),
+    { concurrency: FRONT_API_CONCURRENCY }
+  );
+
+  return [
+    formatConversationForLLM(firstConversation, firstInboxes),
+    ...remainingFormatted,
+  ];
+}
+
+interface FrontRecipient {
+  handle?: string;
+  name?: string;
+  email?: string;
+}
+
+interface FrontMessage {
+  created_at: number;
+  type?: string;
+  is_inbound?: boolean;
+  author?: { email?: string; username?: string };
+  recipients?: FrontRecipient[];
+  subject?: string;
+  body?: string;
+  text?: string;
+  attachments?: Array<{ filename: string }>;
+}
+
+export function formatMessagesForLLM(messages: FrontMessage[]): string {
+  if (messages.length === 0) {
+    return "No messages found.";
+  }
+
+  const sortedMessages = [...messages].sort(
+    (a, b) => a.created_at - b.created_at
+  );
+
+  const timeline = sortedMessages
+    .map((msg, index) => {
+      const timestamp = new Date(msg.created_at * 1000).toISOString();
+      const type =
+        msg.type === "comment"
+          ? "COMMENT"
+          : msg.is_inbound
+            ? "RECEIVED"
+            : "SENT";
+      const attachmentInfo =
+        msg.attachments && msg.attachments.length > 0
+          ? `\n  ATTACHMENTS:\n${msg.attachments.map((a) => `  - ${a.filename}`).join("\n")}`
+          : "";
+
+      const authorName = msg.author?.email ?? msg.author?.username ?? "Unknown";
+      const recipientNames =
+        msg.recipients?.map((r) => r.handle ?? r.name).join(", ") ?? "N/A";
+
+      return `<entry index="${index + 1}" type="${type}">
+  FROM: ${authorName}
+  TO: ${recipientNames}
+  TIMESTAMP: ${timestamp}
+  ${msg.subject ? `SUBJECT: ${msg.subject}\n` : ""}CONTENT:
+  ${msg.body ?? msg.text ?? ""}${attachmentInfo}
+  </entry>`;
+    })
+    .join("\n\n");
+
+  const metadata = `<conversation_timeline>
+  TOTAL_MESSAGES: ${sortedMessages.length}
+  TIMELINE_START: ${new Date(sortedMessages[0].created_at * 1000).toISOString()}
+  TIMELINE_END: ${new Date(sortedMessages[sortedMessages.length - 1].created_at * 1000).toISOString()}
+  </conversation_timeline>\n\n`;
+
+  return metadata + timeline;
+}
+
+const FrontDraftSchema = z.object({
+  id: z.string(),
+  version: z.string(),
+  author: z
+    .object({
+      email: z.string().optional(),
+      username: z.string().optional(),
+    })
+    .optional(),
+  body: z.string().optional(),
+  text: z.string().optional(),
+  subject: z.string().optional(),
+  created_at: z.number(),
+  updated_at: z.number().optional(),
+  attachments: z.array(z.object({ filename: z.string() })).optional(),
+});
+
+type FrontDraft = z.infer<typeof FrontDraftSchema>;
+
+const FrontDraftsResponseSchema = z.object({
+  _results: z.array(FrontDraftSchema.passthrough()).optional(),
+});
+
+export function parseFrontDraftsResponse(data: unknown): FrontDraft[] {
+  const parsed = FrontDraftsResponseSchema.safeParse(data);
+  if (!parsed.success) {
+    logger.error(
+      { error: parsed.error.message },
+      "[FrontMCP] Invalid drafts response format"
+    );
+    throw new MCPError(
+      "Invalid response format from Front API drafts endpoint"
+    );
+  }
+  return parsed.data._results ?? [];
+}
+
+export function formatDraftsForLLM(
+  drafts: FrontDraft[],
+  conversationId: string
+): string {
+  if (drafts.length === 0) {
+    return `No drafts found in conversation ${conversationId}`;
+  }
+
+  const formatted = drafts
+    .map((draft) => {
+      const author = draft.author?.email ?? draft.author?.username ?? "Unknown";
+      const createdAt = new Date(draft.created_at * 1000).toISOString();
+      const updatedAt = draft.updated_at
+        ? new Date(draft.updated_at * 1000).toISOString()
+        : createdAt;
+      const attachmentCount = draft.attachments?.length ?? 0;
+
+      return `<draft id="${draft.id}" version="${draft.version}">
+  AUTHOR: ${author}
+  CREATED: ${createdAt}
+  UPDATED: ${updatedAt}
+  SUBJECT: ${draft.subject ?? "(No subject)"}
+  BODY: ${draft.text ?? draft.body ?? ""}
+  ATTACHMENTS: ${attachmentCount}
+  </draft>`;
+    })
+    .join("\n\n");
+
+  return (
+    `Found ${drafts.length} draft(s) in conversation ${conversationId}` +
+    "\n\n" +
+    formatted
+  );
+}
+
+interface FrontMessagesResponse {
+  _results?: FrontMessage[];
+}
+
+export async function findChannelAddress(
+  apiToken: string,
+  conversationId: string,
+  conversation: FrontConversation,
+  messagesData: FrontMessagesResponse
+): Promise<string | null> {
+  const messages = messagesData._results ?? [];
+
+  if (conversation.inbox?.address) {
+    return conversation.inbox.address;
+  }
+
+  const lastInboundMessage = messages
+    .filter((msg) => msg.is_inbound && msg.type !== "comment")
+    .sort((a, b) => b.created_at - a.created_at)[0];
+
+  if (
+    !lastInboundMessage?.recipients ||
+    lastInboundMessage.recipients.length === 0
+  ) {
+    logger.warn(
+      {
+        conversation_id: conversationId,
+        has_last_inbound_message: !!lastInboundMessage,
+        message_recipients_count: lastInboundMessage?.recipients?.length ?? 0,
+      },
+      "[FrontMCP] Unable to find channel address from last inbound message"
+    );
+    return null;
+  }
+
+  for (const recipient of lastInboundMessage.recipients) {
+    const recipientAddress = recipient.handle ?? recipient.email;
+    if (!recipientAddress) {
+      continue;
+    }
+
+    try {
+      await makeFrontAPIRequest({
+        method: "GET",
+        endpoint: `channels/alt:address:${recipientAddress}`,
+        apiToken,
+      });
+
+      return recipientAddress;
+    } catch (error) {
+      if (
+        error instanceof MCPError &&
+        error.message.includes("Resource not found")
+      ) {
+        continue;
+      }
+      logger.warn(
+        {
+          conversation_id: conversationId,
+          error: normalizeError(error).message,
+        },
+        "[FrontMCP] Error checking if recipient is a channel"
+      );
+    }
+  }
+
+  return null;
+}

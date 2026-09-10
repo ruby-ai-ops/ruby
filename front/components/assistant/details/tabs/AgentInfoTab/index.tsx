@@ -1,0 +1,184 @@
+import { buildAgentInstructionsReadOnlyExtensions } from "@app/components/agent_builder/instructions/AgentBuilderInstructionsEditor";
+import { AssistantKnowledgeSection } from "@app/components/assistant/details/tabs/AgentInfoTab/AssistantKnowledgeSection";
+import { AssistantSkillsToolsSection } from "@app/components/assistant/details/tabs/AgentInfoTab/AssistantSkillsToolsSection";
+import { RedactedAgentMessage } from "@app/components/assistant/details/tabs/AgentInfoTab/RedactedAgentMessage";
+import { preprocessMarkdownForEditor } from "@app/components/editor/lib/preprocessMarkdownForEditor";
+import { getModelProviderLogo } from "@app/components/providers/types";
+import { useTheme } from "@app/components/sparkle/ThemeContext";
+import type { AgentConfigurationType } from "@app/types/assistant/agent";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
+import { SUPPORTED_MODEL_CONFIGS } from "@app/types/assistant/models/models";
+import type { WorkspaceType } from "@app/types/user";
+import { isAdmin } from "@app/types/user";
+import { Avatar, Chip, cn, Markdown, Page } from "@ruby-ai/sparkle";
+import { EditorContent, useEditor } from "@tiptap/react";
+import { useEffect, useMemo, useRef } from "react";
+
+export function AgentInfoTab({
+  agentConfiguration,
+  owner,
+}: {
+  agentConfiguration: AgentConfigurationType;
+  owner: WorkspaceType;
+}) {
+  const { isDark } = useTheme();
+  const isRubyAgent =
+    agentConfiguration.sId === GLOBAL_AGENTS_SID.RUBY ||
+    agentConfiguration.sId === GLOBAL_AGENTS_SID.DEEP_DIVE ||
+    agentConfiguration.sId === GLOBAL_AGENTS_SID.RUBY_EDGE;
+
+  const isGlobalAgent = agentConfiguration.scope === "global";
+  const displayKnowledge = !isGlobalAgent || isRubyAgent;
+
+  const instructions = agentConfiguration.instructions ?? "";
+  const instructionsHtml = agentConfiguration.instructionsHtml ?? null;
+  const displayInstructions =
+    !isGlobalAgent && (instructionsHtml !== null || instructions.length > 0);
+
+  // The API redacts the private fields (instructions, skills, knowledge) of the agents an admin
+  // cannot read, and flags it by returning `canRead: false`. Only admins ever get such a response.
+  const isRedactedForAdmin = isAdmin(owner) && !agentConfiguration.canRead;
+
+  const model = SUPPORTED_MODEL_CONFIGS.find(
+    (m) =>
+      m.modelId === agentConfiguration.model.modelId &&
+      m.providerId === agentConfiguration.model.providerId
+  );
+
+  return (
+    <div className="flex flex-col gap-5">
+      {agentConfiguration.tags.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {agentConfiguration.tags.map((tag) => (
+            <Chip key={tag.sId} color="info" label={tag.name} size="xs" />
+          ))}
+        </div>
+      )}
+
+      {agentConfiguration.description && (
+        <div className="text-sm text-foreground">
+          <Markdown
+            content={agentConfiguration.description}
+            forcedTextSize="text-sm"
+          />
+        </div>
+      )}
+
+      {isRedactedForAdmin && (
+        <RedactedAgentMessage
+          agentConfiguration={agentConfiguration}
+          owner={owner}
+        />
+      )}
+
+      {displayInstructions && (
+        <div className="dd-privacy-mask flex flex-col gap-4">
+          <div className="heading-lg text-foreground">Instructions</div>
+          <div
+            className={cn(
+              "max-h-[400px] overflow-y-auto rounded-lg border border-border bg-muted-background px-3 py-2"
+            )}
+          >
+            <ReadOnlyInstructionsEditor
+              instructions={instructions}
+              instructionsHtml={instructionsHtml}
+            />
+          </div>
+        </div>
+      )}
+
+      {!isRedactedForAdmin && (
+        <AssistantSkillsToolsSection
+          agentConfiguration={agentConfiguration}
+          owner={owner}
+          isRubyAgent={isRubyAgent}
+        />
+      )}
+
+      {displayKnowledge && !isRedactedForAdmin && (
+        <>
+          <Page.Separator />
+          <AssistantKnowledgeSection
+            agentConfiguration={agentConfiguration}
+            owner={owner}
+          />
+        </>
+      )}
+
+      {model && (
+        <div className="flex flex-col gap-5">
+          <div className="heading-lg text-foreground">Model</div>
+          <div className="flex flex-row items-center gap-2">
+            <Avatar
+              icon={getModelProviderLogo(model.providerId, isDark)}
+              size="xs"
+            />
+            <div className="whitespace-nowrap mr-2">{model.displayName}</div>
+            <div className="text-sm text-muted-foreground">
+              {model.description}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface ReadOnlyInstructionsEditorProps {
+  instructions: string;
+  instructionsHtml: string | null;
+}
+
+function ReadOnlyInstructionsEditor({
+  instructions,
+  instructionsHtml,
+}: ReadOnlyInstructionsEditorProps) {
+  const extensions = useMemo(
+    () => buildAgentInstructionsReadOnlyExtensions(),
+    []
+  );
+
+  const initialContentSetRef = useRef(false);
+
+  const editor = useEditor(
+    {
+      extensions,
+      editable: false,
+      immediatelyRender: false,
+    },
+    [extensions]
+  );
+
+  useEffect(() => {
+    if (
+      !editor ||
+      editor.isDestroyed ||
+      initialContentSetRef.current ||
+      (!instructions && !instructionsHtml)
+    ) {
+      return;
+    }
+
+    initialContentSetRef.current = true;
+
+    requestAnimationFrame(() => {
+      if (editor && !editor.isDestroyed) {
+        if (instructionsHtml) {
+          editor.commands.setContent(instructionsHtml, {
+            emitUpdate: false,
+          });
+        } else if (instructions) {
+          editor.commands.setContent(
+            preprocessMarkdownForEditor(instructions),
+            {
+              emitUpdate: false,
+              contentType: "markdown",
+            }
+          );
+        }
+      }
+    });
+  }, [editor, instructions, instructionsHtml]);
+
+  return <EditorContent editor={editor} />;
+}

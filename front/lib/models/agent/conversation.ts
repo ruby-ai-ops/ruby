@@ -1,0 +1,1171 @@
+import type { AgentMessageFeedbackDirection } from "@app/lib/api/assistant/conversation/feedbacks";
+import type { AgentStepContentModel } from "@app/lib/models/agent/agent_step_content";
+import type { ConversationForkModel } from "@app/lib/models/agent/conversation_fork";
+import { TriggerModel } from "@app/lib/models/agent/triggers/triggers";
+import { frontSequelize } from "@app/lib/resources/storage";
+import {
+  DANGEROUSLY_UNBOUNDED_TEXT,
+  DataTypes,
+  literal,
+  Op,
+} from "@app/lib/resources/storage/data_types";
+import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
+import { KeyModel } from "@app/lib/resources/storage/models/keys";
+import { SpaceModel } from "@app/lib/resources/storage/models/spaces";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import { WorkspaceAwareModel } from "@app/lib/resources/storage/wrappers/workspace_models";
+import type {
+  AgentMessageStatus,
+  CompactionMessageStatus,
+  ConversationMetadata,
+  ConversationVisibility,
+  MessageVisibility,
+  ParticipantActionType,
+  UserMessageOrigin,
+} from "@app/types/assistant/conversation";
+import type { ModelResolutionMethodType } from "@app/types/assistant/models/types";
+import { MODEL_RESOLUTION_METHODS } from "@app/types/assistant/models/types";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { CreationOptional, ForeignKey, NonAttribute } from "sequelize";
+
+export class ConversationModel extends WorkspaceAwareModel<ConversationModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare sId: string;
+  declare title: string | null;
+  declare visibility: CreationOptional<ConversationVisibility>;
+  declare depth: CreationOptional<number>;
+  declare isRunningAgentLoop: CreationOptional<boolean>;
+  declare triggerId: ForeignKey<TriggerModel["id"]> | null;
+  declare hasError: CreationOptional<boolean>;
+  declare metadata: CreationOptional<ConversationMetadata>;
+
+  declare requestedSpaceIds: number[];
+
+  // Note: Using spaceId for the FK instead of vaultId as it is not a "ResourceWithSpace" and it's aligned with "requestedSpaceIds".
+  declare spaceId: ForeignKey<SpaceModel["id"]> | null;
+  declare space: NonAttribute<SpaceModel>;
+  declare forkedFrom?: NonAttribute<ConversationForkModel | null>;
+}
+
+ConversationModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    sId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    title: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: true,
+    },
+    visibility: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "unlisted",
+    },
+    depth: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    isRunningAgentLoop: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    requestedSpaceIds: {
+      type: DataTypes.ARRAY(DataTypes.BIGINT),
+      allowNull: false,
+      defaultValue: [],
+    },
+    hasError: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    metadata: {
+      type: DataTypes.JSONB,
+      allowNull: false,
+      defaultValue: {},
+    },
+  },
+  {
+    modelName: "conversation",
+    indexes: [
+      {
+        unique: true,
+        fields: ["workspaceId", "sId"],
+      },
+      {
+        fields: ["workspaceId", "triggerId"],
+      },
+      {
+        fields: ["workspaceId", "spaceId"],
+      },
+      { fields: ["spaceId"], concurrently: true },
+      {
+        name: "conversations_trigger_id",
+        fields: ["triggerId"],
+        where: { triggerId: { [Op.ne]: null } },
+        concurrently: true,
+      },
+      {
+        fields: ["workspaceId", "createdAt"],
+        name: "conversations_workspace_id_created_at_idx",
+      },
+    ],
+    sequelize: frontSequelize,
+  }
+);
+
+ConversationModel.belongsTo(TriggerModel, {
+  as: "trigger",
+  foreignKey: {
+    name: "triggerId",
+    allowNull: true,
+  },
+  onDelete: "SET NULL",
+});
+
+TriggerModel.hasMany(ConversationModel, {
+  as: "conversations",
+  foreignKey: {
+    name: "triggerId",
+    allowNull: true,
+  },
+  onDelete: "SET NULL",
+});
+
+ConversationModel.belongsTo(SpaceModel, {
+  as: "space",
+  foreignKey: {
+    name: "spaceId",
+    allowNull: true,
+  },
+  onDelete: "RESTRICT",
+});
+
+SpaceModel.hasMany(ConversationModel, {
+  as: "conversations",
+});
+
+export class ConversationParticipantModel extends WorkspaceAwareModel<ConversationParticipantModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare action: ParticipantActionType;
+  declare actionRequired: boolean;
+
+  declare conversationId: ForeignKey<ConversationModel["id"]>;
+  declare userId: ForeignKey<UserModel["id"]>;
+
+  declare conversation?: NonAttribute<ConversationModel>;
+  declare user?: NonAttribute<UserModel>;
+}
+ConversationParticipantModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    action: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    actionRequired: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+  },
+  {
+    modelName: "conversation_participant",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["workspaceId", "userId", "conversationId"],
+        unique: true,
+      },
+      {
+        fields: ["workspaceId", "userId", "action"],
+      },
+      {
+        fields: ["conversationId"],
+        name: "conversation_participants_conversation_id",
+        concurrently: true,
+      },
+      {
+        fields: ["workspaceId", "conversationId", "actionRequired"],
+        name: "conversation_participants_workspace_conversation_action_idx",
+        concurrently: true,
+      },
+    ],
+  }
+);
+ConversationModel.hasMany(ConversationParticipantModel, {
+  foreignKey: { name: "conversationId", allowNull: false },
+  onDelete: "RESTRICT",
+});
+ConversationParticipantModel.belongsTo(ConversationModel, {
+  foreignKey: { name: "conversationId", allowNull: false },
+});
+UserModel.hasMany(ConversationParticipantModel, {
+  foreignKey: { name: "userId", allowNull: false },
+  onDelete: "RESTRICT",
+});
+ConversationParticipantModel.belongsTo(UserModel, {
+  foreignKey: { name: "userId", allowNull: false },
+});
+
+export class UserConversationReadsModel extends WorkspaceAwareModel<UserConversationReadsModel> {
+  declare lastReadAt: Date;
+
+  declare conversationId: ForeignKey<ConversationModel["id"]>;
+  declare userId: ForeignKey<UserModel["id"]>;
+
+  declare conversation?: NonAttribute<ConversationModel>;
+  declare user?: NonAttribute<UserModel>;
+}
+UserConversationReadsModel.init(
+  {
+    lastReadAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "user_conversation_reads",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["workspaceId", "userId", "conversationId"],
+        unique: true,
+      },
+      {
+        fields: ["conversationId"],
+        name: "user_conversation_reads_conversation_id",
+        concurrently: true,
+      },
+      {
+        fields: ["workspaceId", "userId"],
+      },
+    ],
+  }
+);
+ConversationModel.hasMany(UserConversationReadsModel, {
+  foreignKey: { name: "conversationId", allowNull: false },
+  onDelete: "RESTRICT",
+});
+UserConversationReadsModel.belongsTo(ConversationModel, {
+  foreignKey: { name: "conversationId", allowNull: false },
+});
+UserModel.hasMany(UserConversationReadsModel, {
+  foreignKey: { name: "userId", allowNull: false },
+  onDelete: "RESTRICT",
+});
+UserConversationReadsModel.belongsTo(UserModel, {
+  foreignKey: { name: "userId", allowNull: false },
+});
+
+export class UserMessageModel extends WorkspaceAwareModel<UserMessageModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare content: string;
+
+  // TODO(MCP Clean-up): Remove these once we have migrated to the new MCP server ids.
+  declare localMCPServerIds?: string[];
+  declare clientSideMCPServerIds: string[];
+
+  declare userContextUsername: string;
+  declare userContextTimezone: string;
+  declare userContextFullName: string | null;
+  declare userContextEmail: string | null;
+  declare userContextProfilePictureUrl: string | null;
+  declare userContextOrigin: UserMessageOrigin;
+
+  declare agenticMessageType: "run_agent" | "agent_handover" | null;
+  declare agenticOriginMessageId: string | null;
+
+  // The concrete provider/model/effort triplet requested by the user when
+  // running the agent. null when the user did not request a specific model.
+  declare requestedProviderId: string | null;
+  declare requestedModelId: string | null;
+  declare requestedReasoningEffort: string | null;
+
+  declare userContextLastTriggerRunAt: Date | null;
+  declare userContextApiKeyId: ForeignKey<KeyModel["id"]> | null;
+  declare userContextAuthMethod: string | null;
+
+  declare userId: ForeignKey<UserModel["id"]> | null;
+  // Denormalized from messages for conversation-scoped fetches (plain column, no FK — the value
+  // is derived from messages at write time).
+  declare conversationId: ModelId;
+
+  declare user?: NonAttribute<UserModel>;
+  declare key?: NonAttribute<KeyModel>;
+}
+
+UserMessageModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    content: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: false,
+    },
+    // TODO(MCP Clean-up): Remove these once we have migrated to the new MCP server ids.
+    localMCPServerIds: {
+      type: DataTypes.ARRAY(DataTypes.STRING),
+      allowNull: false,
+      defaultValue: [],
+    },
+    clientSideMCPServerIds: {
+      type: DataTypes.ARRAY(DataTypes.STRING),
+      allowNull: false,
+      defaultValue: [],
+    },
+    userContextUsername: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    userContextTimezone: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    userContextFullName: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    userContextEmail: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    userContextProfilePictureUrl: {
+      type: DataTypes.STRING(2048),
+      allowNull: true,
+    },
+    userContextOrigin: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    userContextLastTriggerRunAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    userContextApiKeyId: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+      references: {
+        model: KeyModel,
+        key: "id",
+      },
+    },
+    userContextAuthMethod: {
+      type: DataTypes.STRING(50),
+      allowNull: true,
+    },
+    agenticMessageType: {
+      type: DataTypes.STRING(16),
+      allowNull: true,
+    },
+    agenticOriginMessageId: {
+      type: DataTypes.STRING(32),
+      allowNull: true,
+    },
+    requestedProviderId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    requestedModelId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    requestedReasoningEffort: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    conversationId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "user_message",
+    sequelize: frontSequelize,
+    indexes: [
+      { fields: ["userContextOrigin"], concurrently: true },
+      { fields: ["workspaceId"], concurrently: true },
+      { fields: ["workspaceId", "conversationId"], concurrently: true },
+      { fields: ["userContextApiKeyId"], concurrently: true },
+      {
+        fields: ["workspaceId", "agenticOriginMessageId"],
+        concurrently: true,
+        name: "user_messages_workspace_agentic_origin_idx",
+      },
+      {
+        // WARNING we use full capital functions and constants as the query where we want this index to be used is in capital letters, and indices are case-sensitive
+        // The query https://ruby.ad/ruby/blob/6cb11eecb8c8bb549efc5afb25197606d76672b9/front/pages/api/w/%5BwId%5D/workspace-analytics.ts#L67-L126
+        fields: [
+          "workspaceId",
+          literal("DATE(TIMEZONE('UTC', \"createdAt\"))"),
+          "userId",
+        ],
+        concurrently: true,
+        name: "user_messages_workspace_id_date_created_at_user_id_idx",
+      },
+    ],
+    hooks: {
+      beforeValidate: (userMessage) => {
+        const hasAgenticMessageType = !!userMessage.agenticMessageType;
+        const hasAgenticOriginMessageId = !!userMessage.agenticOriginMessageId;
+        if (hasAgenticMessageType !== hasAgenticOriginMessageId) {
+          throw new Error(
+            "agenticMessageType and agenticOriginMessageId must be set together"
+          );
+        }
+      },
+    },
+  }
+);
+
+UserModel.hasMany(UserMessageModel, {
+  foreignKey: { name: "userId", allowNull: true }, // null = message is not associated with a user
+});
+UserMessageModel.belongsTo(UserModel, {
+  foreignKey: { name: "userId", allowNull: true },
+});
+
+KeyModel.hasMany(UserMessageModel, {
+  foreignKey: { name: "userContextApiKeyId", allowNull: true },
+});
+UserMessageModel.belongsTo(KeyModel, {
+  as: "key",
+  foreignKey: { name: "userContextApiKeyId", allowNull: true },
+  onDelete: "RESTRICT",
+});
+
+export class AgentMessageModel extends WorkspaceAwareModel<AgentMessageModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+  declare runIds: string[] | null;
+  declare status: CreationOptional<AgentMessageStatus>;
+
+  declare errorCode: string | null;
+  declare errorMessage: string | null;
+  declare errorMetadata: Record<string, string | number | boolean> | null;
+
+  declare skipToolsValidation: boolean;
+
+  // Not a relation as global agents are not in the DB + sId is stable across versions. Both sId and
+  // version are needed to uniquely identify the agent configuration.
+  declare agentConfigurationId: string;
+  declare agentConfigurationVersion: number;
+
+  declare agentStepContents?: NonAttribute<AgentStepContentModel[]>;
+  declare message?: NonAttribute<MessageModel>;
+  declare feedbacks?: NonAttribute<AgentMessageFeedbackModel[]>;
+
+  declare modelInteractionDurationMs: number | null;
+  declare completedAt: Date | null;
+  declare prunedContext: boolean | null;
+  declare costCredits: number | null;
+
+  // The concrete provider/model/effort triplet used by the message when
+  // running the agent. Legacy: null when the message runs the agent's configured model.
+  declare resolvedProviderId: string | null;
+  declare resolvedModelId: string | null;
+  declare resolvedReasoningEffort: string | null;
+  declare modelResolutionMethod: ModelResolutionMethodType | null;
+
+  // Denormalized from messages for conversation-scoped fetches (plain column, no FK — the value
+  // is derived from messages at write time).
+  declare conversationId: ModelId;
+}
+
+AgentMessageModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    runIds: {
+      type: DataTypes.ARRAY(DataTypes.STRING),
+      allowNull: true,
+    },
+    status: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "created",
+    },
+    errorCode: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    errorMessage: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: true,
+    },
+    errorMetadata: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      defaultValue: null,
+      validate: {
+        isValidJSON(value: any) {
+          if (value !== null && typeof value !== "object") {
+            throw new Error("errorMetadata must be an object or null");
+          }
+          if (
+            value !== null &&
+            !Object.values(value).every(
+              (v) =>
+                typeof v === "string" ||
+                typeof v === "number" ||
+                typeof v === "boolean"
+            )
+          ) {
+            throw new Error(
+              "errorMetadata values must be string | number | boolean"
+            );
+          }
+        },
+      },
+    },
+    skipToolsValidation: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    agentConfigurationId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    agentConfigurationVersion: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    modelInteractionDurationMs: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    },
+    completedAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    prunedContext: {
+      type: DataTypes.BOOLEAN,
+      allowNull: true,
+      defaultValue: false,
+    },
+    costCredits: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    },
+    resolvedProviderId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    resolvedModelId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    resolvedReasoningEffort: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+    },
+    modelResolutionMethod: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
+      validate: {
+        isIn: [MODEL_RESOLUTION_METHODS],
+      },
+    },
+    conversationId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "agent_message",
+    sequelize: frontSequelize,
+    indexes: [
+      { fields: ["workspaceId"], concurrently: true },
+      { fields: ["workspaceId", "conversationId"], concurrently: true },
+      // Index for agent-based data retention queries.
+      { fields: ["workspaceId", "agentConfigurationId"], concurrently: true },
+    ],
+  }
+);
+
+export class AgentMessageFeedbackModel extends WorkspaceAwareModel<AgentMessageFeedbackModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare agentConfigurationId: string;
+  declare agentConfigurationVersion: number;
+  declare agentMessageId: ForeignKey<AgentMessageModel["id"]>;
+  declare userId: ForeignKey<UserModel["id"]>;
+  declare conversationId: ForeignKey<ConversationModel["id"]>;
+  declare isConversationShared: boolean;
+  declare dismissed: boolean;
+
+  declare thumbDirection: AgentMessageFeedbackDirection;
+  declare content: string | null;
+
+  declare agentMessage: NonAttribute<AgentMessageModel>;
+  declare user: NonAttribute<UserModel>;
+}
+
+AgentMessageFeedbackModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    agentConfigurationId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    agentConfigurationVersion: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+    thumbDirection: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    content: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: true,
+    },
+    isConversationShared: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    dismissed: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    conversationId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+      references: {
+        model: "conversations",
+        key: "id",
+      },
+    },
+  },
+  {
+    modelName: "agent_message_feedback",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["agentConfigurationId"],
+      },
+      {
+        fields: ["agentMessageId"],
+      },
+      {
+        fields: ["userId"],
+      },
+      {
+        fields: ["agentConfigurationId", "agentMessageId", "userId"],
+        unique: true,
+        name: "agent_message_feedbacks_agent_configuration_id_agent_message_id",
+      },
+      { fields: ["workspaceId"], concurrently: true },
+      {
+        fields: ["conversationId"],
+        name: "agent_message_feedbacks_conversation_id",
+        concurrently: true,
+      },
+    ],
+  }
+);
+
+ConversationModel.hasMany(AgentMessageFeedbackModel, {
+  foreignKey: { name: "conversationId", allowNull: true },
+  onDelete: "RESTRICT",
+});
+AgentMessageFeedbackModel.belongsTo(ConversationModel, {
+  as: "conversation",
+  foreignKey: { name: "conversationId", allowNull: true },
+});
+
+AgentMessageModel.hasMany(AgentMessageFeedbackModel, {
+  as: "feedbacks",
+  onDelete: "RESTRICT",
+});
+UserModel.hasMany(AgentMessageFeedbackModel, {
+  onDelete: "SET NULL",
+});
+AgentMessageFeedbackModel.belongsTo(UserModel, {
+  as: "user",
+});
+AgentMessageFeedbackModel.belongsTo(AgentMessageModel, {
+  as: "agentMessage",
+});
+
+export class CompactionMessageModel extends WorkspaceAwareModel<CompactionMessageModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+  declare runIds: string[] | null;
+  declare sourceConversationId: string | null;
+
+  declare status: CompactionMessageStatus;
+  declare content: string | null;
+
+  // Denormalized from messages for conversation-scoped fetches (the conversation this compaction
+  // message belongs to — sourceConversationId is the compacted one).
+  declare conversationId: ModelId;
+}
+
+CompactionMessageModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    runIds: {
+      type: DataTypes.ARRAY(DataTypes.STRING),
+      allowNull: true,
+    },
+    sourceConversationId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    status: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "created",
+    },
+    content: {
+      type: DANGEROUSLY_UNBOUNDED_TEXT,
+      allowNull: true,
+    },
+    conversationId: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "compaction_message",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        fields: ["workspaceId"],
+        concurrently: true,
+      },
+      { fields: ["workspaceId", "conversationId"], concurrently: true },
+    ],
+  }
+);
+
+export class MessageModel extends WorkspaceAwareModel<MessageModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare sId: string;
+
+  declare version: CreationOptional<number>;
+  declare rank: number;
+  declare visibility: CreationOptional<MessageVisibility>;
+
+  declare conversationId: ForeignKey<ConversationModel["id"]>;
+
+  declare parentId: ForeignKey<MessageModel["id"]> | null;
+  declare userMessageId: ForeignKey<UserMessageModel["id"]> | null;
+  declare agentMessageId: ForeignKey<AgentMessageModel["id"]> | null;
+  declare contentFragmentId: ForeignKey<ContentFragmentModel["id"]> | null;
+  declare compactionMessageId: ForeignKey<CompactionMessageModel["id"]> | null;
+
+  declare userMessage?: NonAttribute<UserMessageModel>;
+  declare agentMessage?: NonAttribute<AgentMessageModel>;
+  declare contentFragment?: NonAttribute<ContentFragmentModel>;
+  declare compactionMessage?: NonAttribute<CompactionMessageModel>;
+  declare reactions?: NonAttribute<MessageReactionModel[]>;
+
+  declare conversation?: NonAttribute<ConversationModel>;
+}
+
+MessageModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    sId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    version: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    visibility: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "visible",
+    },
+    rank: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "message",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        unique: true,
+        fields: ["sId"],
+      },
+      // Unique index for rank and version.
+      {
+        unique: true,
+        fields: ["workspaceId", "conversationId", "rank", "version"],
+        name: "messages_workspace_id_conversation_id_rank_version_unique",
+        concurrently: true,
+      },
+      {
+        fields: ["conversationId"],
+        name: "messages_conversation_id",
+        concurrently: true,
+      },
+      {
+        fields: ["agentMessageId"],
+        concurrently: true,
+      },
+      {
+        fields: ["userMessageId"],
+        concurrently: true,
+      },
+      {
+        fields: ["contentFragmentId"],
+        concurrently: true,
+      },
+      {
+        fields: ["compactionMessageId"],
+        concurrently: true,
+      },
+      {
+        fields: ["parentId"],
+        concurrently: true,
+      },
+      {
+        fields: ["workspaceId", "conversationId", "sId"],
+      },
+      // Index for data retention workflow - optimizes GROUP BY with MAX(createdAt).
+      {
+        fields: ["workspaceId", "conversationId", "createdAt"],
+        concurrently: true,
+      },
+    ],
+    hooks: {
+      beforeValidate: (message) => {
+        if (
+          Number(!!message.userMessageId) +
+            Number(!!message.agentMessageId) +
+            Number(!!message.contentFragmentId) +
+            Number(!!message.compactionMessageId) !==
+          1
+        ) {
+          throw new Error(
+            "Exactly one of userMessageId, agentMessageId, contentFragmentId, compactionMessageId must be non-null"
+          );
+        }
+      },
+    },
+  }
+);
+
+ConversationModel.hasMany(MessageModel, {
+  foreignKey: { name: "conversationId", allowNull: false },
+  onDelete: "RESTRICT",
+});
+MessageModel.belongsTo(ConversationModel, {
+  as: "conversation",
+  foreignKey: { name: "conversationId", allowNull: false },
+});
+
+UserMessageModel.hasOne(MessageModel, {
+  as: "message",
+  foreignKey: { name: "userMessageId", allowNull: true },
+});
+MessageModel.belongsTo(UserMessageModel, {
+  as: "userMessage",
+  foreignKey: { name: "userMessageId", allowNull: true },
+});
+
+AgentMessageModel.hasOne(MessageModel, {
+  as: "message",
+  foreignKey: { name: "agentMessageId", allowNull: true },
+});
+MessageModel.belongsTo(AgentMessageModel, {
+  as: "agentMessage",
+  foreignKey: { name: "agentMessageId", allowNull: true },
+});
+
+MessageModel.belongsTo(MessageModel, {
+  foreignKey: { name: "parentId", allowNull: true },
+});
+ContentFragmentModel.hasOne(MessageModel, {
+  as: "message",
+  foreignKey: { name: "contentFragmentId", allowNull: true },
+});
+MessageModel.belongsTo(ContentFragmentModel, {
+  as: "contentFragment",
+  foreignKey: { name: "contentFragmentId", allowNull: true },
+});
+
+CompactionMessageModel.hasOne(MessageModel, {
+  as: "message",
+  foreignKey: { name: "compactionMessageId", allowNull: true },
+});
+MessageModel.belongsTo(CompactionMessageModel, {
+  as: "compactionMessage",
+  foreignKey: { name: "compactionMessageId", allowNull: true },
+});
+
+export class MessageReactionModel extends WorkspaceAwareModel<MessageReactionModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare messageId: ForeignKey<MessageModel["id"]>;
+
+  // User is nullable so that we can store reactions from a Slackbot message
+  declare userId: ForeignKey<UserModel["id"]> | null;
+  declare userContextUsername: string;
+  declare userContextFullName: string | null;
+
+  declare reaction: string;
+
+  declare user: NonAttribute<UserModel> | null;
+}
+
+MessageReactionModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    userContextUsername: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    userContextFullName: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    reaction: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+  },
+  {
+    modelName: "message_reaction",
+    sequelize: frontSequelize,
+    indexes: [
+      {
+        unique: true,
+        fields: ["messageId", "reaction", "userContextUsername"], // Not perfect as that means that a user and slack user with the same username can't react with the same emoji, but that's an edge case.
+      },
+      { fields: ["messageId"] },
+      {
+        fields: ["userId"],
+        concurrently: true,
+      },
+      { fields: ["workspaceId"], concurrently: true },
+    ],
+  }
+);
+
+MessageModel.hasMany(MessageReactionModel, {
+  as: "reactions",
+  foreignKey: { name: "messageId", allowNull: false },
+  onDelete: "RESTRICT",
+});
+MessageReactionModel.belongsTo(MessageModel, {
+  foreignKey: { name: "messageId", allowNull: false },
+});
+UserModel.hasMany(MessageReactionModel, {
+  foreignKey: { name: "userId", allowNull: true }, // null = mention is from a user using a Slackbot
+});
+MessageReactionModel.belongsTo(UserModel, {
+  foreignKey: { name: "userId", allowNull: true }, // null = mention is not a user using a Slackbot
+});
+
+export type MentionStatusType =
+  | "pending_conversation_access" // Waiting for user input to invite to conversation
+  | "pending_project_membership" // Waiting for user input to add to project (mentioning user is project editor)
+  | "approved" // Auto or manually approved
+  | "rejected" // Auto or manually rejected
+  | "user_restricted_by_conversation_access" // The conversation access is restricted to the user (the conversation uses at least one space that the user doesn't have access to)
+  | "agent_restricted_by_space_usage"; // The agent uses at least one space that the conversation doesn't have access to (eg: projects conversations cannot use private spaces).
+
+export class MentionModel extends WorkspaceAwareModel<MentionModel> {
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  declare messageId: ForeignKey<MessageModel["id"]>;
+
+  // a Mention is either an agent mention xor a user mention
+  declare agentConfigurationId: string | null; // Not a relation as global agents are not in the DB
+  declare userId: ForeignKey<UserModel["id"]> | null;
+  declare user: NonAttribute<UserModel> | null;
+
+  declare message: NonAttribute<MessageModel>;
+
+  declare status: MentionStatusType;
+  declare dismissed: boolean | null;
+}
+
+MentionModel.init(
+  {
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW,
+    },
+    agentConfigurationId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    userId: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+      references: {
+        model: UserModel,
+        key: "id",
+      },
+    },
+    status: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "approved",
+    },
+    dismissed: {
+      type: DataTypes.BOOLEAN,
+      allowNull: true,
+      defaultValue: false,
+    },
+  },
+  {
+    modelName: "mention",
+    sequelize: frontSequelize,
+    indexes: [
+      // TODO(WORKSPACE_ID_ISOLATION 2025-05-12): Remove index
+      {
+        fields: ["messageId"],
+      },
+      {
+        fields: ["workspaceId", "messageId"],
+      },
+      // TODO(WORKSPACE_ID_ISOLATION 2025-05-12): Remove index
+      {
+        fields: ["agentConfigurationId", "createdAt"],
+      },
+      {
+        fields: ["workspaceId", "agentConfigurationId", "createdAt"],
+      },
+    ],
+    hooks: {
+      beforeValidate: (mention) => {
+        if (
+          Number(!!mention.userId) + Number(!!mention.agentConfigurationId) !==
+          1
+        ) {
+          throw new Error(
+            "Exactly one of userId, agentConfigurationId must be non-null"
+          );
+        }
+      },
+    },
+  }
+);
+
+MessageModel.hasMany(MentionModel, {
+  foreignKey: { name: "messageId", allowNull: false },
+  onDelete: "RESTRICT",
+});
+MentionModel.belongsTo(MessageModel, {
+  foreignKey: { name: "messageId", allowNull: false },
+});
+MentionModel.belongsTo(UserModel, {
+  foreignKey: { name: "userId", allowNull: true },
+});

@@ -1,0 +1,95 @@
+import assert from "assert";
+
+import { Authenticator } from "@app/lib/auth";
+import { isManaged } from "@app/lib/data_sources";
+import { AgentDataSourceConfigurationModel } from "@app/lib/models/agent/actions/data_sources";
+import { DataSourceResource } from "@app/lib/resources/data_source_resource";
+import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import type { Logger } from "@app/logger/logger";
+import { makeScript } from "@app/scripts/helpers";
+import { runOnAllWorkspaces } from "@app/scripts/workspace_helpers";
+import type { LightWorkspaceType } from "@app/types/user";
+async function backfillViewsInAgentDataSourceConfigurationForWorkspace(
+  workspace: LightWorkspaceType,
+  logger: Logger,
+  execute: boolean
+) {
+  const auth = await Authenticator.internalAdminForWorkspace(workspace.sId);
+
+  // List workspace data sources.
+  const dataSources = await DataSourceResource.listByWorkspace(auth);
+
+  // Filter managed data sources.
+  const managedDataSources = dataSources.filter((ds) => isManaged(ds));
+
+  logger.info(
+    `Found ${managedDataSources.length} managed data sources for workspace(${workspace.sId}).`
+  );
+
+  const globalVault = await SpaceResource.fetchWorkspaceGlobalSpace(auth);
+
+  // Retrieve data source views for managed data sources.
+  const dataSourceViews =
+    await DataSourceViewResource.listForDataSourcesInSpace(
+      auth,
+      managedDataSources,
+      globalVault
+    );
+
+  // Count agent data source configurations that uses those data sources.
+
+  const agentDataSourceConfigurationsCount =
+    await AgentDataSourceConfigurationModel.count({
+      where: {
+        dataSourceId: managedDataSources.map((ds) => ds.id),
+      },
+    });
+
+  logger.info(
+    `About to update ${agentDataSourceConfigurationsCount} agent data source configurations for workspace(${workspace.sId}).`
+  );
+
+  if (!execute) {
+    return;
+  }
+
+  for (const ds of managedDataSources) {
+    const dataSourceView = dataSourceViews.find(
+      (dsv) => dsv.dataSourceId === ds.id
+    );
+    assert(
+      dataSourceView,
+      `Data source view not found for data source ${ds.id}.`
+    );
+
+    await AgentDataSourceConfigurationModel.update(
+      { dataSourceViewId: dataSourceView.id },
+      {
+        where: {
+          dataSourceId: ds.id,
+        },
+      }
+    );
+
+    logger.info(
+      `Updated agent data source configuration for data source ${ds.id}.`
+    );
+  }
+
+  logger.info(
+    `Updated all agent data source configurations for workspace(${workspace.sId}).`
+  );
+}
+
+makeScript({}, async ({ execute }, logger) => {
+  return runOnAllWorkspaces(async (workspace) => {
+    await backfillViewsInAgentDataSourceConfigurationForWorkspace(
+      workspace,
+      logger,
+      execute
+    );
+
+    logger.info(`Finished backfilling views for workspace(${workspace.sId}).`);
+  });
+});

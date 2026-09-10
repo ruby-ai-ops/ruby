@@ -1,0 +1,152 @@
+import type { CSVRecord } from "@app/lib/api/csv";
+import { generateCSVSnippet, toCsv } from "@app/lib/api/csv";
+import { processAndStoreFile } from "@app/lib/api/files/processing";
+import type { Authenticator } from "@app/lib/auth";
+import { FileResource } from "@app/lib/resources/file_resource";
+import type { CoreAPIDataSourceDocumentSection } from "@app/types/core/data_source";
+
+/**
+ * Generate a CSV file and a snippet of the file.
+ * Save the file to the database and return the file and the snippet.
+ *
+ * TODO(FILE_SYSTEM/COMPUTER): migrate to RubyFileSystem once query_tables is ported to the computer world.
+ * Kept on FileResource because tabular results are indexed into the conversation SQLite data
+ * source so query_tables can re-query them.
+ */
+export async function generateCSVFileAndSnippet(
+  auth: Authenticator,
+  {
+    title,
+    conversationId,
+    results,
+  }: {
+    title: string;
+    conversationId: string;
+    results: Array<CSVRecord>;
+  }
+): Promise<{
+  csvFile: FileResource;
+  csvSnippet: string;
+}> {
+  const workspace = auth.getNonNullableWorkspace();
+  const user = auth.user();
+
+  const {
+    csvOutput,
+    contentType,
+    fileName,
+  }: {
+    csvOutput: string;
+    contentType: "text/csv" | "text/plain";
+    fileName: string;
+  } =
+    results.length > 0
+      ? {
+          csvOutput: await toCsv(results),
+          contentType: "text/csv",
+          fileName: `${title}.csv`,
+        }
+      : {
+          csvOutput: "The query produced no results.",
+          contentType: "text/plain",
+          fileName: `${title}.txt`,
+        };
+  const csvFile = await FileResource.makeNew({
+    workspaceId: workspace.id,
+    userId: user?.id ?? null,
+    contentType,
+    fileName,
+    fileSize: Buffer.byteLength(csvOutput),
+    useCase: "tool_output",
+    useCaseMetadata: {
+      conversationId,
+    },
+  });
+  const csvSnippet = generateCSVSnippet({
+    content: csvOutput,
+    totalRecords: results.length,
+  });
+
+  await processAndStoreFile(auth, {
+    file: csvFile,
+    content: {
+      type: "string",
+      value: csvOutput,
+    },
+  });
+
+  return { csvFile, csvSnippet };
+}
+
+/**
+ * Generate a json file representing a table as a section.
+ * This type of file is used to store the results of a tool call coming up from a csv in a way that can be searched.
+ * Save it to the database and return it.
+ *
+ * TODO(FILE_SYSTEM/COMPUTER): remove once semantic search for tool outputs is killed.
+ * The section file only exists to feed the indexing pipeline for text search within query results.
+ */
+export async function generateSectionFile(
+  auth: Authenticator,
+  {
+    title,
+    conversationId,
+    results,
+    sectionColumnsPrefix,
+  }: {
+    title: string;
+    conversationId: string;
+    results: Array<CSVRecord>;
+    sectionColumnsPrefix: string[] | null;
+  }
+): Promise<FileResource> {
+  const workspace = auth.getNonNullableWorkspace();
+  const user = auth.user();
+
+  // We loop through the results to represent each row as a section.
+  // The content of the file is the JSON representation of the section.
+  const sections: Array<CoreAPIDataSourceDocumentSection> = [];
+  for (const row of results) {
+    const prefix = sectionColumnsPrefix
+      ? sectionColumnsPrefix
+          .map((c) => row[c] ?? "")
+          .join(" ")
+          .trim() || null
+      : null;
+    const rowContent = JSON.stringify(row);
+    const section: CoreAPIDataSourceDocumentSection = {
+      prefix,
+      content: rowContent,
+      sections: [],
+    };
+    sections.push(section);
+  }
+  const section = {
+    prefix: title,
+    content: null,
+    sections,
+  };
+  const content = JSON.stringify(section);
+
+  const sectionFile = await FileResource.makeNew({
+    workspaceId: workspace.id,
+    userId: user?.id ?? null,
+    contentType: "application/vnd.ruby.section.json",
+    fileName: title,
+    fileSize: Buffer.byteLength(content),
+    useCase: "tool_output",
+    useCaseMetadata: {
+      conversationId,
+    },
+  });
+
+  await processAndStoreFile(auth, {
+    file: sectionFile,
+    content: {
+      type: "string",
+      value: content,
+    },
+  });
+
+  return sectionFile;
+}

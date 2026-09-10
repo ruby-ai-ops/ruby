@@ -1,0 +1,73 @@
+import type { LoggerInterface } from "@ruby-ai/client";
+import { CancelledFailure } from "@temporalio/common";
+import { v4 as uuidv4 } from "uuid";
+
+let once = false;
+
+export function setupGlobalErrorHandler(logger: LoggerInterface) {
+  if (once) {
+    logger.info({}, "Global error handler already setup");
+    return;
+  }
+  once = true;
+  process.on("unhandledRejection", (reason, promise) => {
+    // CancelledFailure: NOT_FOUND from Temporal SDK is expected when workflows
+    // are terminated while activities are still pending on the worker.
+    // This is not actionable — downgrade from panic to warn.
+    if (reason instanceof CancelledFailure && reason.message === "NOT_FOUND") {
+      logger.warn(
+        { error: reason },
+        "Temporal activity cancellation for terminated workflow (ignored)"
+      );
+      return;
+    }
+
+    // The GCS client (teeny-request) connects a response to its stream only once the
+    // response arrives. If we closed that stream in the meantime, the connect throws
+    // in a place no caller can catch. Harmless timing issue, so warn instead of panic.
+    if (
+      reason instanceof Error &&
+      "code" in reason &&
+      reason.code === "ERR_STREAM_UNABLE_TO_PIPE"
+    ) {
+      logger.warn({ error: reason }, "Stream teardown race (ignored)");
+      return;
+    }
+
+    // uuid here serves as a correlation id for the console.error and the logger.error.
+    const uuid = uuidv4();
+    // console.log here is important because the promise.catch() below could fail.
+    console.error("unhandledRejection", promise, reason, uuid);
+
+    promise.catch((error) => {
+      // We'll get the call stack from error only if the promise was rejected with an error object.
+      // Example: new Promise((_, reject) => reject(new Error("Some error")))
+      logger.error(
+        {
+          error,
+          panic: true,
+          uuid,
+          reason: reason instanceof Error ? reason.stack : String(reason),
+          errorMessage: error instanceof Error ? error.message : String(error),
+        },
+        "Unhandled Rejection"
+      );
+    });
+  });
+
+  process.on("uncaughtException", (error) => {
+    if (
+      error instanceof Error &&
+      (error.message.includes("terminated") ||
+        error.message.includes("ECONNRESET"))
+    ) {
+      logger.warn({ error }, "Undici connection cleanup error (ignored)");
+      return;
+    }
+
+    logger.error(
+      { error, message: error.message, stack: error.stack, panic: true },
+      "Uncaught Exception"
+    );
+  });
+}

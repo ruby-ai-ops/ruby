@@ -1,0 +1,69 @@
+import { useAuth } from "@app/lib/auth/AuthContext";
+import { useCellContext } from "@app/lib/auth/CellContext";
+import {
+  BarHeader,
+  Button,
+  cn,
+  RubyLogo,
+  Page,
+  Rocket02,
+} from "@ruby-ai/sparkle";
+import { UserDropdownMenu } from "@extension/ui/components/navigation/UserDropdownMenu";
+import { Link } from "react-router-dom";
+
+export const SubscribePage = () => {
+  const { workspace } = useAuth();
+  const { cellInfo } = useCellContext();
+  return (
+    <div>
+      <BarHeader
+        title=""
+        tooltip=""
+        rightActions={
+          <div className="items-right flex flex-row space-x-1">
+            <UserDropdownMenu />
+          </div>
+        }
+      />
+      <div
+        className={cn(
+          "flex h-screen flex-col p-4",
+          "bg-background text-foreground"
+        )}
+      >
+        <div className="flex flex-1 flex-col items-center justify-center gap-4">
+          <div className="flex max-w-[400px] flex-col items-center text-center">
+            <Link to="https://ruby.ad" target="_blank">
+              <RubyLogo className="h-8 w-36" />
+            </Link>
+          </div>
+          <div className="max-w-[400px] text-center">
+            <Page.H variant="h4">Almost there!</Page.H>
+          </div>
+          <div className="text-center text-lg">
+            Subscribe to start using Ruby agent from anywhere in your browser.
+          </div>
+
+          {cellInfo && (
+            <div className="m-1 flex text-center">
+              <Link to={`${cellInfo.url}/w/${workspace.sId}/subscribe`}>
+                <Button
+                  icon={Rocket02}
+                  variant="primary"
+                  label="Get started"
+                  onClick={() => {
+                    window.open(
+                      `${cellInfo.url}/w/${workspace.sId}/subscribe`,
+                      "_blank"
+                    );
+                  }}
+                  size="sm"
+                />
+              </Link>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};

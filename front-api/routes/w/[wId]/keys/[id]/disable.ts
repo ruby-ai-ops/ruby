@@ -1,0 +1,69 @@
+import {
+  buildAuditLogTarget,
+  emitAuditLogEvent,
+  getAuditLogContext,
+} from "@app/lib/api/audit/workos_audit";
+import { KeyResource } from "@app/lib/resources/key_resource";
+import type { PostKeysResponseBody } from "@app/types/api/keys";
+import { workspaceApp } from "@front-api/middlewares/ctx";
+import { ensureIsAdmin } from "@front-api/middlewares/ensure_role";
+import { apiError, type HandlerResult } from "@front-api/middlewares/utils";
+import { validate } from "@front-api/middlewares/validator";
+import { z } from "zod";
+
+const KeyIdParamSchema = z.object({
+  id: z.string(),
+});
+
+// Mounted at /api/w/:wId/keys/:id/disable.
+const app = workspaceApp();
+
+/** @ignoreswagger */
+app.post(
+  "/",
+  ensureIsAdmin(),
+  validate("param", KeyIdParamSchema),
+  async (ctx): HandlerResult<PostKeysResponseBody> => {
+    const auth = ctx.get("auth");
+    const user = auth.getNonNullableUser();
+    const owner = auth.getNonNullableWorkspace();
+
+    const { id } = ctx.req.valid("param");
+
+    const key = await KeyResource.fetchByWorkspaceAndId({
+      workspace: owner,
+      id,
+    });
+
+    if (!key) {
+      return apiError(ctx, {
+        status_code: 404,
+        api_error: {
+          type: "key_not_found",
+          message: "Could not find the key.",
+        },
+      });
+    }
+
+    await key.setIsDisabled();
+
+    void emitAuditLogEvent({
+      auth,
+      action: "api_key.revoked",
+      targets: [
+        buildAuditLogTarget("workspace", owner),
+        buildAuditLogTarget("api_key", {
+          sId: String(key.id),
+          name: key.name,
+        }),
+      ],
+      context: getAuditLogContext(auth),
+    });
+
+    return ctx.json({
+      key: await key.toJSONWithSpaces(auth, user.id),
+    });
+  }
+);
+
+export default app;

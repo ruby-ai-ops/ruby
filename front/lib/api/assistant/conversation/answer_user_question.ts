@@ -1,0 +1,199 @@
+import { isToolAskUserQuestionEvent } from "@app/lib/actions/mcp";
+import type { UserQuestionAnswer } from "@app/lib/actions/types";
+import { isSandboxChildActionInfo } from "@app/lib/actions/types";
+import { canCurrentUserRespondToParentUserMessage } from "@app/lib/api/assistant/conversation/can_current_user_respond";
+import { getUserMessageIdFromMessageId } from "@app/lib/api/assistant/conversation/messages";
+import { resumeAncestorConversations } from "@app/lib/api/assistant/conversation/resume_ancestor_conversations";
+import { getMessageChannelId } from "@app/lib/api/assistant/streaming/helpers";
+import { getRedisHybridManager } from "@app/lib/api/redis-hybrid-manager";
+import { resolveSandboxChildBlock } from "@app/lib/api/sandbox/sandbox_child_block";
+import type { Authenticator } from "@app/lib/auth";
+import { RubyError } from "@app/lib/error";
+import { AgentMCPActionResource } from "@app/lib/resources/agent_mcp_action_resource";
+import type { ConversationResource } from "@app/lib/resources/conversation_resource";
+import logger from "@app/logger/logger";
+import { launchAgentLoopWorkflow } from "@app/temporal/agent_loop/client";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+
+export async function registerUserAnswer(
+  auth: Authenticator,
+  conversation: ConversationResource,
+  {
+    actionId,
+    messageId,
+    answer,
+  }: {
+    actionId: string;
+    messageId: string;
+    answer: UserQuestionAnswer;
+  }
+): Promise<Result<void, RubyError>> {
+  const owner = auth.getNonNullableWorkspace();
+  const user = auth.user();
+  const { sId: conversationId, title: conversationTitle } = conversation;
+
+  logger.info(
+    {
+      actionId,
+      messageId,
+      conversationId,
+      workspaceId: owner.sId,
+      userId: user?.sId,
+    },
+    "User question answer request"
+  );
+
+  const {
+    agentMessageId,
+    agentMessageVersion,
+    userMessageId,
+    userMessageVersion,
+    userMessageUserId,
+    userMessageOrigin,
+  } = await getUserMessageIdFromMessageId(auth, {
+    messageId,
+  });
+
+  if (
+    !canCurrentUserRespondToParentUserMessage({
+      parentUserId: userMessageUserId,
+      currentUserId: user?.id,
+    })
+  ) {
+    return new Err(
+      new RubyError(
+        "unauthorized",
+        "User is not authorized to answer this question"
+      )
+    );
+  }
+
+  const action = await AgentMCPActionResource.fetchById(auth, actionId);
+  if (!action) {
+    return new Err(
+      new RubyError("action_not_found", `Action not found: ${actionId}`)
+    );
+  }
+
+  if (action.status !== "blocked_user_answer_required") {
+    return new Err(
+      new RubyError(
+        "action_not_blocked",
+        `Action is not blocked for user question: ${action.status}`
+      )
+    );
+  }
+
+  // A blocked action is only actionable while its agent message can still resume: answering one
+  // left behind by a non-resumable terminal message would relaunch an agent loop that was already
+  // terminated.
+  if (!(await action.canAgentMessageResume(auth))) {
+    return new Err(
+      new RubyError(
+        "action_not_blocked",
+        "Action belongs to an agent message that can no longer resume"
+      )
+    );
+  }
+
+  await action.updateStepContext({
+    ...action.stepContext,
+    resumeState: {
+      ...action.stepContext.resumeState,
+      answer,
+    },
+  });
+
+  // Change status to ready so the tool re-runs.
+  const [updatedCount] = await action.updateStatusFromExpected(auth, {
+    status: "ready_allowed_explicitly",
+    expectedStatus: "blocked_user_answer_required",
+  });
+
+  if (updatedCount === 0) {
+    logger.info(
+      {
+        actionId,
+        messageId,
+        workspaceId: owner.sId,
+        userId: user?.sId,
+      },
+      "Action already answered"
+    );
+
+    return new Ok(undefined);
+  }
+
+  await getRedisHybridManager().removeEvent((event) => {
+    const payload = JSON.parse(event.message["payload"]);
+    return isToolAskUserQuestionEvent(payload) && payload.actionId === actionId;
+  }, getMessageChannelId(messageId));
+
+  const { sandboxChildActionInfo } = action.stepContext;
+  if (isSandboxChildActionInfo(sandboxChildActionInfo)) {
+    // Sandbox-child resolution always relaunches the parent bash (the
+    // frozen sandbox must be thawed regardless of the user's answer).
+    // See validateAction for the full rationale.
+    await resolveSandboxChildBlock(auth, {
+      action,
+      sandboxChildActionInfo,
+      agentLoopArgs: {
+        agentMessageId,
+        agentMessageVersion,
+        conversationId,
+        conversationTitle,
+        userMessageId,
+        userMessageVersion,
+        userMessageOrigin,
+      },
+    });
+    return new Ok(undefined);
+  }
+
+  // Only launch the agent loop if there are no remaining blocked actions.
+  const blockedActions =
+    await AgentMCPActionResource.listBlockedActionsForConversation(
+      auth,
+      conversation
+    );
+
+  if (blockedActions.some((a) => a.messageId === messageId)) {
+    logger.info(
+      { blockedActions },
+      "Skipping agent loop launch because there are remaining blocked actions"
+    );
+    return new Ok(undefined);
+  }
+
+  await launchAgentLoopWorkflow({
+    auth,
+    agentLoopArgs: {
+      agentMessageId,
+      agentMessageVersion,
+      conversationId,
+      conversationTitle,
+      userMessageId,
+      userMessageVersion,
+      userMessageOrigin,
+    },
+    startStep: action.stepContent.step,
+    waitForCompletion: true,
+  });
+
+  logger.info(
+    {
+      workspaceId: owner.sId,
+      conversationId,
+      messageId,
+      actionId,
+    },
+    "User question answered, agent loop resumed"
+  );
+
+  // A sub-agent's caller sits in `blocked_child_action_input_required` until we relaunch it. The
+  // answer is already committed, so a failed wake-up is logged, never returned.
+  await resumeAncestorConversations(auth, conversation, { agentMessageId });
+
+  return new Ok(undefined);
+}

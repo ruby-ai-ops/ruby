@@ -1,0 +1,54 @@
+/core/target
+*.sqlite
+.DS_Store
+.idea
+.air
+test.ts
+.env.local
+.env.agent.local
+qdrant_storage
+.*.swp
+.rgignore
+core-api-keys.json
+oauth-api-keys.json
+/extension/build/
+**/__pycache__
+**/.claude/*
+!**/.claude/skills/
+**/.claude/skills/*
+!**/.claude/skills/ruby-*/
+**/.claude/skills/ruby-hive/
+**/.codex
+**/.yalc
+yalc.lock
+front/public/sitemap.xml
+front/public/robots.txt
+mprocs.log
+process-compose*.log
+**/tsconfig.tsbuildinfo
+**/.npm-cache
+AGENTS.local.md
+CLAUDE.local.md
+.cursor/docker-volumes/
+dev/docker-volumes/
+node_modules
+thoughts/*
+.superpowers/
+
+# ruby-hive worktrees
+.hives/
+
+# Direnv
+.direnv/
+.envrc
+.envrc.local
+
+# Storybook static build output
+**/storybook-static/
+
+# Local pptx test decks dropped at the repo root during pptx tooling work
+/*.pptx
+
+# Sandbox provider build scratch dirs
+/front/lib/api/sandbox/providers/sandbox-build-*/
+

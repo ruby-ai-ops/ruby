@@ -1,0 +1,235 @@
+import { ActionDetailsWrapper } from "@app/components/actions/ActionDetailsWrapper";
+import type { ActionDetailsDisplayContext } from "@app/components/actions/mcp/details/types";
+import { PreviewableCitation } from "@app/components/assistant/conversation/attachment/PreviewableCitation";
+import type {
+  SqlQueryOutputType,
+  ThinkingOutputType,
+  ToolGeneratedFileType,
+} from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import {
+  isDataSourceNodeContentType,
+  isDataSourceNodeListType,
+  isIncludeResultResourceType,
+  isSearchResultResourceType,
+  isWarningResourceType,
+  isWebsearchResultResourceType,
+} from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import type { ActionGeneratedFileType } from "@app/lib/actions/types";
+import { getDocumentIcon } from "@app/lib/content_nodes";
+import { removeNulls } from "@app/types/shared/utils/general";
+import {
+  Chip,
+  CodeBlock,
+  ContentBlockWrapper,
+  ContentMessage,
+  FaviconIcon,
+  InfoCircle,
+  Markdown,
+  PaginatedCitationsGrid,
+  Tooltip,
+} from "@ruby-ai/sparkle";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+
+interface ThinkingBlockProps {
+  resource: ThinkingOutputType;
+}
+
+export function ThinkingBlock({ resource }: ThinkingBlockProps) {
+  return (
+    resource.text && (
+      <div className="text-sm font-normal text-muted-foreground">
+        <ContentMessage
+          title="Reasoning"
+          variant="primary"
+          icon={InfoCircle}
+          size="lg"
+        >
+          <Markdown
+            content={resource.text}
+            isStreaming={false}
+            forcedTextSize="text-sm"
+            textColor="text-muted-foreground"
+            isLastMessage={false}
+          />
+        </ContentMessage>
+      </div>
+    )
+  );
+}
+
+interface SqlQueryBlockProps {
+  resource: SqlQueryOutputType;
+}
+
+export function SqlQueryBlock({ resource }: SqlQueryBlockProps) {
+  return (
+    <div className="text-sm font-normal text-muted-foreground">
+      <ContentBlockWrapper content={resource.text}>
+        <CodeBlock
+          className="language-sql max-h-60 overflow-y-auto"
+          wrapLongLines={true}
+        >
+          {resource.text}
+        </CodeBlock>
+      </ContentBlockWrapper>
+    </div>
+  );
+}
+
+interface ToolGeneratedFileDetailsProps {
+  resource:
+    | ToolGeneratedFileType
+    | ActionGeneratedFileType
+    | Omit<ActionGeneratedFileType, "snippet">;
+}
+
+export function ToolGeneratedFileDetails({
+  resource,
+}: ToolGeneratedFileDetailsProps) {
+  const snippet =
+    "text" in resource
+      ? resource.text
+      : "snippet" in resource
+        ? (resource.snippet ?? undefined)
+        : undefined;
+
+  return (
+    <PreviewableCitation
+      size="sm"
+      fileId={resource.fileId ?? null}
+      filePath={"filePath" in resource ? resource.filePath : undefined}
+      contentType={resource.contentType}
+      title={resource.title}
+      description={snippet}
+    />
+  );
+}
+
+interface SearchResultProps {
+  actionName: string;
+  visual: React.ComponentType<{ className?: string }>;
+  actionOutput: CallToolResult["content"] | null;
+  displayContext: ActionDetailsDisplayContext;
+  query: string | null;
+}
+
+export function SearchResultDetails({
+  actionName,
+  visual,
+  displayContext,
+  actionOutput,
+  query,
+}: SearchResultProps) {
+  const displayQuery = query ?? "No query provided";
+
+  const warning = actionOutput
+    ?.filter(isWarningResourceType)
+    .map((o) => o.resource)?.[0];
+
+  const singleFileContentText = actionOutput
+    ?.filter(isDataSourceNodeContentType)
+    .map((o) => o.resource.text)
+    .join("\n");
+
+  const citations = (() => {
+    if (!actionOutput) {
+      return [];
+    }
+    return removeNulls(
+      actionOutput.flatMap((r) => {
+        if (isWebsearchResultResourceType(r)) {
+          return [
+            {
+              description: r.resource.text,
+              title: r.resource.title,
+              icon: <FaviconIcon websiteUrl={r.resource.uri} />,
+              href: r.resource.uri,
+            },
+          ];
+        }
+        if (isSearchResultResourceType(r) || isIncludeResultResourceType(r)) {
+          const IconComponent = getDocumentIcon(r.resource.source.provider);
+          return [
+            {
+              description: "",
+              title: r.resource.text,
+              icon: <IconComponent />,
+              href: r.resource.uri,
+            },
+          ];
+        }
+        if (isDataSourceNodeListType(r)) {
+          return r.resource.data.map((node) => {
+            const IconComponent = getDocumentIcon(node.connectorProvider);
+            return {
+              description: `${node.path}${
+                node.lastUpdatedAt ? ` • ${node.lastUpdatedAt}` : ""
+              }`,
+              title: node.title,
+              icon: <IconComponent />,
+              // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+              href: node.sourceUrl || undefined,
+            };
+          });
+        }
+        if (isDataSourceNodeContentType(r)) {
+          const { metadata } = r.resource;
+          const IconComponent = getDocumentIcon(metadata.connectorProvider);
+          return [
+            {
+              description: `${metadata.path}${
+                metadata.lastUpdatedAt ? ` • ${metadata.lastUpdatedAt}` : ""
+              }`,
+              title: metadata.title,
+              icon: <IconComponent />,
+              // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+              href: metadata.sourceUrl || undefined,
+            },
+          ];
+        }
+        return [null];
+      })
+    );
+  })();
+
+  return (
+    <ActionDetailsWrapper
+      displayContext={displayContext}
+      actionName={actionName}
+      visual={visual}
+    >
+      {displayContext === "conversation" ? (
+        <div className="text-sm font-normal text-muted-foreground">
+          {displayQuery}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-4 pl-6 pt-4">
+          <div className="flex flex-col gap-1">
+            <span className="font-medium text-foreground">Query</span>
+            <div className="text-muted-foreground">{displayQuery}</div>
+            {warning && (
+              <Tooltip
+                label={warning.text}
+                trigger={<Chip color="warning" label={warning.warningTitle} />}
+              />
+            )}
+          </div>
+          {actionOutput && (
+            <div className="flex flex-col gap-2">
+              <span className="font-medium text-foreground">Results</span>
+              {singleFileContentText && (
+                <Markdown
+                  content={singleFileContentText}
+                  isStreaming={false}
+                  forcedTextSize="text-sm"
+                  textColor="text-muted-foreground"
+                />
+              )}
+              <PaginatedCitationsGrid items={citations} />
+            </div>
+          )}
+        </div>
+      )}
+    </ActionDetailsWrapper>
+  );
+}

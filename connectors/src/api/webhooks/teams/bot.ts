@@ -1,0 +1,928 @@
+import { processFileAttachments } from "@connectors/api/webhooks/teams/content_fragments";
+import { getMicrosoftClient } from "@connectors/connectors/microsoft";
+import { getMessagesFromConversation } from "@connectors/connectors/microsoft/lib/graph_api";
+import { apiConfig } from "@connectors/lib/api/config";
+import type { MessageFootnotes } from "@connectors/lib/bot/citations";
+import { annotateCitations } from "@connectors/lib/bot/citations";
+import { makeConversationUrl } from "@connectors/lib/bot/conversation_utils";
+import type { MentionMatch } from "@connectors/lib/bot/mentions";
+import { processMessageForMention } from "@connectors/lib/bot/mentions";
+import { MicrosoftBotMessageModel } from "@connectors/lib/models/microsoft_bot";
+import type { Logger } from "@connectors/logger/logger";
+import type { ConnectorResource } from "@connectors/resources/connector_resource";
+import { getHeaderFromUserEmail } from "@connectors/types";
+import type {
+  AgentActionPublicType,
+  APIError,
+  ConversationPublicType,
+  PublicPostContentFragmentRequestBody,
+  PublicPostMessagesRequestBody,
+  Result,
+  UserMessageType,
+} from "@ruby-ai/client";
+import { RubyAPI, Err, Ok } from "@ruby-ai/client";
+import type { ChatMessage } from "@microsoft/microsoft-graph-types";
+import type { Activity, TurnContext } from "botbuilder";
+import removeMarkdown from "remove-markdown";
+
+import {
+  createBasicToolApprovalAdaptiveCard,
+  createPersonalAuthenticationAdaptiveCard,
+  createResponseAdaptiveCard,
+  createStreamingAdaptiveCard,
+} from "./adaptive_cards";
+import { updateActivity } from "./bot_messaging_utils";
+import { validateTeamsUser } from "./user_validation";
+
+export async function botAnswerMessage(
+  context: TurnContext,
+  message: string,
+  connector: ConnectorResource,
+  agentActivityId: string,
+  localLogger: Logger
+): Promise<Result<undefined, Error>> {
+  const {
+    conversation: { id: conversationId },
+    id: userActivityId,
+    replyToId,
+  } = context.activity;
+
+  if (!userActivityId) {
+    return new Err(new Error("No user activity ID found"));
+  }
+
+  // Validate user first - this will handle all user validation and error messaging
+  const validatedUser = await validateTeamsUser(
+    context,
+    connector,
+    localLogger
+  );
+  if (!validatedUser) {
+    // Error message already sent by validateTeamsUser
+    return new Ok(undefined);
+  }
+
+  const { email, displayName, userAadObjectId } = validatedUser;
+
+  // Check for existing Ruby conversation for this Teams conversation
+  const allMicrosoftBotMessages = await MicrosoftBotMessageModel.findAll({
+    where: {
+      connectorId: connector.id,
+      conversationId: conversationId,
+    },
+    order: [["createdAt", "DESC"]],
+  });
+
+  // Find the most recent message that has a Ruby conversation ID
+  const lastMicrosoftBotMessage =
+    allMicrosoftBotMessages.find((msg) => msg.rubyConversationId) || null;
+
+  const rubyAPI = new RubyAPI(
+    { url: apiConfig.getRubyFrontAPIUrl() },
+    {
+      workspaceId: connector.workspaceId,
+      apiKey: connector.workspaceAPIKey,
+      extraHeaders: {
+        ...getHeaderFromUserEmail(email),
+      },
+    },
+    localLogger
+  );
+
+  const agentConfigurationsRes = await rubyAPI.getAgentConfigurations({});
+  if (agentConfigurationsRes.isErr()) {
+    return new Err(new Error(agentConfigurationsRes.error.message));
+  }
+
+  const activeAgentConfigurations = agentConfigurationsRes.value.filter(
+    (ac) => ac.status === "active"
+  );
+
+  // Teams sends mentions as <at>name</at> XML-style tags
+  const botName = context.activity.recipient?.name;
+  if (botName) {
+    const matches = message.match(/<at>.*?<\/at>/gi);
+    if (matches) {
+      for (const m of matches) {
+        const mentionedName = m.replace(/<\/?at>/gi, "").trim();
+        // Remove mention if it matches the bot's name (case-insensitive)
+        if (mentionedName.toLowerCase() === botName.toLowerCase()) {
+          message = message.replace(m, "").trim();
+        }
+      }
+    }
+  }
+
+  // Process mentions in Teams messages (similar to Slack but for Teams format)
+  // Teams mentions come in a different format than Slack
+  const messageWithoutMarkdown = removeMarkdown(message);
+
+  // Extract all @mentions, ~mentions and +mentions (Teams typically uses @)
+  const mentionResult = processMessageForMention({
+    message: messageWithoutMarkdown,
+    activeAgentConfigurations,
+  });
+
+  if (mentionResult.isErr()) {
+    return new Err(mentionResult.error);
+  }
+
+  const mention = mentionResult.value.mention;
+
+  message = mentionResult.value.processedMessage;
+
+  const buildContentFragmentRes = await makeContentFragments(
+    context,
+    rubyAPI,
+    connector,
+    lastMicrosoftBotMessage,
+    localLogger
+  );
+
+  if (buildContentFragmentRes.isErr()) {
+    localLogger.error(
+      {
+        error: buildContentFragmentRes.error,
+        connectorId: connector.id,
+        teamsConversationId: conversationId,
+      },
+      "Failed to build content fragments"
+    );
+    // Continue without content fragments rather than failing completely
+  }
+
+  const messageReqBody: PublicPostMessagesRequestBody = {
+    content: message,
+    mentions: [{ configurationId: mention.agentId }],
+    context: {
+      timezone: "UTC", // Teams doesn't provide timezone info easily
+      username: displayName,
+      fullName: displayName,
+      email: email,
+      profilePictureUrl: null,
+      origin: "teams" as const,
+    },
+  };
+
+  let conversation: ConversationPublicType | undefined = undefined;
+  let userMessage: UserMessageType | undefined = undefined;
+
+  if (lastMicrosoftBotMessage?.rubyConversationId) {
+    // Check conversation existence (it might have been deleted between two messages).
+    const conversationRes = await rubyAPI.getConversation({
+      conversationId: lastMicrosoftBotMessage.rubyConversationId,
+    });
+
+    // If it doesn't exist, we will create a new one later.
+    if (conversationRes.isOk()) {
+      // Add content fragments if available
+      if (buildContentFragmentRes.isOk() && buildContentFragmentRes.value) {
+        for (const cf of buildContentFragmentRes.value) {
+          const contentFragmentRes = await rubyAPI.postContentFragment({
+            conversationId: lastMicrosoftBotMessage.rubyConversationId,
+            contentFragment: cf,
+          });
+          if (contentFragmentRes.isErr()) {
+            localLogger.error(
+              {
+                error: contentFragmentRes.error,
+                connectorId: connector.id,
+                teamsConversationId: conversationId,
+              },
+              "Failed to post content fragment"
+            );
+            // Continue without this content fragment
+          }
+        }
+      }
+
+      const messageRes = await rubyAPI.postUserMessage({
+        conversationId: lastMicrosoftBotMessage.rubyConversationId,
+        message: messageReqBody,
+      });
+      if (messageRes.isErr()) {
+        return new Err(new Error(messageRes.error.message));
+      }
+      userMessage = messageRes.value;
+
+      // Reload conversation to get the latest state
+      const newConversationRes = await rubyAPI.getConversation({
+        conversationId: lastMicrosoftBotMessage.rubyConversationId,
+      });
+      if (newConversationRes.isErr()) {
+        return new Err(new Error(newConversationRes.error.message));
+      }
+      conversation = newConversationRes.value;
+    } else {
+      localLogger.warn(
+        {
+          connectorId: connector.id,
+          teamsConversationId: conversationId,
+          rubyConversationId: lastMicrosoftBotMessage.rubyConversationId,
+        },
+        "Ruby conversation not found, will create new one"
+      );
+    }
+  }
+
+  // If the conversation does not exist, we create a new one.
+  if (!conversation || !userMessage) {
+    const newConversationRes = await rubyAPI.createConversation({
+      title: null,
+      visibility: "unlisted",
+      message: messageReqBody,
+      contentFragments: buildContentFragmentRes.isOk()
+        ? buildContentFragmentRes.value
+        : undefined,
+    });
+    if (newConversationRes.isErr()) {
+      return new Err(new Error(newConversationRes.error.message));
+    }
+
+    conversation = newConversationRes.value.conversation;
+    userMessage = newConversationRes.value.message;
+
+    if (!userMessage) {
+      return new Err(new Error("Failed to retrieve the created message."));
+    }
+  }
+
+  const m = await MicrosoftBotMessageModel.create({
+    connectorId: connector.id,
+    userAadObjectId: userAadObjectId,
+    email: email,
+    conversationId: conversationId,
+    userActivityId: userActivityId,
+    agentActivityId: agentActivityId,
+    rubyConversationId: conversation.sId,
+    replyToId: replyToId,
+  });
+
+  // Stream agent response and send updates to Teams
+  const streamAgentResponseRes = await streamAgentResponse({
+    context,
+    rubyAPI,
+    conversation,
+    userMessage,
+    mention,
+    connector,
+    agentActivityId,
+    localLogger,
+  });
+
+  if (streamAgentResponseRes.isErr()) {
+    return streamAgentResponseRes;
+  }
+
+  const { formattedContent, footnotes, agentMessageId } =
+    streamAgentResponseRes.value;
+
+  await m.update({
+    rubyAgentMessageId: agentMessageId,
+  });
+
+  const finalCard = createResponseAdaptiveCard({
+    response: formattedContent,
+    mentionedAgent: mention,
+    conversationUrl: makeConversationUrl(
+      connector.workspaceId,
+      conversation.sId
+    ),
+    workspaceId: connector.workspaceId,
+    agentConfigurations: activeAgentConfigurations,
+    originalMessage: message,
+    footnotes: footnotes,
+  });
+
+  await sendTeamsResponse(context, agentActivityId, finalCard, localLogger);
+
+  // Return the result with streaming info
+  return new Ok(undefined);
+}
+
+async function streamAgentResponse({
+  context,
+  rubyAPI,
+  conversation,
+  userMessage,
+  mention,
+  connector,
+  agentActivityId,
+  localLogger,
+}: {
+  context: TurnContext;
+  rubyAPI: RubyAPI;
+  conversation: ConversationPublicType;
+  userMessage: UserMessageType;
+  mention: MentionMatch;
+  connector: ConnectorResource;
+  agentActivityId: string;
+  localLogger: Logger;
+}): Promise<
+  Result<
+    {
+      agentMessageId: string;
+      formattedContent: string;
+      footnotes: MessageFootnotes;
+    },
+    Error
+  >
+> {
+  // For Bot Framework approach with streaming updates
+  const streamRes = await rubyAPI.streamAgentAnswerEvents({
+    conversation,
+    userMessageId: userMessage.sId,
+  });
+
+  if (streamRes.isErr()) {
+    return new Err(new Error(streamRes.error.message));
+  }
+
+  // Collect the full response and stream updates
+  let finalResponse = "";
+  let finalFormattedContent = "";
+  let finalFootnotes: MessageFootnotes = [];
+  let agentMessageSuccess = undefined;
+  let lastUpdateTime = Date.now();
+  let chainOfThought = "";
+  let agentState = "thinking";
+  const actions: AgentActionPublicType[] = [];
+  const UPDATE_INTERVAL_MS = 1500;
+
+  for await (const event of streamRes.value.eventStream) {
+    switch (event.type) {
+      case "agent_error": {
+        return new Err(new Error(event.error.message));
+      }
+      case "agent_message_success": {
+        agentMessageSuccess = event;
+        finalResponse = event.message.content ?? "";
+        const { formattedContent, footnotes } = annotateCitations(
+          finalResponse,
+          actions
+        );
+        finalFormattedContent = formattedContent;
+        finalFootnotes = footnotes;
+        break;
+      }
+      case "generation_tokens": {
+        // Stream updates at intervals to avoid rate limits
+        if (event.classification === "tokens") {
+          finalResponse += event.text;
+          agentState = "writing";
+        } else if (event.classification === "chain_of_thought") {
+          if (event.text === "\n\n") {
+            chainOfThought = "";
+          } else {
+            chainOfThought += event.text;
+          }
+          agentState = "thinking";
+        }
+
+        const now = Date.now();
+        if (now - lastUpdateTime > UPDATE_INTERVAL_MS) {
+          lastUpdateTime = now;
+          const text =
+            agentState === "thinking" ? chainOfThought : finalResponse;
+          if (text.trim()) {
+            // Process citations for streaming updates (only format content, no footnotes)
+            const { formattedContent } = annotateCitations(text, actions);
+
+            const streamingCard = createStreamingAdaptiveCard({
+              response: formattedContent,
+              agentName: mention.agentName,
+              conversationUrl: null,
+              workspaceId: connector.workspaceId,
+            });
+
+            // Send streaming update to Teams app webhook endpoint
+            // Skip retry for streaming updates - if they fail, just ignore silently
+            await sendTeamsResponse(
+              context,
+              agentActivityId,
+              streamingCard,
+              localLogger,
+              true // skipRetry
+            );
+          }
+        }
+        break;
+      }
+      case "tool_params": {
+        const streamingCard = createStreamingAdaptiveCard({
+          response: event.action.displayLabels?.running ?? "Running a tool",
+          agentName: mention.agentName,
+          conversationUrl: null,
+          workspaceId: connector.workspaceId,
+        });
+        agentState = "acting";
+        await sendTeamsResponse(
+          context,
+          agentActivityId,
+          streamingCard,
+          localLogger
+        );
+
+        break;
+      }
+      case "agent_action_success":
+        actions.push(event.action);
+        break;
+      case "tool_personal_auth_required": {
+        const conversationUrl = makeConversationUrl(
+          connector.workspaceId,
+          conversation.sId
+        );
+        await updateActivity(context, {
+          id: agentActivityId,
+          ...createPersonalAuthenticationAdaptiveCard({
+            conversationUrl,
+            workspaceId: connector.workspaceId,
+          }),
+        });
+        break;
+      }
+      case "tool_error": {
+        return new Err(
+          new Error(
+            `Tool message error: code: ${event.error.code} message: ${event.error.message}`
+          )
+        );
+      }
+      case "tool_approve_execution": {
+        // Find the MicrosoftBotMessage to get the microsoftBotMessageId
+        const microsoftBotMessage = await MicrosoftBotMessageModel.findOne({
+          where: {
+            connectorId: connector.id,
+            rubyConversationId: conversation.sId,
+          },
+          order: [["createdAt", "DESC"]],
+        });
+
+        if (!microsoftBotMessage) {
+          localLogger.error(
+            {
+              connectorId: connector.id,
+              conversationId: conversation.sId,
+            },
+            "No MicrosoftBotMessage found for tool approval request"
+          );
+          break;
+        }
+
+        // Get the user's AAD Object ID for user-specific view
+        const userAadObjectId = microsoftBotMessage.userAadObjectId;
+
+        if (!userAadObjectId) {
+          localLogger.error(
+            {
+              connectorId: connector.id,
+              conversationId: conversation.sId,
+              microsoftBotMessageId: microsoftBotMessage.id,
+            },
+            "No userAadObjectId found, cannot send approval card with user-specific view"
+          );
+          break;
+        }
+
+        // Send approval card in thread with user-specific view
+        // The original user sees interactive buttons, others see a read-only message
+        const approvalCard = createBasicToolApprovalAdaptiveCard({
+          toolName: event.metadata.toolName,
+          conversationId: event.conversationId,
+          messageId: event.messageId,
+          actionId: event.actionId,
+          workspaceId: connector.workspaceId,
+          microsoftBotMessageId: microsoftBotMessage.id,
+          userAadObjectId: context.activity.from.id, // Pass user ID for user-specific views
+        });
+
+        try {
+          await updateActivity(context, {
+            id: agentActivityId,
+            ...approvalCard,
+          });
+        } catch (error) {
+          localLogger.error(
+            {
+              error,
+              connectorId: connector.id,
+              conversationId: conversation.sId,
+            },
+            "Failed to send tool approval card"
+          );
+        }
+        break;
+      }
+      default:
+        // Ignore other events
+        break;
+    }
+  }
+
+  if (agentMessageSuccess) {
+    return new Ok({
+      agentMessageId: agentMessageSuccess.message.sId,
+      formattedContent: finalFormattedContent,
+      footnotes: finalFootnotes,
+    });
+  } else {
+    return new Err(new Error("No response generated"));
+  }
+}
+
+const sendTeamsResponse = async (
+  context: TurnContext,
+  agentActivityId: string,
+  adaptiveCard: Partial<Activity>,
+  localLogger: Logger,
+  skipRetry = false
+): Promise<Result<string, Error>> => {
+  // Update existing message for streaming
+  const updateResult = await updateActivity(
+    context,
+    {
+      ...adaptiveCard,
+      id: agentActivityId,
+    },
+    skipRetry
+  );
+
+  if (updateResult.isOk()) {
+    return updateResult;
+  }
+
+  // Only log if not skipping retry (for non-streaming updates)
+  if (!skipRetry) {
+    localLogger.warn(
+      { error: updateResult.error },
+      "Failed to send response message"
+    );
+
+    return updateResult;
+  } else {
+    // For streaming updates, just silently ignore failures
+    return new Ok(agentActivityId);
+  }
+};
+
+async function makeContentFragments(
+  context: TurnContext,
+  rubyAPI: RubyAPI,
+  connector: ConnectorResource,
+  lastMicrosoftBotMessage: MicrosoftBotMessageModel | null,
+  localLogger: Logger
+): Promise<Result<PublicPostContentFragmentRequestBody[] | undefined, Error>> {
+  // Get Microsoft Graph client only for file downloads
+  const client = await getMicrosoftClient(connector.connectionId);
+  const teamsConversationId = context.activity.conversation.id;
+
+  // Detect conversation type based on ID pattern
+  // Channel conversations typically contain thread patterns like @thread.tacv2
+  // Chat conversations (1:1 or group) have different formats
+  const isChannelConversation =
+    teamsConversationId.includes("@thread.") ||
+    teamsConversationId.includes("@teams.") ||
+    context.activity.channelData?.teamsChannelId;
+
+  // For regular chats (non-channel), we don't need message history
+  // but we still want to process file attachments from the current message
+  if (!isChannelConversation) {
+    // Get current message attachments from the Bot Framework context
+    const currentMessageAttachments = context.activity.attachments || [];
+
+    if (currentMessageAttachments.length === 0) {
+      return new Ok(undefined);
+    }
+
+    const allContentFragments = await processFileAttachments(
+      currentMessageAttachments,
+      rubyAPI,
+      client,
+      localLogger
+    );
+
+    return new Ok(
+      allContentFragments.length > 0 ? allContentFragments : undefined
+    );
+  }
+
+  // Get conversation history using Microsoft Graph API.
+  // This can fail with InsufficientPrivileges if the connector admin user is
+  // not a member of the chat/channel. In that case, gracefully continue
+  // without conversation history (the bot can still respond to the current message).
+  let messages: ChatMessage[] = [];
+  try {
+    const conversationHistory = await getMessagesFromConversation(
+      localLogger,
+      client,
+      teamsConversationId
+    );
+    messages = conversationHistory.results || [];
+  } catch (error) {
+    localLogger.warn(
+      { error, teamsConversationId },
+      "Failed to fetch conversation history, continuing without it"
+    );
+    // Process only current message attachments (like we do for non-channel conversations)
+    const currentMessageAttachments = context.activity.attachments || [];
+    if (currentMessageAttachments.length === 0) {
+      return new Ok(undefined);
+    }
+    const allContentFragments = await processFileAttachments(
+      currentMessageAttachments,
+      rubyAPI,
+      client,
+      localLogger
+    );
+    return new Ok(
+      allContentFragments.length > 0 ? allContentFragments : undefined
+    );
+  }
+
+  const startIndex =
+    messages.findIndex((msg) => msg.id === context.activity.id) + 1;
+  // Filter for new user messages since last bot interaction (excluded) or root message (included)
+  const lastBotMessageId = lastMicrosoftBotMessage?.agentActivityId;
+  const rootMessageId =
+    teamsConversationId.match(/;messageid=([^;]+)/i)?.[1] || undefined;
+
+  const endIndex = lastMicrosoftBotMessage
+    ? messages.findIndex((msg) => msg.id === lastBotMessageId)
+    : messages.findIndex((msg) => msg.id === rootMessageId) + 1;
+
+  // Get only messages that come after the last bot message (or all if no previous bot message)
+  const messagesToConsider =
+    endIndex >= 0
+      ? messages.slice(startIndex, endIndex)
+      : messages.slice(startIndex);
+
+  const newMessages = messagesToConsider.filter(
+    (message) => message.from?.user
+  );
+
+  const allContentFragments: PublicPostContentFragmentRequestBody[] = [];
+
+  // Process file attachments from both new messages AND the current message
+  const allMessagesToCheckForFiles = [
+    ...newMessages,
+    // Add current message to check for attachments
+    ...messages.filter((message) => {
+      return message.id === context.activity.id;
+    }),
+  ];
+
+  const allAttachments = allMessagesToCheckForFiles.flatMap(
+    (message) => message.attachments || []
+  );
+
+  // Upload file attachments
+  const fileContentFragments = await processFileAttachments(
+    allAttachments,
+    rubyAPI,
+    client,
+    localLogger
+  );
+
+  allContentFragments.push(...fileContentFragments);
+
+  // Create conversation history fragment
+  const conversationText = newMessages
+    .slice()
+    .reverse()
+    .map((message) => {
+      const sender = message.from?.user?.displayName || "Unknown User";
+      const timestamp = message.createdDateTime
+        ? new Date(message.createdDateTime).toISOString()
+        : "Unknown time";
+      const content = (message.body?.content || "")
+        .replace(/<[^>]*>/g, "")
+        .trim();
+      return `[${timestamp}] ${sender}: ${content}`;
+    })
+    .join("\n\n");
+
+  const title = lastMicrosoftBotMessage
+    ? "Teams - new messages"
+    : "Teams conversation history";
+  const fileName = `teams_conversation-${teamsConversationId}.txt`;
+
+  const fileRes = await rubyAPI.uploadFile({
+    contentType: "text/plain",
+    fileName,
+    fileSize: conversationText.length,
+    useCase: "conversation",
+    useCaseMetadata: lastMicrosoftBotMessage
+      ? { conversationId: lastMicrosoftBotMessage.conversationId }
+      : undefined,
+    fileObject: new File([conversationText], fileName, {
+      type: "text/plain",
+    }),
+  });
+
+  if (fileRes.isOk()) {
+    allContentFragments.push({
+      title,
+      url: null,
+      fileId: fileRes.value.sId,
+      context: null,
+    });
+  }
+
+  return new Ok(
+    allContentFragments.length > 0 ? allContentFragments : undefined
+  );
+}
+
+export async function sendFeedback({
+  context,
+  connector,
+  thumbDirection,
+  localLogger,
+}: {
+  context: TurnContext;
+  connector: ConnectorResource;
+  thumbDirection: "up" | "down";
+  localLogger: Logger;
+}) {
+  // Validate user first
+  const validatedUser = await validateTeamsUser(
+    context,
+    connector,
+    localLogger
+  );
+  if (!validatedUser) {
+    return;
+  }
+
+  const { email, displayName } = validatedUser;
+
+  const conversationId = context.activity.conversation?.id;
+  const replyTo = context.activity.replyToId;
+
+  if (!conversationId || !replyTo) {
+    localLogger.error("No conversation ID or reply to ID found in activity");
+    return;
+  }
+
+  // Find the MicrosoftBotMessage to get the Ruby conversation ID
+  const microsoftBotMessage = await MicrosoftBotMessageModel.findOne({
+    where: {
+      connectorId: connector.id,
+      conversationId: conversationId,
+      agentActivityId: replyTo,
+    },
+    order: [["createdAt", "DESC"]],
+  });
+
+  if (
+    !microsoftBotMessage?.rubyConversationId ||
+    !microsoftBotMessage?.rubyAgentMessageId
+  ) {
+    localLogger.error(
+      "No MicrosoftBotMessage found for conversation ID and reply to ID"
+    );
+    return;
+  }
+
+  const rubyAPI = new RubyAPI(
+    { url: apiConfig.getRubyFrontAPIUrl() },
+    {
+      workspaceId: connector.workspaceId,
+      apiKey: connector.workspaceAPIKey,
+      extraHeaders: {
+        ...getHeaderFromUserEmail(email),
+      },
+    },
+    localLogger
+  );
+
+  const feedbackRes = await rubyAPI.postFeedback(
+    microsoftBotMessage.rubyConversationId,
+    microsoftBotMessage.rubyAgentMessageId,
+    {
+      thumbDirection,
+      feedbackContent: null,
+      isConversationShared: true, // Teams feedback is considered shared
+    }
+  );
+
+  if (feedbackRes.isErr()) {
+    localLogger.error(
+      {
+        error: feedbackRes.error,
+        rubyConversationId: microsoftBotMessage.rubyConversationId,
+        thumbDirection,
+        userEmail: email,
+        userDisplayName: displayName,
+      },
+      "Failed to submit feedback from Teams"
+    );
+    return;
+  }
+}
+
+export async function botValidateToolExecution({
+  context,
+  connector,
+  approved,
+  conversationId,
+  messageId,
+  actionId,
+  microsoftBotMessageId,
+  localLogger,
+}: {
+  context: TurnContext;
+  connector: ConnectorResource;
+  approved: "approved" | "rejected";
+  conversationId: string;
+  messageId: string;
+  actionId: string;
+  microsoftBotMessageId: number;
+  localLogger: Logger;
+}): Promise<Result<undefined, APIError | Error>> {
+  // Validate user first
+  const validatedUser = await validateTeamsUser(
+    context,
+    connector,
+    localLogger
+  );
+  if (!validatedUser) {
+    return new Ok(undefined);
+  }
+
+  const { email } = validatedUser;
+
+  // Find the MicrosoftBotMessage
+  const microsoftBotMessage = await MicrosoftBotMessageModel.findOne({
+    where: { id: microsoftBotMessageId },
+  });
+
+  if (!microsoftBotMessage) {
+    localLogger.error(
+      { microsoftBotMessageId },
+      "No MicrosoftBotMessage found for tool validation"
+    );
+    return new Err(new Error("Missing Microsoft bot message"));
+  }
+
+  const rubyAPI = new RubyAPI(
+    { url: apiConfig.getRubyFrontAPIUrl() },
+    {
+      workspaceId: connector.workspaceId,
+      apiKey: connector.workspaceAPIKey,
+      extraHeaders: {
+        ...getHeaderFromUserEmail(email),
+      },
+    },
+    localLogger
+  );
+
+  // Call validateAction on Ruby API
+  const res = await rubyAPI.validateAction({
+    conversationId,
+    messageId,
+    actionId,
+    approved,
+  });
+
+  if (res.isErr()) {
+    localLogger.error(
+      {
+        error: res.error,
+        conversationId,
+        messageId,
+        actionId,
+      },
+      "Failed to validate action on Ruby API"
+    );
+    return res;
+  }
+
+  // Retry blocked actions on the main conversation if it differs from the event's conversation
+  if (
+    microsoftBotMessage.rubyConversationId &&
+    microsoftBotMessage.rubyConversationId !== conversationId
+  ) {
+    const retryRes = await rubyAPI.retryMessage({
+      conversationId,
+      messageId,
+      blockedOnly: true,
+    });
+
+    if (retryRes.isErr()) {
+      localLogger.error(
+        {
+          error: retryRes.error,
+          connectorId: connector.id,
+          mainConversationId: microsoftBotMessage.rubyConversationId,
+          eventConversationId: conversationId,
+          agentMessageId: messageId,
+        },
+        "Failed to retry blocked actions on the main conversation"
+      );
+    }
+  }
+
+  return new Ok(undefined);
+}

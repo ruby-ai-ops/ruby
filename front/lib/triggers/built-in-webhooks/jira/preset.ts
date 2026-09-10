@@ -1,0 +1,59 @@
+import {
+  issueCreatedExample,
+  issueCreatedSchema,
+} from "@app/lib/triggers/built-in-webhooks/jira/schemas/issue_created";
+import {
+  issueDeletedExample,
+  issueDeletedSchema,
+} from "@app/lib/triggers/built-in-webhooks/jira/schemas/issue_deleted";
+import {
+  issueUpdatedExample,
+  issueUpdatedSchema,
+} from "@app/lib/triggers/built-in-webhooks/jira/schemas/issue_updated";
+import type {
+  BaseWebhookPreset,
+  WebhookEvent,
+} from "@app/types/triggers/webhooks_source_preset";
+
+const JIRA_ISSUE_CREATED_EVENT: WebhookEvent = {
+  name: "issue_created",
+  value: "jira:issue_created",
+  description:
+    "Triggered when a new issue is created in Jira. The event includes details about the issue, creator, and project.",
+  schema: issueCreatedSchema,
+  sample: issueCreatedExample,
+};
+
+const JIRA_ISSUE_UPDATED_EVENT: WebhookEvent = {
+  name: "issue_updated",
+  value: "jira:issue_updated",
+  description:
+    "Triggered when an existing issue is updated in Jira. The event includes details about the changes made to the issue.",
+  schema: issueUpdatedSchema,
+  sample: issueUpdatedExample,
+};
+
+const JIRA_ISSUE_DELETED_EVENT: WebhookEvent = {
+  name: "issue_deleted",
+  value: "jira:issue_deleted",
+  description:
+    "Triggered when an issue is deleted in Jira. The event includes details about the deleted issue and the user who performed the deletion.",
+  schema: issueDeletedSchema,
+  sample: issueDeletedExample,
+};
+
+export const JIRA_WEBHOOK_PRESET: BaseWebhookPreset = {
+  name: "Jira",
+  eventCheck: {
+    type: "body",
+    field: "webhookEvent",
+  },
+  events: [
+    JIRA_ISSUE_CREATED_EVENT,
+    JIRA_ISSUE_UPDATED_EVENT,
+    JIRA_ISSUE_DELETED_EVENT,
+  ],
+  description: "Receive events from Jira such as creation of issues.",
+  filterGenerationInstructions: null,
+  webhookPageUrl: `https://id.atlassian.com/manage-profile/security/api-tokens`,
+};

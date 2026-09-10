@@ -1,0 +1,551 @@
+import {
+  ActionDetailsWrapper,
+  ActionExecutionProvider,
+} from "@app/components/actions/ActionDetailsWrapper";
+import {
+  makeQueryTextForDataSourceSearch,
+  makeQueryTextForFind,
+  makeQueryTextForInclude,
+  makeQueryTextForList,
+} from "@app/components/actions/mcp/details/input_rendering";
+import {
+  MCPAgentMemoryEditActionDetails,
+  MCPAgentMemoryEraseActionDetails,
+  MCPAgentMemoryRecordActionDetails,
+  MCPAgentMemoryRetrieveActionDetails,
+} from "@app/components/actions/mcp/details/MCPAgentMemoryActionDetails";
+import { MCPAskUserQuestionActionDetails } from "@app/components/actions/mcp/details/MCPAskUserQuestionActionDetails";
+import { MCPBrowseActionDetails } from "@app/components/actions/mcp/details/MCPBrowseActionDetails";
+import { MCPConversationCatFileDetails } from "@app/components/actions/mcp/details/MCPConversationFilesActionDetails";
+import {
+  DataSourceNodeContentDetails,
+  FilesystemPathDetails,
+} from "@app/components/actions/mcp/details/MCPDataSourcesFileSystemActionDetails";
+import { MCPDataWarehousesBrowseDetails } from "@app/components/actions/mcp/details/MCPDataWarehousesBrowseDetails";
+import { MCPExtractActionDetails } from "@app/components/actions/mcp/details/MCPExtractActionDetails";
+import { MCPGetDatabaseSchemaActionDetails } from "@app/components/actions/mcp/details/MCPGetDatabaseSchemaActionDetails";
+import { MCPImageGenerationActionDetails } from "@app/components/actions/mcp/details/MCPImageGenerationActionDetails";
+import { MCPListToolsActionDetails } from "@app/components/actions/mcp/details/MCPListToolsActionDetails";
+import { MCPRunAgentActionDetails } from "@app/components/actions/mcp/details/MCPRunAgentActionDetails";
+import { MCPSandboxActionDetails } from "@app/components/actions/mcp/details/MCPSandboxActionDetails";
+import { MCPSandboxAddEgressDomainDetails } from "@app/components/actions/mcp/details/MCPSandboxAddEgressDomainDetails";
+import { MCPSkillEnableActionDetails } from "@app/components/actions/mcp/details/MCPSkillEnableActionDetails";
+import { MCPTablesQueryActionDetails } from "@app/components/actions/mcp/details/MCPTablesQueryActionDetails";
+import {
+  SearchResultDetails,
+  ToolGeneratedFileDetails,
+} from "@app/components/actions/mcp/details/MCPToolOutputDetails";
+import { MCPToolsetsEnableActionDetails } from "@app/components/actions/mcp/details/MCPToolsetsEnableActionDetails";
+import type {
+  ActionDetailsDisplayContext,
+  ToolExecutionDetailsProps,
+} from "@app/components/actions/mcp/details/types";
+import { InternalActionIcons } from "@app/components/resources/resources_icons";
+import { ENABLE_SKILL_TOOL_NAME } from "@app/lib/actions/constants";
+import {
+  DATA_WAREHOUSES_DESCRIBE_TABLES_TOOL_NAME,
+  DATA_WAREHOUSES_FIND_TOOL_NAME,
+  DATA_WAREHOUSES_LIST_TOOL_NAME,
+  DATA_WAREHOUSES_QUERY_TOOL_NAME,
+  GENERATE_IMAGE_TOOL_NAME,
+  getInternalMCPServerIconByName,
+  INCLUDE_TOOL_NAME,
+  INTERNAL_SERVERS_WITH_WEBSEARCH,
+  PROCESS_TOOL_NAME,
+  SEARCH_TOOL_NAME,
+  SKILL_MANAGEMENT_SERVER_NAME,
+  TOOLSETS_ENABLE_TOOL_NAME,
+  TOOLSETS_LIST_TOOL_NAME,
+  WEBBROWSER_TOOL_NAME,
+  WEBSEARCH_TOOL_NAME,
+} from "@app/lib/actions/mcp_internal_actions/constants";
+import type { ProgressNotificationContentType } from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import {
+  getOutputText,
+  isResourceContentWithText,
+  isTextContent,
+} from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import {
+  isDataSourceFilesystemFindInputType,
+  isDataSourceFilesystemListInputType,
+  isIncludeInputType,
+  isSearchInputTypeWithTags,
+  isWebsearchInputType,
+} from "@app/lib/actions/mcp_internal_actions/types";
+import { MCP_SPECIFICATION } from "@app/lib/actions/utils_ui";
+import {
+  AGENT_MEMORY_COMPACT_TOOL_NAME,
+  AGENT_MEMORY_EDIT_TOOL_NAME,
+  AGENT_MEMORY_ERASE_TOOL_NAME,
+  AGENT_MEMORY_RECORD_TOOL_NAME,
+  AGENT_MEMORY_RETRIEVE_TOOL_NAME,
+} from "@app/lib/api/actions/servers/agent_memory/metadata";
+import { CONVERSATION_CAT_FILE_ACTION_NAME } from "@app/lib/api/actions/servers/conversation_files/metadata";
+import {
+  FILESYSTEM_CAT_TOOL_NAME,
+  FILESYSTEM_FIND_TOOL_NAME,
+  FILESYSTEM_LIST_TOOL_NAME,
+  FILESYSTEM_LOCATE_IN_TREE_TOOL_NAME,
+  FILESYSTEM_SEARCH_TOOL_NAME,
+} from "@app/lib/api/actions/servers/data_sources_file_system/metadata";
+import {
+  EXECUTE_DATABASE_QUERY_TOOL_NAME,
+  GET_DATABASE_SCHEMA_TOOL_NAME,
+  TABLE_QUERY_V2_SERVER_NAME,
+} from "@app/lib/api/actions/servers/query_tables_v2/metadata";
+import {
+  SKILL_AUTHORING_SERVER_NAME,
+  UPDATE_SKILL_TOOL_NAME,
+} from "@app/lib/api/actions/servers/skill_authoring/metadata";
+import { useSkill } from "@app/lib/swr/skill_configurations";
+import { isValidJSON } from "@app/lib/utils/json";
+import type { AgentMCPActionWithOutputType } from "@app/types/actions";
+import type { AgentMessageStatus } from "@app/types/assistant/conversation";
+import { isString } from "@app/types/shared/utils/general";
+import { asDisplayName } from "@app/types/shared/utils/string_utils";
+import type { LightWorkspaceType } from "@app/types/user";
+import {
+  Clock,
+  ContentBlockWrapper,
+  ContentMessage,
+  File06,
+  Globe01,
+  Markdown,
+  SearchMd,
+} from "@ruby-ai/sparkle";
+import { useEffect, useState } from "react";
+
+interface MCPActionDetailsProps {
+  action: AgentMCPActionWithOutputType;
+  owner: LightWorkspaceType;
+  lastNotification: ProgressNotificationContentType | null;
+  messageStatus?: AgentMessageStatus;
+  displayContext: ActionDetailsDisplayContext;
+}
+
+function getActionLabel({
+  action,
+  displayContext,
+}: {
+  action: AgentMCPActionWithOutputType;
+  displayContext: ActionDetailsDisplayContext;
+}): string {
+  if (action.displayLabels) {
+    return displayContext === "conversation"
+      ? action.displayLabels.running
+      : action.displayLabels.done;
+  }
+
+  return (
+    (displayContext === "conversation" ? "Running a tool" : "Run a tool") +
+    (action.functionCallName
+      ? `: ${asDisplayName(action.functionCallName)}`
+      : "")
+  );
+}
+
+export function MCPActionDetails(props: MCPActionDetailsProps) {
+  return (
+    <ActionExecutionProvider
+      executionDurationMs={props.action.executionDurationMs}
+      isExecuting={props.action.status === "running"}
+      startedAtMs={props.action.createdAt}
+    >
+      <MCPActionDetailsInner {...props} />
+    </ActionExecutionProvider>
+  );
+}
+
+function MCPActionDetailsInner({
+  action,
+  displayContext,
+  owner,
+  lastNotification,
+  messageStatus,
+}: MCPActionDetailsProps) {
+  const {
+    params: originalParams,
+    status,
+    output: baseOutput,
+    internalMCPServerName,
+    toolName,
+  } = action;
+  const params = {
+    ...originalParams,
+    ...(action.userEditedInputs ?? {}),
+  };
+
+  const [output, setOutput] = useState(baseOutput);
+
+  useEffect(() => {
+    if (status === "denied") {
+      const deniedMessage = {
+        type: "text" as const,
+        text: "Tool execution rejected or skipped by the user.",
+      };
+
+      if (baseOutput === null) {
+        setOutput([deniedMessage]);
+      } else {
+        setOutput([...baseOutput, deniedMessage]);
+      }
+    } else {
+      setOutput(baseOutput);
+    }
+  }, [status, baseOutput]);
+
+  const toolOutputDetailsProps: ToolExecutionDetailsProps = {
+    lastNotification,
+    messageStatus,
+    owner,
+    toolOutput: output,
+    toolParams: params,
+    displayContext,
+  };
+
+  if (
+    internalMCPServerName === "search" ||
+    internalMCPServerName === "data_sources_file_system" ||
+    (internalMCPServerName === "pod_manager" && toolName === "semantic_search")
+  ) {
+    switch (toolName) {
+      case SEARCH_TOOL_NAME:
+      case FILESYSTEM_SEARCH_TOOL_NAME:
+        return (
+          <SearchResultDetails
+            displayContext={displayContext}
+            actionName={
+              displayContext === "conversation"
+                ? "Searching data"
+                : "Search data"
+            }
+            actionOutput={output}
+            visual={SearchMd}
+            query={
+              isSearchInputTypeWithTags(params)
+                ? makeQueryTextForDataSourceSearch(params)
+                : null
+            }
+          />
+        );
+      case FILESYSTEM_LIST_TOOL_NAME:
+      case FILESYSTEM_FIND_TOOL_NAME:
+        return (
+          <SearchResultDetails
+            displayContext={displayContext}
+            actionName={
+              displayContext === "conversation"
+                ? "Browsing data sources"
+                : "Browse data sources"
+            }
+            actionOutput={output}
+            query={
+              isDataSourceFilesystemFindInputType(params)
+                ? makeQueryTextForFind(params)
+                : isDataSourceFilesystemListInputType(params)
+                  ? makeQueryTextForList(params)
+                  : null
+            }
+            visual={File06}
+          />
+        );
+      case FILESYSTEM_CAT_TOOL_NAME:
+        return <DataSourceNodeContentDetails {...toolOutputDetailsProps} />;
+      case FILESYSTEM_LOCATE_IN_TREE_TOOL_NAME:
+        return <FilesystemPathDetails {...toolOutputDetailsProps} />;
+    }
+  }
+
+  if (
+    (internalMCPServerName === "include_data" &&
+      toolName === INCLUDE_TOOL_NAME) ||
+    (internalMCPServerName === "pod_manager" &&
+      toolName === "retrieve_recent_documents")
+  ) {
+    return (
+      <SearchResultDetails
+        displayContext={displayContext}
+        actionName={
+          displayContext === "conversation" ? "Including data" : "Include data"
+        }
+        actionOutput={output}
+        visual={Clock}
+        query={
+          isIncludeInputType(params) ? makeQueryTextForInclude(params) : null
+        }
+      />
+    );
+  }
+
+  if (
+    INTERNAL_SERVERS_WITH_WEBSEARCH.some(
+      (name) => internalMCPServerName === name
+    )
+  ) {
+    switch (toolName) {
+      case WEBSEARCH_TOOL_NAME:
+        return (
+          <SearchResultDetails
+            displayContext={displayContext}
+            query={isWebsearchInputType(params) ? params.query : null}
+            actionName={
+              displayContext === "conversation"
+                ? "Searching the web"
+                : "Web search"
+            }
+            actionOutput={output}
+            visual={Globe01}
+          />
+        );
+      case WEBBROWSER_TOOL_NAME:
+        return <MCPBrowseActionDetails {...toolOutputDetailsProps} />;
+    }
+  }
+
+  if (internalMCPServerName === TABLE_QUERY_V2_SERVER_NAME) {
+    switch (toolName) {
+      case GET_DATABASE_SCHEMA_TOOL_NAME:
+        return (
+          <MCPGetDatabaseSchemaActionDetails {...toolOutputDetailsProps} />
+        );
+      case EXECUTE_DATABASE_QUERY_TOOL_NAME:
+        return <MCPTablesQueryActionDetails {...toolOutputDetailsProps} />;
+    }
+  }
+
+  if (
+    internalMCPServerName === "extract_data" &&
+    toolName === PROCESS_TOOL_NAME
+  ) {
+    return <MCPExtractActionDetails {...toolOutputDetailsProps} />;
+  }
+
+  if (
+    internalMCPServerName === "image_generation" &&
+    toolName === GENERATE_IMAGE_TOOL_NAME
+  ) {
+    return <MCPImageGenerationActionDetails {...toolOutputDetailsProps} />;
+  }
+
+  if (internalMCPServerName === "run_agent") {
+    return <MCPRunAgentActionDetails {...toolOutputDetailsProps} />;
+  }
+
+  if (internalMCPServerName === "agent_memory") {
+    switch (toolName) {
+      case AGENT_MEMORY_RETRIEVE_TOOL_NAME:
+        return (
+          <MCPAgentMemoryRetrieveActionDetails {...toolOutputDetailsProps} />
+        );
+      case AGENT_MEMORY_RECORD_TOOL_NAME:
+        return (
+          <MCPAgentMemoryRecordActionDetails {...toolOutputDetailsProps} />
+        );
+      case AGENT_MEMORY_ERASE_TOOL_NAME:
+        return <MCPAgentMemoryEraseActionDetails {...toolOutputDetailsProps} />;
+      case AGENT_MEMORY_EDIT_TOOL_NAME:
+      case AGENT_MEMORY_COMPACT_TOOL_NAME:
+        return (
+          <MCPAgentMemoryEditActionDetails
+            {...toolOutputDetailsProps}
+            toolName={toolName}
+          />
+        );
+    }
+  }
+
+  if (internalMCPServerName === "toolsets") {
+    switch (toolName) {
+      case TOOLSETS_ENABLE_TOOL_NAME:
+        return <MCPToolsetsEnableActionDetails {...toolOutputDetailsProps} />;
+      case TOOLSETS_LIST_TOOL_NAME:
+        return <MCPListToolsActionDetails {...toolOutputDetailsProps} />;
+    }
+  }
+
+  if (
+    internalMCPServerName === SKILL_MANAGEMENT_SERVER_NAME &&
+    toolName === ENABLE_SKILL_TOOL_NAME
+  ) {
+    return <MCPSkillEnableActionDetails {...toolOutputDetailsProps} />;
+  }
+
+  if (
+    internalMCPServerName === SKILL_AUTHORING_SERVER_NAME &&
+    toolName === UPDATE_SKILL_TOOL_NAME
+  ) {
+    return (
+      <MCPSkillAuthoringUpdateActionDetails
+        owner={owner}
+        action={{ ...action, output }}
+        displayContext={displayContext}
+        lastNotification={lastNotification}
+        messageStatus={messageStatus}
+      />
+    );
+  }
+
+  if (internalMCPServerName === "data_warehouses") {
+    switch (toolName) {
+      case DATA_WAREHOUSES_LIST_TOOL_NAME:
+      case DATA_WAREHOUSES_FIND_TOOL_NAME:
+        return <MCPDataWarehousesBrowseDetails {...toolOutputDetailsProps} />;
+      case DATA_WAREHOUSES_DESCRIBE_TABLES_TOOL_NAME:
+        return (
+          <MCPGetDatabaseSchemaActionDetails {...toolOutputDetailsProps} />
+        );
+      case DATA_WAREHOUSES_QUERY_TOOL_NAME:
+        return <MCPTablesQueryActionDetails {...toolOutputDetailsProps} />;
+    }
+  }
+
+  if (
+    internalMCPServerName === "conversation_files" &&
+    toolName === CONVERSATION_CAT_FILE_ACTION_NAME
+  ) {
+    return <MCPConversationCatFileDetails {...toolOutputDetailsProps} />;
+  }
+
+  if (internalMCPServerName === "sandbox") {
+    if (toolName === "add_egress_domain") {
+      return <MCPSandboxAddEgressDomainDetails {...toolOutputDetailsProps} />;
+    }
+    return <MCPSandboxActionDetails {...toolOutputDetailsProps} />;
+  }
+
+  if (internalMCPServerName === "ask_user_question") {
+    return <MCPAskUserQuestionActionDetails {...toolOutputDetailsProps} />;
+  }
+
+  return (
+    <GenericActionDetails
+      owner={owner}
+      lastNotification={lastNotification}
+      messageStatus={messageStatus}
+      displayContext={displayContext}
+      action={{ ...action, params, output }}
+    />
+  );
+}
+
+export function GenericActionDetails({
+  owner,
+  action,
+  displayContext,
+}: MCPActionDetailsProps) {
+  const inputs =
+    Object.keys(action.params).length > 0
+      ? JSON.stringify(action.params, undefined, 2)
+      : null;
+
+  const actionIcon =
+    action.internalMCPServerName &&
+    InternalActionIcons[
+      getInternalMCPServerIconByName(action.internalMCPServerName)
+    ];
+
+  return (
+    <ActionDetailsWrapper
+      displayContext={displayContext}
+      actionName={getActionLabel({ action, displayContext })}
+      visual={actionIcon ?? MCP_SPECIFICATION.cardIcon}
+    >
+      {displayContext !== "conversation" && (
+        <div className="dd-privacy-mask flex flex-col gap-4 py-4 pl-6">
+          <div>
+            <span className="font-medium text-foreground">Inputs</span>
+            <RenderToolItemMarkdown text={inputs} type="input" />
+          </div>
+          {action.output && (
+            <div>
+              <span className="font-medium text-foreground">Output</span>
+              <div className="my-2 flex flex-col gap-2">
+                {action.output
+                  .filter(
+                    (o) => isTextContent(o) || isResourceContentWithText(o)
+                  )
+                  .map((o, index) => (
+                    <RenderToolItemMarkdown
+                      key={index}
+                      text={getOutputText(o)}
+                      type="output"
+                    />
+                  ))}
+              </div>
+            </div>
+          )}
+
+          {action.generatedFiles.filter((f) => !f.hidden).length > 0 && (
+            <>
+              <span className="heading-base">Generated Files</span>
+              <div className="flex flex-wrap gap-2">
+                {action.generatedFiles
+                  .filter((f) => !f.hidden)
+                  .map((file) => (
+                    <ToolGeneratedFileDetails
+                      key={file.fileId}
+                      resource={file}
+                    />
+                  ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </ActionDetailsWrapper>
+  );
+}
+
+// `update_skill` identifies its target by `sId`, which is meaningless to a
+// human. Resolve it to the skill name (or "Unknown skill") and surface that in
+// the inputs instead of the raw id, reusing the generic renderer otherwise.
+function MCPSkillAuthoringUpdateActionDetails(props: MCPActionDetailsProps) {
+  const { action, owner } = props;
+
+  const skillId = isString(action.params.sId) ? action.params.sId : null;
+  const { skill, isSkillLoading } = useSkill({
+    workspaceId: owner.sId,
+    skillId,
+    disabled: !skillId,
+  });
+
+  const skillName = isSkillLoading
+    ? "Loading…"
+    : (skill?.name ?? "Unknown skill");
+
+  const { sId: _sId, ...restParams } = action.params;
+  const displayAction = {
+    ...action,
+    params: { skill: skillName, ...restParams },
+  };
+
+  return <GenericActionDetails {...props} action={displayAction} />;
+}
+
+const RenderToolItemMarkdown = ({
+  text,
+  type,
+}: {
+  text: string | null;
+  type: "input" | "output";
+}) => {
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+  if (!text) {
+    text =
+      type === "input"
+        ? "*The tool was called with no specified inputs.*"
+        : "*The tool completed with no output.*";
+  }
+
+  if (isValidJSON(text)) {
+    return <Markdown content={`\`\`\`json\n${text}\n\`\`\``} />;
+  }
+
+  return (
+    <ContentBlockWrapper content={text}>
+      <ContentMessage variant="primary" size="lg">
+        <Markdown content={text} />
+      </ContentMessage>
+    </ContentBlockWrapper>
+  );
+};

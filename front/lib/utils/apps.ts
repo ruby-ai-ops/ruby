@@ -1,0 +1,491 @@
+// We use the public API to call the Ruby Apps, it's okay here.
+
+import { default as config } from "@app/lib/api/config";
+import { getDatasetHash, getDatasets } from "@app/lib/api/datasets";
+import type { Authenticator } from "@app/lib/auth";
+import { AppResource } from "@app/lib/resources/app_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { DatasetModel } from "@app/lib/resources/storage/models/apps";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import type { AppType } from "@app/types/app";
+import type { CoreAPIError } from "@app/types/core/core_api";
+import { CoreAPI } from "@app/types/core/core_api";
+import type { DatasetType } from "@app/types/dataset";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+// biome-ignore lint/plugin/enforceClientTypesInPublicApi: existing usage
+import type { ApiAppImportType, ApiAppType } from "@ruby-ai/client";
+import isEqual from "lodash/isEqual";
+import omit from "lodash/omit";
+
+async function updateOrCreateApp(
+  auth: Authenticator,
+  {
+    appToImport,
+    space,
+  }: {
+    appToImport: ApiAppImportType;
+    space: SpaceResource;
+  }
+): Promise<
+  Result<{ app: AppResource; updated: boolean }, Error | CoreAPIError>
+> {
+  const existingApps = await AppResource.listBySpace(auth, space, {
+    includeDeleted: true,
+  });
+  const existingApp = existingApps.find((a) => a.sId === appToImport.sId);
+  if (existingApp) {
+    // Check if existing app was deleted
+    if (existingApp.deletedAt) {
+      return new Err(
+        new Error("App has been deleted, it can't be reimported.")
+      );
+    }
+
+    // Now update if name/descriptions have been modified
+    if (
+      existingApp.name !== appToImport.name ||
+      existingApp.description !== appToImport.description
+    ) {
+      await existingApp.updateSettings(auth, {
+        name: appToImport.name,
+        description: appToImport.description,
+      });
+      return new Ok({ app: existingApp, updated: true });
+    }
+    return new Ok({ app: existingApp, updated: false });
+  } else {
+    // An app with this sId exist, check workspace and space first to see if it matches
+    const existingApp = await AppResource.fetchById(auth, appToImport.sId);
+    if (existingApp) {
+      return new Err(
+        new Error("App with this sId already exists in another space.")
+      );
+    }
+
+    // App does not exist, create a new app
+    const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+    const p = await coreAPI.createProject();
+
+    if (p.isErr()) {
+      return p;
+    }
+    const rubyAPIProject = p.value.project;
+
+    const owner = auth.getNonNullableWorkspace();
+    const newApp = await AppResource.makeNew(
+      {
+        id: appToImport.id,
+        sId: appToImport.sId,
+        name: appToImport.name,
+        description: appToImport.description,
+        visibility: "private",
+        rubyAPIProjectId: rubyAPIProject.project_id.toString(),
+        workspaceId: owner.id,
+      },
+      space
+    );
+
+    return new Ok({ app: newApp, updated: true });
+  }
+}
+
+async function updateDatasets(
+  auth: Authenticator,
+  {
+    app,
+    datasetsToImport,
+  }: {
+    app: AppResource;
+    datasetsToImport: ApiAppImportType["datasets"];
+  }
+): Promise<Result<boolean, CoreAPIError>> {
+  if (datasetsToImport) {
+    const owner = auth.getNonNullableWorkspace();
+    const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+    // Getting all existing datasets for this app
+    const existingDatasets = await DatasetModel.findAll({
+      where: {
+        workspaceId: owner.id,
+        appId: app.id,
+      },
+    });
+
+    for (const datasetToImport of datasetsToImport) {
+      // First, create or update the dataset in core
+      const coreDataset = await coreAPI.createDataset({
+        projectId: app.rubyAPIProjectId,
+        datasetId: datasetToImport.name,
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+        data: datasetToImport.data || [],
+      });
+      if (coreDataset.isErr()) {
+        return coreDataset;
+      }
+
+      // Now update the dataset in front if it exists, or create one
+      if (datasetToImport.schema) {
+        const dataset = existingDatasets.find(
+          (d) => d.name === datasetToImport.name
+        );
+        if (dataset) {
+          if (
+            !isEqual(dataset.schema, datasetToImport.schema) ||
+            dataset.description !== datasetToImport.description
+          ) {
+            await dataset.update({
+              description: datasetToImport.description,
+              schema: datasetToImport.schema,
+            });
+          }
+        } else {
+          await DatasetModel.create({
+            name: datasetToImport.name,
+            description: datasetToImport.description,
+            appId: app.id,
+            workspaceId: owner.id,
+            schema: datasetToImport.schema,
+          });
+        }
+      }
+    }
+  }
+  return new Ok(true);
+}
+
+async function updateAppSpecifications(
+  auth: Authenticator,
+  {
+    app,
+    savedSpecification,
+    coreSpecifications,
+    savedConfig,
+  }: {
+    app: AppResource;
+    savedSpecification: string;
+    coreSpecifications?: Record<string, string>;
+    savedConfig: string;
+  }
+): Promise<Result<boolean, CoreAPIError | Error>> {
+  logger.info({ sId: app.sId, name: app.name }, "Updating app specifications");
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+  // Specification or config have been modified and need to be imported
+  if (
+    savedSpecification !== app.savedSpecification ||
+    savedConfig !== app.savedConfig
+  ) {
+    await app.updateState(auth, {
+      savedSpecification,
+      savedConfig,
+    });
+  } else {
+    logger.info(
+      { sId: app.sId, name: app.name },
+      "No changes to front app specifications"
+    );
+  }
+
+  if (coreSpecifications) {
+    const existingHashes = await coreAPI.getSpecificationHashes({
+      projectId: app.rubyAPIProjectId,
+    });
+    if (existingHashes.isOk()) {
+      // Remove hashes that already exist in core
+      coreSpecifications = omit(
+        coreSpecifications,
+        existingHashes.value.hashes
+      );
+    }
+
+    if (Object.keys(coreSpecifications).length > 0) {
+      logger.info(
+        {
+          sId: app.sId,
+          name: app.name,
+          hashes: Object.keys(coreSpecifications),
+        },
+        "Updating core app specifications"
+      );
+
+      await concurrentExecutor(
+        Object.values(coreSpecifications),
+        async (specification) => {
+          await coreAPI.saveSpecification({
+            projectId: app.rubyAPIProjectId,
+            specification: specification,
+          });
+        },
+        { concurrency: 10 }
+      );
+
+      return new Ok(true);
+    }
+  }
+  return new Ok(false);
+}
+
+export async function importApp(
+  auth: Authenticator,
+  space: SpaceResource,
+  appToImport: ApiAppImportType
+): Promise<
+  Result<{ app: AppResource; updated: boolean }, CoreAPIError | Error>
+> {
+  logger.info(
+    { sId: appToImport.sId, name: appToImport.name },
+    "Importing app"
+  );
+  const appRes = await updateOrCreateApp(auth, {
+    appToImport,
+    space,
+  });
+  if (appRes.isErr()) {
+    logger.error(
+      { sId: appToImport.sId, name: appToImport.name, error: appRes.error },
+      "Error when importing app config"
+    );
+    return appRes;
+  }
+
+  const { app, updated } = appRes.value;
+
+  const datasetsRes = await updateDatasets(auth, {
+    app,
+    datasetsToImport: appToImport.datasets,
+  });
+  if (datasetsRes.isErr()) {
+    logger.error(
+      {
+        sId: app.sId,
+        name: app.name,
+        error: datasetsRes.error,
+      },
+      "Error when importing app datasets"
+    );
+    return datasetsRes;
+  }
+
+  if (appToImport.savedSpecification && appToImport.savedConfig) {
+    const updateSpecificationsRes = await updateAppSpecifications(auth, {
+      app,
+      savedSpecification: appToImport.savedSpecification,
+      coreSpecifications: appToImport.coreSpecifications,
+      savedConfig: appToImport.savedConfig,
+    });
+    if (updateSpecificationsRes.isErr()) {
+      logger.error(
+        {
+          sId: app.sId,
+          name: app.name,
+          error: updateSpecificationsRes.error,
+        },
+        "Error when importing app specifications"
+      );
+      return updateSpecificationsRes;
+    }
+
+    const specUpdated = updateSpecificationsRes.value;
+    if (updated || specUpdated) {
+      logger.info(
+        { sId: app.sId, appName: app.name },
+        "App imported successfully"
+      );
+    }
+
+    return new Ok({ app, updated: updated || specUpdated });
+  }
+
+  if (updated) {
+    logger.info(
+      { sId: app.sId, appName: app.name },
+      "App imported successfully"
+    );
+  } else {
+    logger.info(
+      { sId: app.sId, appName: app.name },
+      "App unchanged, no updated needed"
+    );
+  }
+  return new Ok({ app, hash: undefined, updated });
+}
+
+interface ImportRes {
+  sId: string;
+  name: string;
+  error?: string;
+}
+
+export async function importApps(
+  auth: Authenticator,
+  space: SpaceResource,
+  appsToImport: ApiAppImportType[]
+): Promise<ImportRes[]> {
+  const apps: ImportRes[] = [];
+
+  for (const appToImport of appsToImport) {
+    const res = await importApp(auth, space, appToImport);
+    if (res.isErr()) {
+      apps.push({
+        sId: appToImport.sId,
+        name: appToImport.name,
+        error: res.error.message,
+      });
+    } else {
+      const { app, updated } = res.value;
+      if (updated) {
+        apps.push({ sId: app.sId, name: app.name });
+      }
+    }
+  }
+
+  return apps;
+}
+
+const extractDatasetIdsAndHashes = (specification: string) => {
+  const dataSetsToFetch: { datasetId: string; hash: string }[] = [];
+  const dataBlockMatch = specification.match(
+    /data [^\n]+\s*{\s*dataset_id:\s*([^\n]+)\s*hash:\s*([^\n]+)\s*}/
+  );
+  if (dataBlockMatch) {
+    const [, datasetId, hash] = dataBlockMatch;
+    dataSetsToFetch.push({ datasetId, hash });
+  }
+  return dataSetsToFetch;
+};
+
+export type ExportedApp = Omit<AppType, "space" | "id"> & {
+  datasets: DatasetType[];
+};
+
+/**
+ * Returns the serialized app along with the latest version of each dataset
+ * it references (including soft-deleted ones). Used by the poke admin UI
+ * to export a single app for re-import elsewhere.
+ */
+export async function exportAppWithDatasets(
+  auth: Authenticator,
+  app: AppResource
+): Promise<ExportedApp> {
+  const dataSetsToFetch = (await getDatasets(auth, app.toJSON())).map((ds) => ({
+    datasetId: ds.name,
+    hash: "latest",
+  }));
+  const datasets: DatasetType[] = [];
+  for (const dataset of dataSetsToFetch) {
+    const fromCore = await getDatasetHash(
+      auth,
+      app,
+      dataset.datasetId,
+      dataset.hash,
+      { includeDeleted: true }
+    );
+    if (fromCore) {
+      datasets.push(fromCore);
+    }
+  }
+  const appJson = omit(app.toJSON(), "id", "space");
+  return { ...appJson, datasets };
+}
+
+export async function exportApps(
+  auth: Authenticator,
+  space: SpaceResource
+): Promise<Result<ApiAppType[], Error>> {
+  const apps = await AppResource.listBySpace(auth, space);
+
+  // All apps belong to `space`; load its grant-derived enrichment once so the exported app keeps the
+  // space's `groupIds`/`isRestricted` (part of the public app contract) without relying on the
+  // eagerly-loaded grants.
+  const [enrichedSpace] = await SpaceResource.enrichSpacesWithAccess(auth, [
+    space,
+  ]);
+
+  const enhancedApps = await concurrentExecutor(
+    apps.filter((app) => app.canRead(auth)),
+
+    async (app) => {
+      const specsToFetch = await getSpecificationsHashesFromCore(
+        app.rubyAPIProjectId
+      );
+
+      const dataSetsToFetch = (await getDatasets(auth, app.toJSON())).map(
+        (ds) => ({ datasetId: ds.name, hash: "latest" })
+      );
+
+      const coreSpecifications: { [key: string]: string } = {};
+
+      if (specsToFetch) {
+        for (const hash of specsToFetch) {
+          const coreSpecification = await getSpecificationFromCore(
+            app.rubyAPIProjectId,
+            hash
+          );
+          if (coreSpecification) {
+            // Parse dataset_id and hash from specification if it contains DATA section
+            dataSetsToFetch.push(
+              ...extractDatasetIdsAndHashes(coreSpecification.data)
+            );
+
+            coreSpecifications[hash] = coreSpecification.data;
+          }
+        }
+      }
+      const datasets = [];
+      for (const dataset of dataSetsToFetch) {
+        const fromCore = await getDatasetHash(
+          auth,
+          app,
+          dataset.datasetId,
+          dataset.hash,
+          { includeDeleted: true }
+        );
+        if (fromCore) {
+          datasets.push(fromCore);
+        }
+      }
+
+      return {
+        ...app.enrichWithSpaceAccess(enrichedSpace),
+        datasets,
+        coreSpecifications,
+      };
+    },
+    { concurrency: 5 }
+  );
+  return new Ok(enhancedApps);
+}
+
+async function getSpecificationsHashesFromCore(rubyAPIProjectId: string) {
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+  const coreSpec = await coreAPI.getSpecificationHashes({
+    projectId: rubyAPIProjectId,
+  });
+
+  if (coreSpec.isErr()) {
+    return null;
+  }
+
+  return coreSpec.value.hashes;
+}
+
+async function getSpecificationFromCore(
+  rubyAPIProjectId: string,
+  hash: string
+) {
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+  const coreSpec = await coreAPI.getSpecification({
+    projectId: rubyAPIProjectId,
+    specificationHash: hash,
+  });
+
+  if (coreSpec.isErr()) {
+    return null;
+  }
+
+  return coreSpec.value.specification;
+}

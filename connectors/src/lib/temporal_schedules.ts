@@ -1,0 +1,254 @@
+import { getTemporalClient } from "@connectors/lib/temporal";
+import logger from "@connectors/logger/logger";
+import type { ConnectorResource } from "@connectors/resources/connector_resource";
+import { normalizeError } from "@connectors/types";
+import type { Result } from "@ruby-ai/client";
+import { Err, Ok } from "@ruby-ai/client";
+import type {
+  Client,
+  ScheduleHandle,
+  ScheduleOptionsAction,
+  ScheduleSpec,
+} from "@temporalio/client";
+import {
+  ScheduleNotFoundError,
+  ScheduleOverlapPolicy,
+  WorkflowNotFoundError,
+} from "@temporalio/client";
+import type { Duration } from "@temporalio/common";
+
+/**
+ * Terminates running workflows spawned by the given schedule.
+ * Throws a `ScheduleNotFoundError` if the schedule does not exist.
+ */
+async function terminateWorkflowsForSchedule(
+  scheduleHandle: ScheduleHandle,
+  client: Client,
+  {
+    stopReason,
+  }: {
+    stopReason: string;
+  }
+) {
+  const scheduleDescription = await scheduleHandle.describe();
+  // Terminate all the recent actions of the schedule,
+  // the running workflows are not available under scheduleDescription.info.runningActions.
+  for (const action of scheduleDescription.info.recentActions) {
+    try {
+      const workflowHandle = client.workflow.getHandle(
+        action.action.workflow.workflowId
+      );
+      await workflowHandle.terminate(stopReason);
+    } catch (error) {
+      if (!(error instanceof WorkflowNotFoundError)) {
+        logger.error({ error }, "Failed to terminate workflow.");
+        throw error;
+      }
+    }
+  }
+}
+
+/**
+ * Creates a schedule for the given connector.
+ */
+export async function createSchedule({
+  scheduleId,
+  action,
+  policies = {
+    overlap: ScheduleOverlapPolicy.BUFFER_ONE,
+    catchupWindow: "1 day",
+  },
+  spec,
+  connector,
+}: {
+  scheduleId: string;
+  action: ScheduleOptionsAction;
+  policies: {
+    overlap?: ScheduleOverlapPolicy;
+    catchupWindow?: Duration;
+    pauseOnFailure?: boolean;
+  };
+  spec: ScheduleSpec;
+  connector?: ConnectorResource;
+}): Promise<Result<string, Error>> {
+  const client = await getTemporalClient();
+
+  try {
+    const scheduleHandle = await client.schedule.create({
+      action: {
+        ...action,
+        // Workflow-level search attributes.
+        searchAttributes: {
+          ...action.searchAttributes,
+          connectorId: connector ? [connector?.id] : undefined,
+        },
+        // Workflow-level memo.
+        memo: {
+          ...action.memo,
+          connectorId: connector?.id,
+        },
+      },
+      scheduleId,
+      policies,
+      spec,
+      // Schedule-level search attributes.
+      searchAttributes: {
+        connectorId: connector ? [connector?.id] : undefined,
+      },
+    });
+
+    // Trigger the schedule to start the workflow immediately, unless a
+    // startAt delay was specified (in which case we let the schedule fire
+    // on its own after the delay).
+    if (!spec.startAt) {
+      await scheduleHandle.trigger();
+    }
+  } catch (error) {
+    logger.error(
+      {
+        connectorId: connector?.id,
+        scheduleId,
+        error,
+      },
+      "Failed to create and trigger schedule."
+    );
+    return new Err(normalizeError(error));
+  }
+
+  return new Ok(scheduleId);
+}
+
+/**
+ * Deletes the schedule and terminates the running workflows.
+ */
+export async function deleteSchedule({
+  scheduleId,
+  connector,
+}: {
+  scheduleId: string;
+  connector: ConnectorResource;
+}): Promise<Result<void, Error>> {
+  const client = await getTemporalClient();
+
+  const scheduleHandle = client.schedule.getHandle(scheduleId);
+  try {
+    // Terminate the running workflows.
+    await terminateWorkflowsForSchedule(scheduleHandle, client, {
+      stopReason: "Schedule deleted",
+    });
+
+    // Delete the schedule.
+    await scheduleHandle.delete();
+  } catch (error) {
+    if (!(error instanceof ScheduleNotFoundError)) {
+      logger.error(
+        {
+          connectorId: connector.id,
+          scheduleId,
+          error,
+        },
+        "Failed to delete schedule and terminate workflow."
+      );
+      return new Err(normalizeError(error));
+    }
+  }
+
+  return new Ok(undefined);
+}
+
+/**
+ * Unpauses the schedule if paused and triggers the schedule to start the workflow immediately.
+ */
+export async function unpauseAndTriggerSchedule({
+  scheduleId,
+  connector,
+}: {
+  scheduleId: string;
+  connector?: ConnectorResource;
+}): Promise<Result<string, Error>> {
+  const client = await getTemporalClient();
+
+  const scheduleHandle = client.schedule.getHandle(scheduleId);
+  try {
+    // Unpause the schedule if paused.
+    const scheduleDescription = await scheduleHandle.describe();
+    if (scheduleDescription.state.paused) {
+      await scheduleHandle.unpause();
+    }
+
+    // Trigger the schedule to start the workflow immediately.
+    await scheduleHandle.trigger();
+  } catch (error) {
+    if (!(error instanceof ScheduleNotFoundError)) {
+      logger.error(
+        {
+          connectorId: connector?.id,
+          scheduleId,
+          error,
+        },
+        "Failed to unpause and trigger schedule."
+      );
+      return new Err(normalizeError(error));
+    }
+  }
+
+  return new Ok(scheduleId);
+}
+
+/**
+ * Pauses the schedule if running and terminates the running workflows.
+ */
+export async function pauseSchedule({
+  scheduleId,
+  connector,
+  stopReason,
+}: {
+  scheduleId: string;
+  connector: ConnectorResource;
+  stopReason: string;
+}): Promise<Result<void, Error>> {
+  const client = await getTemporalClient();
+
+  const scheduleHandle = client.schedule.getHandle(scheduleId);
+  try {
+    // Pause the schedule if running.
+    await scheduleHandle.pause();
+
+    // Terminate the running workflows.
+    await terminateWorkflowsForSchedule(scheduleHandle, client, {
+      stopReason,
+    });
+  } catch (error) {
+    if (!(error instanceof ScheduleNotFoundError)) {
+      logger.error(
+        {
+          connectorId: connector.id,
+          scheduleId,
+          error,
+        },
+        "Failed to stop schedule and terminate workflow."
+      );
+      return new Err(normalizeError(error));
+    }
+  }
+
+  return new Ok(undefined);
+}
+
+export async function scheduleExists({ scheduleId }: { scheduleId: string }) {
+  const client = await getTemporalClient();
+
+  try {
+    const scheduleHandle = client.schedule.getHandle(scheduleId);
+
+    // This will actually throw an error if the schedule does not exist.
+    await scheduleHandle.describe();
+
+    return true;
+  } catch (error) {
+    if (!(error instanceof ScheduleNotFoundError)) {
+      throw error;
+    }
+    return false;
+  }
+}

@@ -1,0 +1,22 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+
+    - uses: ./
+      with:
+        postgresql password: test
+        postgresql init scripts: test/sql
+
+    - uses: actions/setup-node@v1
+
+    - run: npm ci
+      working-directory: test
+
+    - run: node index.js
+      working-directory: test

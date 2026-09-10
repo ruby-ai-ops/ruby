@@ -1,0 +1,114 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
+import { SpaceFactory } from "@app/tests/utils/SpaceFactory";
+import { UserFactory } from "@app/tests/utils/UserFactory";
+import type { TestWorkspacePlan } from "@app/tests/utils/WorkspaceFactory";
+import { workspaceForPlan } from "@app/tests/utils/WorkspaceFactory";
+import type { MembershipRoleType } from "@app/types/memberships";
+import type { WorkspaceType } from "@app/types/user";
+import type { RequestMethod } from "node-mocks-http";
+import { createMocks } from "node-mocks-http";
+import { vi } from "vitest";
+
+import { setupWorkOSMocks } from "./mocks/workos";
+
+// Setup WorkOS mocks
+setupWorkOSMocks();
+
+// Hono middlewares call `getWorkOSSessionWithSetCookies` directly to resolve a
+// session from the workos cookie. Mock it here so tests using
+// `createPrivateApiMockRequest` against Hono routes resolve the same
+// authenticated session.
+vi.mock(import("../../lib/api/workos/user"), async (importOriginal) => {
+  const mod = await importOriginal();
+  return {
+    ...mod,
+    getWorkOSSessionWithSetCookies: vi.fn(),
+  };
+});
+
+import { getWorkOSSessionWithSetCookies } from "../../lib/api/workos/user";
+import { Authenticator } from "../../lib/auth";
+
+/**
+ * Creates a mock request with authentication for testing private API endpoints.
+ *
+ * This helper sets up a test workspace with a user and membership, then creates
+ * a mock request authenticated with that user. Used to simulate authenticated API calls
+ * in tests.
+ *
+ * @param options Configuration options
+ * @param options.method HTTP method to use for the request (default: "GET")
+ * @param options.role Role to assign to the user in the workspace (default: "user")
+ */
+export const createPrivateApiMockRequest = async ({
+  method = "GET",
+  role = "user",
+  isSuperUser = false,
+  plan = "basic",
+  workspace: existingWorkspace,
+}: {
+  method?: RequestMethod;
+  role?: MembershipRoleType;
+  isSuperUser?: boolean;
+  plan?: TestWorkspacePlan;
+  workspace?: WorkspaceType;
+} = {}) => {
+  const workspace = existingWorkspace ?? (await workspaceForPlan(plan));
+  const user = await (isSuperUser
+    ? UserFactory.superUser()
+    : UserFactory.basic());
+
+  // Use the idempotent defaults so this helper can be called more than once on
+  // the same workspace (e.g. to re-authenticate as a different role).
+  const adminAuth = await Authenticator.internalAdminForWorkspace(
+    workspace.sId
+  );
+  const { globalGroup, systemGroup, globalSpace, systemSpace } =
+    await SpaceFactory.defaults(adminAuth);
+
+  const membership = await MembershipFactory.associate(workspace, user, {
+    role,
+  });
+
+  const session = {
+    type: "workos" as const,
+    sessionId: "test-session-id",
+    user: {
+      workOSUserId: user.workOSUserId!,
+      email: user.email!,
+      email_verified: true,
+      name: user.username!,
+      nickname: user.username!,
+      organizations: [],
+    },
+    authenticationMethod: "GoogleOAuth",
+    isSSO: false,
+    workspaceId: workspace.sId,
+    organizationId: workspace.workOSOrganizationId ?? undefined,
+    region: "us-central1" as const,
+  };
+  vi.mocked(getWorkOSSessionWithSetCookies).mockResolvedValue({
+    session,
+    setCookies: [],
+  });
+
+  const { req, res } = createMocks<IncomingMessage, ServerResponse>({
+    method: method,
+    query: { wId: workspace.sId },
+    headers: {},
+  });
+
+  return {
+    req,
+    res,
+    workspace,
+    user,
+    membership,
+    globalGroup,
+    globalSpace,
+    systemGroup,
+    systemSpace,
+    auth: await Authenticator.fromUserIdAndWorkspaceId(user.sId, workspace.sId),
+  };
+};

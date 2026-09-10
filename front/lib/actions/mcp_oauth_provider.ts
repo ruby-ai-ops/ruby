@@ -1,0 +1,98 @@
+import config from "@app/lib/api/config";
+import { finalizeUriForProvider } from "@app/lib/api/oauth/utils";
+import { isDevelopment } from "@app/types/shared/env";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import type {
+  OAuthClientInformationFull,
+  OAuthClientInformationMixed,
+  OAuthClientMetadata,
+  OAuthTokens,
+} from "@modelcontextprotocol/sdk/shared/auth.js";
+
+export class MCPOAuthProviderError extends Error {
+  constructor(method: string) {
+    super(`MCPOAuthProvider: ${method} not implemented`);
+    this.name = "MCPOAuthProviderError";
+  }
+}
+
+export class MCPOAuthProvider implements OAuthClientProvider {
+  private token: OAuthTokens | undefined;
+
+  constructor(tokens?: OAuthTokens) {
+    this.token = tokens;
+  }
+  get redirectUrl(): string {
+    // Must return a concrete redirect URI. The MCP SDK (>=1.29) treats a falsy
+    // `redirectUrl` as a non-interactive (client_credentials) flow and calls
+    // `fetchToken()` with no authorization code and no `prepareTokenRequest`,
+    // throwing "Either provider.prepareTokenRequest() or authorizationCode is
+    // required" on any OAuth-gated server. Returning the URI keeps the
+    // interactive authorization-code path, where `saveCodeVerifier()` throws to
+    // cleanly signal that OAuth is required.
+    return finalizeUriForProvider("mcp");
+  }
+
+  get clientMetadata(): OAuthClientMetadata {
+    const baseUrl = config.getStaticWebsiteUrl();
+
+    // In production `baseUrl` is always https so these URIs are always set.
+    // In dev `baseUrl` is http://localhost and OAuth servers reject non-https
+    // URIs here — we drop these informational fields entirely; they don't
+    // matter for local testing.
+    if (!isDevelopment() && !baseUrl.startsWith("https://")) {
+      throw new Error(
+        `OAuth client metadata requires an HTTPS base URL, got: ${baseUrl}`
+      );
+    }
+    const informationalUris = isDevelopment()
+      ? {}
+      : {
+          client_uri: baseUrl,
+          logo_uri: baseUrl + "/static/AppIcon.png",
+          tos_uri: baseUrl + "/terms",
+          policy_uri: baseUrl + "/privacy",
+        };
+
+    return {
+      redirect_uris: [finalizeUriForProvider("mcp")],
+      client_name: "Ruby",
+      ...informationalUris,
+      contacts: ["support@ruby.ad"],
+      software_id: "ruby",
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+    };
+  }
+
+  clientInformation(): OAuthClientInformationFull | undefined {
+    return undefined;
+  }
+
+  saveClientInformation(_clientInformation: OAuthClientInformationMixed): void {
+    // No-op: the SDK checks for this method's existence before attempting
+    // dynamic client registration. We provide it so the probe/discovery
+    // flow doesn't throw prematurely.
+  }
+
+  async tokens(): Promise<OAuthTokens | undefined> {
+    return this.token;
+  }
+
+  saveTokens() {
+    throw new MCPOAuthProviderError("saveTokens");
+  }
+
+  redirectToAuthorization() {
+    throw new MCPOAuthProviderError("redirectToAuthorization");
+  }
+
+  saveCodeVerifier() {
+    throw new MCPOAuthProviderError("saveCodeVerifier");
+  }
+
+  codeVerifier(): string | Promise<string> {
+    throw new MCPOAuthProviderError("codeVerifier");
+  }
+}

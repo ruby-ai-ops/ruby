@@ -1,0 +1,474 @@
+import config from "@app/lib/api/config";
+import { countActiveSeatsForWorkspace } from "@app/lib/api/workspace_seats";
+import { MembershipResource } from "@app/lib/resources/membership_resource";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { rateLimiter } from "@app/lib/utils/rate_limiter";
+import { renderLightWorkspaceType } from "@app/lib/workspace";
+import logger from "@app/logger/logger";
+import type { JobType } from "@app/types/job_type";
+import type { MembershipRoleType } from "@app/types/memberships";
+import type { LightWorkspaceType, UserType } from "@app/types/user";
+import chunk from "lodash/chunk";
+import keyBy from "lodash/keyBy";
+
+const CUSTOMERIO_HOST = "https://track-eu.customer.io/api";
+
+export class CustomerioServerSideTracking {
+  static trackSignup({
+    user,
+    anonymousId,
+  }: {
+    user: UserType;
+    anonymousId?: string;
+  }) {
+    return CustomerioServerSideTracking._identifyUser({ user, anonymousId });
+  }
+
+  static identifyWorkspaces({
+    workspaces,
+  }: {
+    workspaces: Array<
+      LightWorkspaceType & {
+        planCode?: string;
+        seats?: number;
+        subscriptionStartAt?: Date | null;
+        requestCancelAt?: Date | null;
+      }
+    >;
+  }) {
+    return Promise.all(
+      workspaces.map(async (ws) =>
+        CustomerioServerSideTracking._identifyWorkspace({ workspace: ws })
+      )
+    );
+  }
+
+  static async trackCreateMembership({
+    user,
+    workspace,
+    role,
+    startAt,
+  }: {
+    user: UserType;
+    workspace: LightWorkspaceType;
+    role: MembershipRoleType;
+    startAt: Date;
+  }) {
+    await CustomerioServerSideTracking._identifyWorkspace({
+      workspace,
+    });
+    await CustomerioServerSideTracking._identifyUser({
+      user,
+      workspaces: [
+        {
+          sId: workspace.sId,
+          startAt,
+          role,
+          endAt: null,
+        },
+      ],
+    });
+  }
+
+  static async trackRevokeMembership({
+    user,
+    workspace,
+    role,
+    startAt,
+    endAt,
+  }: {
+    user: UserType;
+    workspace: LightWorkspaceType;
+    role: MembershipRoleType;
+    startAt: Date;
+    endAt: Date;
+  }) {
+    await CustomerioServerSideTracking._identifyWorkspace({
+      workspace,
+    });
+    await CustomerioServerSideTracking._identifyUser({
+      user,
+      workspaces: [
+        {
+          sId: workspace.sId,
+          startAt,
+          endAt,
+          role,
+        },
+      ],
+    });
+  }
+
+  static async trackUpdateMembershipRole({
+    user,
+    workspace,
+    previousRole,
+    role,
+  }: {
+    user: UserType;
+    workspace: LightWorkspaceType;
+    previousRole: MembershipRoleType;
+    role: MembershipRoleType;
+  }) {
+    await CustomerioServerSideTracking._identifyWorkspace({
+      workspace,
+    });
+    await CustomerioServerSideTracking._identifyUser({
+      user,
+      workspaces: [
+        {
+          sId: workspace.sId,
+          role,
+        },
+      ],
+    });
+    await CustomerioServerSideTracking._trackEvent({
+      eventName: "role_updated",
+      user,
+      workspace,
+      eventAttributes: {
+        newRole: role,
+        previousRole,
+      },
+    });
+  }
+
+  static async trackUpdateUser({
+    user,
+    workspace,
+    role,
+    jobType,
+  }: {
+    user: UserType;
+    workspace: LightWorkspaceType;
+    role: MembershipRoleType;
+    jobType?: JobType;
+  }) {
+    await CustomerioServerSideTracking._identifyWorkspace({
+      workspace,
+    });
+    await CustomerioServerSideTracking._identifyUser({
+      user,
+      workspaces: [
+        {
+          sId: workspace.sId,
+          role,
+          jobType,
+        },
+      ],
+    });
+  }
+
+  static async backfillUser({ user }: { user: UserType }) {
+    const u = await UserResource.fetchById(user.sId);
+
+    if (!u) {
+      logger.error(
+        { userId: user.sId },
+        "Failed to backfill user on Customer.io"
+      );
+      return;
+    }
+
+    const { memberships: userMemberships } =
+      await MembershipResource.getLatestMemberships({
+        users: [u],
+      });
+
+    const workspaces = keyBy(
+      await WorkspaceResource.fetchByModelIds(
+        userMemberships.map((m) => m.workspaceId)
+      ),
+      "id"
+    );
+
+    // Identify all workspace objects.
+    const chunks = chunk(userMemberships, 8);
+    for (const c of chunks) {
+      await Promise.all(
+        c.map(async (membership) => {
+          const ws = renderLightWorkspaceType({
+            workspace: workspaces[membership.workspaceId],
+          });
+          await CustomerioServerSideTracking._identifyWorkspace({
+            workspace: ws,
+          });
+        })
+      );
+    }
+
+    await CustomerioServerSideTracking._identifyUser({
+      user,
+      workspaces: userMemberships.map((m) => ({
+        sId: workspaces[m.workspaceId].sId,
+        startAt: m.startAt,
+        endAt: m.endAt,
+        role: m.role,
+      })),
+    });
+  }
+
+  static async _identifyWorkspace({
+    workspace,
+  }: {
+    workspace: LightWorkspaceType & {
+      planCode?: string;
+      seats?: number;
+      subscriptionStartAt?: Date | null;
+      requestCancelAt?: Date | null;
+    };
+  }) {
+    if (!config.getCustomerIoEnabled()) {
+      return;
+    }
+
+    const subscription =
+      await SubscriptionResource.fetchActiveByWorkspaceModelId(workspace.id);
+
+    if (!subscription) {
+      throw new Error("Unreachable: Workspace subscription not found");
+    }
+
+    const planCode = workspace.planCode ?? subscription.getPlan().code;
+    const seats =
+      workspace.seats ?? (await countActiveSeatsForWorkspace(workspace.sId));
+
+    // Unless the info changes, we only identify a given workspace once per day.
+    const rateLimiterKey = `customerio_workspace:${workspace.sId}:${workspace.name}:${planCode}:${seats}`;
+    if (
+      !(await rateLimiter({
+        key: rateLimiterKey,
+        maxPerTimeframe: 1,
+        timeframeSeconds: 60 * 60 * 24,
+        logger: logger,
+      }))
+    ) {
+      return;
+    }
+
+    const attributes: Record<string, string | number | null> = {
+      name: workspace.name,
+      planCode,
+      seats,
+    };
+
+    if (workspace.subscriptionStartAt !== undefined) {
+      attributes.subscriptionStartAt = workspace.subscriptionStartAt
+        ? Math.floor(workspace.subscriptionStartAt.getTime() / 1000)
+        : null;
+    }
+    if (workspace.requestCancelAt !== undefined) {
+      attributes.requestCancelAt = workspace.requestCancelAt
+        ? Math.floor(workspace.requestCancelAt.getTime() / 1000)
+        : null;
+    }
+
+    // eslint-disable-next-line no-restricted-globals
+    const r = await fetch(`${CUSTOMERIO_HOST}/v2/entity`, {
+      method: "POST",
+      headers: CustomerioServerSideTracking._headers(),
+      body: JSON.stringify({
+        identifiers: {
+          object_type_id: "1",
+          object_id: workspace.sId,
+        },
+        type: "object",
+        action: "identify",
+        attributes,
+      }),
+    });
+
+    if (!r.ok) {
+      throw new Error(`Failed to identify workspace ${workspace.sId}`);
+    }
+  }
+
+  static async _identifyUser({
+    user,
+    workspaces,
+    anonymousId,
+  }: {
+    user: UserType;
+    workspaces?: Array<{
+      sId: string;
+      startAt?: Date;
+      endAt?: Date | null;
+      role: MembershipRoleType;
+      jobType?: JobType;
+    }>;
+    anonymousId?: string;
+  }) {
+    if (!config.getCustomerIoEnabled()) {
+      return;
+    }
+
+    const attributes: Record<string, any> = {
+      email: user.email,
+      first_name: user.firstName,
+      last_name: user.lastName,
+      created_at: Math.floor(user.createdAt / 1000),
+      sid: user.sId,
+    };
+
+    // Include the anonymous device ID so email templates can link back to the
+    // user's web session: {{ customer.ruby_anonymous_id }}.
+    if (anonymousId) {
+      attributes.ruby_anonymous_id = anonymousId;
+    }
+
+    const body: Record<string, any> = {
+      identifiers: {
+        email: user.email,
+      },
+      type: "person",
+      action: "identify",
+      attributes,
+    };
+
+    if (workspaces) {
+      body.cio_relationships = workspaces.map((w) => {
+        const relAttributes: Record<string, any> = {
+          role: w.role,
+        };
+        if (w.startAt !== undefined) {
+          relAttributes.start_at = Math.floor(w.startAt.getTime() / 1000);
+        }
+        if (w.endAt !== undefined && w.endAt !== null) {
+          relAttributes.end_at = w.endAt
+            ? Math.floor(w.endAt.getTime() / 1000)
+            : null;
+        }
+        if (w.jobType !== undefined) {
+          relAttributes.job_type = w.jobType;
+        }
+        return {
+          identifiers: {
+            object_type_id: "1",
+            object_id: w.sId,
+          },
+          relationship_attributes: relAttributes,
+        };
+      });
+    }
+
+    // eslint-disable-next-line no-restricted-globals
+    const r = await fetch(`${CUSTOMERIO_HOST}/v2/entity`, {
+      method: "POST",
+      headers: CustomerioServerSideTracking._headers(),
+      body: JSON.stringify(body),
+    });
+
+    if (!r.ok) {
+      const json = await r.json();
+      throw new Error(`Failed to identify user ${user.email}: ${json}`);
+    }
+  }
+
+  static async deleteUser({ user }: { user: UserType }) {
+    if (!config.getCustomerIoEnabled()) {
+      return;
+    }
+
+    // eslint-disable-next-line no-restricted-globals
+    const r = await fetch(`${CUSTOMERIO_HOST}/v2/entity`, {
+      method: "POST",
+      headers: CustomerioServerSideTracking._headers(),
+      body: JSON.stringify({
+        identifiers: {
+          email: user.email,
+        },
+        type: "person",
+        action: "delete",
+      }),
+    });
+
+    if (!r.ok) {
+      const json = await r.json();
+      throw new Error(`Failed to delete user ${user.email}: ${json}`);
+    }
+  }
+
+  static async deleteWorkspace({
+    workspace,
+  }: {
+    workspace: LightWorkspaceType;
+  }) {
+    if (!config.getCustomerIoEnabled()) {
+      return;
+    }
+
+    // eslint-disable-next-line no-restricted-globals
+    const r = await fetch(`${CUSTOMERIO_HOST}/v2/entity`, {
+      method: "POST",
+      headers: CustomerioServerSideTracking._headers(),
+      body: JSON.stringify({
+        identifiers: {
+          object_type_id: "1",
+          object_id: workspace.sId,
+        },
+        type: "object",
+        action: "delete",
+      }),
+    });
+
+    if (!r.ok) {
+      const json = await r.json();
+      throw new Error(`Failed to delete workspace ${workspace.sId}: ${json}`);
+    }
+  }
+
+  static async _trackEvent({
+    user,
+    workspace,
+    eventName,
+    eventAttributes,
+  }: {
+    user: UserType;
+    workspace?: LightWorkspaceType;
+    eventName: string;
+    eventAttributes?: Record<string, any>;
+  }) {
+    if (!config.getCustomerIoEnabled()) {
+      return;
+    }
+
+    const eventData: Record<string, any> = { ...eventAttributes };
+    if (workspace) {
+      eventData.workspace_id = workspace.sId;
+      eventData.workspace_name = workspace.name;
+    }
+
+    const body: Record<string, any> = {
+      name: eventName,
+      data: eventAttributes,
+    };
+
+    // eslint-disable-next-line no-restricted-globals
+    const r = await fetch(
+      `${CUSTOMERIO_HOST}/v1/customers/${encodeURIComponent(
+        user.email
+      )}/events`,
+      {
+        method: "POST",
+        headers: CustomerioServerSideTracking._headers(),
+        body: JSON.stringify(body),
+      }
+    );
+
+    if (!r.ok) {
+      const json = await r.json();
+      throw new Error(`Failed to track event ${eventName}: ${json}`);
+    }
+  }
+
+  static _headers() {
+    return {
+      "Content-Type": "application/json",
+      Authorization: `Basic ${Buffer.from(
+        `${config.getCustomerIoSiteId()}:${config.getCustomerIoApiKey()}`
+      ).toString("base64")}`,
+    };
+  }
+}

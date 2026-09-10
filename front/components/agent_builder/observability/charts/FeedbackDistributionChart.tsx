@@ -1,0 +1,247 @@
+import {
+  FEEDBACK_DISTRIBUTION_LEGEND,
+  FEEDBACK_DISTRIBUTION_PALETTE,
+} from "@app/components/agent_builder/observability/constants";
+import { useObservabilityContext } from "@app/components/agent_builder/observability/ObservabilityContext";
+import { VersionMarkersDots } from "@app/components/agent_builder/observability/shared/VersionMarkers";
+import {
+  filterTimeSeriesByVersionWindow,
+  padSeriesToTimeRange,
+} from "@app/components/agent_builder/observability/utils";
+import { ChartContainer } from "@app/components/charts/ChartContainer";
+import { legendFromConstant } from "@app/components/charts/ChartLegend";
+import { ChartTooltipCard } from "@app/components/charts/ChartTooltip";
+import { CHART_HEIGHT, CHART_MARGIN } from "@app/components/charts/constants";
+import { useSelectableSeries } from "@app/components/charts/useSelectableSeries";
+import {
+  useAgentFeedbackDistribution,
+  useAgentVersionMarkers,
+} from "@app/lib/swr/assistants";
+import { formatShortDate } from "@app/lib/utils/timestamps";
+import { cn } from "@ruby-ai/sparkle";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import type { TooltipContentProps } from "recharts/types/component/Tooltip";
+
+interface FeedbackDistributionChartProps {
+  workspaceId: string;
+  agentConfigurationId: string;
+  isCustomAgent: boolean;
+}
+
+interface FeedbackDistributionData {
+  timestamp: number;
+  date: string;
+  positive: number;
+  negative: number;
+}
+
+function isFeedbackDistributionData(
+  data: unknown
+): data is FeedbackDistributionData {
+  if (typeof data !== "object" || data === null) {
+    return false;
+  }
+
+  return (
+    "timestamp" in data &&
+    typeof data.timestamp === "number" &&
+    "date" in data &&
+    typeof data.date === "string" &&
+    "positive" in data &&
+    typeof data.positive === "number" &&
+    "negative" in data &&
+    typeof data.negative === "number"
+  );
+}
+
+function FeedbackDistributionTooltip(
+  props: TooltipContentProps<number, string> & {
+    activeKey?: string;
+    selectedKey?: string;
+  }
+) {
+  const { active, payload, activeKey, selectedKey } = props;
+  if (!active || !payload || payload.length === 0) {
+    return null;
+  }
+  const first = payload[0];
+  if (!first?.payload || !isFeedbackDistributionData(first.payload)) {
+    return null;
+  }
+  const row = first.payload;
+
+  return (
+    <ChartTooltipCard
+      title={row.date}
+      rows={FEEDBACK_DISTRIBUTION_LEGEND.map(({ key, label }) => ({
+        key,
+        label,
+        value: row[key],
+        colorClassName: FEEDBACK_DISTRIBUTION_PALETTE[key],
+      }))}
+      activeKey={activeKey}
+      selectedKey={selectedKey}
+    />
+  );
+}
+
+function zeroFactory(timestamp: number) {
+  return {
+    timestamp,
+    date: formatShortDate(timestamp),
+    positive: 0,
+    negative: 0,
+  };
+}
+
+export function FeedbackDistributionChart({
+  workspaceId,
+  agentConfigurationId,
+  isCustomAgent,
+}: FeedbackDistributionChartProps) {
+  const { period, mode, selectedVersion } = useObservabilityContext();
+  const {
+    feedbackDistribution,
+    isFeedbackDistributionLoading,
+    isFeedbackDistributionError,
+  } = useAgentFeedbackDistribution({
+    workspaceId,
+    agentConfigurationId,
+    days: period,
+    disabled: !workspaceId || !agentConfigurationId,
+  });
+  const { versionMarkers } = useAgentVersionMarkers({
+    workspaceId,
+    agentConfigurationId,
+    days: period,
+    disabled: !workspaceId || !agentConfigurationId || !isCustomAgent,
+  });
+
+  const {
+    selectedKey,
+    activeKey,
+    isDimmed,
+    lineActiveDot,
+    decorate,
+    hoverHandlers,
+  } = useSelectableSeries();
+
+  const legendItems = decorate(
+    legendFromConstant(
+      FEEDBACK_DISTRIBUTION_LEGEND,
+      FEEDBACK_DISTRIBUTION_PALETTE,
+      {
+        includeVersionMarker:
+          isCustomAgent && mode === "timeRange" && versionMarkers.length > 0,
+      }
+    ),
+    { skip: (item) => item.key === "versionMarkers" }
+  );
+
+  const filteredData = filterTimeSeriesByVersionWindow(
+    feedbackDistribution,
+    isCustomAgent ? mode : "timeRange",
+    selectedVersion,
+    versionMarkers
+  );
+
+  const data = padSeriesToTimeRange(filteredData, mode, period, zeroFactory);
+
+  return (
+    <ChartContainer
+      title="Feedback Trends"
+      description="Daily counts of positive and negative feedback."
+      isLoading={isFeedbackDistributionLoading}
+      errorMessage={
+        isFeedbackDistributionError
+          ? "Failed to load feedback distribution data."
+          : undefined
+      }
+      emptyMessage={
+        data.length === 0 ? "No feedback data available." : undefined
+      }
+      height={CHART_HEIGHT}
+      legendItems={legendItems}
+    >
+      <LineChart data={data} margin={CHART_MARGIN}>
+        <CartesianGrid vertical={false} className="stroke-border" />
+        <XAxis
+          dataKey="date"
+          type="category"
+          scale="point"
+          allowDuplicatedCategory={false}
+          className="text-xs text-muted-foreground"
+          tickLine={false}
+          axisLine={false}
+          tickMargin={8}
+          minTickGap={16}
+        />
+        <YAxis
+          className="text-xs text-muted-foreground"
+          tickLine={false}
+          axisLine={false}
+          tickMargin={8}
+        />
+        <Tooltip
+          content={(props: TooltipContentProps<number, string>) => (
+            <FeedbackDistributionTooltip
+              {...props}
+              activeKey={activeKey}
+              selectedKey={selectedKey}
+            />
+          )}
+          cursor={false}
+          wrapperStyle={{ outline: "none", zIndex: 50 }}
+          contentStyle={{
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            boxShadow: "none",
+          }}
+        />
+        <Line
+          type="monotone"
+          dataKey="positive"
+          name="Positive"
+          className={cn(
+            FEEDBACK_DISTRIBUTION_PALETTE.positive,
+            "transition-opacity",
+            isDimmed("positive") && "opacity-25"
+          )}
+          stroke="currentColor"
+          strokeWidth={2}
+          dot={false}
+          activeDot={lineActiveDot("positive")}
+          isAnimationActive={false}
+          {...hoverHandlers("positive")}
+        />
+        <Line
+          type="monotone"
+          dataKey="negative"
+          name="Negative"
+          className={cn(
+            FEEDBACK_DISTRIBUTION_PALETTE.negative,
+            "transition-opacity",
+            isDimmed("negative") && "opacity-25"
+          )}
+          stroke="currentColor"
+          strokeWidth={2}
+          dot={false}
+          activeDot={lineActiveDot("negative")}
+          isAnimationActive={false}
+          {...hoverHandlers("negative")}
+        />
+        {isCustomAgent && (
+          <VersionMarkersDots mode={mode} versionMarkers={versionMarkers} />
+        )}
+      </LineChart>
+    </ChartContainer>
+  );
+}

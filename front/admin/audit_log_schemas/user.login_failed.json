@@ -1,0 +1,16 @@
+{
+  "action": "user.login_failed",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "user"
+    }
+  ],
+  "metadata": {
+    "reason": "string",
+    "authentication_method": "string",
+    "actor_type": "string"
+  }
+}

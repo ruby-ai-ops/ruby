@@ -1,0 +1,28 @@
+import { useEffect, useState } from "react";
+
+export function useSheetContainer(
+  mountPortalContainer?: Element
+): Element | undefined {
+  const [container, setContainer] = useState<Element | undefined>(
+    mountPortalContainer
+  );
+
+  useEffect(() => {
+    if (mountPortalContainer) {
+      setContainer(mountPortalContainer);
+      return;
+    }
+
+    if (!container) {
+      const dialogElements = document.querySelectorAll(
+        ".sheet[role=dialog][data-state=open]"
+      );
+      const lastDialog = dialogElements[dialogElements.length - 1];
+      if (lastDialog) {
+        setContainer(lastDialog);
+      }
+    }
+  }, [container, mountPortalContainer]);
+
+  return container;
+}

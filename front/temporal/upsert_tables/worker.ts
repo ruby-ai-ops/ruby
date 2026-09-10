@@ -1,0 +1,53 @@
+import { getTemporalWorkerConnection } from "@app/lib/temporal";
+import { ActivityInboundLogInterceptor } from "@app/lib/temporal_monitoring";
+import logger from "@app/logger/logger";
+import {
+  createTemporalWorker,
+  getWorkflowConfig,
+} from "@app/temporal/bundle_helper";
+import * as activities from "@app/temporal/upsert_tables/activities";
+import type { Context } from "@temporalio/activity";
+import TsconfigPathsPlugin from "tsconfig-paths-webpack-plugin";
+
+import { QUEUE_NAME } from "./config";
+
+// Must match the deployment's terminationGracePeriodSeconds minus 10s buffer.
+const SHUTDOWN_GRACE_TIME_MS = 70 * 1_000;
+
+export async function runUpsertTableQueueWorker() {
+  const { connection, namespace } = await getTemporalWorkerConnection();
+
+  const worker = await createTemporalWorker({
+    ...getWorkflowConfig({
+      workerName: "upsert_table_queue",
+      getWorkflowsPath: () => require.resolve("./workflows"),
+    }),
+    activities,
+    taskQueue: QUEUE_NAME,
+    // At the time of edit we have 1 upsert-table-worker. We target 20 overall concurrency.
+    maxConcurrentActivityTaskExecutions: 20,
+    connection,
+    namespace,
+    shutdownGraceTime: SHUTDOWN_GRACE_TIME_MS,
+    interceptors: {
+      activity: [
+        (ctx: Context) => {
+          return {
+            inbound: new ActivityInboundLogInterceptor(ctx, logger),
+          };
+        },
+      ],
+    },
+    bundlerOptions: {
+      // Update the webpack config to use aliases from our tsconfig.json.
+      webpackConfigHook: (config) => {
+        const plugins = config.resolve?.plugins ?? [];
+
+        config.resolve!.plugins = [...plugins, new TsconfigPathsPlugin({})];
+        return config;
+      },
+    },
+  });
+
+  await worker.run();
+}

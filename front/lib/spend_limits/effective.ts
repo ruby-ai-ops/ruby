@@ -1,0 +1,86 @@
+import type { CustomerAlert } from "@metronome/sdk/resources/v1/customers";
+
+export type EffectiveSpendLimitSource =
+  | "override"
+  | "group"
+  | "default"
+  | "none";
+
+type SpendLimitAlertState = CustomerAlert["customer_status"];
+
+// Priority: per-user `override` > the highest of the user's `group` caps >
+// seat-type `default`. `groupCapAwuCredits` is the max cap across the groups the
+// user belongs to (null when none of them carry a cap). All three values must be
+// expressed in the same unit (all pool-only, or all pool + seat allowance).
+export function resolveEffectiveSpendLimitAwuCredits(args: {
+  overrideAwuCredits: number | null;
+  groupCapAwuCredits: number | null;
+  defaultAwuCredits: number;
+}): number;
+export function resolveEffectiveSpendLimitAwuCredits(args: {
+  overrideAwuCredits: number | null;
+  groupCapAwuCredits: number | null;
+  defaultAwuCredits: number | null;
+}): number | null;
+export function resolveEffectiveSpendLimitAwuCredits({
+  overrideAwuCredits,
+  groupCapAwuCredits,
+  defaultAwuCredits,
+}: {
+  overrideAwuCredits: number | null;
+  groupCapAwuCredits: number | null;
+  defaultAwuCredits: number | null;
+}): number | null {
+  if (overrideAwuCredits !== null) {
+    return overrideAwuCredits;
+  }
+  if (groupCapAwuCredits !== null) {
+    return groupCapAwuCredits;
+  }
+  return defaultAwuCredits;
+}
+
+// Where the effective spend limit comes from: a user-specific `override`, a
+// `group` cap, the seat-type `default`, or `none` when nothing is configured
+// (unlimited).
+export function resolveEffectiveSpendLimitSource({
+  overrideAwuCredits,
+  groupCapAwuCredits,
+  defaultAwuCredits,
+}: {
+  overrideAwuCredits: number | null;
+  groupCapAwuCredits: number | null;
+  defaultAwuCredits: number | null;
+}): EffectiveSpendLimitSource {
+  if (overrideAwuCredits !== null) {
+    return "override";
+  }
+  if (groupCapAwuCredits !== null) {
+    return "group";
+  }
+  if (defaultAwuCredits !== null) {
+    return "default";
+  }
+  return "none";
+}
+
+export function resolveEffectiveSpendLimitState({
+  overrideState,
+  defaultState,
+}: {
+  overrideState: SpendLimitAlertState | undefined;
+  defaultState: SpendLimitAlertState | undefined;
+}): {
+  state: SpendLimitAlertState;
+  source: EffectiveSpendLimitSource;
+} {
+  if (overrideState !== undefined) {
+    return { state: overrideState, source: "override" };
+  }
+
+  if (defaultState !== undefined) {
+    return { state: defaultState, source: "default" };
+  }
+
+  return { state: "ok", source: "none" };
+}

@@ -1,0 +1,404 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { z } from "zod";
+
+const conferenceEntryPointsSchema = z
+  .array(
+    z.object({
+      entryPointType: z
+        .enum(["video", "phone", "sip", "more"])
+        .describe("How attendees join the conference."),
+      uri: z
+        .string()
+        .max(1300)
+        .describe(
+          "The entry point URI. Use http(s): for video/more, tel: for phone, or sip: for SIP."
+        ),
+      label: z
+        .string()
+        .max(512)
+        .optional()
+        .describe("The user-visible label for the entry point."),
+    })
+  )
+  .min(1)
+  .describe(
+    "Ways to join the conference. All must belong to the same conference."
+  );
+
+const googleMeetConferenceSchema = z.object({
+  type: z
+    .literal("google_meet")
+    .describe("Create a new Google Meet conference."),
+});
+
+const customConferenceSchema = z.object({
+  type: z.literal("custom").describe("Use a custom or third-party conference."),
+  name: z.string().describe("The user-visible conference solution name."),
+  entryPoints: conferenceEntryPointsSchema,
+});
+
+const noConferenceSchema = z.object({
+  type: z.literal("none").describe("Create the event without a conference."),
+});
+
+const createEventConferenceSchema = z.discriminatedUnion("type", [
+  googleMeetConferenceSchema,
+  customConferenceSchema,
+  noConferenceSchema,
+]);
+
+const updateEventConferenceSchema = z.discriminatedUnion("type", [
+  googleMeetConferenceSchema,
+  customConferenceSchema,
+]);
+
+export type GoogleCalendarConference = z.infer<
+  typeof createEventConferenceSchema
+>;
+
+const sharedEventFields = {
+  transparency: z
+    .enum(["opaque", "transparent"])
+    .optional()
+    .describe(
+      "'transparent' = Free (won't block booking availability). Default 'opaque' = Busy."
+    ),
+  visibility: z
+    .enum(["default", "public", "private", "confidential"])
+    .optional()
+    .describe(
+      "'private' hides event details from other calendar viewers. Changing this on an existing event affects all viewers immediately."
+    ),
+  reminders: z
+    .object({
+      useDefault: z.boolean(),
+      overrides: z
+        .array(
+          z.object({
+            method: z.enum(["email", "popup"]),
+            minutes: z.number().int().min(0),
+          })
+        )
+        .optional(),
+    })
+    .optional()
+    .describe("Custom reminders. Set useDefault: false and provide overrides."),
+  extendedProperties: z
+    .object({
+      private: z.record(z.string(), z.string()).optional(),
+    })
+    .optional()
+    .describe(
+      "Private key-value metadata visible only to this application. Keys and values must be plain strings."
+    ),
+};
+
+const eventStartSchema = z.union([
+  z.object({ dateTime: z.string().describe("RFC3339 start time") }),
+  z.object({
+    date: z.string().describe("All-day start date (YYYY-MM-DD)"),
+  }),
+]);
+
+const eventEndSchema = z.union([
+  z.object({ dateTime: z.string().describe("RFC3339 end time") }),
+  z.object({
+    date: z.string().describe("Exclusive all-day end date (YYYY-MM-DD)"),
+  }),
+]);
+
+export const GOOGLE_CALENDAR_TOOLS_METADATA = [
+  {
+    name: "list_calendars",
+    description:
+      "List all Google Calendars accessible by the user. Supports pagination via pageToken.",
+    schema: {
+      pageToken: z.string().optional().describe("Page token for pagination."),
+      maxResults: z
+        .number()
+        .optional()
+        .describe("Maximum number of calendars to return (max 250)."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Google calendars",
+      done: "List Google calendars",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "list_events",
+    description:
+      "List, search, or browse the events and agenda on a Google Calendar for a given day, week, or date range. If 'q' is provided, performs a free-text search of events.",
+    schema: {
+      calendarId: z
+        .string()
+        .default("primary")
+        .describe("The calendar ID (default: 'primary')."),
+      q: z
+        .string()
+        .optional()
+        .describe("Free text search query for event fields."),
+      timeMin: z
+        .string()
+        .optional()
+        .describe("RFC3339 lower bound for event start time (inclusive)."),
+      timeMax: z
+        .string()
+        .optional()
+        .describe("RFC3339 upper bound for event end time (exclusive)."),
+      maxResults: z
+        .number()
+        .optional()
+        .describe("Maximum number of events to return (max 2500)."),
+      pageToken: z.string().optional().describe("Page token for pagination."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Google Calendar events",
+      done: "List Google Calendar events",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "get_event",
+    description:
+      "Get the full details of a single event from a Google Calendar by its event ID.",
+    schema: {
+      calendarId: z
+        .string()
+        .default("primary")
+        .describe("The calendar ID (default: 'primary')."),
+      eventId: z.string().describe("The ID of the event to retrieve."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Retrieving Google Calendar event",
+      done: "Retrieve Google Calendar event",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "create_event",
+    description:
+      "Create and schedule a meeting, event, or appointment on Google Calendar. " +
+      "By default, add the calling user as organizer and attendee, call " +
+      "check_availability first, and call get_user_timezones before scheduling.",
+    schema: {
+      calendarId: z
+        .string()
+        .default("primary")
+        .describe("The calendar ID (default: 'primary')."),
+      summary: z.string().describe("Title of the event."),
+      description: z
+        .string()
+        .optional()
+        .describe(
+          "Description of the event. Supports basic HTML tags (<b>, <i>, <br>, <ul>, <li>, <a href='...'>). Use raw HTML tags — never escape them as entities. Use plain text only when no formatting is needed."
+        ),
+      start: eventStartSchema.describe("Timed or all-day event start."),
+      end: eventEndSchema.describe("Timed or all-day event end (exclusive)."),
+      attendees: z
+        .array(z.string())
+        .optional()
+        .describe("List of attendee email addresses."),
+      location: z.string().optional().describe("Location of the event."),
+      colorId: z.string().optional().describe("Color ID for the event."),
+      conference: createEventConferenceSchema
+        .default({ type: "google_meet" })
+        .describe(
+          "Conference setup. Defaults to a new Google Meet conference. Use " +
+            "'custom' for phone, SIP, video, or third-party conferencing, or " +
+            "'none' to create the event without a conference."
+        ),
+      eventType: z
+        .enum(["default", "focusTime", "outOfOffice"])
+        .optional()
+        .describe(
+          "'focusTime' creates a native Focus Time block (DND in Google Chat, auto-decline). 'outOfOffice' creates an OOO block. Primary calendar only. Cannot be changed after creation."
+        ),
+      ...sharedEventFields,
+    },
+    stake: "medium",
+    displayLabels: {
+      running: "Creating Google Calendar event",
+      done: "Create Google Calendar event",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "update_event",
+    description:
+      "Update or reschedule a Google Calendar event or meeting to a new time, " +
+      "location, set of attendees, or conference.",
+    schema: {
+      calendarId: z
+        .string()
+        .default("primary")
+        .describe("The calendar ID (default: 'primary')."),
+      eventId: z.string().describe("The ID of the event to update."),
+      summary: z.string().optional().describe("Title of the event."),
+      description: z
+        .string()
+        .optional()
+        .describe(
+          "Description of the event. Only include this field when intentionally changing the description. Supports basic HTML tags (<b>, <i>, <br>, <ul>, <li>, <a href='...'>). Use raw HTML tags — never escape them as entities. Use plain text only when no formatting is needed."
+        ),
+      start: eventStartSchema
+        .optional()
+        .describe("Timed or all-day event start."),
+      end: eventEndSchema
+        .optional()
+        .describe("Timed or all-day event end (exclusive)."),
+      attendees: z
+        .array(z.string())
+        .optional()
+        .describe("List of attendee email addresses."),
+      location: z.string().optional().describe("Location of the event."),
+      colorId: z.string().optional().describe("Color ID for the event."),
+      conference: updateEventConferenceSchema
+        .optional()
+        .describe(
+          "Conference setup. Use 'google_meet' to create a new Google Meet " +
+            "conference or 'custom' for phone, SIP, video, or third-party " +
+            "conferencing. Omit to preserve the existing conference."
+        ),
+      ...sharedEventFields,
+    },
+    stake: "medium",
+    displayLabels: {
+      running: "Updating Google Calendar event",
+      done: "Update Google Calendar event",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "delete_event",
+    description: "Delete, cancel, or remove an event from a Google Calendar.",
+    schema: {
+      calendarId: z
+        .string()
+        .default("primary")
+        .describe("The calendar ID (default: 'primary')."),
+      eventId: z.string().describe("The ID of the event to delete."),
+    },
+    stake: "medium",
+    displayLabels: {
+      running: "Deleting Google Calendar event",
+      done: "Delete Google Calendar event",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "check_availability",
+    description:
+      "Find free time slots when participants are all available to meet, computing combined free/busy availability across multiple attendees within a date range using Google Calendar.",
+    schema: {
+      participants: z
+        .array(
+          z.object({
+            email: z
+              .string()
+              .describe(
+                "Email address of the participant whose calendar should be checked."
+              ),
+            timezone: z
+              .string()
+              .describe(
+                "IANA timezone identifier for this participant (e.g., 'America/New_York')."
+              ),
+            dailyTimeWindowStart: z
+              .string()
+              .regex(
+                /^([01]?[0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9])?$/,
+                "Time must be in HH:mm or HH:mm:ss format (24-hour)"
+              )
+              .optional()
+              .describe(
+                "Optional start of the participant's working window (local time, HH:mm or HH:mm:ss)."
+              ),
+            dailyTimeWindowEnd: z
+              .string()
+              .regex(
+                /^([01]?[0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9])?$/,
+                "Time must be in HH:mm or HH:mm:ss format (24-hour)"
+              )
+              .optional()
+              .describe(
+                "Optional end of the participant's working window (local time, HH:mm or HH:mm:ss)."
+              ),
+          })
+        )
+        .min(1, "Provide at least one participant.")
+        .max(10, "A maximum of 10 participants is supported.")
+        .describe(
+          "Participants to include in the availability check. Specify their timezone and optional daily working window."
+        ),
+      startTimeRange: z
+        .string()
+        .describe(
+          "ISO 8601 timestamp for the beginning of the range to analyze (UTC)."
+        ),
+      endTimeRange: z
+        .string()
+        .describe(
+          "ISO 8601 timestamp for the end of the range to analyze (UTC)."
+        ),
+      excludeWeekends: z
+        .boolean()
+        .default(false)
+        .describe(
+          "If true, Saturdays and Sundays (in each participant's timezone) are ignored when computing availability."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Checking Google Calendar availability",
+      done: "Check Google Calendar availability",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "get_user_timezones",
+    description:
+      "Get the timezone of attendees by looking up timezone settings for multiple users from their Google Calendar configuration. Only works for calendars shared with you.",
+    schema: {
+      emails: z
+        .array(z.string())
+        .max(50, "Maximum 50 email addresses allowed")
+        .describe("Array of email addresses to get timezone information for"),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Checking Google Calendar user timezones",
+      done: "Check Google Calendar user timezones",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+] as const;
+
+export const GOOGLE_CALENDAR_SERVER = {
+  serverInfo: {
+    name: "google_calendar",
+    version: "1.0.0",
+    description:
+      "Manage Google Calendar: list calendars, create and update meeting events, check free/busy availability, and look up attendee timezones.",
+    authorization: {
+      provider: "google_drive",
+      supported_use_cases: ["personal_actions", "platform_actions"],
+      scope:
+        "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events",
+    },
+    icon: "GcalLogo",
+    documentationUrl: "https://docs.ruby.ad/docs/google-calendar",
+  },
+  tools: GOOGLE_CALENDAR_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

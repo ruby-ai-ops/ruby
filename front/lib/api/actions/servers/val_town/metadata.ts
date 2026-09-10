@@ -1,0 +1,305 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { z } from "zod";
+
+export const VAL_TOWN_TOOLS_METADATA = [
+  {
+    name: "create_val",
+    description:
+      "Create a new val (project) in Val Town: a serverless TypeScript/JavaScript function for HTTP endpoints, scripts, email handlers, or scheduled tasks. Use create_file to add files to the val.",
+    schema: {
+      name: z
+        .string()
+        .min(1)
+        .max(48)
+        .regex(
+          /^[a-zA-Z][a-zA-Z0-9\-_]*$/,
+          "Name must start with a letter and contain only letters, numbers, hyphens, and underscores"
+        )
+        .describe("The name of the val to create."),
+      privacy: z
+        .enum(["public", "private", "unlisted"])
+        .describe(
+          "This resource's privacy setting. Unlisted resources do not appear on profile pages or elsewhere, but you can link to them."
+        ),
+      description: z
+        .string()
+        .max(64)
+        .optional()
+        .describe("Optional description of what the val does."),
+      orgId: z
+        .string()
+        .uuid()
+        .optional()
+        .describe("ID of the org to create the val in."),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Creating val",
+      done: "Create val",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "get_val",
+    description:
+      "Get a specific Val Town val (serverless script or project) by its ID, including its files and metadata.",
+    schema: {
+      valId: z.string().describe("The ID of the val to retrieve"),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Retrieving val",
+      done: "Retrieve val",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "list_vals",
+    description:
+      "List Val Town vals (serverless TypeScript/JavaScript functions and projects) available to the user's account.",
+    schema: {
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .describe("Maximum number of vals to return"),
+      cursor: z
+        .string()
+        .optional()
+        .describe("Cursor to start the pagination from"),
+      privacy: z
+        .enum(["public", "private", "unlisted"])
+        .optional()
+        .describe("Filter vals by privacy level"),
+      user_id: z.string().optional().describe("User ID to filter by"),
+      list_only_user_vals: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("List only the authenticated user's vals (default: true)"),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing vals",
+      done: "List vals",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "search_vals",
+    description:
+      "Search for Val Town vals (serverless scripts and projects) by name, description, or code content.",
+    schema: {
+      query: z.string().describe("Search query to find vals"),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(20)
+        .describe("Maximum number of vals to return"),
+      cursor: z
+        .string()
+        .optional()
+        .describe("Cursor to start the pagination from"),
+      privacy: z
+        .enum(["public", "private", "unlisted"])
+        .optional()
+        .describe("Filter vals by privacy level"),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Searching vals",
+      done: "Search vals",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "list_val_files",
+    description:
+      "List all files in a specific Val Town val (serverless project).",
+    schema: {
+      valId: z.string().describe("The ID of the val to list files for"),
+      path: z
+        .string()
+        .optional()
+        .describe(
+          "The path to list files from (default: root directory, use empty string for root)"
+        ),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Maximum number of files to return"),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Number of files to skip"),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing val files",
+      done: "List val files",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "get_file_content",
+    description:
+      "Get the content of a specific file in a val using the Val Town API",
+    schema: {
+      valId: z.string().describe("The ID of the val containing the file"),
+      filePath: z
+        .string()
+        .describe("The path of the file to retrieve (e.g., 'main.ts')"),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Retrieving file content",
+      done: "Retrieve file content",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "delete_file",
+    description:
+      "Delete or remove a specific file from a val using the Val Town API",
+    schema: {
+      valId: z.string().describe("The ID of the val containing the file"),
+      filePath: z
+        .string()
+        .describe("The path of the file to delete (e.g., 'main.ts')"),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Deleting file",
+      done: "Delete file",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "update_file_content",
+    description:
+      "Update the code or content of a specific file in a Val Town val. Use write_file to change the file type, name, or path.",
+    schema: {
+      valId: z.string().describe("The ID of the val containing the file"),
+      filePath: z
+        .string()
+        .describe("The path of the file to update (e.g., 'main.ts')"),
+      content: z
+        .string()
+        .max(80000)
+        .describe("The new content for the file (max 80,000 characters)"),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Updating file content",
+      done: "Update file content",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "write_file",
+    description:
+      "Write, rename, or move files in a Val Town val. Set content, change the file type (HTTP, email, interval, script), rename a file, or move it to a new directory.",
+    schema: {
+      valId: z.string().describe("The ID of the val containing the file"),
+      filePath: z
+        .string()
+        .describe("The path of the file to update (e.g., 'main.ts')"),
+      content: z
+        .string()
+        .max(80000)
+        .optional()
+        .describe("The new content for the file (max 80,000 characters)"),
+      name: z.string().optional().describe("The new name for the file"),
+      type: z
+        .enum(["script", "http", "email", "file", "interval"])
+        .optional()
+        .describe("The new type for the file"),
+      parent_path: z
+        .string()
+        .optional()
+        .describe("Path to the directory you'd like to move this file to"),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Writing file",
+      done: "Write file",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "create_file",
+    description:
+      "Create a new empty file in an existing val. Use write_file to add content and set the file type.",
+    schema: {
+      valId: z.string().describe("The ID of the val to create the file in"),
+      filePath: z
+        .string()
+        .describe("The path of the file to create (e.g., 'main.ts')"),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Creating file",
+      done: "Create file",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "call_http_endpoint",
+    description:
+      "Run an HTTP val endpoint by getting the file's endpoint link and making a request to it",
+    schema: {
+      valId: z.string().describe("The ID of the val containing the file"),
+      filePath: z
+        .string()
+        .describe("The path of the file to run (e.g., 'main.ts')"),
+      body: z
+        .string()
+        .optional()
+        .describe(
+          'Optional JSON string to send as the request body. Example: \'{"key": "value"}\''
+        ),
+      method: z
+        .enum(["GET", "POST", "PUT", "DELETE", "PATCH"])
+        .optional()
+        .default("POST")
+        .describe("HTTP method to use"),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Calling HTTP endpoint",
+      done: "Call HTTP endpoint",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+] as const;
+
+export const VAL_TOWN_SERVER = {
+  serverInfo: {
+    name: "val_town",
+    version: "1.0.0",
+    description:
+      "Create and manage Val Town vals: serverless TypeScript/JavaScript functions, HTTP endpoints, email handlers, and scheduled scripts.",
+    authorization: null,
+    icon: "ValTownLogo",
+    documentationUrl: "https://docs.ruby.ad/docs/val-town",
+    developerSecretSelection: "required",
+  },
+  tools: VAL_TOWN_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

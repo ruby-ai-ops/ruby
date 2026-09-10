@@ -1,0 +1,1142 @@
+// Types.
+import type { RubyError } from "@app/lib/error";
+import { z } from "zod";
+
+import { assertNever } from "./shared/utils/assert_never";
+import { removeNulls } from "./shared/utils/general";
+import type { UserType } from "./user";
+
+const uniq = <T>(arr: T[]): T[] => Array.from(new Set(arr));
+
+export const TABLE_PREFIX = "TABLE:";
+export const RUBY_FILE_ID_HEADER = "X-Ruby-File-Id";
+export const RUBY_FILE_CONTENT_TYPE_HEADER = "X-Ruby-File-Content-Type";
+
+export type FileStatus = "created" | "failed" | "ready";
+
+export type FileUseCase =
+  | "conversation"
+  | "avatar"
+  | "tool_output"
+  // Upsert document: case in which a document first exists as a file resource
+  // on our end, and we wish to upsert it in a datasource. In that case, it will
+  // be temporarily stored in the upsert queue during the upsert operation (and
+  // exists permanently as a file resource).
+  | "upsert_document"
+  // Folders document: case in which a document is uploaded from scratch (e.g.
+  // via the UI in a Folder). In that case, it will be stored permanently as a file
+  // resource even for the upsert (no need to transit via upsert queue).
+  | "folders_document"
+  | "upsert_table"
+  // Project context: case in which a file is uploaded to a project's shared
+  // context datasource. Accessible to all conversations within the project.
+  | "project_context"
+  // Skill attachment: file attached to a skill configuration, synced to the
+  // sandbox at /ruby/skills/<skill-name>/<filename>.
+  | "skill_attachment"
+  // Workspace branding: logo/favicon uploaded by workspace admins.
+  | "workspace_branding";
+
+export type FileUseCaseMetadata = {
+  conversationId?: string;
+  skillId?: string;
+  spaceId?: string;
+  sourceConversationId?: string;
+  generatedTables?: string[];
+  lastEditedByAgentConfigurationId?: string;
+  sourceProvider?: string;
+  sourceIcon?: string;
+  hideFromUser?: boolean;
+  // `skipFileProcessing` means "do not run upload-time processing (Tika / resize / transcribe)";
+  // only the original blob exists. Stamped together for sandbox-mounted raw delimited files.
+  skipFileProcessing?: boolean;
+  // Which branding asset this file was uploaded for (workspace_branding use case only).
+  asset?: string;
+  // Root scoped path of a published Frame's source tree in the mount (interactive content
+  // only). Set when the frame has been published: its presence means a built bundle exists
+  // (stored as the processed version) and records where to re-read sources on republish.
+  frameBundleRootPath?: string;
+  // Scoped path of the Frame's entry file, relative to frameBundleRootPath, as of the last
+  // successful publish. The model names the entry's full path directly when publishing (see the
+  // publish tool), so fileName has no guaranteed relationship to it: this is the only durable
+  // record of what the entry actually is. Live edits (no model in the loop, triggered by a UI
+  // click) reuse it to know what to rebuild from, rather than guessing from fileName.
+  frameEntryRelPath?: string;
+  // Immutable Frames v2 publication currently served by the Frame.
+  activePublicationId?: string;
+  // Name and description from the manifest of the active publication. Refreshed on every
+  // activation, so they describe what is served, not what the source folder currently says.
+  frameName?: string;
+  frameDescription?: string;
+};
+
+export function isConversationFileUseCase(
+  useCase: string
+): useCase is "conversation" | "tool_output" {
+  return ["conversation", "tool_output"].includes(useCase);
+}
+
+export const MAX_EMAILS_PER_INVITE = 20;
+
+export const fileShareScopeSchema = z.enum([
+  "emails_only",
+  "public",
+  "workspace_and_emails",
+  "workspace",
+]);
+
+export type FileShareScope = z.infer<typeof fileShareScopeSchema>;
+
+/**
+ * Whether a share scope makes the file visible to every workspace member holding its link.
+ * "workspace" is the legacy spelling of "workspace_and_emails".
+ */
+export function isWorkspaceVisibleShareScope(scope: FileShareScope): boolean {
+  return scope === "workspace_and_emails" || scope === "workspace";
+}
+
+/**
+ * Allowlist of files a shared Frame may load via useFile().
+ * AuthorizedFileAccessModel stores one row per authorized file ref for the
+ * current frame version (replaced on recompute).
+ */
+export const authorizedFileAccessKindSchema = z.enum([
+  "file_id",
+  "canonical_path",
+  "unverifiable",
+]);
+
+export type AuthorizedFileAccessKind = z.infer<
+  typeof authorizedFileAccessKindSchema
+>;
+
+const authorizedFileAccessEntryBaseSchema = {
+  shareScope: fileShareScopeSchema,
+  frameContentHash: z.string(),
+  allowedAt: z.string(),
+};
+
+const authorizedFileIdAccessEntrySchema = z
+  .object({
+    kind: z.literal("file_id"),
+    ref: z.string(),
+    fileName: z.string().optional(),
+    ...authorizedFileAccessEntryBaseSchema,
+  })
+  .strict();
+
+const authorizedCanonicalPathAccessEntrySchema = z
+  .object({
+    kind: z.literal("canonical_path"),
+    ref: z.string(),
+    legacyPath: z.string().optional(),
+    fileName: z.string().optional(),
+    ...authorizedFileAccessEntryBaseSchema,
+  })
+  .strict();
+
+const authorizedUnverifiableAccessEntrySchema = z
+  .object({
+    kind: z.literal("unverifiable"),
+    ref: z.string(),
+    ...authorizedFileAccessEntryBaseSchema,
+  })
+  .strict();
+
+export const authorizedFileAccessEntrySchema = z.discriminatedUnion("kind", [
+  authorizedFileIdAccessEntrySchema,
+  authorizedCanonicalPathAccessEntrySchema,
+  authorizedUnverifiableAccessEntrySchema,
+]);
+
+type AuthorizedFileAccessEntry = z.infer<
+  typeof authorizedFileAccessEntrySchema
+>;
+
+const authorizedFileIdRefSchema = z
+  .object({
+    kind: z.literal("file_id"),
+    ref: z.string(),
+    fileName: z.string().optional(),
+  })
+  .strict();
+
+const authorizedCanonicalPathRefSchema = z
+  .object({
+    kind: z.literal("canonical_path"),
+    ref: z.string(),
+    legacyPath: z.string().optional(),
+    fileName: z.string().optional(),
+  })
+  .strict();
+
+export const authorizedFileRefSchema = z.discriminatedUnion("kind", [
+  authorizedFileIdRefSchema,
+  authorizedCanonicalPathRefSchema,
+]);
+
+export type AuthorizedFileRef = z.infer<typeof authorizedFileRefSchema>;
+
+export function getAuthorizedFileRefLabel(ref: AuthorizedFileRef): string {
+  if (ref.fileName) {
+    return ref.fileName;
+  }
+  if (ref.kind === "file_id") {
+    return ref.ref;
+  }
+  return ref.ref.split("/").pop() ?? ref.ref;
+}
+
+export function entryToAuthorizedFileRef(
+  entry: AuthorizedFileAccessEntry
+): AuthorizedFileRef | null {
+  switch (entry.kind) {
+    case "unverifiable":
+      return null;
+    case "file_id":
+      return {
+        kind: "file_id",
+        ref: entry.ref,
+        ...(entry.fileName ? { fileName: entry.fileName } : {}),
+      };
+    case "canonical_path":
+      return {
+        kind: "canonical_path",
+        ref: entry.ref,
+        ...(entry.legacyPath ? { legacyPath: entry.legacyPath } : {}),
+        ...(entry.fileName ? { fileName: entry.fileName } : {}),
+      };
+    default:
+      return assertNever(entry);
+  }
+}
+
+/** Active allowlist view derived from non-revoked DB rows. */
+export type AuthorizedFileAccessAllowlist = {
+  generatedByUserId: number | null;
+  frameContentHash: string;
+  refs: AuthorizedFileRef[];
+};
+
+/** Result of scanning frame content before persisting rows. */
+export type ComputedAuthorizedFileAccess = AuthorizedFileAccessAllowlist & {
+  unverifiableRefs?: string[];
+};
+
+export function parseAuthorizedFileAccessEntry(
+  data: unknown
+): AuthorizedFileAccessEntry {
+  return authorizedFileAccessEntrySchema.parse(data);
+}
+
+export type AuthorizedFileAccessShareError = Omit<RubyError, "code"> & {
+  code: "invalid_request_error" | "internal_error";
+  unverifiableRefs?: string[];
+};
+
+export function isUnverifiableFrameFileRefsShareError(
+  error: AuthorizedFileAccessShareError
+): error is AuthorizedFileAccessShareError & {
+  code: "invalid_request_error";
+  unverifiableRefs: string[];
+} {
+  return (
+    error.code === "invalid_request_error" &&
+    Array.isArray(error.unverifiableRefs) &&
+    error.unverifiableRefs.length > 0
+  );
+}
+
+export interface SharingGrantType {
+  id: number;
+  email: string;
+  grantedAt: number;
+  grantedBy: UserType | null;
+  expiresAt: number | null;
+  revokedAt: number | null;
+  lastViewedAt: number | null;
+  // True when the workspace policy prevents this grant from granting access.
+  blockedByPolicy?: boolean;
+}
+
+export interface FileType {
+  contentType: AllSupportedFileContentType;
+  downloadUrl?: string;
+  version: number;
+  fileName: string;
+  fileSize: number;
+  sId: string;
+  // TODO(spolu): move this to being the ModelId
+  id: string;
+  status: FileStatus;
+  uploadUrl?: string;
+  publicUrl?: string;
+  useCase: FileUseCase;
+}
+
+/**
+ * @swaggerschema PrivateFileWithUploadUrl (swagger_private_schemas.ts)
+ */
+export type FileTypeWithUploadUrl = FileType & {
+  uploadUrl: string;
+};
+
+export type FileTypeWithMetadata = FileType & {
+  useCaseMetadata: FileUseCaseMetadata;
+};
+
+type FileFormatCategory = "image" | "data" | "code" | "delimited" | "audio";
+
+// Define max sizes for each category.
+const MAX_FILE_SIZES_DEFAULT: Record<FileFormatCategory, number> = {
+  data: 50 * 1024 * 1024, // 50MB.
+  code: 50 * 1024 * 1024, // 50MB.
+  delimited: 50 * 1024 * 1024, // 50MB.
+  image: 20 * 1024 * 1024, // 20MB - Gemini limit due to base64 conversion overhead
+  audio: 100 * 1024 * 1024, // 100 MB, audio files can be large, ex transcript of meetings
+};
+
+export const MAX_FILE_SIZES = MAX_FILE_SIZES_DEFAULT;
+
+// Conversations: large delimited files (CSV/XLSX) are mounted into the sandbox and read as-is by
+// the agent's code rather than loaded into its context, so they can be much larger than regular
+// uploads.
+const MAX_FILE_SIZES_LARGE_DELIMITED: Record<FileFormatCategory, number> = {
+  ...MAX_FILE_SIZES_DEFAULT,
+  delimited: 350 * 1024 * 1024,
+};
+
+// Skill attachments: tabular files (CSV/XLSX -> delimited) AND documents (PDF/DOCX/PPTX -> data)
+// are mounted into the sandbox and read as-is, so both categories can be much larger than regular
+// uploads.
+const MAX_FILE_SIZES_LARGE_SKILL: Record<FileFormatCategory, number> = {
+  ...MAX_FILE_SIZES_DEFAULT,
+  delimited: 350 * 1024 * 1024,
+  data: 350 * 1024 * 1024,
+};
+
+// Whether an upload is stored as a raw sandbox file: kept as-is with no upload-time processing
+// (no Tika extraction / image resize) and not indexed. Always requires sandbox tools.
+//  - conversation: large delimited files are served raw to the sandbox instead of indexed as tables;
+//  - skill_attachment: delimited tables and data documents (PDF/DOCX/PPTX) are mounted raw.
+export function allowsSandboxRawUpload({
+  category,
+  hasSandboxTools,
+  useCase,
+}: {
+  category: FileFormatCategory;
+  hasSandboxTools: boolean;
+  useCase: FileUseCase;
+}): boolean {
+  if (!hasSandboxTools) {
+    return false;
+  }
+
+  switch (useCase) {
+    case "conversation":
+      return category === "delimited";
+    case "skill_attachment":
+      return category === "delimited" || category === "data";
+    case "avatar":
+    case "tool_output":
+    case "upsert_document":
+    case "folders_document":
+    case "upsert_table":
+    case "project_context":
+    case "workspace_branding":
+      return false;
+    default:
+      assertNever(useCase);
+  }
+}
+
+export function resolveMaxFileSizes({
+  hasSandboxTools,
+  useCase,
+}: {
+  hasSandboxTools: boolean;
+  useCase: FileUseCase;
+}): Record<FileFormatCategory, number> {
+  if (!hasSandboxTools) {
+    return MAX_FILE_SIZES_DEFAULT;
+  }
+
+  switch (useCase) {
+    case "conversation":
+      return MAX_FILE_SIZES_LARGE_DELIMITED;
+    case "skill_attachment":
+      return MAX_FILE_SIZES_LARGE_SKILL;
+    case "avatar":
+    case "tool_output":
+    case "upsert_document":
+    case "folders_document":
+    case "upsert_table":
+    case "project_context":
+    case "workspace_branding":
+      return MAX_FILE_SIZES_DEFAULT;
+    default:
+      return assertNever(useCase);
+  }
+}
+
+export function fileSizeToHumanReadable(size: number, decimals = 0) {
+  if (size < 1024) {
+    return `${size.toFixed(decimals)} B`;
+  }
+
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(decimals)} KB`;
+  }
+
+  if (size < 1024 * 1024 * 1024) {
+    return `${(size / (1024 * 1024)).toFixed(decimals)} MB`;
+  }
+
+  return `${(size / (1024 * 1024 * 1024)).toFixed(decimals)} GB`;
+}
+
+const BIG_FILE_SIZE = 5_000_000;
+
+export function isBigFileSize(size: number) {
+  return size > BIG_FILE_SIZE;
+}
+
+// Function to ensure file size is within max limit for given content type.
+export function ensureFileSize(
+  contentType: AllSupportedFileContentType,
+  fileSize: number,
+  opts: {
+    hasSandboxTools: boolean;
+    useCase: FileUseCase;
+  }
+): boolean {
+  const format = getFileFormat(contentType);
+
+  if (format) {
+    return fileSize <= resolveMaxFileSizes(opts)[format.cat];
+  }
+
+  return false;
+}
+
+export function ensureFileSizeByFormatCategory(
+  category: FileFormatCategory,
+  fileSize: number,
+  opts: {
+    hasSandboxTools: boolean;
+    useCase: FileUseCase;
+  }
+): boolean {
+  return fileSize <= resolveMaxFileSizes(opts)[category];
+}
+
+type FileFormat = {
+  cat: FileFormatCategory;
+  exts: string[];
+  /**
+   * Indicates whether the file type can be safely displayed directly in the browser.
+   *
+   * Security considerations:
+   * - Default is false (not safe to display)
+   * - Only explicitly whitelisted file types should be marked as safe
+   * - File types that could contain executable code or XSS vectors should never be marked as safe
+   * - Unknown content types are treated as unsafe by default
+   *
+   * Safe file types typically include:
+   * - Images (jpeg, png, gif, webp)
+   * - Documents (pdf, doc, ppt)
+   * - Plain text formats (txt, markdown)
+   * - Structured data (json, csv)
+   *
+   * Unsafe file types include:
+   * - HTML and XML files
+   * - Script files (js, ts, py, etc.)
+   * - Audio files (mp4, ogg, etc.)
+   * - Any file type that could contain executable code
+   */
+  isSafeToDisplay: boolean;
+  /**
+   * When true, this format opens in the resizable conversation side panel
+   * (like frames) rather than the cramped file preview modal. This is the
+   * source of truth for the open-in-side-panel behavior per content type.
+   * Note: the side panel preview relies on the path-based conversion route, so
+   * a file path is still required at the call site.
+   */
+  opensInSidePanel?: boolean;
+  // When set, restricts which upload use cases expose this format in their file picker.
+  // Possible values: conversation, avatar, tool_output, skill_attachment, upsert_document,
+  // folders_document, upsert_table, project_context. Omit to allow in all contexts.
+  allowedFileUploadUseCases?: readonly FileUseCase[];
+};
+
+// NOTE: if we add more content types, we need to update the public api package. (but the
+// typechecker should catch it).
+export const FILE_FORMATS = {
+  // Images.
+  "image/jpeg": {
+    cat: "image",
+    exts: [".jpg", ".jpeg"],
+    isSafeToDisplay: true,
+  },
+  "image/png": { cat: "image", exts: [".png"], isSafeToDisplay: true },
+  "image/gif": { cat: "image", exts: [".gif"], isSafeToDisplay: true },
+  "image/webp": { cat: "image", exts: [".webp"], isSafeToDisplay: true },
+  "image/svg+xml": { cat: "image", exts: [".svg"], isSafeToDisplay: false },
+  "image/bmp": { cat: "image", exts: [".bmp"], isSafeToDisplay: true },
+  "image/x-icon": {
+    cat: "image",
+    exts: [".ico"],
+    isSafeToDisplay: true,
+    allowedFileUploadUseCases: ["workspace_branding"],
+  },
+
+  // Structured.
+  "text/csv": { cat: "delimited", exts: [".csv"], isSafeToDisplay: true },
+  "text/comma-separated-values": {
+    cat: "delimited",
+    exts: [".csv"],
+    isSafeToDisplay: true,
+  },
+  "text/tsv": { cat: "delimited", exts: [".tsv"], isSafeToDisplay: true },
+  "text/tab-separated-values": {
+    cat: "delimited",
+    exts: [".tsv"],
+    isSafeToDisplay: true,
+  },
+  "application/vnd.ms-excel": {
+    cat: "delimited",
+    exts: [".xls"],
+    isSafeToDisplay: true,
+  },
+  "application/vnd.google-apps.spreadsheet": {
+    cat: "delimited",
+    exts: [],
+    isSafeToDisplay: true,
+  },
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+    cat: "delimited",
+    exts: [".xlsx"],
+    isSafeToDisplay: true,
+  },
+
+  // Custom for section json files generated from tables query results.
+  "application/vnd.ruby.section.json": {
+    cat: "data",
+    exts: [".json"],
+    isSafeToDisplay: true,
+  },
+  // Data.
+  "text/plain": {
+    cat: "data",
+    exts: [".txt", ".log", ".cfg", ".conf"],
+    isSafeToDisplay: true,
+  },
+  "text/markdown": {
+    cat: "data",
+    exts: [".md", ".markdown"],
+    isSafeToDisplay: true,
+  },
+  // Internal content type for pasted text attachments in conversations.
+  "text/vnd.ruby.attachment.pasted": {
+    cat: "data",
+    exts: [".txt"],
+    isSafeToDisplay: true,
+  },
+  "text/vnd.ruby.attachment.slack.thread": {
+    cat: "data",
+    exts: [".txt"],
+    isSafeToDisplay: true,
+  },
+  "text/calendar": { cat: "data", exts: [".ics"], isSafeToDisplay: true },
+  "application/json": { cat: "data", exts: [".json"], isSafeToDisplay: true },
+  "application/msword": {
+    cat: "data",
+    exts: [".doc", ".docx"],
+    isSafeToDisplay: true,
+  },
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": {
+    cat: "data",
+    exts: [".docx", ".doc"],
+    isSafeToDisplay: true,
+  },
+  "application/vnd.ms-powerpoint": {
+    cat: "data",
+    exts: [".ppt", ".pptx"],
+    isSafeToDisplay: true,
+    opensInSidePanel: true,
+  },
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": {
+    cat: "data",
+    exts: [".ppt", ".pptx"],
+    isSafeToDisplay: true,
+    opensInSidePanel: true,
+  },
+  "application/pdf": { cat: "data", exts: [".pdf"], isSafeToDisplay: true },
+  "application/vnd.google-apps.document": {
+    cat: "data",
+    exts: [],
+    isSafeToDisplay: true,
+  },
+  "application/vnd.google-apps.presentation": {
+    cat: "data",
+    exts: [],
+    isSafeToDisplay: true,
+  },
+  "message/rfc822": { cat: "data", exts: [".eml"], isSafeToDisplay: false },
+  // Code - most code files are not safe to display by default.
+  "text/xml": { cat: "data", exts: [".xml"], isSafeToDisplay: false },
+  "application/xml": { cat: "data", exts: [".xml"], isSafeToDisplay: false },
+  "text/html": {
+    cat: "data",
+    exts: [".html", ".htm", ".xhtml", ".xhtml+xml"],
+    isSafeToDisplay: false,
+  },
+  "text/css": { cat: "code", exts: [".css"], isSafeToDisplay: false },
+  "text/javascript": {
+    cat: "code",
+    exts: [".js", ".mjs", ".jsx"],
+    isSafeToDisplay: false,
+  },
+  "text/typescript": {
+    cat: "code",
+    exts: [".ts", ".tsx"],
+    isSafeToDisplay: false,
+  },
+  "application/x-sh": { cat: "code", exts: [".sh"], isSafeToDisplay: false },
+  "text/x-sh": { cat: "code", exts: [".sh"], isSafeToDisplay: false },
+  "text/x-python": { cat: "code", exts: [".py"], isSafeToDisplay: false },
+  "text/x-python-script": {
+    cat: "code",
+    exts: [".py"],
+    isSafeToDisplay: false,
+  },
+  "application/x-yaml": {
+    cat: "code",
+    exts: [".yaml", ".yml"],
+    isSafeToDisplay: false,
+  },
+  "text/yaml": { cat: "code", exts: [".yaml", ".yml"], isSafeToDisplay: false },
+  "text/vnd.yaml": {
+    cat: "code",
+    exts: [".yaml", ".yml"],
+    isSafeToDisplay: false,
+  },
+  "text/x-c": {
+    cat: "code",
+    exts: [".c", ".cc", ".cpp", ".cxx", ".dic", ".h", ".hh"],
+    isSafeToDisplay: false,
+  },
+  "text/x-csharp": { cat: "code", exts: [".cs"], isSafeToDisplay: false },
+  "text/x-java-source": {
+    cat: "code",
+    exts: [".java"],
+    isSafeToDisplay: false,
+  },
+  "text/x-php": { cat: "code", exts: [".php"], isSafeToDisplay: false },
+  "text/x-ruby": { cat: "code", exts: [".rb"], isSafeToDisplay: false },
+  "text/x-sql": { cat: "code", exts: [".sql"], isSafeToDisplay: false },
+  "text/x-swift": { cat: "code", exts: [".swift"], isSafeToDisplay: false },
+  "text/x-rust": { cat: "code", exts: [".rs"], isSafeToDisplay: false },
+  "text/x-go": { cat: "code", exts: [".go"], isSafeToDisplay: false },
+  "text/x-kotlin": {
+    cat: "code",
+    exts: [".kt", ".kts"],
+    isSafeToDisplay: false,
+  },
+  "text/x-scala": { cat: "code", exts: [".scala"], isSafeToDisplay: false },
+  "text/x-groovy": { cat: "code", exts: [".groovy"], isSafeToDisplay: false },
+  "text/x-perl": { cat: "code", exts: [".pl", ".pm"], isSafeToDisplay: false },
+  "text/x-perl-script": {
+    cat: "code",
+    exts: [".pl", ".pm"],
+    isSafeToDisplay: false,
+  },
+
+  // Audio
+  "audio/mpeg": {
+    cat: "audio",
+    exts: [".mp3", ".mp4"],
+    isSafeToDisplay: true,
+  },
+  // In theory deprecated => https://mimetype.io/audio/x-m4a
+  // But apple voice recordings use it.
+  "audio/x-m4a": {
+    cat: "audio",
+    exts: [".m4a", ".mp4"],
+    isSafeToDisplay: true,
+  },
+  "audio/wav": { cat: "audio", exts: [".wav"], isSafeToDisplay: true },
+  // Legacy MIME type for WAV files, still reported by some browsers.
+  "audio/x-wav": { cat: "audio", exts: [".wav"], isSafeToDisplay: true },
+  "audio/ogg": { cat: "audio", exts: [".ogg"], isSafeToDisplay: true },
+  "audio/webm": { cat: "audio", exts: [".webm"], isSafeToDisplay: true },
+  // Chrome sometimes uses video/webm for audio files, and we can still process them as audio only files
+  "video/webm": { cat: "audio", exts: [".webm"], isSafeToDisplay: true },
+
+  // Fonts — skill attachments only.
+  "font/woff": {
+    cat: "data",
+    exts: [".woff"],
+    isSafeToDisplay: false,
+    allowedFileUploadUseCases: ["skill_attachment"],
+  },
+  "font/woff2": {
+    cat: "data",
+    exts: [".woff2"],
+    isSafeToDisplay: false,
+    allowedFileUploadUseCases: ["skill_attachment"],
+  },
+  "font/otf": {
+    cat: "data",
+    exts: [".otf"],
+    isSafeToDisplay: false,
+    allowedFileUploadUseCases: ["skill_attachment"],
+  },
+  "font/ttf": {
+    cat: "data",
+    exts: [".ttf"],
+    isSafeToDisplay: false,
+    allowedFileUploadUseCases: ["skill_attachment"],
+  },
+  "font/collection": {
+    cat: "data",
+    exts: [".ttc", ".otc"],
+    isSafeToDisplay: false,
+    allowedFileUploadUseCases: ["skill_attachment"],
+  },
+
+  // Unknown.
+  "application/octet-stream": {
+    cat: "data",
+    exts: [],
+    isSafeToDisplay: false,
+  },
+
+  // Declare type with satisfies to allow flexible key typing while ensuring FileFormat values
+  // and correct FILE_FORMATS key inference.
+} as const satisfies Record<string, FileFormat>;
+
+// Define a type that is the list of all keys from FILE_FORMATS.
+export type SupportedFileContentType = keyof typeof FILE_FORMATS;
+
+export const frameContentType = "application/vnd.ruby.frame";
+export const frameV2ContentType = "application/vnd.ruby.frame.v2+json";
+export const frameSlideshowContentType = "application/vnd.ruby.frame.slideshow";
+export const sandboxFunctionContentType =
+  "application/vnd.ruby.sandbox.function";
+
+// Interactive Content MIME types for specialized use cases (not exposed via APIs).
+export const INTERACTIVE_CONTENT_FILE_FORMATS = {
+  // Custom for frame code files managed by interactive_content MCP server.
+  // These files are internal-only and should not be exposed via APIs.
+  // Limited to JavaScript/TypeScript files that can run in the browser.
+  [frameContentType]: {
+    cat: "code",
+    exts: [".js", ".jsx", ".ts", ".tsx"],
+    isSafeToDisplay: true,
+  },
+  [frameSlideshowContentType]: {
+    cat: "code",
+    exts: [".js", ".jsx", ".ts", ".tsx"],
+    isSafeToDisplay: true,
+  },
+} as const satisfies Record<string, FileFormat>;
+
+// Define a type for Interactive Content file content types.
+export type InteractiveContentFileContentType =
+  keyof typeof INTERACTIVE_CONTENT_FILE_FORMATS;
+
+const FRAME_V2_FILE_FORMATS = {
+  [frameV2ContentType]: {
+    cat: "code",
+    exts: [".json"],
+    isSafeToDisplay: true,
+  },
+} as const satisfies Record<string, FileFormat>;
+
+type FrameV2FileContentType = keyof typeof FRAME_V2_FILE_FORMATS;
+
+export type FrameFileContentType =
+  | InteractiveContentFileContentType
+  | FrameV2FileContentType;
+
+const SANDBOX_FUNCTION_FILE_FORMATS = {
+  [sandboxFunctionContentType]: {
+    cat: "code",
+    exts: [".ts"],
+    isSafeToDisplay: false,
+  },
+} as const satisfies Record<string, FileFormat>;
+
+export type SandboxFunctionFileContentType =
+  keyof typeof SANDBOX_FUNCTION_FILE_FORMATS;
+
+export const ALL_FILE_FORMATS = {
+  ...INTERACTIVE_CONTENT_FILE_FORMATS,
+  ...FRAME_V2_FILE_FORMATS,
+  ...SANDBOX_FUNCTION_FILE_FORMATS,
+  ...FILE_FORMATS,
+};
+// Union type for all supported content types.
+export type AllSupportedFileContentType =
+  | InteractiveContentFileContentType
+  | FrameV2FileContentType
+  | SandboxFunctionFileContentType
+  | SupportedFileContentType;
+
+export type AllSupportedWithRubySpecificFileContentType =
+  | AllSupportedFileContentType
+  | "application/vnd.ruby.tool-output.data-source-search-result"
+  | "application/vnd.ruby.tool-output.websearch-result"
+  | "application/vnd.ruby.tool-output.data-source-node-content";
+
+export type SupportedImageContentType = {
+  [K in keyof typeof FILE_FORMATS]: (typeof FILE_FORMATS)[K] extends {
+    cat: "image";
+  }
+    ? K
+    : never;
+}[keyof typeof FILE_FORMATS];
+
+type SupportedDelimitedTextContentType = {
+  [K in keyof typeof FILE_FORMATS]: (typeof FILE_FORMATS)[K] extends {
+    cat: "delimited";
+  }
+    ? K
+    : never;
+}[keyof typeof FILE_FORMATS];
+
+export type SupportedNonImageContentType = {
+  [K in keyof typeof FILE_FORMATS]: (typeof FILE_FORMATS)[K] extends {
+    cat: "image";
+  }
+    ? never
+    : K;
+}[keyof typeof FILE_FORMATS];
+
+type SupportedAudioContentType = {
+  [K in keyof typeof FILE_FORMATS]: (typeof FILE_FORMATS)[K] extends {
+    cat: "audio";
+  }
+    ? K
+    : never;
+}[keyof typeof FILE_FORMATS];
+
+// All the ones listed above
+export const supportedUploadableContentType = Object.keys(FILE_FORMATS);
+
+export const DEFAULT_FILE_CONTENT_TYPE: SupportedFileContentType =
+  "application/octet-stream";
+
+export function isSupportedFileContentType(
+  contentType: string
+): contentType is SupportedFileContentType {
+  return !!FILE_FORMATS[contentType as SupportedFileContentType];
+}
+
+export function isInteractiveContentType(
+  contentType: string
+): contentType is InteractiveContentFileContentType {
+  return !!INTERACTIVE_CONTENT_FILE_FORMATS[
+    contentType as InteractiveContentFileContentType
+  ];
+}
+
+export function isSandboxFunctionContentType(
+  contentType: string
+): contentType is SandboxFunctionFileContentType {
+  return !!SANDBOX_FUNCTION_FILE_FORMATS[
+    contentType as SandboxFunctionFileContentType
+  ];
+}
+
+export function isFrameV2ContentType(
+  contentType: string
+): contentType is FrameV2FileContentType {
+  return contentType === frameV2ContentType;
+}
+
+export function isFrameContentType(
+  contentType: string
+): contentType is FrameFileContentType {
+  return (
+    isInteractiveContentType(contentType) || isFrameV2ContentType(contentType)
+  );
+}
+
+export function getFileDisplayName(file: {
+  contentType: string;
+  fileName: string;
+  useCaseMetadata?: FileUseCaseMetadata | null;
+}): string {
+  if (
+    isFrameV2ContentType(file.contentType) &&
+    file.useCaseMetadata?.frameName
+  ) {
+    return file.useCaseMetadata.frameName;
+  }
+
+  return file.fileName;
+}
+
+export function isAllSupportedFileContentType(
+  contentType: string
+): contentType is AllSupportedFileContentType {
+  return (
+    isInteractiveContentType(contentType) ||
+    isFrameV2ContentType(contentType) ||
+    isSandboxFunctionContentType(contentType) ||
+    isSupportedFileContentType(contentType)
+  );
+}
+
+// UseCases supported on the public API
+export function isPubliclySupportedUseCase(
+  useCase: string
+): useCase is FileUseCase {
+  return ["conversation"].includes(useCase);
+}
+
+export function isSupportedImageContentType(
+  contentType: string
+): contentType is SupportedImageContentType {
+  const format = getFileFormat(contentType);
+
+  if (format) {
+    return format.cat === "image";
+  }
+
+  return false;
+}
+
+/**
+ * Returns true for images that can be sent to LLM vision APIs.
+ * SVG is categorized as "image" for UI display but is vector-based and not supported by vision APIs.
+ */
+export function isLLMVisionSupportedImageContentType(
+  contentType: string
+): contentType is SupportedImageContentType {
+  return (
+    isSupportedImageContentType(contentType) && contentType !== "image/svg+xml"
+  );
+}
+
+export function isSupportedDelimitedTextContentType(
+  contentType: string
+): contentType is SupportedDelimitedTextContentType {
+  const format = getFileFormat(contentType);
+
+  if (format) {
+    return format.cat === "delimited";
+  }
+
+  return false;
+}
+
+export function isSupportedAudioContentType(
+  contentType: string
+): contentType is SupportedAudioContentType {
+  const format = getFileFormat(contentType);
+
+  if (format) {
+    return format.cat === "audio";
+  }
+
+  return false;
+}
+
+type SupportedFontContentType =
+  | "font/woff"
+  | "font/woff2"
+  | "font/otf"
+  | "font/ttf"
+  | "font/collection";
+
+export function isSupportedFontContentType(
+  contentType: string
+): contentType is SupportedFontContentType {
+  return (
+    contentType === "font/woff" ||
+    contentType === "font/woff2" ||
+    contentType === "font/otf" ||
+    contentType === "font/ttf" ||
+    contentType === "font/collection"
+  );
+}
+
+export function getFileFormatCategory(
+  contentType: string
+): FileFormatCategory | null {
+  const format = getFileFormat(contentType);
+
+  if (format) {
+    return format.cat;
+  }
+
+  return null;
+}
+
+export function getFileFormat(contentType: string): FileFormat | null {
+  if (isSupportedFileContentType(contentType)) {
+    const format = FILE_FORMATS[contentType];
+    if (format) {
+      return format;
+    }
+  }
+
+  return null;
+}
+
+export function extensionsForContentType(
+  contentType: AllSupportedFileContentType
+): string[] {
+  const format = getFileFormat(contentType);
+
+  if (format) {
+    return format.exts;
+  }
+
+  return [];
+}
+
+function isFormatAllowedForUseCase(
+  format: (typeof FILE_FORMATS)[keyof typeof FILE_FORMATS],
+  useCase?: FileUseCase
+): boolean {
+  if (!("allowedFileUploadUseCases" in format)) {
+    return true;
+  }
+  return useCase
+    ? format.allowedFileUploadUseCases.some((uc) => uc === useCase)
+    : false;
+}
+
+export function getSupportedFileExtensions(
+  cat?: FileFormatCategory,
+  useCase?: FileUseCase
+) {
+  return uniq(
+    removeNulls(
+      Object.values(FILE_FORMATS).flatMap((format) =>
+        isFormatAllowedForUseCase(format, useCase) &&
+        (!cat || format.cat === cat)
+          ? format.exts
+          : []
+      )
+    )
+  );
+}
+
+export function getSupportedNonImageFileExtensions(useCase?: FileUseCase) {
+  return uniq(
+    removeNulls(
+      Object.values(FILE_FORMATS).flatMap((format) =>
+        isFormatAllowedForUseCase(format, useCase) && format.cat !== "image"
+          ? format.exts
+          : []
+      )
+    )
+  );
+}
+
+export function getSupportedNonImageMimeTypes(useCase?: FileUseCase) {
+  return uniq(
+    removeNulls(
+      Object.entries(FILE_FORMATS).map(([key, value]) =>
+        isFormatAllowedForUseCase(value, useCase) && value.cat !== "image"
+          ? (key as SupportedNonImageContentType)
+          : null
+      )
+    )
+  );
+}
+
+// Browsers may report incorrect MIME types for certain file extensions.
+// For example, it seems that it's likely that Windows, with Excel installed,
+// reports .csv files as application/vnd.ms-excel, which causes them
+// to be routed to the Tika text extraction pipeline instead of the native CSV parser.
+const EXTENSION_CONTENT_TYPE_OVERRIDES: Record<
+  string,
+  SupportedFileContentType
+> = {
+  ".csv": "text/csv",
+  ".tsv": "text/tsv",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".otf": "font/otf",
+  ".ttf": "font/ttf",
+  ".ttc": "font/collection",
+  ".otc": "font/collection",
+};
+
+export function stripMimeParameters(contentType: string): string {
+  return contentType.split(";")[0];
+}
+
+/**
+ * MIME types are case-insensitive per RFC 2045. Use this at every upload and
+ * serving boundary so mixed-case values like TEXT/HTML cannot bypass content-type safety gating.
+ */
+export function normalizeMimeType(contentType: string): string {
+  return stripMimeParameters(contentType).toLowerCase();
+}
+
+export function stripFileExtension(fileName: string): string {
+  return fileName.replace(/\.[^.]+$/, "");
+}
+
+// This function overrides the browser-reported content type with a more accurate one based on the file extension, if applicable.
+export function resolveFileContentType(
+  browserContentType: string,
+  fileName: string
+): string {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex !== -1) {
+    const extension = fileName.slice(dotIndex).toLowerCase();
+    const override = EXTENSION_CONTENT_TYPE_OVERRIDES[extension];
+    if (override) {
+      return override;
+    }
+  }
+
+  return stripMimeParameters(browserContentType);
+}
+
+export function isPdfContentType(contentType: string): boolean {
+  return contentType === "application/pdf";
+}
+
+export function isMarkdownContentType(contentType: string): boolean {
+  return contentType === "text/markdown";
+}
+
+export function opensInSidePanel(contentType: string): boolean {
+  return getFileFormat(contentType)?.opensInSidePanel ?? false;
+}
+
+/**
+ * Infers a supported content type from a file name's extension.
+ * Returns null if the extension is not recognized.
+ */
+export function contentTypeFromFileName(
+  fileName: string
+): SupportedFileContentType | null {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex === -1) {
+    return null;
+  }
+  const extension = fileName.slice(dotIndex).toLowerCase();
+
+  for (const key of Object.keys(FILE_FORMATS)) {
+    if (isSupportedFileContentType(key)) {
+      const exts: readonly string[] = FILE_FORMATS[key].exts;
+      if (exts.includes(extension)) {
+        return key;
+      }
+    }
+  }
+
+  return null;
+}

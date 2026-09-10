@@ -1,0 +1,72 @@
+import { DataSourceViewsDataTable } from "@app/components/poke/data_source_views/table";
+import { GroupPermissionsDataTable } from "@app/components/poke/group_permissions/table";
+import { MembersDataTable } from "@app/components/poke/members/table";
+import { PluginList } from "@app/components/poke/plugins/PluginList";
+import { ProjectConnectorKnowledgeDataTable } from "@app/components/poke/projects/connector_knowledge/table";
+import { ProjectConversationDataTable } from "@app/components/poke/projects/conversations/table";
+import { ProjectPodDatabaseDataTable } from "@app/components/poke/projects/pod_databases/table";
+import { ProjectTasksDataTable } from "@app/components/poke/projects/tasks/table";
+import { ViewSpaceViewTable } from "@app/components/poke/spaces/view";
+import type { PokeGetSpaceDetails } from "@app/lib/api/poke/spaces";
+import { useWorkspace } from "@app/lib/auth/AuthContext";
+import { LinkWrapper } from "@ruby-ai/sparkle";
+
+interface ProjectPageProps {
+  details: PokeGetSpaceDetails;
+}
+
+export function ProjectPage({ details }: ProjectPageProps) {
+  const owner = useWorkspace();
+
+  const { members, metadata, sandbox, space } = details;
+
+  return (
+    <>
+      <h3 className="text-xl font-bold">
+        Pod {space.name} within workspace{" "}
+        <LinkWrapper href={`/poke/${owner.sId}`} className="text-highlight-500">
+          {owner.name}
+        </LinkWrapper>
+      </h3>
+      {metadata?.description && (
+        <p className="mt-2 text-sm text-muted-foreground">
+          {metadata.description}
+        </p>
+      )}
+      <div className="flex flex-row gap-x-6">
+        <ViewSpaceViewTable sandbox={sandbox} space={space} />
+        <div className="mt-4 flex grow flex-col">
+          {Object.entries(members).map(([groupName, groupMembers]) => (
+            <MembersDataTable
+              key={groupName}
+              groupName={groupName}
+              members={groupMembers}
+              owner={owner}
+              readonly
+            />
+          ))}
+          <PluginList
+            pluginResourceTarget={{
+              resourceId: space.sId,
+              resourceType: "spaces",
+              workspace: owner,
+            }}
+          />
+          <ProjectConversationDataTable owner={owner} projectId={space.sId} />
+          <ProjectConnectorKnowledgeDataTable
+            owner={owner}
+            projectId={space.sId}
+          />
+          <ProjectTasksDataTable owner={owner} projectId={space.sId} />
+          <DataSourceViewsDataTable owner={owner} spaceId={space.sId} />
+          <ProjectPodDatabaseDataTable owner={owner} projectId={space.sId} />
+          <GroupPermissionsDataTable
+            owner={owner}
+            resourceType="space"
+            resourceId={space.id}
+          />
+        </div>
+      </div>
+    </>
+  );
+}

@@ -1,0 +1,165 @@
+// biome-ignore lint/suspicious/noImportCycles: ignored using `--suppress`
+import { makeFeedbackSubmittedBlock } from "@connectors/connectors/slack/chat/blocks";
+import {
+  getSlackClient,
+  getSlackUserInfoMemoized,
+} from "@connectors/connectors/slack/lib/slack_client";
+import { apiConfig } from "@connectors/lib/api/config";
+import logger from "@connectors/logger/logger";
+import { ConnectorResource } from "@connectors/resources/connector_resource";
+import { SlackConfigurationResource } from "@connectors/resources/slack_configuration_resource";
+import { getHeaderFromUserEmail } from "@connectors/types";
+
+export async function submitFeedbackToAPI({
+  conversationId,
+  messageId,
+  workspaceId,
+  slackUserId,
+  slackTeamId,
+  thumbDirection,
+  feedbackContent,
+  slackChannelId,
+  slackMessageTs,
+  slackThreadTs,
+  responseUrl,
+}: {
+  conversationId: string;
+  messageId: string;
+  workspaceId: string;
+  slackUserId: string;
+  slackTeamId: string;
+  thumbDirection: "up" | "down";
+  feedbackContent: string;
+  slackChannelId: string;
+  slackMessageTs: string;
+  slackThreadTs: string;
+  responseUrl: string;
+}) {
+  try {
+    const slackConfig =
+      await SlackConfigurationResource.fetchByActiveBot(slackTeamId);
+    if (!slackConfig) {
+      logger.error(
+        { slackTeamId },
+        "Failed to find Slack configuration for team"
+      );
+      return;
+    }
+
+    const connector = await ConnectorResource.fetchById(
+      slackConfig.connectorId
+    );
+    if (!connector) {
+      logger.error(
+        { workspaceId, connectorId: slackConfig.connectorId },
+        "Failed to find connector"
+      );
+      return;
+    }
+
+    const connectorWId = connector.workspaceId;
+
+    let userEmail: string | undefined = undefined;
+    try {
+      const slackClient = await getSlackClient(connector.id);
+      const slackUserInfo = await getSlackUserInfoMemoized(
+        connector.id,
+        slackClient,
+        slackUserId
+      );
+      userEmail = slackUserInfo.email || undefined;
+    } catch (error) {
+      logger.warn(
+        {
+          error,
+          slackUserId,
+          connectorId: connector.id,
+        },
+        "Failed to get Slack user email for feedback"
+      );
+    }
+
+    const response = await fetch(
+      `${apiConfig.getRubyFrontAPIUrl()}/api/v1/w/${connectorWId}/assistant/conversations/${conversationId}/messages/${messageId}/feedbacks`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${connector.workspaceAPIKey}`,
+          ...getHeaderFromUserEmail(userEmail),
+        },
+        body: JSON.stringify({
+          thumbDirection,
+          feedbackContent,
+          isConversationShared: true, // Since they're submitting feedback via Slack, we consider it shared (there's a warning in the modal).
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.text();
+      logger.error(
+        {
+          conversationId,
+          messageId,
+          connectorWId,
+          metadataWorkspaceId: workspaceId,
+          slackUserId,
+          statusCode: response.status,
+          error: errorData,
+        },
+        "Failed to submit feedback to API"
+      );
+      return;
+    }
+
+    logger.info(
+      {
+        conversationId,
+        messageId,
+        connectorWId,
+        slackUserId,
+        thumbDirection,
+      },
+      "Feedback submitted from Slack"
+    );
+
+    // Update the Slack message to show feedback has been submitted
+    // Using response_url works for both regular and ephemeral messages
+    try {
+      await fetch(responseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          replace_original: true,
+          blocks: makeFeedbackSubmittedBlock(),
+        }),
+      });
+    } catch (error) {
+      logger.error(
+        {
+          error,
+          slackChannelId,
+          slackMessageTs,
+          slackThreadTs,
+          conversationId,
+          messageId,
+        },
+        "Failed to update Slack message after feedback submission"
+      );
+    }
+  } catch (error) {
+    logger.error(
+      {
+        conversationId,
+        messageId,
+        workspaceId,
+        slackUserId,
+        error,
+      },
+      "Error submitting feedback to API"
+    );
+  }
+}

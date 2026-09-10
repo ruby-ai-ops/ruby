@@ -1,0 +1,977 @@
+import type {
+  MockMcpDescription,
+  TestSuite,
+  WorkspaceContext,
+} from "@app/tests/reinforcement-evals/lib/types";
+import {
+  calledDescribeMcp,
+  editSkillWithAgentFacingDescription,
+  editSkillWithInlineToolReference,
+  editSkillWithInstructions,
+  editSkillWithoutInlineToolReference,
+  mockTool,
+  noSuggestion,
+} from "@app/tests/reinforcement-evals/lib/types";
+
+const LINKEDIN_MCP_DESCRIPTION: MockMcpDescription = {
+  sId: "mcp_linkedin",
+  description: "Search and enrich company and people profiles from LinkedIn",
+  tools: [
+    {
+      name: "search_company",
+      description: "Search for a company on LinkedIn by name",
+      inputs: [
+        {
+          name: "company_name",
+          type: "string",
+          description: "The name of the company to search for",
+        },
+      ],
+    },
+    {
+      name: "search_user",
+      description: "Search for a person on LinkedIn by name",
+      inputs: [
+        {
+          name: "name",
+          type: "string",
+          description: "The full name of the person to search for",
+        },
+      ],
+    },
+    {
+      name: "enrich_company_data",
+      description: "Get detailed profile data for a company",
+      inputs: [
+        {
+          name: "company_id",
+          type: "string",
+          description:
+            "The LinkedIn company identifier returned by search_company",
+        },
+      ],
+    },
+    {
+      name: "enrich_user",
+      description: "Get detailed profile data for a person",
+      inputs: [
+        {
+          name: "user_id",
+          type: "string",
+          description: "The LinkedIn user identifier returned by search_user",
+        },
+      ],
+    },
+  ],
+};
+
+const JIRA_MCP_DESCRIPTION: MockMcpDescription = {
+  sId: "mcp_jira",
+  description: "Search and manage JIRA issues and projects",
+  tools: [
+    {
+      name: "jira-create-issue",
+      description: "Create a new JIRA ticket",
+      inputs: [
+        {
+          name: "project",
+          type: "string",
+          description: "The JIRA project key the ticket belongs to",
+        },
+        {
+          name: "summary",
+          type: "string",
+          description: "Short summary of the ticket",
+        },
+        {
+          name: "description",
+          type: "string",
+          description: "Detailed description of the ticket",
+        },
+        {
+          name: "issueType",
+          type: "string",
+          description:
+            'The issue type (e.g. "Task", "Bug"). Defaults to "Task"',
+          required: false,
+        },
+      ],
+    },
+    {
+      name: "jira-search-issues",
+      description: "Search for issues using a JQL query",
+      inputs: [
+        {
+          name: "jql",
+          type: "string",
+          description: "The JQL query used to filter issues",
+        },
+      ],
+    },
+    {
+      name: "jira-get-sprint-status",
+      description:
+        "Retrieve the current sprint's progress, including ticket counts by status",
+      inputs: [
+        {
+          name: "board",
+          type: "string",
+          description: 'The board to read the sprint from (e.g. "Engineering")',
+        },
+      ],
+    },
+  ],
+};
+
+const WORKSPACE_CONTEXT: WorkspaceContext = {
+  mcpDescriptions: [LINKEDIN_MCP_DESCRIPTION, JIRA_MCP_DESCRIPTION],
+  tools: [
+    mockTool("Slack", "Read and send Slack messages"),
+    mockTool("Notion", "Search Notion workspace"),
+    mockTool("GitHub", "Access GitHub repositories"),
+    mockTool("JIRA", "Search and manage JIRA issues and projects"),
+    mockTool(
+      "Web Search",
+      "Search the web for current information and real-time data"
+    ),
+    mockTool(
+      "Calendar",
+      "Manage calendar events, check availability, and schedule meetings"
+    ),
+    mockTool(
+      "LinkedIn",
+      "Search and enrich company and people profiles from LinkedIn"
+    ),
+  ],
+};
+
+export const analyzeConversationSuite: TestSuite = {
+  name: "analyze-conversation",
+  description:
+    "Analyze conversations to generate synthetic suggestions for skill improvements",
+  testCases: [
+    {
+      scenarioId: "unclear-instructions",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Meeting Scheduler",
+          sId: "skill_meeting_scheduler",
+          description: "Helps schedule meetings",
+          instructions: "Help with meetings.",
+          tools: [{ name: "Calendar", sId: "mcp_calendar" }],
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content: "Can you schedule a meeting with Sarah for tomorrow at 2pm?",
+        },
+        {
+          role: "agent",
+          content:
+            "I can help with meetings. What would you like me to do exactly?",
+        },
+        {
+          role: "user",
+          content:
+            "I just told you — schedule a meeting with Sarah tomorrow at 2pm. Why are you asking me again?",
+        },
+        {
+          role: "agent",
+          content:
+            "I apologize for the confusion. Let me check Sarah's availability for tomorrow at 2pm.",
+          actions: [
+            {
+              functionCallName: "calendar-check-availability",
+              status: "succeeded",
+              params: { user: "Sarah", date: "tomorrow", time: "2pm" },
+              output: '{"available": true}',
+            },
+            {
+              functionCallName: "calendar-create-event",
+              status: "succeeded",
+              params: {
+                title: "Meeting with Sarah",
+                date: "tomorrow",
+                time: "2pm",
+              },
+              output: '{"eventId": "evt_123"}',
+            },
+          ],
+        },
+        {
+          role: "user",
+          content:
+            "Finally. The instructions for this skill seem really vague.",
+          feedback: {
+            direction: "down",
+            comment:
+              "Skill instructions are too vague — it didn't know what to do with a straightforward scheduling request.",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [editSkillWithInstructions("skill_meeting_scheduler")],
+      judgeCriteria: `The analyst MUST call edit_skill with instructionEdits for skill "skill_meeting_scheduler".
+The suggestion should:
+- Provide clearer instructions that explain the skill should proactively schedule meetings when given enough information (attendee, date, time)
+- Reference that the current instructions ("Help with meetings.") are too vague
+- Include guidance on checking availability before scheduling
+- Have a meaningful analysis referencing the user's confusion
+
+Score 0 if no edit_skill with instructionEdits call is made.
+Score 0-1 if the suggestion doesn't substantially improve the instructions' clarity.
+Score 2 if the suggestion improves clarity but misses key details (e.g., check availability first).
+Score 3 if the suggestion provides clear, actionable instructions that would prevent the observed confusion.`,
+    },
+    {
+      scenarioId: "missing-tool",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Research Assistant",
+          sId: "skill_research",
+          description:
+            "Helps users research topics and find current information",
+          instructions:
+            "Help users research topics thoroughly. Search for up-to-date information when needed. Cite sources when possible.",
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "Can you find the latest news about the EU AI Act regulations?",
+        },
+        {
+          role: "agent",
+          content:
+            "I don't currently have the ability to search the web for real-time information. Based on what I know, the EU AI Act was adopted in 2024, but I may not have the most current developments. Would you like me to help with what I have?",
+        },
+        {
+          role: "user",
+          content:
+            "That's really frustrating. A research skill without web search is useless for finding current information.",
+          feedback: {
+            direction: "down",
+            comment:
+              "Research skill needs web search to be useful for current topics.",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [
+        editSkillWithInlineToolReference("skill_research", "mcp_web_search"),
+      ],
+      judgeCriteria: `The analyst MUST call edit_skill with instructionEdits to suggest adding the Web Search tool
+as an inline <tool id="mcp_web_search" name="Web Search" /> reference in skill "skill_research". The suggestion should:
+- Discover available tools before authoring the inline <tool> reference
+- Add Web Search through an instruction edit
+- Include an analysis explaining that the skill's purpose requires web search for current information
+- Reference that the agent couldn't fulfill the user's core request without this capability
+
+Score 0 if no edit_skill with instructionEdits call is made.
+Score 0-1 if edit_skill is called but with the wrong tool ID or wrong skill ID.
+Score 2 if the correct inline tool reference is suggested but the analysis is weak.
+Score 3 if the correct inline tool reference is suggested with a clear, well-reasoned analysis.`,
+    },
+    {
+      scenarioId: "unused-tool",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Code Review Helper",
+          sId: "skill_code_review",
+          description: "Helps review code and suggest improvements",
+          instructions: [
+            "Review code provided by the user. Focus on code quality, potential bugs, and best practices. Suggest improvements.",
+            "",
+            '<tool id="mcp_github" name="GitHub" />',
+            '<tool id="mcp_calendar" name="Calendar" />',
+          ].join("\n"),
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "Can you review this function?\n\nfunction add(a, b) { return a + b; }",
+        },
+        {
+          role: "agent",
+          content:
+            "Here's my review of the function:\n\n1. **Type safety**: The function lacks type annotations. Consider using TypeScript.\n2. **Edge cases**: No input validation for non-numeric values.\n3. **Naming**: The function name is clear and concise.\n\nSuggested improvement:\n```typescript\nfunction add(a: number, b: number): number {\n  return a + b;\n}\n```",
+          actions: [
+            {
+              functionCallName: "calendar-list-events",
+              status: "failed",
+              params: {},
+              output: "Error: not relevant to the current task",
+            },
+          ],
+        },
+        {
+          role: "user",
+          content:
+            "Good review, but why did it try to access my calendar? That's weird for a code review.",
+          feedback: {
+            direction: "down",
+            comment:
+              "The Calendar tool has nothing to do with code review and caused a confusing error.",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [
+        editSkillWithoutInlineToolReference(
+          "skill_code_review",
+          "mcp_calendar"
+        ),
+      ],
+      judgeCriteria: `The analyst MUST call edit_skill with instructionEdits to remove the inline Calendar tool
+reference (<tool id="mcp_calendar" name="Calendar" />) from skill "skill_code_review". The suggestion should:
+- Remove Calendar through an instruction edit
+- Include an analysis explaining that Calendar is irrelevant to code review and caused confusion
+- Reference the failed tool call and user complaint
+
+Score 0 if no edit_skill with instructionEdits call is made.
+Score 0-1 if edit_skill is called but it removes the wrong inline tool reference.
+Score 2 if the correct inline tool removal is suggested but the analysis is weak.
+Score 3 if the correct removal is suggested with a clear analysis referencing the confusion it caused.`,
+    },
+    {
+      scenarioId: "instruction-and-tool-gap",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Bug Reporter",
+          sId: "skill_bug_reporter",
+          description: "Helps file bug reports from user descriptions",
+          instructions:
+            "When a user describes a bug, create a well-structured bug report with steps to reproduce, expected behavior, and actual behavior. File the bug report in the project tracker.",
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "The login page crashes when I enter a special character in the password field. Can you file a bug for this?",
+        },
+        {
+          role: "agent",
+          content:
+            "I've prepared a bug report:\n\n**Title**: Login page crash on special characters in password\n**Steps to reproduce**: Enter a special character in the password field on the login page\n**Expected**: Password field accepts special characters\n**Actual**: Page crashes\n\nHowever, I don't have access to a project tracker to file this. You'll need to copy this into JIRA or your tracker manually.",
+        },
+        {
+          role: "user",
+          content:
+            "The instructions say to file it in the tracker but the skill can't actually do that. Pretty broken.",
+          feedback: {
+            direction: "down",
+            comment:
+              "Skill promises to file bugs but has no tool to do it. Instructions and tools are mismatched.",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [
+        editSkillWithInlineToolReference("skill_bug_reporter", "mcp_jira"),
+      ],
+      judgeCriteria: `The analyst MUST call edit_skill with instructionEdits for skill "skill_bug_reporter".
+The instruction edit must add the JIRA capability as an inline <tool id="mcp_jira" name="JIRA" /> reference and update the surrounding instructions to use JIRA for filing bugs.
+
+The inline tool reference and instruction change are co-dependent and should be expressed together in the instruction edit.
+
+Score 0 if no edit_skill with instructionEdits call is made.
+Score 1 if the inline JIRA tag is added but the instructions don't explain how to use it, or the analysis is weak.
+Score 2 if the JIRA tag and instructions are both present but the instruction/tool connection isn't explicit.
+Score 3 if the instruction edit clearly adds JIRA as an inline tool reference, tells the skill to file bugs through it, and explains the mismatch.`,
+    },
+    {
+      scenarioId: "successful-conversation",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Data Lookup",
+          sId: "skill_data_lookup",
+          description: "Looks up data in Notion for the team",
+          instructions:
+            "Search Notion for the requested information. Present findings clearly with source references. If multiple results match, show the most relevant ones.",
+          tools: [{ name: "Notion", sId: "mcp_notion" }],
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content: "What's the Q1 revenue target for 2026?",
+        },
+        {
+          role: "agent",
+          content:
+            'According to the "2026 Revenue Targets" page in Notion, the Q1 target is **$2.5M**, representing 15% growth over Q4 2025.',
+          actions: [
+            {
+              functionCallName: "notion-search",
+              status: "succeeded",
+              params: { query: "Q1 2026 revenue target" },
+              output:
+                '{"results": [{"title": "2026 Revenue Targets", "content": "Q1: $2.5M (15% QoQ growth)"}]}',
+            },
+          ],
+          feedback: {
+            direction: "up",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [noSuggestion()],
+      judgeCriteria: `This is a smooth, successful conversation. The skill searched Notion, found accurate data,
+cited the source, and presented it clearly. The user gave a thumbs up.
+
+There is nothing to improve — no negative feedback, no tool errors, no confusion.
+
+Score 0 if any substantive suggestion is made.
+Score 3 if no suggestion is created (empty suggestions arrays only).`,
+    },
+    {
+      scenarioId: "user-feedback-driven",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Email Drafter",
+          sId: "skill_email_drafter",
+          description: "Drafts professional emails",
+          instructions:
+            "Draft emails based on user requests. Keep them professional and concise.",
+          tools: [{ name: "Slack", sId: "mcp_slack" }],
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "Draft an email to the client apologizing for the delayed shipment.",
+        },
+        {
+          role: "agent",
+          content:
+            "Subject: Shipment Delay Notification\n\nDear Customer,\n\nWe regret to inform you that your shipment has been delayed. We are working to resolve this.\n\nRegards,\nThe Team",
+        },
+        {
+          role: "user",
+          content:
+            "This is way too generic. I need it to sound empathetic and offer a specific remedy, like a discount or expedited shipping. The skill should know our company's tone — we're a premium brand.",
+          feedback: {
+            direction: "down",
+            comment:
+              "Email is generic and doesn't match our premium brand voice. Should include specific remedies for delays.",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [editSkillWithInstructions("skill_email_drafter")],
+      judgeCriteria: `The analyst MUST call edit_skill with instructionEdits for skill "skill_email_drafter".
+The suggestion should:
+- Add guidance about using a premium, empathetic brand voice
+- Include direction to offer specific remedies when addressing complaints
+- Reference the user's explicit feedback about generic tone and missing remedies
+- Preserve the existing instruction about being professional and concise
+
+Score 0 if no edit_skill with instructionEdits call is made.
+Score 0-1 if the suggestion is generic and doesn't address the specific feedback points.
+Score 2 if the suggestion addresses tone but misses the remedy guidance (or vice versa).
+Score 3 if the suggestion addresses both brand voice and remedy guidance with a clear analysis.`,
+    },
+    {
+      scenarioId: "wrong-tool-order-linkedin-enrich",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Enrich user info with LinkedIn",
+          sId: "skill_linkedin_enrich",
+          description:
+            "Enriches company and people profiles using LinkedIn data",
+          instructions:
+            'Use the LinkedIn tool to enrich user and company information when requested.\n\n<tool id="mcp_linkedin" name="LinkedIn" />\n\nCall enrich_user to get detailed profile data for a person, or enrich_company_data for company information.',
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "Can you enrich the profile of René Cotty who works at Acme Corp?",
+        },
+        {
+          role: "agent",
+          content:
+            "I wasn't able to find René Cotty's profile. The LinkedIn enrichment returned no results for the ID I tried.",
+          actions: [
+            {
+              functionCallName: "enrich_user",
+              status: "succeeded",
+              params: { user_id: "rene-cotty" },
+              output: "User not found",
+            },
+          ],
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [
+        calledDescribeMcp("mcp_linkedin"),
+        editSkillWithInstructions("skill_linkedin_enrich"),
+      ],
+      judgeCriteria: `The analyst MUST call describe_mcp with mcpId "mcp_linkedin" AND call edit_skill with instructionEdits for skill "skill_linkedin_enrich".
+Adding instructions about how to form the user_id is not enough and will never work — the suggestion MUST be about using the search_user tool to look up the correct ID first.
+The suggestion should:
+- Add a step to first call search_user (or search_company) to retrieve the correct LinkedIn ID before calling enrich_user (or enrich_company_data)
+- Reference the enrich_user call returning "User not found" as the signal
+- Preserve the skill's purpose of enriching profiles
+
+Score 0 if describe_mcp("mcp_linkedin") was not called.
+Score 0 if no edit_skill with instructionEdits call is made.
+Score 1 if the analysis correctly identifies the root failure but does not add an instruction about using search_user.
+Score 3 if describe_mcp was called, and the suggestion clearly instructs to search first to obtain the correct ID, then call enrich with that ID.`,
+    },
+    {
+      scenarioId: "multi-skill-targeted-feedback",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "GitHub Reporter",
+          sId: "skill_github_reporter",
+          description:
+            "Extracts data from GitHub repositories including issues, PRs, and project boards for the engineering team",
+          instructions: `You are the GitHub Reporter skill for Acme Corp's engineering team. Use this skill to extract repository activity, issues, and pull requests from our GitHub organization.
+
+## Projects
+
+Our GitHub organization contains the following repositories:
+- **CoreEngine**: The main backend service handling API requests, authentication, and data processing.
+- **FrontendUI**: The customer-facing React web application and design system.
+- **InfraOps**: Infrastructure-as-code, CI/CD pipelines, and deployment tooling.
+- **MobileApp**: The iOS and Android mobile application built with React Native.
+
+## Tools
+
+- Use \`github-list-issues\` to retrieve open and closed issues for one or more repositories. Always specify the project names in the \`projects\` parameter.
+- Use \`github-list-prs\` to retrieve pull requests (open, merged, closed) for one or more repositories. Always specify the project names in the \`projects\` parameter.
+- Use \`github-get-repo-stats\` to retrieve commit activity, contributor stats, and release history for a single repository.
+
+When reporting, group results by repository and include issue/PR status.`,
+          tools: [{ name: "GitHub", sId: "mcp_github" }],
+        },
+        {
+          name: "Jira Extractor",
+          sId: "skill_jira_extractor",
+          description:
+            "Extracts tickets, sprint data, and project status from Jira for the engineering and product teams",
+          instructions: `You are the Jira Extractor skill for Acme Corp. Use this skill to retrieve tickets, sprint progress, and project status from our Jira instance.
+
+## Projects
+
+Our Jira workspace contains the following projects:
+- **ENG** (Engineering): Backend and infrastructure work items, bugs, and technical debt.
+- **FRONT** (Frontend): UI/UX tasks, design implementation, and frontend bugs.
+- **MOBILE** (Mobile): Mobile app features, platform-specific bugs, and release tracking.
+- **PROD** (Product): Product requirements, feature specifications, and roadmap items.
+
+## Tools
+
+- Use \`jira-get-sprint-status\` to retrieve the current sprint's progress, including ticket counts by status and completion percentage. Specify the \`board\` parameter (e.g., "Engineering", "Frontend", "Mobile").
+- Use \`jira-search-issues\` to search for issues using JQL queries. Use this for filtered searches (e.g., by assignee, label, priority, or date range).
+- Use \`jira-create-issue\` to create new tickets. Always set the \`project\`, \`summary\`, \`description\`, and \`issueType\` fields. Default issue type is "Task" unless the user specifies otherwise.
+
+When presenting sprint data, always include the sprint name, overall progress percentage, and a breakdown of tickets by status (To Do, In Progress, Done).`,
+          tools: [{ name: "JIRA", sId: "mcp_jira" }],
+        },
+        {
+          name: "Notion Publisher",
+          sId: "skill_notion_publisher",
+          description:
+            "Publishes reports and documents to the Acme Corp Notion workspace",
+          instructions: `You are the Notion Publisher skill for Acme Corp. Use this skill to read content from Notion, create new pages, and update existing pages in our shared workspace.
+
+## Workspace sections
+
+Our Notion workspace is organized into the following top-level sections:
+- **Engineering Reports**: Weekly and monthly engineering reports, incident post-mortems, and architecture decision records.
+- **Product Specs**: Product requirements documents, feature specs, and design briefs.
+- **Meeting Notes**: Agendas and notes from team standups, retrospectives, and planning sessions.
+- **Team Wiki**: Onboarding guides, process documentation, and team directories.
+
+## Tools
+
+- Use \`notion-search\` to find existing pages by title or content. Use this before creating a new page to avoid duplicates.
+- Use \`notion-get-page\` to retrieve the full content of an existing Notion page by its page ID.
+- Use \`notion-create-page\` to create a new page. Always specify the \`database\` (section name) and \`title\`. Use the appropriate section based on the content type.
+- Use \`notion-update-page\` to edit the content of an existing page by its page ID. Use this to append or replace sections of a page.
+
+## Content structure
+
+When creating or updating pages, follow these formatting rules:
+- Start with an H1 title matching the page title.
+- Use H2 headings for major sections (e.g., "GitHub Activity", "Jira Sprint Status").
+- Use tables for structured data (issues, PRs, tickets) with columns for key, title, status, and assignee.
+- Use bullet points for summaries and highlights.
+- Always include a "Generated on" date at the bottom of reports.`,
+          tools: [{ name: "Notion", sId: "mcp_notion" }],
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "I need a combined report of our GitHub activity and Jira sprint status. Pull the data from both and publish it as a report on Notion.",
+        },
+        {
+          role: "agent",
+          content:
+            "I'll gather data from both GitHub and Jira, then publish the combined report to Notion.",
+          actions: [
+            {
+              functionCallName: "github-list-issues",
+              status: "succeeded",
+              params: {
+                projects: ["CoreEngine", "FrontendUI", "InfraOps", "MobileApp"],
+              },
+              output:
+                '{"issues": [{"project": "CoreEngine", "title": "Fix auth flow", "status": "open"}, {"project": "FrontendUI", "title": "Update dashboard", "status": "closed"}]}',
+            },
+            {
+              functionCallName: "github-list-prs",
+              status: "succeeded",
+              params: {
+                projects: ["CoreEngine", "FrontendUI", "InfraOps", "MobileApp"],
+              },
+              output:
+                '{"prs": [{"project": "CoreEngine", "title": "Refactor auth module", "status": "merged"}, {"project": "MobileApp", "title": "Add push notifications", "status": "open"}]}',
+            },
+            {
+              functionCallName: "jira-get-sprint-status",
+              status: "succeeded",
+              params: { board: "Engineering" },
+              output:
+                '{"sprint": "Sprint 24", "progress": "75%", "tickets": [{"key": "ENG-401", "summary": "API rate limiting", "status": "In Progress"}, {"key": "ENG-402", "summary": "DB migration", "status": "Done"}]}',
+            },
+            {
+              functionCallName: "notion-create-page",
+              status: "succeeded",
+              params: {
+                database: "Engineering Reports",
+                title: "GitHub & Jira Combined Report",
+                content:
+                  "# GitHub & Jira Combined Report\n\n## GitHub Activity\n\n| Project | Title | Type | Status |\n|---|---|---|---|\n| CoreEngine | Fix auth flow | Issue | Open |\n| CoreEngine | Refactor auth module | PR | Merged |\n| FrontendUI | Update dashboard | Issue | Closed |\n| MobileApp | Add push notifications | PR | Open |\n\n## Jira Sprint Status\n\n**Sprint 24** — 75% complete\n\n| Key | Summary | Status |\n|---|---|---|\n| ENG-401 | API rate limiting | In Progress |\n| ENG-402 | DB migration | Done |\n\n*Generated on 2026-04-10*",
+              },
+              output:
+                '{"pageId": "page_abc123", "url": "https://app.notion.com/p/report-abc123"}',
+            },
+          ],
+        },
+        {
+          role: "agent",
+          content:
+            "I've published the combined report to Notion. Here's a summary:\n\n**GitHub Activity:**\n- CoreEngine: 1 open issue (Fix auth flow), 1 merged PR (Refactor auth module)\n- FrontendUI: 1 closed issue (Update dashboard)\n- MobileApp: 1 open PR (Add push notifications)\n\n**Jira Sprint 24 (75% complete):**\n- ENG-401: API rate limiting (In Progress)\n- ENG-402: DB migration (Done)\n\nFull report: https://app.notion.com/p/report-abc123",
+        },
+        {
+          role: "user",
+          content:
+            "The info looks wrong for GitHub — you are missing all the tickets from project DevCode. That's one of our most active repos and it's not in the report at all.",
+        },
+        {
+          role: "agent",
+          content:
+            "You're right, I'm sorry about that. Let me pull the data from the DevCode repository and update the report.",
+          actions: [
+            {
+              functionCallName: "github-list-issues",
+              status: "succeeded",
+              params: { projects: ["DevCode"] },
+              output:
+                '{"issues": [{"project": "DevCode", "title": "Implement caching layer", "status": "open"}, {"project": "DevCode", "title": "Fix race condition in worker", "status": "open"}, {"project": "DevCode", "title": "Add retry logic for webhooks", "status": "closed"}]}',
+            },
+            {
+              functionCallName: "github-list-prs",
+              status: "succeeded",
+              params: { projects: ["DevCode"] },
+              output:
+                '{"prs": [{"project": "DevCode", "title": "Add caching middleware", "status": "open"}, {"project": "DevCode", "title": "Fix worker pool exhaustion", "status": "merged"}]}',
+            },
+            {
+              functionCallName: "notion-update-page",
+              status: "succeeded",
+              params: {
+                pageId: "page_abc123",
+                content:
+                  "## DevCode Activity\n\n| Title | Type | Status |\n|---|---|---|\n| Implement caching layer | Issue | Open |\n| Fix race condition in worker | Issue | Open |\n| Add retry logic for webhooks | Issue | Closed |\n| Add caching middleware | PR | Open |\n| Fix worker pool exhaustion | PR | Merged |",
+              },
+              output: '{"success": true}',
+            },
+          ],
+        },
+        {
+          role: "agent",
+          content:
+            "I've updated the Notion report with the DevCode data. Here's what was added:\n\n**DevCode:**\n- 2 open issues (Implement caching layer, Fix race condition in worker), 1 closed issue (Add retry logic for webhooks)\n- 1 open PR (Add caching middleware), 1 merged PR (Fix worker pool exhaustion)\n\nThe report at https://app.notion.com/p/report-abc123 now includes all five repositories.",
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [editSkillWithInstructions("skill_github_reporter")],
+      judgeCriteria: `The analyst MUST call edit_skill with instructionEdits for skill "skill_github_reporter" ONLY.
+The suggestion should:
+- Add "DevCode" to the list of known GitHub projects in the skill instructions
+- Reference that the current project list is incomplete and caused missing data in the report
+- Keep the existing projects (CoreEngine, FrontendUI, InfraOps, MobileApp) and add DevCode
+
+CRITICAL constraints:
+- There MUST NOT be any edit_skill call targeting "skill_jira_extractor" or "skill_notion_publisher"
+- The user's complaint is specifically about GitHub missing the DevCode project — the Jira and Notion skills worked correctly
+- Only the GitHub Reporter skill needs updating
+
+Score 0 if no edit_skill call is made for skill_github_reporter, or if edit_skill is called for skill_jira_extractor or skill_notion_publisher.
+Score 1 if edit_skill is called only for skill_github_reporter but the suggestion doesn't specifically mention adding DevCode to the project list.
+Score 3 if edit_skill is called only for skill_github_reporter, the suggestion adds DevCode to the project list, and no other skills are modified.`,
+    },
+    {
+      scenarioId: "nested-skill-targeted-attribution",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Report Orchestrator",
+          sId: "skill_report_orchestrator",
+          description:
+            "Orchestrates building and publishing financial reports by gathering data and delegating formatting before posting the result",
+          instructions: [
+            "You are the Report Orchestrator skill for Acme Corp's finance team. Use this skill to build and publish financial reports.",
+            "",
+            "## Workflow",
+            "",
+            "Follow these steps in order:",
+            "1. Use `notion-get-page` to retrieve the raw financial figures from the source page the user references.",
+            "2. Hand the raw figures to the Data Formatter skill, which owns all table and number formatting rules. Always delegate formatting to it rather than formatting numbers yourself.",
+            "3. Use `slack-post-message` to publish the formatted report to the channel the user specifies.",
+            "",
+            "## Delegation",
+            "",
+            "Formatting of the report contents (tables, columns, and how figures are rendered) is the responsibility of the Data Formatter skill referenced below. Pass it the raw figures and use its output verbatim.",
+            "",
+            '<skill id="skill_data_formatter" name="Data Formatter" />',
+          ].join("\n"),
+          tools: [
+            { name: "Notion", sId: "mcp_notion" },
+            { name: "Slack", sId: "mcp_slack" },
+          ],
+        },
+        {
+          name: "Data Formatter",
+          sId: "skill_data_formatter",
+          description:
+            "Formats raw financial figures into clean Markdown tables for inclusion in reports",
+          instructions: `You are the Data Formatter skill for Acme Corp. Use this skill to turn raw financial figures into a clean Markdown table that other skills can publish.
+
+## Formatting rules
+
+- Render the figures as a Markdown table with one row per line item.
+- Use the columns: "Line Item", "Amount", and "Change vs. Prior Period".
+- Right-align the "Amount" and "Change vs. Prior Period" columns.
+- Use thousands separators for large numbers (e.g., 1,200,000).
+- Express "Change vs. Prior Period" as a signed percentage (e.g., +12%, -4%).
+- Sort rows from largest to smallest amount.`,
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "Build the Q2 revenue report from the figures on our finance Notion page and post it to the #finance channel.",
+        },
+        {
+          role: "agent",
+          content:
+            "I'll pull the Q2 figures from Notion, format them into the report table, and post it to #finance.",
+          actions: [
+            {
+              functionCallName: "notion-get-page",
+              status: "succeeded",
+              params: { pageId: "page_q2_finance" },
+              output:
+                '{"figures": [{"lineItem": "Subscriptions", "amount": 1200000, "changePct": 12}, {"lineItem": "Professional Services", "amount": 850000, "changePct": -4}, {"lineItem": "Support Contracts", "amount": 320000, "changePct": 7}]}',
+            },
+            {
+              functionCallName: "slack-post-message",
+              status: "succeeded",
+              params: {
+                channel: "#finance",
+                text: "*Q2 Revenue Report*\n\n| Line Item | Amount | Change vs. Prior Period |\n|---|--:|--:|\n| Subscriptions | 1,200,000 | +12% |\n| Professional Services | 850,000 | -4% |\n| Support Contracts | 320,000 | +7% |",
+              },
+              output: '{"ts": "1712750400.000100", "channel": "#finance"}',
+            },
+          ],
+        },
+        {
+          role: "agent",
+          content:
+            "I've posted the Q2 revenue report to #finance. It lists Subscriptions (1,200,000, +12%), Professional Services (850,000, -4%), and Support Contracts (320,000, +7%).",
+        },
+        {
+          role: "user",
+          content:
+            "The amounts in that table are just bare numbers — there's no currency on them at all. I can't tell whether these are dollars or euros, and finance can't post an ambiguous report like that.",
+          feedback: {
+            direction: "down",
+            comment:
+              "The amounts in the report table have no currency — they're ambiguous numbers, so nobody can tell if they're dollars or euros.",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [editSkillWithInstructions("skill_data_formatter")],
+      judgeCriteria: `The analyst MUST call edit_skill with instructionEdits for the child skill "skill_data_formatter" ONLY.
+The failure originates in the Data Formatter skill's formatting rules: they describe the table columns and number formatting but never require a currency to be shown on the "Amount" column, which produced the ambiguous bare numbers the user complained about. The Report Orchestrator delegated correctly and its own instructions are complete and correct.
+The suggestion should:
+- Add a formatting rule to the Data Formatter requiring monetary amounts to be rendered with an explicit currency (a symbol or ISO currency code, e.g. $1,200,000 or 1,200,000 USD)
+- Reference that the current rules omit currency, causing the ambiguous numbers in the posted report
+- Preserve the existing formatting rules (columns, thousands separators, signed percentages, sort order)
+
+CRITICAL constraints:
+- The analyst MUST target the child skill "skill_data_formatter" with instructionEdits
+- There MUST NOT be any edit_skill call targeting the parent "skill_report_orchestrator"
+- The fix must address the specific child-owned defect (missing currency on amounts); the parent's instructions are correct and its delegation to the Data Formatter worked as intended
+
+Score 0 if no edit_skill with instructionEdits call is made for skill_data_formatter, or if edit_skill targets the parent skill_report_orchestrator.
+Score 1 if edit_skill targets only skill_data_formatter but the edit doesn't specifically address requiring a currency on the amounts.
+Score 3 if edit_skill targets skill_data_formatter only, adds a rule requiring an explicit currency on monetary amounts, and leaves the parent skill_report_orchestrator untouched.`,
+    },
+    {
+      scenarioId: "misleading-agent-facing-description",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Payment Issue Resolver",
+          sId: "skill_payment_resolver",
+          // Too broad: nothing tells the agent this skill is ONLY for failures
+          // and chargebacks, so it gets enabled for unrelated billing questions.
+          description: "Helps customers with payment issues.",
+          instructions:
+            "When a customer reports that a payment failed, walk them through the retry flow: first ask for the failed transaction ID, then call payment-retry with that ID, and report the new status. For chargeback disputes, collect the dispute reason and call chargeback-open with the transaction ID and reason. Always confirm the resolution before ending the conversation.",
+          tools: [{ name: "JIRA", sId: "mcp_jira" }],
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "Hey, I just moved — how do I update the billing address on my account?",
+        },
+        {
+          role: "agent",
+          content:
+            "I can help you with your payment issue. To get started, what's the transaction ID of the payment that failed?",
+        },
+        {
+          role: "user",
+          content:
+            "There's no failed payment. I just want to change my billing address. Why are you asking about transaction IDs?",
+        },
+        {
+          role: "agent",
+          content:
+            "Apologies for the confusion. I'm set up to handle failed payments and chargebacks. For a billing address update you'll want to use Account Settings — I'm not able to do that here.",
+          feedback: {
+            direction: "down",
+            comment:
+              "This skill kicked in for a billing address change, which has nothing to do with payment failures. Its description is way too broad — the agent shouldn't have picked this skill at all for an address update.",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [
+        editSkillWithAgentFacingDescription("skill_payment_resolver"),
+      ],
+      judgeCriteria: `The skill's instructions accurately describe what it does (handling failed payments and chargeback disputes), so they should NOT be edited. The routing problem comes entirely from the agentFacingDescription "Helps customers with payment issues." being too broad — it caused the agent to enable this skill for a billing address update.
+
+The analyst MUST call edit_skill with an agentFacingDescriptionEdit for skill "skill_payment_resolver". The new description should:
+- Narrow the skill to failed payments and chargeback disputes specifically
+- Explicitly steer the agent AWAY from generic billing/account changes (e.g. address updates, invoice questions)
+- Stay focused on routing signals (when to use vs. not), not behavior (which lives in the instructions)
+
+Score 0 if no edit_skill call with agentFacingDescriptionEdit is made for skill_payment_resolver.
+Score 0 if the suggestion is bundled with instructionEdits — per the analysis prompt, description edits should be a standalone edit_skill call when the routing problem is the only issue (the instructions and tools here are correct).
+Score 1 if a description edit is made but it does not narrow the scope (still vague) OR does not steer away from billing/address-style requests.
+Score 2 if the new description narrows the skill but the language is weak or does not call out what to skip.
+Score 3 if the new description clearly limits the skill to payment failures + chargebacks AND explicitly tells the agent not to use it for unrelated billing/account-management changes.`,
+    },
+    {
+      scenarioId: "knowledge-tag-vague-runbook-instructions",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "On-call runbook shortcut",
+          sId: "skill_eval_runbook",
+          description: "Surfaces the incident runbook from workspace knowledge",
+          instructions: "Always open the incident runbook document first.",
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "According to our incident runbook, when should we page the on-call engineer?",
+        },
+        {
+          role: "agent",
+          content:
+            "The **Incident runbook** says to page on-call when customer-facing APIs return 5xx for more than five minutes or when the error budget burn rate exceeds the threshold in section 2.1.",
+          actions: [
+            {
+              functionCallName: "company_data__find",
+              status: "succeeded",
+              params: { query: "incident runbook" },
+            },
+            {
+              functionCallName: "company_data__list",
+              status: "succeeded",
+              params: { nodeId: null },
+            },
+            {
+              functionCallName: "company_data__cat",
+              status: "succeeded",
+              params: { nodeId: "doc_incident_runbook" },
+            },
+          ],
+        },
+      ],
+      workspaceContext: {
+        tools: [
+          mockTool(
+            "Company data",
+            "Search, list, and read documents from connected company data sources"
+          ),
+        ],
+        searchKnowledgeNodes: [
+          {
+            nodeId: "doc_incident_runbook",
+            title: "Incident runbook",
+            dataSourceViewId: "dsv_eval_handbook",
+            spaceId: "spc_eval_workspace",
+            hasChildren: false,
+            connectorProvider: null,
+            sourceUrl: null,
+          },
+        ],
+      },
+      expectedToolCalls: [editSkillWithInstructions("skill_eval_runbook")],
+      judgeCriteria: `The analyst should treat the runbook skill instructions as underspecified: they tell the agent to open a document but not which node to read, which led to search/list work before reading the file.
+The ideal improvement is to embed a direct <knowledge> reference to the runbook node so future runs can open it without exploratory browsing.
+
+The analyst SHOULD:
+1. Call search_knowledge to discover the incident runbook node in workspace knowledge.
+2. Call edit_skill with instructionEdits for skill "skill_eval_runbook" that embed a <knowledge id="doc_incident_runbook" title="Incident runbook" space="spc_eval_workspace" dsv="dsv_eval_handbook" hasChildren="false"/> tag inline in the replacement instruction content.
+
+Score 0 if no edit_skill call is made for skill_eval_runbook.
+Score 1 if edit_skill is called with instructionEdits for skill_eval_runbook but the instruction content does not include any <knowledge> tag.
+Score 2 if edit_skill is called with instructionEdits that include a <knowledge> tag but the tag attributes are missing or incorrect (wrong nodeId, missing dsv/space, etc.).
+Score 3 if edit_skill is called with instructionEdits for skill_eval_runbook and the instruction content includes a correctly formed <knowledge id="doc_incident_runbook" ...> tag with all required attributes aligned with the search_knowledge result.`,
+    },
+  ],
+};

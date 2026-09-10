@@ -1,0 +1,120 @@
+import { statsDMetrics } from "@app/lib/utils/statsd";
+import logger from "@app/logger/logger";
+
+import { METRICS } from "@app/temporal/agent_loop/activities/instrumentation";
+import type { InjectedSinks } from "@temporalio/worker";
+import type { Sinks } from "@temporalio/workflow";
+
+/**
+ * Sink interface for agent loop instrumentation.
+ *
+ * Fire-and-forget sinks that don't record in workflow history, don't consume activity slots,
+ * and run on the same worker with callDuringReplay: false.
+ *
+ * All arguments must be primitives (structured clone constraint).
+ */
+export interface AgentLoopInstrumentationSinks extends Sinks {
+  metrics: {
+    logPhaseStart(
+      workspaceId: string,
+      agentMessageId: string,
+      conversationId: string,
+      startStep: number
+    ): void;
+
+    logStepCompletion(
+      agentMessageId: string,
+      conversationId: string,
+      step: number,
+      stepStartTime: number
+    ): void;
+
+    logPhaseCompletion(
+      workspaceId: string,
+      agentMessageId: string,
+      conversationId: string,
+      initialStartTime: number | undefined,
+      stepsCompleted: number,
+      syncStartTime: number
+    ): void;
+  };
+}
+
+export const instrumentationSinks: InjectedSinks<AgentLoopInstrumentationSinks> =
+  {
+    metrics: {
+      logPhaseStart: {
+        fn(
+          _info,
+          workspaceId: string,
+          agentMessageId: string,
+          conversationId: string,
+          startStep: number
+        ) {
+          logger.info(
+            { workspaceId, agentMessageId, conversationId, startStep },
+            "Agent loop phase execution started"
+          );
+          statsDMetrics.increment(METRICS.PHASE_STARTS, 1);
+        },
+      },
+      logStepCompletion: {
+        fn(
+          _info,
+          _agentMessageId: string,
+          _conversationId: string,
+          step: number,
+          stepStartTime: number
+        ) {
+          const stepDurationMs = Date.now() - stepStartTime;
+          // We use different tags to avoid having a cardinality (number of time series to be precise) too high.
+          const incrementTags = [`step:${step}`];
+          const distributionTags = [`step:${step < 16 ? step : "16+"}`];
+
+          statsDMetrics.increment(METRICS.STEP_STARTS, 1, incrementTags);
+          statsDMetrics.increment(METRICS.STEP_COMPLETIONS, 1, incrementTags);
+          statsDMetrics.distribution(
+            METRICS.STEP_DURATION,
+            stepDurationMs,
+            distributionTags
+          );
+        },
+      },
+      logPhaseCompletion: {
+        fn(
+          _info,
+          workspaceId: string,
+          agentMessageId: string,
+          conversationId: string,
+          initialStartTime: number | undefined,
+          stepsCompleted: number,
+          syncStartTime: number
+        ) {
+          const now = Date.now();
+          const phaseDurationMs = now - syncStartTime;
+          const totalDurationMs = initialStartTime
+            ? now - initialStartTime
+            : phaseDurationMs;
+
+          logger.info(
+            {
+              workspaceId,
+              agentMessageId,
+              conversationId,
+              phaseDurationMs,
+              totalDurationMs,
+              stepsCompleted,
+            },
+            "Agent loop execution completed"
+          );
+
+          statsDMetrics.increment(METRICS.PHASE_COMPLETIONS, 1);
+          statsDMetrics.distribution(METRICS.PHASE_DURATION, phaseDurationMs);
+          statsDMetrics.histogram(METRICS.PHASE_STEPS, stepsCompleted);
+
+          statsDMetrics.increment(METRICS.LOOP_COMPLETIONS, 1);
+          statsDMetrics.distribution(METRICS.LOOP_DURATION, totalDurationMs);
+        },
+      },
+    },
+  };

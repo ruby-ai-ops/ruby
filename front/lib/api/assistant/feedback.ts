@@ -1,0 +1,245 @@
+import { getAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
+import type { AgentMessageFeedbackDirection } from "@app/lib/api/assistant/conversation/feedbacks";
+import type { PaginationParams } from "@app/lib/api/pagination";
+import type { Authenticator } from "@app/lib/auth";
+import { AgentMessageFeedbackResource } from "@app/lib/resources/agent_message_feedback_resource";
+import type { ConversationResource } from "@app/lib/resources/conversation_resource";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import type { UserType } from "@app/types/user";
+import { z } from "zod";
+
+/**
+ * We retrieve the feedbacks for a whole conversation, not just a single message.
+ */
+
+export const AgentMessageFeedbackSchema = z.object({
+  id: z.number(),
+  sId: z.string(),
+  messageId: z.string(),
+  agentMessageId: z.number(),
+  userId: z.number(),
+  thumbDirection: z.enum(["up", "down"]),
+  content: z.string().nullable(),
+  createdAt: z.date(),
+  agentConfigurationId: z.string(),
+  agentConfigurationVersion: z.number(),
+  isConversationShared: z.boolean(),
+  dismissed: z.boolean(),
+});
+
+export type AgentMessageFeedbackType = z.infer<
+  typeof AgentMessageFeedbackSchema
+>;
+
+export type FeedbackUserInfo = {
+  userName: string;
+  userEmail: string;
+  userImageUrl: string | null;
+};
+
+export type FeedbackConversationInfo = {
+  conversationId: string | null;
+};
+
+export type AgentMessageFeedbackWithMetadataType = AgentMessageFeedbackType &
+  FeedbackConversationInfo &
+  FeedbackUserInfo;
+
+export async function getConversationFeedbacksForUser(
+  auth: Authenticator,
+  conversation: ConversationWithoutContentType | ConversationResource
+) {
+  const feedbacksRes =
+    await AgentMessageFeedbackResource.getConversationFeedbacksForUser(
+      auth,
+      conversation
+    );
+
+  const feedbacks = feedbacksRes.map((feedback) => {
+    return feedback.toJSON() as AgentMessageFeedbackType;
+  });
+
+  return new Ok(feedbacks);
+}
+
+/**
+ * We create a feedback for a single message.
+ * As user can be null (user from Slack), we also store the user context, as we do for messages.
+ */
+export async function upsertMessageFeedback(
+  auth: Authenticator,
+  {
+    messageId,
+    conversation,
+    user,
+    thumbDirection,
+    content,
+    isConversationShared,
+  }: {
+    messageId: string;
+    conversation: ConversationWithoutContentType;
+    user: UserType;
+    thumbDirection: AgentMessageFeedbackDirection;
+    content?: string;
+    isConversationShared?: boolean;
+  }
+) {
+  const feedbackWithConversationContext =
+    await AgentMessageFeedbackResource.getFeedbackWithConversationContext({
+      auth,
+      messageId,
+      conversation,
+      user,
+    });
+
+  if (feedbackWithConversationContext.isErr()) {
+    return feedbackWithConversationContext;
+  }
+
+  const { agentMessage, feedback, agentConfiguration, isGlobalAgent } =
+    feedbackWithConversationContext.value;
+
+  const agentConfigurationId = isGlobalAgent
+    ? agentMessage.agentConfigurationId
+    : agentConfiguration.sId;
+
+  if (feedback) {
+    await feedback.updateFields({
+      content,
+      thumbDirection,
+      isConversationShared,
+    });
+    return new Ok({
+      agentConfigurationId,
+      feedbackId: feedback.sId,
+    });
+  }
+
+  const newFeedback = await AgentMessageFeedbackResource.makeNew({
+    workspaceId: auth.getNonNullableWorkspace().id,
+    // If the agent is global, we use the agent configuration id from the agent message
+    // Otherwise, we use the agent configuration id from the agent configuration
+    agentConfigurationId,
+    agentConfigurationVersion: agentMessage.agentConfigurationVersion,
+    conversationId: conversation.id,
+    agentMessageId: agentMessage.id,
+    userId: user.id,
+    thumbDirection,
+    content,
+    isConversationShared: isConversationShared ?? false,
+    dismissed: false,
+  });
+
+  return new Ok({
+    agentConfigurationId,
+    feedbackId: newFeedback.sId,
+  });
+}
+
+/**
+ * The id of a feedback is not exposed on the API so we need to find it from the message id and the user context.
+ * We destroy feedbacks, no point in soft-deleting them.
+ */
+export async function deleteMessageFeedback(
+  auth: Authenticator,
+  {
+    messageId,
+    conversation,
+    user,
+  }: {
+    messageId: string;
+    conversation: ConversationWithoutContentType;
+    user: UserType;
+  }
+) {
+  const feedbackWithContext =
+    await AgentMessageFeedbackResource.getFeedbackWithConversationContext({
+      auth,
+      messageId,
+      conversation,
+      user,
+    });
+
+  if (feedbackWithContext.isErr()) {
+    return feedbackWithContext;
+  }
+
+  const { feedback } = feedbackWithContext.value;
+
+  if (!feedback) {
+    return new Ok(undefined);
+  }
+
+  const deleteRes = await feedback.delete(auth, {});
+
+  if (deleteRes.isErr()) {
+    return deleteRes;
+  }
+
+  return new Ok(undefined);
+}
+
+export async function getAgentFeedbacks({
+  auth,
+  agentConfigurationId,
+  withMetadata,
+  paginationParams,
+  filter = "active",
+  version,
+  days,
+}: {
+  auth: Authenticator;
+  withMetadata: boolean;
+  agentConfigurationId: string;
+  paginationParams: PaginationParams;
+  filter?: "active" | "all";
+  version?: number;
+  days?: number;
+}): Promise<
+  Result<
+    (AgentMessageFeedbackType | AgentMessageFeedbackWithMetadataType)[],
+    Error
+  >
+> {
+  const owner = auth.getNonNullableWorkspace();
+
+  // Make sure the user has access to the agent
+  const agentConfiguration = await getAgentConfiguration(auth, {
+    agentId: agentConfigurationId,
+    variant: "light",
+  });
+  if (!agentConfiguration) {
+    return new Err(new Error("agent_configuration_not_found"));
+  }
+
+  const feedbacksRes =
+    await AgentMessageFeedbackResource.getAgentConfigurationFeedbacksByDescVersion(
+      {
+        workspace: owner,
+        agentConfiguration,
+        paginationParams,
+        filter,
+        version,
+        days,
+      }
+    );
+
+  const feedbacks = feedbacksRes.map((feedback) => feedback.toJSON());
+
+  if (!withMetadata) {
+    return new Ok(feedbacks as AgentMessageFeedbackType[]);
+  }
+
+  const feedbacksWithHiddenConversationId = feedbacks.map((feedback) => ({
+    ...feedback,
+    // Redact the conversationId if user did not share the conversation.
+    conversationId: feedback.isConversationShared
+      ? feedback.conversationId
+      : null,
+  }));
+  return new Ok(
+    feedbacksWithHiddenConversationId as AgentMessageFeedbackWithMetadataType[]
+  );
+}

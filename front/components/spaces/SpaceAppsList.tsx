@@ -1,0 +1,180 @@
+import { SpaceCreateAppModal } from "@app/components/spaces/SpaceCreateAppModal";
+import { ACTION_BUTTONS_CONTAINER_ID } from "@app/components/spaces/SpacePageHeaders";
+import { SpaceSearchContext } from "@app/components/spaces/search/SpaceSearchContext";
+import { useActionButtonsPortal } from "@app/hooks/useActionButtonsPortal";
+import { usePaginationFromUrl } from "@app/hooks/usePaginationFromUrl";
+import { useQueryParams } from "@app/hooks/useQueryParams";
+import { useAppRouter } from "@app/lib/platform";
+import { useApps } from "@app/lib/swr/apps";
+import { removeParamFromRouter } from "@app/lib/utils/router_util";
+import type { AppType } from "@app/types/app";
+import { isString } from "@app/types/shared/utils/general";
+import type { SpaceType } from "@app/types/space";
+import type { LightWorkspaceType } from "@app/types/user";
+import { Button, DataTable, Plus, Spinner, Terminal } from "@ruby-ai/sparkle";
+import type { CellContext, ColumnDef } from "@tanstack/react-table";
+import sortBy from "lodash/sortBy";
+import type { ParsedUrlQuery } from "querystring";
+import type { ComponentType } from "react";
+import * as React from "react";
+import { useState } from "react";
+
+type RowData = {
+  app: AppType;
+  name: string;
+  description: string;
+  icon: ComponentType;
+  workspaceId: string;
+  onClick?: () => void;
+};
+
+const getTableColumns = (): ColumnDef<RowData, string>[] => {
+  return [
+    {
+      id: "name",
+      cell: (info: CellContext<RowData, string>) => (
+        <DataTable.CellContent icon={info.row.original.icon}>
+          {info.getValue()}
+        </DataTable.CellContent>
+      ),
+      accessorFn: (row: RowData) => row.name,
+      meta: {
+        className: "w-80",
+      },
+    },
+    {
+      id: "description",
+      cell: (info: CellContext<RowData, string>) => (
+        <DataTable.CellContent>{info.getValue()}</DataTable.CellContent>
+      ),
+      accessorFn: (row: RowData) => row.description,
+      meta: {
+        className: "w-full",
+      },
+    },
+  ];
+};
+
+const hasAppsModalQuery = (
+  query: ParsedUrlQuery
+): query is ParsedUrlQuery & { modal: string } =>
+  isString(query.modal) && query.modal === "apps";
+
+interface SpaceAppsListProps {
+  canAdministrateApps: boolean;
+  onSelect: (sId: string) => void;
+  owner: LightWorkspaceType;
+  space: SpaceType;
+}
+
+export const SpaceAppsList = ({
+  owner,
+  canAdministrateApps,
+  space,
+  onSelect,
+}: SpaceAppsListProps) => {
+  const router = useAppRouter();
+  const [isCreateAppModalOpened, setIsCreateAppModalOpened] = useState(false);
+
+  const { frontendListFilterQuery } = React.useContext(SpaceSearchContext);
+  const { q: searchParam } = useQueryParams(["q"]);
+  const searchTerm = frontendListFilterQuery ?? searchParam.value ?? "";
+
+  const { apps, isAppsLoading } = useApps({ owner, space });
+
+  const { pagination, setPagination } = usePaginationFromUrl({
+    urlPrefix: "table",
+  });
+
+  const rows: RowData[] = React.useMemo(
+    () =>
+      sortBy(apps, "name").map((app) => ({
+        app,
+        sId: app.sId,
+        category: "apps",
+        name: app.name,
+        description: app.description ?? "",
+        icon: Terminal,
+        workspaceId: owner.sId,
+        onClick: () => onSelect(app.sId),
+      })) || [],
+    [apps, onSelect, owner]
+  );
+
+  React.useEffect(() => {
+    // Extract modal=apps query param to open modal on first render and remove it from URL
+    if (!router.isReady || !canAdministrateApps) {
+      return;
+    }
+    const { query } = router;
+    if (!hasAppsModalQuery(query)) {
+      return;
+    }
+    setIsCreateAppModalOpened(true);
+    void removeParamFromRouter(router, "modal");
+  }, [router.isReady, router.query.modal, canAdministrateApps, router]);
+
+  const { portalToHeader } = useActionButtonsPortal({
+    containerId: ACTION_BUTTONS_CONTAINER_ID,
+  });
+
+  if (isAppsLoading) {
+    return (
+      <div className="mt-8 flex justify-center">
+        <Spinner size="lg" />
+      </div>
+    );
+  }
+
+  const columns = getTableColumns();
+  const isEmpty = rows.length === 0;
+
+  const actionButtons = (
+    <>
+      {canAdministrateApps && (
+        <Button
+          label="New App"
+          variant="primary"
+          icon={Plus}
+          size="sm"
+          onClick={() => {
+            setIsCreateAppModalOpened(true);
+          }}
+        />
+      )}
+    </>
+  );
+
+  return (
+    <>
+      {!isEmpty && portalToHeader(actionButtons)}
+      {isEmpty ? (
+        <div className="flex h-36 w-full items-center justify-center gap-2 rounded-lg bg-muted-background">
+          <Button
+            label="Create App"
+            disabled={!canAdministrateApps}
+            onClick={() => {
+              setIsCreateAppModalOpened(true);
+            }}
+          />
+        </div>
+      ) : (
+        <DataTable
+          data={rows}
+          columns={columns}
+          className="pb-4"
+          filter={searchTerm}
+          filterColumn="name"
+          pagination={pagination}
+          setPagination={setPagination}
+        />
+      )}
+      <SpaceCreateAppModal
+        owner={owner}
+        space={space}
+        isOpen={isCreateAppModalOpened}
+        setIsOpen={setIsCreateAppModalOpened}
+      />
+    </>
+  );
+};

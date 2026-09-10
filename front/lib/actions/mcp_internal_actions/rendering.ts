@@ -1,0 +1,120 @@
+import type {
+  DataSourceNodeListType,
+  RenderedNodeType,
+} from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import type { ResolvedDataSourceConfiguration } from "@app/lib/actions/mcp_internal_actions/tools/utils";
+import type { CoreAPIContentNode } from "@app/types/core/content_node";
+import { DATA_SOURCE_NODE_ID } from "@app/types/core/content_node";
+import type { CoreAPISearchNodesResponse } from "@app/types/core/core_api";
+import type { ConnectorProvider } from "@app/types/data_source";
+import type { TimeFrame } from "@app/types/shared/utils/time_frame";
+import { INTERNAL_MIME_TYPES } from "@ruby-ai/client";
+
+function formatTimestamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  const formattedDate = date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+
+  if (diffDays === 0) {
+    return `${formattedDate} (today)`;
+  } else if (diffDays === 1) {
+    return `${formattedDate} (yesterday)`;
+  } else if (diffDays < 7) {
+    return `${formattedDate} (${diffDays} days ago)`;
+  } else if (diffDays < 30) {
+    const weeks = Math.floor(diffDays / 7);
+    return `${formattedDate} (${weeks} week${weeks > 1 ? "s" : ""} ago)`;
+  } else {
+    return formattedDate;
+  }
+}
+
+/**
+ * Translation from a content node to the format expected to the agent.
+ * Removes references to the term 'content node' and simplifies the format.
+ *
+ * IMPORTANT: This output format (especially hasChildren) is kept aligned with
+ * knowledge node serialization in skill instructions. See:
+ * components/editor/extensions/skill_builder/KnowledgeNode.tsx (renderMarkdown)
+ *
+ * When changing this format, review knowledge serialization to ensure agents see
+ * consistent data structure between tool outputs and instruction-attached knowledge.
+ */
+export function renderNode(
+  node: CoreAPIContentNode,
+  dataSourceIdToConnectorMap: Map<string, ConnectorProvider | null>
+): RenderedNodeType {
+  // Transform data source node IDs to include the data source ID
+  const nodeId =
+    node.node_id === DATA_SOURCE_NODE_ID
+      ? `${DATA_SOURCE_NODE_ID}-${node.data_source_id}`
+      : node.node_id;
+
+  return {
+    nodeId,
+    title: node.title,
+    path: node.parents.join("/"),
+    parentTitle: node.parent_title,
+    lastUpdatedAt: formatTimestamp(node.timestamp),
+    sourceUrl: node.source_url,
+    mimeType: node.mime_type,
+    hasChildren: node.children_count > 0,
+    connectorProvider:
+      dataSourceIdToConnectorMap.get(node.data_source_id) ?? null,
+  };
+}
+
+/**
+ * Translation from core's response to the format expected to the agent.
+ * Removes references to the term 'content node' and simplifies the format.
+ */
+export function renderSearchResults(
+  response: CoreAPISearchNodesResponse,
+  agentDataSourceConfigurations: ResolvedDataSourceConfiguration[]
+): DataSourceNodeListType {
+  const dataSourceIdToConnectorMap = new Map<
+    string,
+    ConnectorProvider | null
+  >();
+  for (const {
+    dataSource: { rubyAPIDataSourceId, connectorProvider },
+  } of agentDataSourceConfigurations) {
+    dataSourceIdToConnectorMap.set(rubyAPIDataSourceId, connectorProvider);
+  }
+
+  return {
+    mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.DATA_SOURCE_NODE_LIST,
+    text: "Content successfully retrieved.",
+    uri: "",
+    data: response.nodes.map((node) =>
+      renderNode(node, dataSourceIdToConnectorMap)
+    ),
+    nextPageCursor: response.next_page_cursor,
+    resultCount: response.hit_count,
+  };
+}
+
+export function renderMimeType(mimeType: string) {
+  return mimeType
+    .replace("application/vnd.ruby.", "")
+    .replace("-", " ")
+    .replace(".", " ");
+}
+
+export function renderRelativeTimeFrameForToolOutput(
+  relativeTimeFrame: TimeFrame | null
+): string {
+  return relativeTimeFrame
+    ? "over the last " +
+        (relativeTimeFrame.duration > 1
+          ? `${relativeTimeFrame.duration} ${relativeTimeFrame.unit}s`
+          : `${relativeTimeFrame.unit}`)
+    : "across all time periods";
+}

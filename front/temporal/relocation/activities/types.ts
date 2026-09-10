@@ -1,0 +1,106 @@
+import type { CoreAPIContentNode } from "@app/types/core/content_node";
+import type { CoreAPIDataset } from "@app/types/core/core_api";
+import type {
+  CoreAPIDocumentBlob,
+  CoreAPITableBlob,
+} from "@app/types/core/data_source";
+import type { RegionType } from "@app/types/region";
+import type { ModelId } from "@app/types/shared/model_id";
+import isPlainObject from "lodash/isPlainObject";
+
+export interface RelocationStatement {
+  sql: string;
+  params: any[];
+  /** Absent when a previous source worker produces the blob during a rolling deployment. */
+  columns?: string[];
+}
+
+export interface RelocationBlob<T extends string = string> {
+  statements: Record<T, RelocationStatement[]>;
+}
+
+export type CoreEntitiesRelocationBlob = RelocationBlob<
+  "plans" | "user_metadata" | "users" | "workspace"
+>;
+
+export interface ReadTableChunkParams {
+  destRegion: RegionType;
+  lastId?: ModelId;
+  limit: number;
+  sourceRegion: RegionType;
+  tableName: string;
+  workspaceId: string;
+  fileName?: string;
+}
+
+export const CORE_API_CONCURRENCY_LIMIT = 48;
+export const CORE_API_LIST_NODES_BATCH_SIZE = 64;
+export const CORE_API_LIST_TABLES_BATCH_SIZE = 8;
+
+// Core.
+
+export interface DataSourceCoreIds {
+  id: ModelId;
+  rubyAPIProjectId: string;
+  rubyAPIDataSourceId: string;
+}
+
+export interface CreateDataSourceProjectResult {
+  rubyAPIProjectId: string;
+  rubyAPIDataSourceId: string;
+}
+
+export interface APIRelocationBlob<
+  T extends string = string,
+  V extends object = object,
+> {
+  blobs: Record<T, V[]>;
+}
+
+export type CoreDocumentAPIRelocationBlob = APIRelocationBlob<
+  "documents",
+  CoreAPIDocumentBlob
+>;
+
+export type CoreFolderAPIRelocationBlob = APIRelocationBlob<
+  "folders",
+  CoreAPIContentNode
+>;
+
+export type CoreTableAPIRelocationBlob = APIRelocationBlob<
+  "tables",
+  CoreAPITableBlob
+>;
+
+export type CoreAppAPIRelocationBlob = APIRelocationBlob<
+  "apps",
+  {
+    coreSpecifications: Record<string, string>;
+    datasets: CoreAPIDataset[];
+  }
+>;
+
+export function isArrayOfPlainObjects(value: unknown) {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((element) => isPlainObject(element))
+  );
+}
+
+export function isStringTooLongError(
+  err: unknown
+): err is { code: "ERR_STRING_TOO_LONG" } {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    err.code === "ERR_STRING_TOO_LONG"
+  );
+}
+
+export function isJSONStringifyRangeError(err: unknown): err is RangeError {
+  return (
+    err instanceof RangeError && err.message.includes("Invalid string length")
+  );
+}

@@ -1,0 +1,252 @@
+use std::collections::HashMap;
+
+use clap::Parser;
+use elasticsearch::indices::{IndicesCreateParts, IndicesExistsParts};
+use http::StatusCode;
+use ruby::search_stores::search_store::{ElasticsearchSearchStore, INDEX_VERSIONS};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(
+        long,
+        help = "The index name (without the version), all registered indices when omitted"
+    )]
+    index_name: Option<String>,
+
+    #[arg(
+        long,
+        help = "The version of the index, the registered version when omitted"
+    )]
+    index_version: Option<u32>,
+
+    #[arg(long, help = "Skip confirmation")]
+    skip_confirmation: bool,
+
+    #[arg(long, help = "Remove previous alias")]
+    remove_previous_alias: bool,
+}
+
+/*
+ * Create indices in Elasticsearch for core
+ *
+ * Usage:
+ * cargo run --bin elasticsearch_create_index -- [--index-name <index_name>] [--index-version <version>] [--skip-confirmation] [--remove-previous-alias]
+ *
+ * Without --index-name, creates every index in INDEX_VERSIONS at its current version, skipping the ones that already exist.
+ * Look for index settings and mappings in src/search_stores/indices/[index_name]_[version].settings.[region].json
+ * Create each index with the given settings and mappings at [index_name]_[version], and set the alias to [index_name]
+ */
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // parse args and env vars
+    let args = Args::parse();
+
+    if args.index_name.is_none() && (args.index_version.is_some() || args.remove_previous_alias) {
+        return Err(anyhow::anyhow!(
+            "--index-version and --remove-previous-alias require --index-name"
+        )
+        .into());
+    }
+
+    let targets: Vec<(String, u32)> = match &args.index_name {
+        Some(index_name) => {
+            let index_version = match args.index_version {
+                Some(v) => v,
+                None => registered_version(index_name)?,
+            };
+            vec![(index_name.clone(), index_version)]
+        }
+        None => INDEX_VERSIONS
+            .iter()
+            .map(|(name, version)| (name.to_string(), *version))
+            .collect(),
+    };
+
+    if args.remove_previous_alias && targets[0].1 == 1 {
+        return Err(anyhow::anyhow!("Cannot remove previous alias for version 1").into());
+    }
+
+    let url = std::env::var("ELASTICSEARCH_URL").expect("ELASTICSEARCH_URL must be set");
+    let username =
+        std::env::var("ELASTICSEARCH_USERNAME").expect("ELASTICSEARCH_USERNAME must be set");
+    let password =
+        std::env::var("ELASTICSEARCH_PASSWORD").expect("ELASTICSEARCH_PASSWORD must be set");
+
+    let region = match std::env::var("NODE_ENV").unwrap_or_default().as_str() {
+        "development" => "local".to_string(),
+        _ => std::env::var("REGION").expect("REGION must be set"),
+    };
+
+    // create ES client
+    let search_store = ElasticsearchSearchStore::new(&url, &username, &password).await?;
+
+    for (index_name, index_version) in targets {
+        create_index(
+            &search_store,
+            &index_name,
+            index_version,
+            &region,
+            args.index_name.is_some(),
+            args.skip_confirmation,
+            args.remove_previous_alias,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn registered_version(index_name: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    match INDEX_VERSIONS.iter().find(|(name, _)| name == &index_name) {
+        Some((_, version)) => Ok(*version),
+        None => {
+            let available = INDEX_VERSIONS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow::anyhow!(
+                "Index '{}' is not configured in INDEX_VERSIONS. Available indices: {}",
+                index_name,
+                available
+            )
+            .into())
+        }
+    }
+}
+
+async fn create_index(
+    search_store: &ElasticsearchSearchStore,
+    index_name: &str,
+    index_version: u32,
+    region: &str,
+    explicit_index: bool,
+    skip_confirmation: bool,
+    remove_previous_alias: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let index_fullname = format!("core.{}_{}", index_name, index_version);
+    let index_alias = format!("core.{}", index_name);
+    let index_previous_fullname = format!("core.{}_{}", index_name, index_version - 1);
+
+    // do not create index if it already exists
+    let response = search_store
+        .client
+        .indices()
+        .exists(IndicesExistsParts::Index(&[index_fullname.as_str()]))
+        .send()
+        .await?;
+
+    if response.status_code() == StatusCode::OK {
+        if explicit_index {
+            return Err(anyhow::anyhow!("Index already exists").into());
+        }
+        println!("Index {} already exists, skipping", index_fullname);
+        return Ok(());
+    }
+
+    // get index settings and mappings, parse them as json
+    let settings_path = format!(
+        "src/search_stores/indices/{}_{}.settings.{}.json",
+        index_name,
+        index_version,
+        region.to_lowercase()
+    );
+    let mappings_path = format!(
+        "src/search_stores/indices/{}_{}.mappings.json",
+        index_name, index_version
+    );
+
+    // catch errors, provide the error message
+    let settings_raw = std::fs::read_to_string(&settings_path).expect(&format!(
+        "Failed to read settings file at {}: {:?}",
+        settings_path,
+        std::io::Error::last_os_error()
+    ));
+    let mappings_raw = std::fs::read_to_string(&mappings_path).expect(&format!(
+        "Failed to read mappings file at {}: {:?}",
+        mappings_path,
+        std::io::Error::last_os_error()
+    ));
+    let settings: HashMap<String, serde_json::Value> =
+        serde_json::from_str(&settings_raw).expect(&format!(
+            "Failed to parse settings file at {settings_path}: {:?}",
+            std::io::Error::last_os_error()
+        ));
+    let mappings: HashMap<String, serde_json::Value> =
+        serde_json::from_str(&mappings_raw).expect(&format!(
+            "Failed to parse mappings file at {mappings_path}: {:?}",
+            std::io::Error::last_os_error()
+        ));
+
+    let body = serde_json::json!({
+        "settings": settings,
+        "mappings": mappings,
+    });
+
+    // confirm creation
+    if !skip_confirmation {
+        println!(
+            "CHECK: Create index '{}' with alias '{}' in region '{}' (remove previous alias: {})? (y to confirm)",
+            index_fullname, index_alias, region, remove_previous_alias
+        );
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if input.trim() != "y" {
+            return Err(anyhow::anyhow!("Aborted").into());
+        }
+    }
+
+    // create index with settings and mappings
+    let index_creation_response = search_store
+        .client
+        .indices()
+        .create(IndicesCreateParts::Index(index_fullname.as_str()))
+        .body(body)
+        .send()
+        .await?;
+
+    match index_creation_response.status_code() {
+        StatusCode::OK => println!("Index created: {}", index_fullname),
+        _ => {
+            let body = index_creation_response.json::<serde_json::Value>().await?;
+            eprintln!("{:?}", body);
+            return Err(anyhow::anyhow!("Failed to create index").into());
+        }
+    }
+
+    // create alias, and remove previous alias if needed
+    let body = match remove_previous_alias {
+        true => serde_json::json!({
+            "actions": [
+                { "add": { "index": index_fullname, "alias": index_alias, "is_write_index": true } },
+                { "remove": { "index": index_previous_fullname, "alias": index_alias } }
+            ]
+        }),
+        false => serde_json::json!({
+            "actions": [
+                { "add": { "index": index_fullname, "alias": index_alias, "is_write_index": true } },
+            ]
+        }),
+    };
+
+    let alias_creation_response = search_store
+        .client
+        .indices()
+        .update_aliases()
+        .body(body)
+        .send()
+        .await?;
+
+    match alias_creation_response.status_code() {
+        StatusCode::OK => {
+            println!("Alias created: {}", index_alias);
+            Ok(())
+        }
+        _ => {
+            let body = alias_creation_response.json::<serde_json::Value>().await?;
+            eprintln!("{:?}", body);
+            Err(anyhow::anyhow!("Failed to create alias").into())
+        }
+    }
+}

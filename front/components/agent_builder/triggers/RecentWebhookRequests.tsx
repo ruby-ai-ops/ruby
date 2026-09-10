@@ -1,0 +1,168 @@
+import type { AgentBuilderWebhookTriggerType } from "@app/components/agent_builder/AgentBuilderFormContext";
+import { useWebhookRequestTriggersForTrigger } from "@app/lib/swr/webhook_source";
+import type { LightWorkspaceType } from "@app/types/user";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  ContentMessageInline,
+  Label,
+  LinkWrapper,
+  Markdown,
+  Separator,
+  Spinner,
+} from "@ruby-ai/sparkle";
+import moment from "moment";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React, { useState } from "react";
+
+import { WebhookRequestStatusBadge } from "./WebhookRequestStatusBadge";
+
+interface RecentWebhookRequestsProps {
+  owner: LightWorkspaceType;
+  agentConfigurationId: string | null;
+  trigger: AgentBuilderWebhookTriggerType;
+}
+
+export function RecentWebhookRequests({
+  owner,
+  agentConfigurationId,
+  trigger,
+}: RecentWebhookRequestsProps) {
+  const defaultOpen = true;
+  const [isOpen, setIsOpen] = useState(defaultOpen);
+  return (
+    <Collapsible defaultOpen={defaultOpen} onOpenChange={setIsOpen}>
+      <CollapsibleTrigger>
+        <Label className="cursor-pointer">Request history</Label>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <RecentWebhookRequestsContent
+          isOpen={isOpen}
+          owner={owner}
+          agentConfigurationId={agentConfigurationId}
+          trigger={trigger}
+        />
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+interface RecentWebhookRequestsContentProps {
+  isOpen: boolean;
+  owner: LightWorkspaceType;
+  agentConfigurationId: string | null;
+  trigger: AgentBuilderWebhookTriggerType;
+}
+
+function RecentWebhookRequestsContent({
+  isOpen,
+  owner,
+  agentConfigurationId,
+  trigger,
+}: RecentWebhookRequestsContentProps) {
+  const { webhookRequests, isWebhookRequestsLoading, isWebhookRequestsError } =
+    useWebhookRequestTriggersForTrigger({
+      owner,
+      triggerId: trigger.sId ?? null,
+      disabled: !trigger || !agentConfigurationId || !isOpen,
+    });
+
+  if (isWebhookRequestsLoading || !isOpen) {
+    return (
+      <div className="flex items-center gap-2">
+        <Spinner size="sm" />
+        <span className="text-sm text-muted-foreground">
+          Loading recent requests...
+        </span>
+      </div>
+    );
+  }
+
+  if (isWebhookRequestsError) {
+    return (
+      <ContentMessageInline variant="warning">
+        Unable to load recent webhook requests.
+      </ContentMessageInline>
+    );
+  }
+
+  if (webhookRequests.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">No webhook requests yet.</p>
+    );
+  }
+
+  const lastBlocked = webhookRequests.find(
+    (request) =>
+      request.status === "rate_limited" ||
+      request.status === "credits_exhausted"
+  );
+
+  return (
+    <div className="space-y-2">
+      {lastBlocked && (
+        <div className="text-sm text-muted-foreground">
+          <p>
+            {lastBlocked.errorMessage ??
+              "Some requests were not processed for this trigger."}
+            {lastBlocked.status === "rate_limited" && (
+              <>
+                <br />
+                Contact{" "}
+                <LinkWrapper
+                  href="mailto:support@ruby.ad?subject=Increase%20Webhook%20Trigger%20Rate%20Limit"
+                  className="underline"
+                >
+                  support@ruby.ad
+                </LinkWrapper>{" "}
+                to increase the rate limit for this trigger.
+              </>
+            )}
+          </p>
+        </div>
+      )}
+      <div className="flex flex-col px-4">
+        {webhookRequests.map((request, idx) => (
+          <div key={request.id}>
+            <Collapsible defaultOpen={false}>
+              <CollapsibleTrigger>
+                <div className="my-2 flex w-full items-center justify-between gap-4">
+                  {moment(new Date(request.timestamp)).calendar(undefined, {
+                    sameDay: "[Today at] LTS",
+                    lastDay: "[Yesterday at] LTS",
+                    lastWeek: "[Last] dddd [at] LTS",
+                  })}
+                  <WebhookRequestStatusBadge status={request.status} />
+                </div>
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                {request.errorMessage && (
+                  <p className="pb-2 text-sm text-muted-foreground">
+                    {request.errorMessage}
+                  </p>
+                )}
+                {request.payload && (
+                  <div className="rounded">
+                    <pre className="max-h-64 overflow-auto text-xs">
+                      <Markdown
+                        forcedTextSize="xs"
+                        content={`\`\`\`json\n${JSON.stringify(request.payload.body, null, 2)}\n\`\`\``}
+                      />
+                    </pre>
+                  </div>
+                )}
+                {!request.payload && !request.errorMessage && (
+                  <p className="text-sm text-muted-foreground">
+                    No payload available.
+                  </p>
+                )}
+              </CollapsibleContent>
+            </Collapsible>
+            {idx < webhookRequests.length - 1 && <Separator />}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}

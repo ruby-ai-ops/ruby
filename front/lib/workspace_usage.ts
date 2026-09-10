@@ -1,0 +1,889 @@
+import { getInternalMCPServerNameAndWorkspaceId } from "@app/lib/actions/mcp_internal_actions/constants";
+import config from "@app/lib/api/config";
+import { AgentConfigurationModel } from "@app/lib/models/agent/agent";
+import {
+  ConversationModel,
+  MessageModel,
+  UserMessageModel,
+} from "@app/lib/models/agent/conversation";
+import { AgentMessageFeedbackResource } from "@app/lib/resources/agent_message_feedback_resource";
+import { getFrontReplicaDbConnection } from "@app/lib/resources/storage";
+import { GroupMembershipModel } from "@app/lib/resources/storage/models/group_memberships";
+import { GroupModel } from "@app/lib/resources/storage/models/groups";
+import { MembershipModel } from "@app/lib/resources/storage/models/membership";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import { getConversationRoute } from "@app/lib/utils/router";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import { CAP_ELIGIBLE_GROUP_KINDS } from "@app/types/groups";
+import type { ModelId } from "@app/types/shared/model_id";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import type { WorkspaceType } from "@app/types/user";
+import { stringify } from "csv-stringify/sync";
+import { endOfDay } from "date-fns/endOfDay";
+import { endOfMonth } from "date-fns/endOfMonth";
+import { format } from "date-fns/format";
+import { Op, QueryTypes, Sequelize } from "sequelize";
+
+const USAGE_TABLES = [
+  "users",
+  "assistant_messages",
+  "builders",
+  "assistants",
+  "feedback",
+  "all",
+] as const;
+
+export type UsageTableType = (typeof USAGE_TABLES)[number];
+
+interface WorkspaceUsageQueryResult {
+  createdAt: string;
+  conversationModelId: string;
+  messageId: string;
+  userMessageId: string;
+  agentMessageId: string;
+  userId: string;
+  userFirstName: string;
+  userLastName: string;
+  assistantId: string;
+  assistantName: string;
+  actionType: string;
+  source: string;
+}
+
+interface MessageUsageQueryResult {
+  message_id: number;
+  created_at: Date;
+  assistant_id: string;
+  assistant_name: string;
+  conversation_id: number;
+  parent_message_id: number | null;
+  user_message_id: number | null;
+  user_id: number | null;
+  user_email: string | null;
+  source: string | null;
+}
+
+type UserUsageQueryResult = {
+  userId: string;
+  userName: string;
+  userEmail: string;
+  messageCount: number;
+  lastMessageSent: string;
+  activeDaysCount: number;
+  groups: string;
+};
+
+type BuilderUsageQueryResult = {
+  userEmail: string;
+  userFirstName: string;
+  userLastName: string;
+  agentsEditionsCount: number;
+  distinctAgentsEditionsCount: number;
+  lastEditAt: string;
+};
+
+interface AgentUsageQueryResult {
+  name: string;
+  description: string;
+  settings: "published" | "unpublished" | "unknown";
+  modelId: string;
+  providerId: string;
+  authorEmails: string[];
+  messages: number;
+  distinctUsersReached: number;
+  distinctConversations: number;
+  lastEdit: Date;
+}
+
+interface FeedbackQueryResult {
+  id: ModelId;
+  createdAt: Date;
+  userName: string;
+  userEmail: string;
+  agentConfigurationId: string;
+  agentConfigurationVersion: number;
+  thumb: "up" | "down";
+  content: string | null;
+  conversationUrl: string | null;
+}
+
+type GroupMembershipQueryResult = {
+  userId: string;
+  groups: string;
+};
+
+type GroupMembershipWithGroup = GroupMembershipModel & {
+  group: GroupModel;
+};
+
+type MembershipWithUser = MembershipModel & {
+  user: UserModel;
+};
+
+export async function unsafeGetUsageData(
+  startDate: Date,
+  endDate: Date,
+  workspace: WorkspaceType
+): Promise<string> {
+  const wId = workspace.sId;
+
+  const readReplica = getFrontReplicaDbConnection();
+
+  // biome-ignore lint/plugin/noRawSql: Leggit
+  const results = await readReplica.query<WorkspaceUsageQueryResult>(
+    `
+      SELECT TO_CHAR(m."createdAt"::timestamp, 'YYYY-MM-DD HH24:MI:SS') AS "createdAt",
+             c."id"                                                     AS "conversationInternalId",
+             m."sId"                                                    AS "messageId",
+             p."sId"                                                    AS "parentMessageId",
+             CASE
+               WHEN um."id" IS NOT NULL THEN 'user'
+               WHEN am."id" IS NOT NULL THEN 'assistant'
+               WHEN cf."id" IS NOT NULL THEN 'content_fragment'
+               END                                                      AS "messageType",
+             um."userContextFullName"                                   AS "userFullName",
+             LOWER(um."userContextEmail")                               AS "userEmail",
+             COALESCE(ac."sId", am."agentConfigurationId")              AS "assistantId",
+             COALESCE(ac."name", am."agentConfigurationId")             AS "assistantName",
+             msv."internalMCPServerId"                                  AS "actionType",
+             um."userContextOrigin"                                     AS "source"
+      FROM "messages" m
+             JOIN
+           "conversations" c ON m."conversationId" = c."id"
+             JOIN
+           "workspaces" w ON c."workspaceId" = w."id"
+             LEFT JOIN
+           "user_messages" um ON m."userMessageId" = um."id"
+             LEFT JOIN
+           "users" u ON um."userId" = u."id"
+             LEFT JOIN
+           "agent_messages" am ON m."agentMessageId" = am."id"
+             LEFT JOIN
+           "content_fragments" cf ON m."contentFragmentId" = cf."id"
+             LEFT JOIN
+           "agent_configurations" ac
+           ON am."agentConfigurationId" = ac."sId" AND am."agentConfigurationVersion" = ac."version"
+             LEFT JOIN
+           "agent_mcp_server_configurations" amsc ON ac."id" = amsc."agentConfigurationId"
+             LEFT JOIN
+           "mcp_server_views" msv ON amsc."mcpServerViewId" = msv."id"
+             LEFT JOIN
+           "messages" p ON m."parentId" = p."id"
+      WHERE w."sId" = :wId
+        AND m."createdAt" >= :startDate
+        AND m."createdAt" <= :endDate
+      GROUP BY m."id", c."id", um."id", am."id", cf."id", ac."id", p."id", msv."internalMCPServerId"
+      ORDER BY m."createdAt" DESC
+    `,
+    {
+      replacements: {
+        wId,
+        startDate: format(startDate, "yyyy-MM-dd'T'00:00:00"), // Use first day of start month
+        endDate: format(endDate, "yyyy-MM-dd'T'23:59:59"), // Use last day of end month
+      },
+      type: QueryTypes.SELECT,
+    }
+  );
+  if (!results.length) {
+    return "No data available for the selected period.";
+  } else {
+    // Do a second pass to replace the internalMCPServerId with the names.
+    const lookup = new Map<string, string>();
+    for (const result of results) {
+      if (!result.actionType) {
+        continue;
+      }
+
+      let name = lookup.get(result.actionType);
+      if (!name) {
+        const r = getInternalMCPServerNameAndWorkspaceId(result.actionType);
+        if (r.isOk()) {
+          name = r.value.name;
+        } else {
+          name = "unknown";
+        }
+        lookup.set(result.actionType, name);
+      }
+      result.actionType = name;
+    }
+  }
+  return generateCsvFromQueryResult(results);
+}
+
+async function getMessageUsageData(
+  startDate: Date,
+  endDate: Date,
+  workspace: WorkspaceType
+): Promise<string> {
+  const wId = workspace.id;
+  const readReplica = getFrontReplicaDbConnection();
+  // biome-ignore lint/plugin/noRawSql: Leggit
+  const results = await readReplica.query<MessageUsageQueryResult>(
+    `
+      SELECT am."id"                                                     AS "message_id",
+             TO_CHAR(am."createdAt"::timestamp, 'YYYY-MM-DD HH24:MI:SS') AS "createdAt",
+             COALESCE(ac."sId", am."agentConfigurationId")               AS "assistant_id",
+             COALESCE(ac."name", am."agentConfigurationId")              AS "assistant_name",
+             CASE
+             	 WHEN ac."status" = 'draft' THEN 'draft'
+               WHEN ac."scope" = 'visible' THEN 'published'
+               WHEN ac."scope" = 'hidden' THEN 'unpublished'
+               ELSE 'unknown'
+               END                                                       AS "assistant_settings",
+             m."conversationId"                                          AS "conversation_id",
+             m."parentId"                                                AS "parent_message_id",
+             um."id"                                                     AS "user_message_id",
+             um."userId"                                                 AS "user_id",
+             LOWER(um."userContextEmail")                                AS "user_email",
+             um."userContextOrigin"                                      AS "source"
+      FROM "agent_messages" am
+             JOIN
+           "messages" m ON am."id" = m."agentMessageId"
+             LEFT JOIN
+           "agent_configurations" ac
+           ON am."agentConfigurationId" = ac."sId" AND am."agentConfigurationVersion" = ac."version"
+             LEFT JOIN
+           "messages" m2 on m."parentId" = m2."id"
+             LEFT JOIN
+           "user_messages" um on m2."userMessageId" = um."id"
+      WHERE am."status" = 'succeeded'
+        AND am."workspaceId" = :wId
+        AND am."createdAt" BETWEEN :startDate AND :endDate
+    `,
+    {
+      replacements: {
+        wId,
+        startDate: format(startDate, "yyyy-MM-dd'T'00:00:00"), // Use first day of start month
+        endDate: format(endDate, "yyyy-MM-dd'T'23:59:59"), // Use last day of end month
+      },
+      type: QueryTypes.SELECT,
+    }
+  );
+  if (!results.length) {
+    return "No data available for the selected period.";
+  }
+  return generateCsvFromQueryResult(results);
+}
+
+export async function getUserGroupMemberships(
+  workspaceId: number,
+  startDate: Date,
+  endDate: Date
+): Promise<Record<string, string>> {
+  const groupMemberships = await getFrontReplicaDbConnection().transaction(
+    async (t) => {
+      const whereClause = {
+        workspaceId,
+        [Op.and]: [
+          { startAt: { [Op.lte]: endDate } },
+          {
+            [Op.or]: [{ endAt: null }, { endAt: { [Op.gte]: startDate } }],
+          },
+        ],
+      };
+
+      return GroupMembershipModel.findAll({
+        where: whereClause,
+        include: [
+          {
+            model: GroupModel,
+            as: "group",
+            attributes: ["name"],
+            required: true,
+            where: {
+              kind: {
+                [Op.in]: [...CAP_ELIGIBLE_GROUP_KINDS],
+              },
+            },
+          },
+        ],
+        transaction: t,
+      }) as Promise<GroupMembershipWithGroup[]>;
+    }
+  );
+
+  const result: Record<string, string> = {};
+  groupMemberships.forEach((membership) => {
+    const userId = membership.userId.toString();
+    const groupName = membership.group.name;
+    result[userId] = result[userId]
+      ? `${result[userId]}, ${groupName}`
+      : groupName;
+  });
+
+  return result;
+}
+
+async function getUserUsageData(
+  startDate: Date,
+  endDate: Date,
+  workspace: WorkspaceType,
+  options?: { includeInactive?: boolean }
+): Promise<string> {
+  const wId = workspace.id;
+  const includeInactiveUsers = options?.includeInactive ?? false;
+
+  const allUserMessages = await getFrontReplicaDbConnection().transaction(
+    async (t) => {
+      return MessageModel.findAll({
+        attributes: [
+          "userMessage.userId",
+          [
+            Sequelize.fn(
+              "MAX",
+              Sequelize.col("userMessage.userContextFullName")
+            ),
+            "userContextFullName",
+          ],
+          [
+            Sequelize.fn(
+              "LOWER",
+              Sequelize.col("userMessage.userContextEmail")
+            ),
+            "userContextEmail",
+          ],
+          "userMessage.userContextOrigin",
+          [Sequelize.fn("COUNT", Sequelize.col("userMessage.id")), "count"],
+          [
+            Sequelize.cast(
+              Sequelize.fn("MAX", Sequelize.col("userMessage.createdAt")),
+              "DATE"
+            ),
+            "lastMessageSent",
+          ],
+          [
+            Sequelize.fn(
+              "COUNT",
+              Sequelize.fn(
+                "DISTINCT",
+                Sequelize.fn("DATE", Sequelize.col("userMessage.createdAt"))
+              )
+            ),
+            "activeDaysCount",
+          ],
+        ],
+        where: {
+          workspaceId: wId,
+          createdAt: {
+            [Op.gte]: startDate,
+            [Op.lte]: endDate,
+          },
+        },
+        include: [
+          {
+            model: UserMessageModel,
+            as: "userMessage",
+            required: true,
+            attributes: [],
+            where: {
+              userId: {
+                [Op.not]: null,
+              },
+              // Filter out "fake" user messages created by the system (new system that replaced the "origin" field for detection of agent messages)
+              agenticMessageType: {
+                [Op.is]: null,
+              },
+            },
+          },
+          {
+            model: ConversationModel,
+            as: "conversation",
+            attributes: [],
+            required: true,
+            where: {
+              workspaceId: wId,
+            },
+          },
+        ],
+        group: [
+          "userMessage.userId",
+          Sequelize.fn("LOWER", Sequelize.col("userMessage.userContextEmail")),
+          "userMessage.userContextOrigin",
+        ],
+        order: [["count", "DESC"]],
+        raw: true,
+        transaction: t,
+      });
+    }
+  );
+
+  // Filter out agent messages (userContextOrigin === "run_agent")
+  // Since agents always have userContextOrigin="run_agent" and humans have
+  // other values, they form separate grouped records. Filtering post-GROUP BY
+  // produces identical results to a database WHERE clause but reduces DB load.
+  const userMessages = allUserMessages.filter((message) => {
+    const origin = (message as unknown as { userContextOrigin: string })
+      .userContextOrigin;
+    return origin !== "run_agent";
+  });
+
+  const userGroupsMap = await getUserGroupMemberships(wId, startDate, endDate);
+
+  const userAggregates = new Map<string, UserUsageQueryResult>();
+
+  userMessages.forEach((result) => {
+    const userId = String((result as unknown as { userId: number }).userId);
+    const userEmail = (result as unknown as { userContextEmail: string })
+      .userContextEmail;
+    const existing = userAggregates.get(userEmail);
+    const current = {
+      userId,
+      userName: (result as unknown as { userContextFullName: string })
+        .userContextFullName,
+      userEmail,
+      messageCount: (result as unknown as { count: number }).count,
+      lastMessageSent: (result as unknown as { lastMessageSent: string })
+        .lastMessageSent,
+      activeDaysCount: (result as unknown as { activeDaysCount: number })
+        .activeDaysCount,
+      groups: userGroupsMap[userId] || "",
+    };
+
+    if (existing) {
+      userAggregates.set(userEmail, {
+        ...existing,
+        userName: current.userName,
+        messageCount: existing.messageCount + current.messageCount,
+        lastMessageSent:
+          current.lastMessageSent > existing.lastMessageSent
+            ? current.lastMessageSent
+            : existing.lastMessageSent,
+        activeDaysCount: Math.max(
+          existing.activeDaysCount,
+          current.activeDaysCount
+        ),
+      });
+    } else {
+      userAggregates.set(userEmail, current);
+    }
+  });
+
+  const userUsage = Array.from(userAggregates.values()).sort(
+    (a, b) => b.messageCount - a.messageCount
+  );
+
+  if (includeInactiveUsers) {
+    const memberships = (await MembershipModel.findAll({
+      where: {
+        workspaceId: wId,
+        [Op.and]: [
+          { startAt: { [Op.lte]: endDate } },
+          { [Op.or]: [{ endAt: null }, { endAt: { [Op.gte]: startDate } }] },
+        ],
+      },
+      include: [
+        {
+          model: UserModel,
+          required: true,
+          attributes: ["id", "email", "name"],
+        },
+      ],
+    })) satisfies MembershipWithUser[];
+
+    const existingEmails = new Set(
+      userUsage.map((usage) => usage.userEmail?.toLowerCase())
+    );
+
+    memberships.forEach((membership) => {
+      const user = membership.user;
+      if (!user) {
+        return;
+      }
+
+      const email = user.email.toLowerCase();
+      if (existingEmails.has(email)) {
+        return;
+      }
+
+      const userId = membership.userId.toString();
+
+      userUsage.push({
+        userId,
+        userName: user.name || email,
+        userEmail: email,
+        messageCount: 0,
+        lastMessageSent: "",
+        activeDaysCount: 0,
+        groups: userGroupsMap[userId] || "",
+      });
+
+      existingEmails.add(email);
+    });
+
+    userUsage.sort((a, b) => {
+      if (b.messageCount !== a.messageCount) {
+        return b.messageCount - a.messageCount;
+      }
+      if (!b.userEmail) {
+        return -1;
+      }
+      if (!a.userEmail) {
+        return 1;
+      }
+      return a.userEmail.localeCompare(b.userEmail);
+    });
+  }
+
+  if (!userUsage.length) {
+    return "No data available for the selected period.";
+  }
+  return generateCsvFromQueryResult(userUsage);
+}
+
+async function getBuildersUsageData(
+  startDate: Date,
+  endDate: Date,
+  workspace: WorkspaceType
+): Promise<string> {
+  const wId = workspace.id;
+  const agentConfigurations = await getFrontReplicaDbConnection().transaction(
+    async (t) => {
+      return AgentConfigurationModel.findAll({
+        attributes: [
+          [
+            Sequelize.fn("COUNT", Sequelize.col("agent_configuration.sId")),
+            "agentsEditionsCount",
+          ],
+          "user.email",
+          "user.firstName",
+          "user.lastName",
+          [
+            Sequelize.fn(
+              "COUNT",
+              Sequelize.literal('DISTINCT "agent_configuration"."sId"')
+            ),
+            "distinctAgentsEditionsCount",
+          ],
+          [
+            Sequelize.cast(
+              Sequelize.fn(
+                "MAX",
+                Sequelize.col("agent_configuration.updatedAt")
+              ),
+              "DATE"
+            ),
+            "lastEditAt",
+          ],
+        ],
+        where: {
+          workspaceId: wId,
+          createdAt: {
+            [Op.gte]: startDate,
+            [Op.lte]: endDate,
+          },
+          status: {
+            [Op.not]: "draft",
+          },
+        },
+        include: [
+          {
+            model: UserModel,
+            as: "user",
+            attributes: [],
+            required: true,
+          },
+        ],
+        raw: true,
+        group: ["authorId", "user.email", "user.firstName", "user.lastName"],
+        transaction: t,
+      });
+    }
+  );
+  const buildersUsage: BuilderUsageQueryResult[] = agentConfigurations.map(
+    (result) => {
+      const castResult = result as unknown as {
+        firstName: string;
+        lastName: string;
+        email: string;
+        agentsEditionsCount: number;
+        distinctAgentsEditionsCount: number;
+        lastEditAt: string;
+      };
+      return {
+        userFirstName: castResult.firstName,
+        userLastName: castResult.lastName,
+        userEmail: castResult.email,
+        agentsEditionsCount: castResult.agentsEditionsCount,
+        distinctAgentsEditionsCount: castResult.distinctAgentsEditionsCount,
+        lastEditAt: castResult.lastEditAt,
+      };
+    }
+  );
+
+  if (!buildersUsage.length) {
+    return "No data available for the selected period.";
+  }
+  return generateCsvFromQueryResult(buildersUsage);
+}
+
+export async function getAssistantUsageData(
+  startDate: Date,
+  endDate: Date,
+  workspace: WorkspaceType,
+  agentConfiguration: LightAgentConfigurationType
+): Promise<number> {
+  const wId = workspace.id;
+  const readReplica = getFrontReplicaDbConnection();
+  // biome-ignore lint/plugin/noRawSql: Leggit
+  const mentions = await readReplica.query<{ messages: number }>(
+    `
+      SELECT COUNT(a."id") AS "messages"
+      FROM "agent_messages" a
+             JOIN "agent_configurations" ac ON a."agentConfigurationId" = ac."sId"
+      WHERE a."createdAt" BETWEEN :startDate AND :endDate
+        AND ac."workspaceId" = :wId
+        AND ac."status" = 'active'
+        AND ac."sId" = :agentConfigurationId
+    `,
+    {
+      type: QueryTypes.SELECT,
+      replacements: {
+        startDate: format(startDate, "yyyy-MM-dd'T'00:00:00"),
+        endDate: format(endDate, "yyyy-MM-dd'T'23:59:59"),
+        agentConfigurationId: agentConfiguration.sId,
+        wId,
+      },
+    }
+  );
+
+  if (!mentions.length) {
+    return 0;
+  }
+  return mentions[0].messages;
+}
+
+async function getAssistantsUsageData(
+  startDate: Date,
+  endDate: Date,
+  workspace: WorkspaceType,
+  options?: { includeInactive?: boolean }
+): Promise<string> {
+  const wId = workspace.id;
+  const includeInactiveAgents = options?.includeInactive ?? false;
+  const readReplica = getFrontReplicaDbConnection();
+  // Include unpublished agents for workspace admins.
+  const scopeFilter =
+    workspace.role === "admin" ? "" : "AND ac.\"scope\" != 'hidden'";
+  // biome-ignore lint/plugin/noRawSql: Leggit
+  const agents = await readReplica.query<AgentUsageQueryResult>(
+    `
+      SELECT ac."name",
+             ac."description",
+             CASE
+               WHEN ac."scope" = 'visible' THEN 'published'
+               WHEN ac."scope" = 'hidden' THEN 'unpublished'
+               ELSE 'unknown'
+             END                                         AS "settings",
+             ac."modelId",
+             ac."providerId",
+             ARRAY_REMOVE(ARRAY_AGG(DISTINCT aut."email"), NULL)::text[] 
+                                                         AS "authorEmails",
+             COUNT(a."id")                               AS "messages",
+             COUNT(DISTINCT u."id")                      AS "distinctUsersReached",
+             COUNT(DISTINCT m."conversationId")          AS "distinctConversations",
+             COALESCE(
+               MAX(CAST(ac."updatedAt" AS DATE)),
+               MAX(CAST(ac."createdAt" AS DATE))
+             )                                           AS "lastEdit"
+      FROM "agent_configurations" ac
+             LEFT JOIN "users" aut ON ac."authorId" = aut."id"
+             LEFT JOIN "agent_messages" a
+                      ON a."agentConfigurationId" = ac."sId"
+                      AND a."workspaceId" = :wId
+                      AND a."status" = 'succeeded'
+                      AND a."createdAt" BETWEEN :startDate AND :endDate
+             LEFT JOIN "messages" m ON a."id" = m."agentMessageId"
+             LEFT JOIN "messages" parent ON m."parentId" = parent."id"
+             LEFT JOIN "user_messages" um ON um."id" = parent."userMessageId"
+             LEFT JOIN "users" u ON um."userId" = u."id"
+      WHERE ac."workspaceId" = :wId
+        AND ac."status" = 'active'
+        ${scopeFilter}
+      GROUP BY ac."id"
+      ORDER BY "messages" DESC, ac."name" ASC;
+    `,
+    {
+      type: QueryTypes.SELECT,
+      replacements: {
+        startDate: format(startDate, "yyyy-MM-dd'T'00:00:00"), // Use first day of start month
+        endDate: format(endDate, "yyyy-MM-dd'T'23:59:59"), // Use last day of end month
+        wId,
+      },
+    }
+  );
+  const filteredAgents = includeInactiveAgents
+    ? agents
+    : agents.filter((agent) => agent.messages > 0);
+
+  if (!filteredAgents.length) {
+    return "No data available for the selected period.";
+  }
+  return generateCsvFromQueryResult(filteredAgents);
+}
+
+async function getFeedbackUsageData(
+  startDate: Date,
+  endDate: Date,
+  workspace: WorkspaceType
+): Promise<string> {
+  const feedbacks = await getFrontReplicaDbConnection().transaction(
+    async (t) => {
+      return AgentMessageFeedbackResource.getFeedbackUsageDataForWorkspace({
+        startDate,
+        endDate,
+        workspace,
+        transaction: t,
+      });
+    }
+  );
+
+  if (feedbacks.length === 0) {
+    return "No data available for the selected period.";
+  }
+
+  const feedbacksWithMinimalFields = feedbacks.map((feedback) => {
+    const jsonFeedback = feedback.toJSON();
+    return {
+      id: jsonFeedback.id,
+      createdAt: jsonFeedback.createdAt,
+      userName: jsonFeedback.userName,
+      userEmail: jsonFeedback.userEmail,
+      agentConfigurationId: jsonFeedback.agentConfigurationId,
+      agentConfigurationVersion: jsonFeedback.agentConfigurationVersion,
+      thumb: jsonFeedback.thumbDirection,
+      // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+      content: jsonFeedback.content?.replace(/\r?\n/g, "\\n") || null,
+      conversationUrl:
+        jsonFeedback.conversationId && jsonFeedback.isConversationShared
+          ? reconstructConversationUrl(workspace, jsonFeedback.conversationId)
+          : null,
+    } as FeedbackQueryResult;
+  });
+  return generateCsvFromQueryResult(feedbacksWithMinimalFields);
+}
+
+function reconstructConversationUrl(
+  workspace: WorkspaceType,
+  conversationId: string
+) {
+  return getConversationRoute(
+    workspace.sId,
+    conversationId,
+    undefined,
+    config.getAppUrl()
+  );
+}
+
+export async function fetchUsageData({
+  table,
+  start,
+  end,
+  workspace,
+  includeInactive = false,
+}: {
+  table: UsageTableType;
+  start: Date;
+  end: Date;
+  workspace: WorkspaceType;
+  includeInactive?: boolean;
+}): Promise<Partial<Record<UsageTableType, string>>> {
+  switch (table) {
+    case "users":
+      return {
+        users: await getUserUsageData(start, end, workspace, {
+          includeInactive,
+        }),
+      };
+    case "assistant_messages":
+      return {
+        assistant_messages: await getMessageUsageData(start, end, workspace),
+      };
+    case "builders":
+      return { builders: await getBuildersUsageData(start, end, workspace) };
+    case "assistants":
+      return {
+        assistants: await getAssistantsUsageData(start, end, workspace, {
+          includeInactive,
+        }),
+      };
+    case "feedback":
+      return {
+        feedback: await getFeedbackUsageData(start, end, workspace),
+      };
+    case "all":
+      // Sequential on purpose: each query is heavy, running them in parallel
+      // spikes load on the read replica.
+      const users = await getUserUsageData(start, end, workspace, {
+        includeInactive,
+      });
+      const assistant_messages = await getMessageUsageData(
+        start,
+        end,
+        workspace
+      );
+      const builders = await getBuildersUsageData(start, end, workspace);
+      const assistants = await getAssistantsUsageData(start, end, workspace, {
+        includeInactive,
+      });
+      const feedback = await getFeedbackUsageData(start, end, workspace);
+      return { users, assistant_messages, builders, assistants, feedback };
+    default:
+      assertNever(table);
+  }
+}
+
+function generateCsvFromQueryResult(
+  rows:
+    | WorkspaceUsageQueryResult[]
+    | UserUsageQueryResult[]
+    | AgentUsageQueryResult[]
+    | MessageUsageQueryResult[]
+    | BuilderUsageQueryResult[]
+    | FeedbackQueryResult[]
+    | GroupMembershipQueryResult[]
+) {
+  if (rows.length === 0) {
+    return "";
+  }
+
+  const headers = Object.keys(rows[0]);
+  const data = rows.map((row) => Object.values(row));
+
+  return stringify([headers, ...data], {
+    header: false,
+    cast: {
+      date: (value) => value.toISOString(),
+    },
+  });
+}
+
+type WorkspaceUsageDateRange =
+  | { mode: "month"; start: string }
+  | { mode: "range"; start: string; end: string };
+
+export function resolveWorkspaceUsageDates(query: WorkspaceUsageDateRange): {
+  startDate: Date;
+  endDate: Date;
+} {
+  const parseDate = (dateString: string) => {
+    const parts = dateString.split("-");
+    return new Date(
+      parseInt(parts[0]),
+      parseInt(parts[1]) - 1,
+      parts[2] ? parseInt(parts[2]) : 1
+    );
+  };
+
+  switch (query.mode) {
+    case "month":
+      const date = parseDate(query.start);
+      return { startDate: date, endDate: endOfMonth(date) };
+    case "range":
+      return {
+        startDate: parseDate(query.start),
+        endDate: endOfDay(parseDate(query.end)),
+      };
+    default:
+      assertNever(query);
+  }
+}

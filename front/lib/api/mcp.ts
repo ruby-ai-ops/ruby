@@ -1,0 +1,291 @@
+import type {
+  CustomResourceIconType,
+  InternalAllowedIconType,
+} from "@app/components/resources/resources_icon_names";
+import type { MCPToolStakeLevelType } from "@app/lib/actions/constants";
+import type {
+  LightMCPToolConfigurationType,
+  MCPToolConfigurationType,
+} from "@app/lib/actions/mcp";
+import type {
+  InternalMCPServerNameType,
+  MCPServerAvailability,
+} from "@app/lib/actions/mcp_internal_actions/constants";
+import type { AuthorizationInfo } from "@app/lib/actions/mcp_metadata_extraction";
+import {
+  isLightClientSideMCPToolConfiguration,
+  isLightServerSideMCPToolConfiguration,
+  isServerSideMCPToolConfiguration,
+} from "@app/lib/actions/types/guards";
+import type { MCPServersUsage } from "@app/lib/api/agent_actions";
+import type {
+  PatchMCPServerBodySchema,
+  PostRequestActionsAccessBodySchema,
+  UpdateMCPToolSettingsBodySchema,
+} from "@app/lib/api/mcp_schemas";
+import type { MCPOAuthUseCase } from "@app/types/oauth/lib";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { EditedByUser } from "@app/types/user";
+import type { JSONSchema7 as JSONSchema } from "json-schema";
+import type { z } from "zod";
+
+const MCP_TOOL_RETRY_POLICY_TYPES = ["retry_on_interrupt", "no_retry"] as const;
+
+export type MCPToolRetryPolicyType =
+  (typeof MCP_TOOL_RETRY_POLICY_TYPES)[number];
+
+// Default to never_retryable if the retry policy is not defined.
+export const DEFAULT_MCP_TOOL_RETRY_POLICY =
+  "no_retry" as const satisfies MCPToolRetryPolicyType;
+
+export type MCPServerViewNameConflictDetails = {
+  // Effective (display) name of the existing tool/connection the new server
+  // collides with.
+  conflictingServerName: string;
+  // Model-facing tool name that both servers resolve to once the server-name
+  // prefix is truncated to fit the tool-name length budget. Undefined when the
+  // collision is a plain display-name match rather than a cropped tool name.
+  conflictingToolName?: string;
+};
+
+export type MCPServerViewNameConflict = {
+  nameConflict: string;
+  conflictDetails?: MCPServerViewNameConflictDetails;
+};
+
+export function isMCPServerViewNameConflict(
+  input: Error | MCPServerViewNameConflict
+): input is MCPServerViewNameConflict {
+  return !(input instanceof Error) && typeof input.nameConflict === "string";
+}
+
+// Build the user-facing message for a name conflict. When the collision comes
+// from a cropped tool name, name the existing connection and the shared
+// model-facing tool name so the cause is diagnosable without diffing every
+// other connection's tool list.
+export function getMCPServerViewNameConflictMessage({
+  nameConflict,
+  conflictDetails,
+}: MCPServerViewNameConflict): string {
+  if (conflictDetails?.conflictingToolName) {
+    return (
+      `The name "${nameConflict}" produces the tool ` +
+      `"${conflictDetails.conflictingToolName}", which already exists on the ` +
+      `connection "${conflictDetails.conflictingServerName}". Enter a ` +
+      `different name.`
+    );
+  }
+  return `An existing Tool is already using the name "${nameConflict}".`;
+}
+
+export function getRetryPolicyFromToolConfiguration(
+  toolConfiguration: MCPToolConfigurationType | LightMCPToolConfigurationType
+): MCPToolRetryPolicyType {
+  return isLightServerSideMCPToolConfiguration(toolConfiguration) ||
+    (!isLightClientSideMCPToolConfiguration(toolConfiguration) &&
+      isServerSideMCPToolConfiguration(toolConfiguration))
+    ? toolConfiguration.retryPolicy
+    : // Client-side MCP tool retry policy is not supported yet.
+      DEFAULT_MCP_TOOL_RETRY_POLICY;
+}
+
+export const TOOL_COST_CATEGORIES = ["basic", "advanced"] as const;
+export type ToolCostCategory = (typeof TOOL_COST_CATEGORIES)[number];
+
+// Schemas are in mcp_schemas.ts to avoid pulling zod + heavy dependencies
+// into the Temporal workflow sandbox.
+// Import schemas from "@app/lib/api/mcp_schemas" directly.
+
+export type ToolDisplayLabels = {
+  running: string; // e.g. "Searching data"
+  done: string; // e.g. "Search data"
+  icon?: InternalAllowedIconType; // optional per-tool icon override
+};
+
+export type MCPToolType = {
+  name: string;
+  description: string;
+  inputSchema?: JSONSchema;
+  // Optional for remote MCP servers (external sources may not have this).
+  // Mandatory for internal MCP servers (enforced via ServerMetadata type).
+  displayLabels?: ToolDisplayLabels;
+  // When true, the tool is loaded upfront in the cached tools prefix instead of
+  // being deferred behind tool search. Absent for remote/client-side tools, which
+  // therefore default to deferred.
+  eager?: boolean;
+  editableArguments?: readonly string[];
+};
+
+export type MCPServerType = {
+  // This will be part of the MCP server metadata at the protocol level.
+  name: string;
+  version: string;
+  description: string;
+
+  // Everything below is only internal.
+  sId: string;
+  icon: CustomResourceIconType | InternalAllowedIconType;
+  authorization: AuthorizationInfo | null;
+  tools: MCPToolType[];
+  availability: MCPServerAvailability;
+  allowMultipleInstances: boolean;
+  documentationUrl: string | null;
+  developerSecretSelection?: DeveloperSecretSelectionType | null;
+  developerSecretSelectionDescription?: string | null;
+  sharedSecret?: string | null;
+  customHeaders?: Record<string, string> | null;
+  meta?: Record<string, string> | null;
+};
+
+export type MCPServerViewTypeType = "remote" | "internal";
+
+export interface MCPServerViewType {
+  id: ModelId;
+  sId: string;
+  name: string | null;
+  description: string | null;
+  createdAt: number;
+  updatedAt: number;
+  spaceId: string;
+  serverType: MCPServerViewTypeType;
+  server: MCPServerType;
+  oAuthUseCase: MCPOAuthUseCase | null;
+  editedByUser: EditedByUser | null;
+  isRestrictedToSkills: boolean;
+  toolsMetadata?: {
+    toolName: string;
+    permission: MCPToolStakeLevelType;
+    enabled: boolean;
+  }[];
+}
+
+// Light variants for list surfaces that only render names, descriptions and icons (conversation
+// capabilities picker, slash menu). Served by GET /mcp/views/jit; full types are structurally
+// assignable to them.
+export type MCPToolLightType = Pick<MCPToolType, "name" | "description">;
+
+export type MCPServerLightType = Pick<
+  MCPServerType,
+  "sId" | "name" | "description" | "icon"
+> & {
+  tools: MCPToolLightType[];
+};
+
+export type MCPServerViewLightType = Pick<
+  MCPServerViewType,
+  "sId" | "name" | "description"
+> & {
+  server: MCPServerLightType;
+};
+
+export type GetJITMCPServerViewsListResponseBody = {
+  success: boolean;
+  serverViews: MCPServerViewLightType[];
+};
+
+export type MCPToolWithAvailabilityType = MCPToolType & {
+  availability: MCPServerAvailability;
+};
+
+export type WithStakeLevelType<T> = T & {
+  stakeLevel: MCPToolStakeLevelType;
+};
+
+export type ServerSideMCPToolTypeWithStakeAndRetryPolicy =
+  WithStakeLevelType<MCPToolWithAvailabilityType> & {
+    toolServerId: string;
+    timeoutMs?: number;
+    retryPolicy: MCPToolRetryPolicyType;
+  };
+
+export type ClientSideMCPToolTypeWithStakeLevel =
+  WithStakeLevelType<MCPToolWithAvailabilityType> & {
+    argumentsRequiringApproval?: string[];
+    timeoutMs?: number;
+  };
+
+export type RemoteMCPServerType = MCPServerType & {
+  url?: string;
+  lastSyncAt?: Date | null;
+  lastError?: string | null;
+  icon: CustomResourceIconType | InternalAllowedIconType;
+  // Always manual and allow multiple instances.
+  availability: "manual";
+  allowMultipleInstances: true;
+};
+
+export type InternalMCPServerDefinitionType = Omit<
+  MCPServerType,
+  "tools" | "sId" | "availability" | "allowMultipleInstances"
+> & {
+  name: InternalMCPServerNameType;
+  // We enforce that we pass an icon here.
+  icon: InternalAllowedIconType;
+  // Whether the server's actions are framed as the agent acting (e.g. "Allow
+  // @agent to schedule a wake-up?") or as the server acting (default, e.g.
+  // "Allow Linear to create an issue?"). Use "agent" for self-contained agent
+  // capabilities; leave undefined for third-party integrations.
+  displayedAs?: "agent" | "server";
+};
+
+export type MCPServerTypeWithViews = MCPServerType & {
+  views: MCPServerViewType[];
+};
+
+export type DeveloperSecretSelectionType = "required" | "optional";
+
+export type GetMCPServerViewsNotActivatedResponseBody = {
+  success: boolean;
+  serverViews: MCPServerViewType[];
+};
+
+export type GetMCPServersResponseBody = {
+  success: true;
+  servers: MCPServerTypeWithViews[];
+};
+
+export type CreateMCPServerResponseBody = {
+  success: true;
+  server: MCPServerType;
+};
+
+export type PostRequestActionsAccessBody = z.infer<
+  typeof PostRequestActionsAccessBodySchema
+>;
+
+export type PatchMCPServerBody = z.infer<typeof PatchMCPServerBodySchema>;
+
+export type GetMCPServerResponseBody = {
+  server: MCPServerTypeWithViews;
+};
+
+export type PatchMCPServerResponseBody = {
+  success: true;
+  server: MCPServerType;
+};
+
+export type DeleteMCPServerResponseBody = {
+  deleted: boolean;
+};
+
+export type GetMCPServersUsageResponseBody = {
+  usage: MCPServersUsage;
+};
+
+export type SyncMCPServerResponseBody = {
+  success: boolean;
+  server: MCPServerType;
+};
+
+export type GetMCPServerViewsListResponseBody = {
+  success: boolean;
+  serverViews: MCPServerViewType[];
+};
+
+export type PatchMCPServerToolsPermissionsResponseBody = {
+  success: boolean;
+};
+
+export type UpdateMCPToolSettingsBodyType = z.infer<
+  typeof UpdateMCPToolSettingsBodySchema
+>;

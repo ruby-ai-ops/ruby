@@ -1,0 +1,16 @@
+{
+  "action": "user.identity_merged",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "user"
+    }
+  ],
+  "metadata": {
+    "primary_user_id": "string",
+    "merged_user_id": "string",
+    "actor_type": "string"
+  }
+}

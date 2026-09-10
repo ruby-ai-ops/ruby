@@ -1,0 +1,113 @@
+import {
+  InputBarContext,
+  InputBarContextProvider,
+} from "@app/components/assistant/conversation/input_bar/InputBarContext";
+import { useActiveConversationId } from "@app/hooks/useActiveConversationId";
+import { useAgentConfiguration } from "@app/lib/swr/assistants";
+import { toRichAgentMentionType } from "@app/types/assistant/mentions";
+import type { LightWorkspaceType } from "@app/types/user";
+import { usePlatform } from "@extension/shared/context/PlatformContext";
+import type { AttachSelectionMessage } from "@extension/shared/messages";
+import { useSearchParam } from "@extension/shared/platform";
+import { useExtensionQuickActions } from "@extension/ui/components/quick_actions/ExtensionQuickActionsProvider";
+import { useFileUploaderService } from "@extension/ui/hooks/useFileUploaderService";
+import type { ReactNode } from "react";
+import { useCallback, useContext, useEffect, useState } from "react";
+
+interface ExtensionInputBarProviderProps {
+  workspace: LightWorkspaceType;
+  children: ReactNode;
+}
+
+/**
+ * Mounted once above the router's page routes (see `ProtectedRoute`), so the
+ * input bar context — including the deferred first message — survives
+ * navigation between the pod and conversation routes.
+ */
+export function ExtensionInputBarProvider({
+  workspace,
+  children,
+}: ExtensionInputBarProviderProps) {
+  const platform = usePlatform();
+  const quickActions = useExtensionQuickActions();
+  const conversationId = useActiveConversationId();
+  const fileUploaderService = useFileUploaderService(
+    platform.capture,
+    conversationId
+  );
+
+  const captureActions = platform.useCaptureActions(
+    workspace,
+    fileUploaderService.uploadContentTab,
+    fileUploaderService.isCapturing,
+    quickActions
+  );
+
+  // Reset fileBlobs when conversationId changes.
+  // We intentionally avoid using a key prop as it would remount
+  // the entire page subtree just to reset a single array.
+  const [prevConversationId, setPrevConversationId] = useState(conversationId);
+  if (conversationId !== prevConversationId) {
+    setPrevConversationId(conversationId);
+    fileUploaderService.resetUpload();
+  }
+
+  useEffect(() => {
+    void platform.messaging?.sendMessage({
+      type: "INPUT_BAR_STATUS",
+      available: true,
+    });
+
+    const cleanup = platform.messaging?.addMessageListener(
+      (message: AttachSelectionMessage) => {
+        if (message.type === "EXT_ATTACH_TAB") {
+          void fileUploaderService.uploadContentTab(message);
+        }
+      }
+    );
+
+    return () => {
+      void platform.messaging?.sendMessage({
+        type: "INPUT_BAR_STATUS",
+        available: false,
+      });
+      cleanup?.();
+    };
+  }, [platform.messaging, fileUploaderService.uploadContentTab]);
+
+  const handleBeforeSubmit = useCallback(() => {
+    void platform.messaging?.sendMessage({ type: "SNAPSHOT_TAB_STATE" });
+  }, [platform.messaging]);
+
+  return (
+    <InputBarContextProvider
+      captureActions={captureActions}
+      fileUploaderService={fileUploaderService}
+      onBeforeSubmit={handleBeforeSubmit}
+    >
+      <AgentQueryParamHandler workspaceId={workspace.sId} />
+      {children}
+    </InputBarContextProvider>
+  );
+}
+
+/**
+ * Reads the ?agent= query param and pre-selects the agent in the input bar.
+ */
+function AgentQueryParamHandler({ workspaceId }: { workspaceId: string }) {
+  const agent = useSearchParam("agent");
+  const { setSelectedAgent } = useContext(InputBarContext);
+
+  const { agentConfiguration } = useAgentConfiguration({
+    workspaceId,
+    agentConfigurationId: agent,
+  });
+
+  useEffect(() => {
+    if (agentConfiguration) {
+      setSelectedAgent(toRichAgentMentionType(agentConfiguration));
+    }
+  }, [agentConfiguration, setSelectedAgent]);
+
+  return null;
+}

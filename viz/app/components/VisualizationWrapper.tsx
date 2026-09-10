@@ -1,0 +1,770 @@
+"use client";
+
+import { EditableFrame } from "@viz/app/components/EditableFrame";
+import { ErrorBoundary } from "@viz/app/components/ErrorBoundary";
+import { VizContext } from "@viz/app/components/VizContext";
+import { SandboxFunctionCallError } from "@viz/app/lib/data-apis/sandbox-function-call-error";
+import type { FrameRuntimeImportName } from "@viz/app/lib/frame-runtime-imports";
+import { extractFileRefs } from "@viz/app/lib/parseFileRefs";
+import {
+  PodFunctionHooksProvider,
+  usePodFunction,
+  usePodFunctionMutation,
+  useUserIdentity,
+} from "@viz/app/lib/pod-function-hooks";
+import { transformEditableText } from "@viz/app/lib/transformEditableText";
+import type {
+  VisualizationAPI,
+  VisualizationConfig,
+  VisualizationDataAPI,
+  VisualizationUIAPI,
+} from "@viz/app/lib/visualization-api";
+import {
+  type CommandResultMap,
+  isDevelopment,
+  type VisualizationRPCCommand,
+  type VisualizationRPCRequestMap,
+} from "@viz/app/types";
+import {
+  type SupportedEventType,
+  type SupportedMessage,
+  validateMessage,
+} from "@viz/app/types/messages";
+import * as rubySlideshowV1 from "@viz/components/ruby/slideshow/v1";
+import * as rubySlideshowV2 from "@viz/components/ruby/slideshow/v2";
+import * as shadcnAll from "@viz/components/ui";
+import * as utilsAll from "@viz/lib/utils";
+import { toBlob, toSvg } from "html-to-image";
+import * as lucideAll from "lucide-react";
+import * as motionAll from "motion/react";
+import * as papaparseAll from "papaparse";
+import * as reactAll from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useResizeDetector } from "react-resize-detector";
+import { importCode, Runner } from "react-runner";
+import * as rechartsAll from "recharts";
+
+// Delay before marking the viz as ready in PDF mode, to let Recharts animations complete.
+const PDF_MODE_READY_DELAY_MS = 5000;
+
+const FRAME_MIME_TYPES = new Set([
+  "application/vnd.ruby.frame",
+  "application/vnd.ruby.frame.slideshow",
+]);
+
+/**
+ * Recursively resolves a file ref to its import value.
+ * - Frame files (code): compiled via importCode so they can be used as React modules.
+ * - Data files: wrapped as { default: File } for direct use.
+ * A promise cache prevents redundant fetches and handles diamond dependencies.
+ * /!\ Circular imports will deadlock. Callers should not create cycles.
+ */
+async function resolveFileRef(
+  key: string,
+  dataAPI: VisualizationDataAPI,
+  baseImports: Record<string, unknown>,
+  cache: Map<string, Promise<unknown>>,
+  isEditable: boolean
+): Promise<unknown> {
+  const cached = cache.get(key);
+  if (cached) {
+    return cached;
+  }
+
+  const promise = (async () => {
+    const file = await dataAPI.fetchFile(key);
+    if (!file) {
+      return { default: null };
+    }
+
+    if (FRAME_MIME_TYPES.has(file.type)) {
+      const text = await file.text();
+      // Only make child-frame text editable when imported via a fil_ ID. Scoped paths
+      // (e.g. ./Foo) have no stable file ID to route edits back to.
+      const codeToUse =
+        isEditable && key.startsWith("fil_")
+          ? transformEditableText(text, key)
+          : text;
+      const refs = extractFileRefs(codeToUse);
+      const nestedEntries = await Promise.all(
+        refs.map(async (ref) => {
+          const nestedKey = ref.type === "fileId" ? ref.fileId : ref.scopedPath;
+          return [
+            nestedKey,
+            await resolveFileRef(
+              nestedKey,
+              dataAPI,
+              baseImports,
+              cache,
+              isEditable
+            ),
+          ] as const;
+        })
+      );
+      const nestedScope = Object.fromEntries(nestedEntries);
+      return importCode(codeToUse, {
+        import: { ...baseImports, ...nestedScope },
+      });
+    }
+
+    return { default: file };
+  })();
+
+  cache.set(key, promise);
+  return promise;
+}
+
+// Regular expressions to capture the value inside a className attribute.
+// We check both double and single quotes separately to handle mixed usage.
+const classNameDoubleQuoteRegex = /className\s*=\s*"([^"]*)"/g;
+const classNameSingleQuoteRegex = /className\s*=\s*'([^']*)'/g;
+
+// Regular expression to capture Tailwind arbitrary values:
+// Matches a word boundary, then one or more lowercase letters or hyphens,
+// followed by a dash, an opening bracket, one or more non-']' characters, and a closing bracket.
+const arbitraryRegex = /\b[a-z-]+-\[[^\]]+\]/g;
+
+/**
+ * Validates that the generated code doesn't contain Tailwind arbitrary values.
+ *
+ * Arbitrary values like h-[600px], w-[800px], bg-[#ff0000] cause visualization failures
+ * because they're not included in our pre-built CSS. This validation fails fast with
+ * a clear error message that gets exposed to the user, allowing them to retry which
+ * provides the error details to the model for correction.
+ */
+function validateTailwindCode(code: string): void {
+  const matches: string[] = [];
+
+  // Check double-quoted className attributes
+  let classMatch: RegExpExecArray | null = null;
+  while ((classMatch = classNameDoubleQuoteRegex.exec(code)) !== null) {
+    const classContent = classMatch[1];
+    if (classContent) {
+      // Find all matching arbitrary values within the class attribute's value.
+      const arbitraryMatches = classContent.match(arbitraryRegex) || [];
+      matches.push(...arbitraryMatches);
+    }
+  }
+
+  // Check single-quoted className attributes
+  while ((classMatch = classNameSingleQuoteRegex.exec(code)) !== null) {
+    const classContent = classMatch[1];
+    if (classContent) {
+      // Find all matching arbitrary values within the class attribute's value.
+      const arbitraryMatches = classContent.match(arbitraryRegex) || [];
+      matches.push(...arbitraryMatches);
+    }
+  }
+
+  // If we found any, remove duplicates and throw an error with up to three examples.
+  if (matches.length > 0) {
+    const uniqueMatches = Array.from(new Set(matches));
+    const examples = uniqueMatches.slice(0, 3).join(", ");
+    throw new Error(
+      `Forbidden Tailwind arbitrary values detected: ${examples}. ` +
+        `Arbitrary values like h-[600px], w-[800px], bg-[#ff0000] are not allowed. ` +
+        `Use predefined classes like h-96, w-full, bg-red-500 instead, or use the style prop for specific values.`
+    );
+  }
+}
+
+export function useVisualizationAPI(
+  sendCrossDocumentMessage: ReturnType<typeof makeSendCrossDocumentMessage>,
+  { allowedOrigins }: { allowedOrigins: string[] }
+): VisualizationUIAPI {
+  const sendHeightToParent = useCallback(
+    async ({ height }: { height: number | null }) => {
+      if (height === null) {
+        return;
+      }
+
+      await sendCrossDocumentMessage("setContentHeight", {
+        height,
+      });
+    },
+    [sendCrossDocumentMessage]
+  );
+
+  const downloadFile = useCallback(
+    async (blob: Blob, filename?: string) => {
+      await sendCrossDocumentMessage("downloadFileRequest", { blob, filename });
+    },
+    [sendCrossDocumentMessage]
+  );
+
+  const displayCode = useCallback(async () => {
+    await sendCrossDocumentMessage("displayCode", null);
+  }, [sendCrossDocumentMessage]);
+
+  const editText = useCallback(
+    async ({
+      newText,
+      oldText,
+      targetFileId,
+      source,
+    }: {
+      newText: string;
+      oldText: string;
+      targetFileId?: string;
+      source?: string;
+    }) => {
+      return await sendCrossDocumentMessage("editText", {
+        oldText,
+        newText,
+        targetFileId,
+        source,
+      });
+    },
+    [sendCrossDocumentMessage]
+  );
+
+  const addEventListener = useCallback(
+    (
+      eventType: SupportedEventType,
+      handler: (data: SupportedMessage) => void
+    ): (() => void) => {
+      const messageHandler = (event: MessageEvent) => {
+        if (!isOriginAllowed(event.origin, allowedOrigins)) {
+          console.log(
+            `Ignored message from unauthorized origin: ${
+              event.origin
+            }, expected one of: ${allowedOrigins.join(", ")}`
+          );
+          return;
+        }
+
+        // Validate message structure using zod.
+        const validatedMessage = validateMessage(event.data);
+        if (!validatedMessage) {
+          if (isDevelopment()) {
+            // Log to help debug the addition of new event types.
+            console.log("Invalid message format received:", event.data);
+          }
+          return;
+        }
+
+        // Check if this is the event type we're listening for
+        if (validatedMessage.type === eventType) {
+          handler(validatedMessage);
+        }
+      };
+
+      window.addEventListener("message", messageHandler);
+
+      // Return cleanup function
+      return () => window.removeEventListener("message", messageHandler);
+    },
+    [allowedOrigins]
+  );
+
+  return {
+    addEventListener,
+    displayCode,
+    downloadFile,
+    editText,
+    sendHeightToParent,
+  };
+}
+
+function useFile(fileId: string, dataAPI: VisualizationDataAPI) {
+  const [file, setFile] = useState<File | null>(null);
+
+  useEffect(() => {
+    const fetch = async () => {
+      try {
+        const fetchedFile = await dataAPI.fetchFile(fileId);
+        setFile(fetchedFile);
+      } catch (_err) {
+        setFile(null);
+      }
+    };
+
+    if (fileId) {
+      fetch();
+    }
+  }, [dataAPI, fileId]);
+
+  return file;
+}
+
+function useDownloadFileCallback(
+  downloadFile: (blob: Blob, filename?: string) => Promise<void>
+) {
+  return useCallback(
+    async ({
+      content,
+      filename,
+    }: {
+      content: string | Blob;
+      filename?: string;
+    }) => {
+      const blob = typeof content === "string" ? new Blob([content]) : content;
+      await downloadFile(blob, filename);
+    },
+    [downloadFile]
+  );
+}
+
+interface RunnerParams {
+  code: string;
+  scope: Record<string, unknown>;
+}
+
+export function VisualizationWrapperWithErrorBoundary({
+  config,
+}: {
+  config: VisualizationConfig;
+}) {
+  const { identifier, allowedOrigins, isFullHeight = false, dataAPI } = config;
+  const sendCrossDocumentMessage = useMemo(
+    () =>
+      makeSendCrossDocumentMessage({
+        identifier,
+        allowedOrigins,
+      }),
+    [identifier, allowedOrigins]
+  );
+
+  const uiAPI = useVisualizationAPI(sendCrossDocumentMessage, {
+    allowedOrigins,
+  });
+
+  const api: VisualizationAPI = useMemo(
+    () => ({ data: dataAPI, ui: uiAPI }),
+    [dataAPI, uiAPI]
+  );
+
+  return (
+    <ErrorBoundary
+      onErrored={(e) => {
+        sendCrossDocumentMessage("setErrorMessage", {
+          errorMessage: e instanceof Error ? e.message : `${e}`,
+          fileId: identifier,
+          isInteractiveContent: isFullHeight,
+        });
+      }}
+    >
+      <VisualizationWrapper config={config} api={api} />
+    </ErrorBoundary>
+  );
+}
+
+// This component renders the generated code.
+// It gets the generated code via message passing to the host window.
+export function VisualizationWrapper({
+  config,
+  api,
+}: {
+  config: VisualizationConfig;
+  api: VisualizationAPI;
+}) {
+  const {
+    identifier,
+    isEditable = false,
+    isFullHeight = false,
+    isPdfMode = false,
+  } = config;
+  const [runnerParams, setRunnerParams] = useState<RunnerParams | null>(null);
+  const [vizReady, setVizReady] = useState(false);
+
+  const [errored, setErrorMessage] = useState<Error | null>(null);
+
+  const {
+    sendHeightToParent,
+    downloadFile,
+    displayCode,
+    editText,
+    addEventListener,
+  } = api.ui;
+
+  const memoizedDownloadFile = useDownloadFileCallback(downloadFile);
+
+  const { ref } = useResizeDetector({
+    handleHeight: true,
+    refreshMode: "debounce",
+    refreshRate: 500,
+    onResize: sendHeightToParent,
+  });
+
+  const handleScreenshotDownload = useCallback(
+    async (name: string = `visualization-${identifier}.png`) => {
+      if (ref.current) {
+        try {
+          const blob = await toBlob(ref.current, {
+            // Skip embedding fonts in the Blob since we cannot access cssRules from the iframe.
+            skipFonts: true,
+          });
+          if (blob) {
+            await downloadFile(blob, name);
+          }
+        } catch (err) {
+          console.error("Failed to convert to Blob", err);
+          window.parent.postMessage(
+            {
+              type: "EXPORT_ERROR",
+              identifier,
+              errorMessage:
+                "Failed to export as PNG. This can happen when the content references external images.",
+            },
+            "*"
+          );
+        }
+      }
+    },
+    [ref, downloadFile, identifier]
+  );
+
+  // Keep latest callbacks in refs so the loadCode effect does not re-run (and
+  // re-transpile) when useResizeDetector's `ref` identity changes after mount.
+  const handleScreenshotDownloadRef = useRef(handleScreenshotDownload);
+  const memoizedDownloadFileRef = useRef(memoizedDownloadFile);
+  useEffect(() => {
+    handleScreenshotDownloadRef.current = handleScreenshotDownload;
+    memoizedDownloadFileRef.current = memoizedDownloadFile;
+  });
+
+  // A rejected promise nothing catches never reaches the ErrorBoundary, which only sees throws
+  // during render. Frame code is async throughout (a `callFunction` awaited without a `catch`, a
+  // failed fetch), so without this the Frame shows a spinner forever and reports nothing.
+  //
+  // This surfaces the error even once the Frame has rendered, which does replace a Frame that was
+  // partly working with the parent's error card. That is the intent: a Frame with an uncaught
+  // rejection is broken, and the card feeds the error back to the model on retry. The event is
+  // deliberately not `preventDefault()`ed so the rejection still reaches the browser console.
+  useEffect(() => {
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const { reason } = event;
+      setErrorMessage(
+        reason instanceof Error ? reason : new Error(String(reason))
+      );
+    };
+
+    window.addEventListener("unhandledrejection", onUnhandledRejection);
+
+    return () =>
+      window.removeEventListener("unhandledrejection", onUnhandledRejection);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCode = async () => {
+      try {
+        const fetchedCode = await api.data.fetchCode();
+        if (cancelled) {
+          return;
+        }
+        if (!fetchedCode) {
+          setErrorMessage(
+            new Error("No code provided to visualization component")
+          );
+          return;
+        }
+        // Validate Tailwind code before processing to catch arbitrary values early. Error gets
+        // exposed to user for retry, providing feedback to the model.
+        validateTailwindCode(fetchedCode);
+
+        // Wrap JSXText nodes with editable spans when inline editing is enabled.
+        const codeToUse = isEditable
+          ? transformEditableText(fetchedCode)
+          : fetchedCode;
+
+        const baseImports = {
+          papaparse: papaparseAll,
+          react: reactAll,
+          recharts: rechartsAll,
+          shadcn: shadcnAll,
+          // Legacy support for utils from previous versions.
+          utils: utilsAll,
+          // New location for utils.
+          "@viz/lib/utils": utilsAll,
+          "lucide-react": lucideAll,
+          "motion/react": motionAll,
+          "@ruby-ai/slideshow/v1": rubySlideshowV1,
+          "@ruby-ai/slideshow/v2": rubySlideshowV2,
+          "@ruby-ai/react-hooks": {
+            SandboxFunctionCallError,
+            callFunction: (functionId: string, input?: unknown) =>
+              api.data.callFunction(functionId, input),
+            captureScreenshot: (...args: [string?]) =>
+              handleScreenshotDownloadRef.current(...args),
+            triggerUserFileDownload: (
+              ...args: Parameters<typeof memoizedDownloadFile>
+            ) => memoizedDownloadFileRef.current(...args),
+            useFile: (fileId: string) => useFile(fileId, api.data),
+            usePodFunction,
+            usePodFunctionMutation,
+            useUserIdentity,
+          },
+        } satisfies Record<FrameRuntimeImportName, unknown>;
+
+        const refs = extractFileRefs(codeToUse);
+        const cache = new Map<string, Promise<unknown>>();
+        const fileEntries = await Promise.all(
+          refs.map(async (ref) => {
+            const key = ref.type === "fileId" ? ref.fileId : ref.scopedPath;
+            return [
+              key,
+              await resolveFileRef(
+                key,
+                api.data,
+                baseImports,
+                cache,
+                isEditable
+              ),
+            ] as const;
+          })
+        );
+        if (cancelled) {
+          return;
+        }
+        const fileImportScope = Object.fromEntries(fileEntries);
+
+        const generatedModule = importCode(codeToUse, {
+          import: {
+            ...fileImportScope,
+            ...baseImports,
+          },
+        });
+
+        setRunnerParams({
+          code: "() => {import Comp from '@ruby-ai/generated-code'; return (<Comp />);}",
+          scope: {
+            import: {
+              react: reactAll,
+              recharts: rechartsAll,
+              shadcn: shadcnAll,
+              utils: utilsAll,
+              "lucide-react": lucideAll,
+              "@ruby-ai/slideshow/v1": rubySlideshowV1,
+              "@ruby-ai/slideshow/v2": rubySlideshowV2,
+              "@ruby-ai/generated-code": generatedModule,
+            },
+          },
+        });
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setErrorMessage(
+          error instanceof Error
+            ? error
+            : new Error("Failed to fetch visualization code")
+        );
+      }
+    };
+
+    void loadCode();
+    return () => {
+      cancelled = true;
+    };
+  }, [api.data, isEditable, identifier]);
+
+  const handleSVGDownload = useCallback(async () => {
+    if (ref.current) {
+      try {
+        const dataUrl = await toSvg(ref.current, {
+          // Skip embedding fonts in the Blob since we cannot access cssRules from the iframe.
+          skipFonts: true,
+        });
+        const svgText = decodeURIComponent(dataUrl.split(",")[1]);
+        const blob = new Blob([svgText], { type: "image/svg+xml" });
+        await downloadFile(blob, `visualization-${identifier}.svg`);
+      } catch (err) {
+        console.error("Failed to convert to Blob", err);
+        window.parent.postMessage(
+          {
+            type: "EXPORT_ERROR",
+            identifier,
+            errorMessage:
+              "Failed to export as SVG. This can happen when the content references external images.",
+          },
+          "*"
+        );
+      }
+    }
+  }, [ref, downloadFile, identifier]);
+
+  const handleDisplayCode = useCallback(async () => {
+    await displayCode();
+  }, [displayCode]);
+
+  // Add message listeners for export requests.
+  useEffect(() => {
+    const cleanups: (() => void)[] = [];
+
+    cleanups.push(
+      addEventListener("EXPORT_PNG", async () => {
+        await handleScreenshotDownload();
+      })
+    );
+
+    cleanups.push(
+      addEventListener("EXPORT_SVG", async () => {
+        await handleSVGDownload();
+      })
+    );
+
+    return () => cleanups.forEach((cleanup) => cleanup());
+  }, [addEventListener, handleScreenshotDownload, handleSVGDownload]);
+
+  const vizContextValue = useMemo(
+    () => ({ isPdfMode, editText }),
+    [isPdfMode, editText]
+  );
+
+  if (errored) {
+    // Throw the error to the ErrorBoundary.
+    throw errored;
+  }
+
+  if (!runnerParams) {
+    // Return null while loading. The parent (VisualizationActionIframe) already
+    // shows a Lottie spinner overlay for this period. Returning null keeps
+    // contentHeight at 0 (no height message sent), so the parent spinner stays
+    // until the runner renders and reports its real height.
+    return null;
+  }
+
+  // In PDF mode: no height constraint, content flows naturally for full capture.
+  const heightClass = isPdfMode ? "" : isFullHeight ? "h-screen" : "";
+
+  const shouldShowControls = !isFullHeight && !isPdfMode;
+
+  const runner = (
+    <div ref={ref}>
+      <Runner
+        code={runnerParams.code}
+        scope={runnerParams.scope}
+        onRendered={(error) => {
+          if (error) {
+            setErrorMessage(error);
+          } else {
+            // Set data-viz-ready attribute once fully rendered to enable screen capture.
+            // In PDF mode, delay to let Recharts animations complete (react-smooth is JS-based).
+            const delayMs = isPdfMode ? PDF_MODE_READY_DELAY_MS : 0;
+            setTimeout(() => setVizReady(true), delayMs);
+          }
+        }}
+      />
+    </div>
+  );
+
+  return (
+    <div
+      className={`relative font-sans group/viz ${heightClass}`}
+      data-viz-ready={vizReady}
+    >
+      {shouldShowControls && (
+        <div className="flex flex-row gap-2 absolute top-2 right-2 rounded transition opacity-0 group-hover/viz:opacity-100 z-50">
+          <button
+            onClick={() => handleScreenshotDownload()}
+            title="Download screenshot"
+            className="h-7 px-2.5 rounded-lg label-xs inline-flex items-center justify-center border border-border text-primary bg-white"
+          >
+            Png
+          </button>
+          <button
+            onClick={handleSVGDownload}
+            title="Download SVG"
+            className="h-7 px-2.5 rounded-lg label-xs inline-flex items-center justify-center border border-border text-primary bg-white"
+          >
+            Svg
+          </button>
+          <button
+            title="Show code"
+            onClick={handleDisplayCode}
+            className="h-7 px-2.5 rounded-lg label-xs inline-flex items-center justify-center border border-border text-primary bg-white"
+          >
+            Code
+          </button>
+        </div>
+      )}
+      <VizContext.Provider value={vizContextValue}>
+        <PodFunctionHooksProvider dataAPI={api.data}>
+          {isEditable ? <EditableFrame>{runner}</EditableFrame> : runner}
+        </PodFunctionHooksProvider>
+      </VizContext.Provider>
+    </div>
+  );
+}
+
+/**
+ * Check if an origin matches any of the allowed origins.
+ * Supports wildcard patterns like "*.preview.ruby.ad" which match any subdomain.
+ */
+function isOriginAllowed(origin: string, allowedOrigins: string[]): boolean {
+  return allowedOrigins.some((allowed) => {
+    if (allowed.startsWith("https://*.")) {
+      const suffix = allowed.slice("https://*".length); // e.g. ".preview.ruby.ad"
+      return origin.startsWith("https://") && origin.endsWith(suffix);
+    }
+    // Firefox Internal UUID is not stable, so we allow all moz-extension:// origins.
+    if (allowed === "moz-extension://*") {
+      return origin.startsWith("moz-extension://");
+    }
+    return origin === allowed;
+  });
+}
+
+export const USER_IDENTITY_RPC_TIMEOUT_MS = 5_000;
+
+export function makeSendCrossDocumentMessage({
+  identifier,
+  allowedOrigins,
+}: {
+  identifier: string;
+  allowedOrigins: string[];
+}) {
+  return <T extends VisualizationRPCCommand>(
+    command: T,
+    params: VisualizationRPCRequestMap[T]
+  ) => {
+    return new Promise<CommandResultMap[T]>((resolve, reject) => {
+      const messageUniqueId = Math.random().toString();
+      let timeoutId: number | null = null;
+
+      const cleanup = () => {
+        window.removeEventListener("message", listener);
+        if (timeoutId !== null) {
+          window.clearTimeout(timeoutId);
+        }
+      };
+
+      const listener = (event: MessageEvent) => {
+        if (!isOriginAllowed(event.origin, allowedOrigins)) {
+          console.log(
+            `Ignored message from unauthorized origin: ${event.origin}`
+          );
+          // Simply ignore messages from unauthorized origins.
+          return;
+        }
+
+        if (event.data.messageUniqueId === messageUniqueId) {
+          cleanup();
+          if (event.data.error) {
+            reject(event.data.error);
+          } else {
+            resolve(event.data.result);
+          }
+        }
+      };
+      window.addEventListener("message", listener);
+      if (command === "getUserIdentity") {
+        timeoutId = window.setTimeout(() => {
+          cleanup();
+          reject(new Error("Frame host did not provide user identity."));
+        }, USER_IDENTITY_RPC_TIMEOUT_MS);
+      }
+      window.parent?.postMessage(
+        {
+          command,
+          messageUniqueId,
+          identifier,
+          params,
+        },
+        "*"
+      );
+    });
+  };
+}

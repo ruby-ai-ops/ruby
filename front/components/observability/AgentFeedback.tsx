@@ -1,0 +1,101 @@
+import { FeedbacksSection } from "@app/components/agent_builder/FeedbacksSection";
+import { useObservabilityContext } from "@app/components/agent_builder/observability/ObservabilityContext";
+import { TabContentChildSectionLayout } from "@app/components/agent_builder/observability/TabContentChildSectionLayout";
+import { isNavigationLocked } from "@app/lib/navigation-lock";
+import { useAgentAnalytics } from "@app/lib/swr/assistants";
+import type { LightWorkspaceType } from "@app/types/user";
+import {
+  LoadingBlock,
+  SafeSuspense,
+  safeLazy,
+  ThumbsDown,
+  ThumbsUp,
+  ValueCard,
+} from "@ruby-ai/sparkle";
+
+const FeedbackDistributionChart = safeLazy(
+  () =>
+    import(
+      "@app/components/agent_builder/observability/charts/FeedbackDistributionChart"
+    ).then((mod) => ({
+      default: mod.FeedbackDistributionChart,
+    })),
+  { canReload: () => !isNavigationLocked() }
+);
+
+function ChartFallback() {
+  return <LoadingBlock className="h-64 rounded-lg" />;
+}
+
+interface AgentFeedbackProps {
+  owner: LightWorkspaceType;
+  agentConfigurationId: string;
+  allowReactions: boolean;
+}
+
+export function AgentFeedback({
+  owner,
+  agentConfigurationId,
+  allowReactions,
+}: AgentFeedbackProps) {
+  const { period, mode, selectedVersion } = useObservabilityContext();
+
+  const versionFilter =
+    allowReactions && mode === "version" ? selectedVersion : null;
+
+  const { agentAnalytics } = useAgentAnalytics({
+    workspaceId: owner.sId,
+    agentConfigurationId,
+    period,
+    version: versionFilter?.version,
+  });
+
+  return (
+    <div className="flex flex-col gap-6 pt-4">
+      <TabContentChildSectionLayout title="Overview">
+        <ValueCard
+          title="Reactions"
+          className="h-24"
+          content={
+            <div className="flex flex-row gap-4 text-2xl">
+              {allowReactions && agentAnalytics?.feedbacks ? (
+                <>
+                  <div className="flex flex-row items-center">
+                    <ThumbsUp className="w-7 pr-2 text-primary-400" />
+                    <div>{agentAnalytics.feedbacks.positiveFeedbacks}</div>
+                  </div>
+                  <div className="flex flex-row items-center">
+                    <ThumbsDown className="w-7 pr-2 text-primary-400" />
+                    <div>{agentAnalytics.feedbacks.negativeFeedbacks}</div>
+                  </div>
+                </>
+              ) : (
+                "-"
+              )}
+            </div>
+          }
+        />
+      </TabContentChildSectionLayout>
+
+      <TabContentChildSectionLayout title="Charts">
+        <SafeSuspense fallback={<ChartFallback />}>
+          <FeedbackDistributionChart
+            workspaceId={owner.sId}
+            agentConfigurationId={agentConfigurationId}
+            isCustomAgent={allowReactions}
+          />
+        </SafeSuspense>
+      </TabContentChildSectionLayout>
+
+      {allowReactions && (
+        <FeedbacksSection
+          key={`${versionFilter?.version ?? "all"}-${mode === "timeRange" ? period : "none"}`}
+          owner={owner}
+          agentConfigurationId={agentConfigurationId}
+          version={versionFilter ? Number(versionFilter.version) : undefined}
+          days={mode === "timeRange" ? period : undefined}
+        />
+      )}
+    </div>
+  );
+}

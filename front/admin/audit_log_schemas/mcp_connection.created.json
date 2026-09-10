@@ -1,0 +1,17 @@
+{
+  "action": "mcp_connection.created",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "mcp_connection"
+    }
+  ],
+  "metadata": {
+    "connection_type": "string",
+    "server_type": "string",
+    "auth_type": "string",
+    "actor_type": "string"
+  }
+}

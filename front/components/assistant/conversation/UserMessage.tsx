@@ -1,0 +1,708 @@
+import type { WorkspaceLimit } from "@app/components/app/ReachedLimitPopup";
+import { DeletedMessage } from "@app/components/assistant/conversation/DeletedMessage";
+import { ToolBarContent } from "@app/components/assistant/conversation/input_bar/toolbar/ToolbarContent";
+import { MessageEmojiPicker } from "@app/components/assistant/conversation/MessageEmojiPicker";
+import { MessageReactions } from "@app/components/assistant/conversation/MessageReactions";
+import type { VirtuosoMessage } from "@app/components/assistant/conversation/types";
+import {
+  isTriggeredOrigin,
+  isUserMessage,
+} from "@app/components/assistant/conversation/types";
+import { UserHandle } from "@app/components/assistant/conversation/UserHandle";
+import { UserMessageMarkdown } from "@app/components/assistant/UserMessageMarkdown";
+import { ConfirmContext } from "@app/components/Confirm";
+import { EditorSelectionToolbar } from "@app/components/editor/EditorSelectionToolbar";
+import type { EditorService } from "@app/components/editor/input_bar/useCustomEditor";
+import useCustomEditor from "@app/components/editor/input_bar/useCustomEditor";
+import { useDeleteMessage } from "@app/hooks/useDeleteMessage";
+import { useEditUserMessage } from "@app/hooks/useEditUserMessage";
+import { useHover } from "@app/hooks/useHover";
+import { useSendNotification } from "@app/hooks/useNotification";
+import config from "@app/lib/api/config";
+import { AGENT_MENTION_REGEX } from "@app/lib/mentions/format";
+import { useIsMobile } from "@app/lib/swr/useIsMobile";
+import { getConversationRoute } from "@app/lib/utils/router";
+import { formatTimestring } from "@app/lib/utils/timestamps";
+import type {
+  UserMessageType,
+  UserMessageTypeWithContentFragments,
+} from "@app/types/assistant/conversation";
+import {
+  isAgentMention,
+  isRichAgentMention,
+} from "@app/types/assistant/mentions";
+import { pluralize } from "@app/types/shared/utils/string_utils";
+import type { WorkspaceType } from "@app/types/user";
+import {
+  Avatar,
+  Button,
+  Clock,
+  ConversationMessageContainer,
+  ConversationMessageContent,
+  ConversationMessageTitle,
+  cn,
+  DotsHorizontal,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  Edit04,
+  Icon,
+  Link01,
+  Toolbar,
+  Tooltip,
+  Trash01,
+  Zap,
+} from "@ruby-ai/sparkle";
+import type { Editor } from "@tiptap/react";
+import { EditorContent } from "@tiptap/react";
+import { useVirtuosoMethods } from "@virtuoso.dev/message-list";
+import { cva } from "class-variance-authority";
+import type React from "react";
+import { useCallback, useContext, useMemo, useState } from "react";
+
+interface UserMessageEditorProps {
+  editor: Editor | null;
+  editorService: EditorService;
+  setShouldShowEditor: (shouldShowEditor: boolean) => void;
+  isSaving: boolean;
+  onSave: () => void;
+}
+
+function UserMessageEditor({
+  editor,
+  editorService,
+  setShouldShowEditor,
+  isSaving,
+  onSave,
+}: UserMessageEditorProps) {
+  const isMobile = useIsMobile();
+
+  if (!editor) {
+    return null;
+  }
+
+  return (
+    <div
+      className="w-full rounded-2xl bg-muted-background py-3 pl-4 pr-3 focus-within:ring-1 focus-within:ring-highlight/30 sm:focus-within:ring-2"
+      onClick={(e) => {
+        // If e.target is not a child of a div with class "tiptap", then focus on the editor
+        if (!(e.target instanceof HTMLElement && e.target.closest(".tiptap"))) {
+          editorService.focusEnd();
+        }
+      }}
+    >
+      <EditorContent
+        editor={editor}
+        disabled={isSaving}
+        className="inline-block max-h-[40vh] min-h-14 w-full overflow-y-auto whitespace-pre-wrap scrollbar-hide"
+      />
+
+      <EditorSelectionToolbar editor={editor} disabled={isMobile}>
+        {editor && (
+          <Toolbar className="inline-flex">
+            <ToolBarContent editor={editor} />
+          </Toolbar>
+        )}
+      </EditorSelectionToolbar>
+
+      <div className="flex justify-end gap-2">
+        <Button
+          variant="ghost-secondary"
+          size="xs"
+          onClick={() => setShouldShowEditor(false)}
+          label="Cancel"
+        />
+        <Button
+          variant="highlight"
+          size="xs"
+          onClick={onSave}
+          label="Save"
+          isLoading={isSaving}
+        />
+      </div>
+    </div>
+  );
+}
+
+interface UserMessageProps {
+  citations?: React.ReactElement[];
+  conversationId: string;
+  currentUserId: string;
+  isFirstInGroup: boolean;
+  isLastMessage: boolean;
+  message: UserMessageTypeWithContentFragments;
+  owner: WorkspaceType;
+  onReactionToggle: (emoji: string) => void;
+  disableReactions?: boolean;
+  isProjectArchived?: boolean;
+  setLimitReachedCode?: (code: WorkspaceLimit) => void;
+}
+
+export function UserMessage({
+  citations,
+  conversationId,
+  currentUserId,
+  isFirstInGroup,
+  isLastMessage,
+  message,
+  owner,
+  onReactionToggle,
+  disableReactions = false,
+  isProjectArchived = false,
+  setLimitReachedCode,
+}: UserMessageProps) {
+  const [shouldShowEditor, setShouldShowEditor] = useState(false);
+  const { ref: userMessageHoveredRef, isHovering: isUserMessageHovered } =
+    useHover();
+  const isAdmin = owner.role === "admin";
+  const { deleteMessage, isDeleting } = useDeleteMessage({
+    owner,
+    conversationId,
+  });
+  const { editMessage, isEditing: isSaving } = useEditUserMessage({
+    owner,
+    conversationId,
+  });
+  const confirm = useContext(ConfirmContext);
+
+  const originalAgentIds = useMemo(
+    () =>
+      new Set(
+        message.mentions.filter(isAgentMention).map((m) => m.configurationId)
+      ),
+    [message.mentions]
+  );
+
+  const handleSave = async () => {
+    const { markdown, mentions } = editorService.getMarkdownAndMentions();
+
+    const filteredMentions = mentions.filter(
+      (m) => !isRichAgentMention(m) || originalAgentIds.has(m.id)
+    );
+
+    let content = markdown;
+    if (filteredMentions.length < mentions.length) {
+      // Strip agent mention syntax from the markdown to match the filtered mentions array.
+      content = markdown
+        .replaceAll(AGENT_MENTION_REGEX, (_match, _label, agentId) =>
+          originalAgentIds.has(agentId) ? _match : ""
+        )
+        .trim();
+    }
+
+    const result = await editMessage({
+      messageId: message.sId,
+      content,
+      mentions: filteredMentions,
+    });
+
+    if (!result) {
+      return;
+    }
+    if (result.isErr()) {
+      setLimitReachedCode?.(result.error);
+      return;
+    }
+
+    setShouldShowEditor(false);
+  };
+
+  const { editor, editorService } = useCustomEditor({
+    owner,
+    conversationId,
+    onEnterKeyDown: handleSave,
+    disableAutoFocus: false,
+    disableAgentMentions: true,
+  });
+
+  const renderName = useCallback(
+    (name: string | null) => {
+      if (!message.user) {
+        return <div>{name}</div>;
+      }
+      return (
+        <UserHandle
+          user={{
+            sId: message.user.sId,
+            name: message.user.fullName,
+          }}
+        />
+      );
+    },
+    [message.user]
+  );
+
+  const methods = useVirtuosoMethods<VirtuosoMessage>();
+
+  const isDeleted = message.visibility === "deleted";
+  const isPending = message.visibility === "pending";
+  const pendingMessageCount = methods.data
+    .get()
+    .filter((m) => isUserMessage(m) && m.visibility === "pending").length;
+  const isEmpty = !message.content;
+  const isCurrentUser = message.user?.sId === currentUserId;
+  const hasCitations = (citations?.length ?? 0) > 0;
+  const shouldHideMessageContent =
+    isEmpty && hasCitations && !isDeleted && !isPending;
+  const canDelete =
+    (isCurrentUser || isAdmin) && !isDeleted && !isProjectArchived;
+  const canEdit = isCurrentUser && !isDeleted && !isProjectArchived;
+
+  const handleDeleteMessage = useCallback(async () => {
+    if (isDeleting || isDeleted) {
+      return;
+    }
+
+    // Only mention the agent reply when the message actually triggered one.
+    const hasAgentReply = message.richMentions.some(isRichAgentMention);
+    const replyNote = hasAgentReply
+      ? " The agent's reply will also be removed."
+      : "";
+
+    const confirmed = await confirm({
+      title: isCurrentUser ? "Delete your message" : "Delete user message",
+      message: isCurrentUser
+        ? `Are you sure you want to delete this message?${replyNote} This action cannot be undone.`
+        : `Are you sure you want to delete this user's message?${replyNote} This will be reflected for all participants.`,
+      validateLabel: "Delete",
+      validateVariant: "warning",
+    });
+
+    if (confirmed) {
+      await deleteMessage(message.sId);
+      // Optimistically update the message visibility in the Virtuoso list
+      methods.data.map((m) => {
+        if (isUserMessage(m) && m.sId === message.sId) {
+          return {
+            ...m,
+            visibility: "deleted",
+          };
+        }
+        return m;
+      });
+    }
+  }, [
+    isDeleting,
+    isDeleted,
+    confirm,
+    deleteMessage,
+    isCurrentUser,
+    message.sId,
+    message.richMentions,
+    methods,
+  ]);
+
+  const handleEditMessage = () => {
+    setShouldShowEditor(true);
+    editorService.setContent(message.content);
+  };
+
+  const isMobile = useIsMobile();
+  const showActions = !isDeleted && !shouldShowEditor;
+  const hasReactions = (message.reactions ?? []).length > 0;
+  // On mobile or when there are reactions, show the action menu below the message.
+  // Otherwise, show it to the side of the message.
+  const showBottomActionMenu = !isDeleted && (hasReactions || isMobile);
+  const showSideActionMenu = !isDeleted && !hasReactions && !isMobile;
+
+  const displayChip =
+    message.version > 0 || isTriggeredOrigin(message.context.origin);
+  const pictureUrl = message.context.profilePictureUrl ?? message.user?.image;
+  const timestamp = formatTimestring(message.created);
+  const name = message.context.fullName ?? undefined;
+
+  // When there are multiple citations, we want to show the message bigger even if the message itself is short
+  const shouldShowBiggerUserMessage = citations && citations.length > 2;
+
+  return (
+    <>
+      {shouldShowEditor ? (
+        <UserMessageEditor
+          editor={editor}
+          editorService={editorService}
+          setShouldShowEditor={setShouldShowEditor}
+          onSave={handleSave}
+          isSaving={isSaving}
+        />
+      ) : (
+        <div
+          className={cn(
+            "flex flex-col",
+            isCurrentUser ? "flex-end gap-1" : "flex-start"
+          )}
+        >
+          {!isCurrentUser && isFirstInGroup && (
+            <div className="mb-1 flex items-center gap-1.5">
+              <Avatar
+                visual={pictureUrl}
+                name={name ?? ""}
+                isRounded
+                size="xs"
+              />
+              <ConversationMessageTitle
+                name={name}
+                timestamp={timestamp}
+                infoChip={
+                  displayChip ? (
+                    <>
+                      {isTriggeredOrigin(message.context.origin) && (
+                        <span className="inline-block leading-none text-muted-foreground">
+                          <TriggerChip message={message} />
+                        </span>
+                      )}
+                      {message.version > 0 && !isDeleted && (
+                        <span className="text-xs text-faint">(edited)</span>
+                      )}
+                    </>
+                  ) : undefined
+                }
+                renderName={renderName}
+              />
+            </div>
+          )}
+          {isCurrentUser && isFirstInGroup && (
+            <div className="inline-flex items-center justify-between gap-0.5 self-end">
+              <ConversationMessageTitle
+                name={undefined}
+                timestamp={timestamp}
+                infoChip={
+                  displayChip ? (
+                    <>
+                      {isTriggeredOrigin(message.context.origin) && (
+                        <span className="inline-block leading-none text-muted-foreground">
+                          <TriggerChip message={message} />
+                        </span>
+                      )}
+                      {message.version > 0 && !isDeleted && (
+                        <span className="text-xs text-faint">(edited)</span>
+                      )}
+                    </>
+                  ) : undefined
+                }
+                renderName={() => null}
+              />
+            </div>
+          )}
+          <ConversationMessageContainer
+            messageType={isCurrentUser ? "me" : "user"}
+            type="user"
+            className={cn(
+              isCurrentUser ? "ml-auto" : undefined,
+              "relative max-w-conversation @xxxs-conversation:max-w-[95%] @xxs-conversation:max-w-[80%] @xs-conversation:max-w-[85%]"
+            )}
+            ref={userMessageHoveredRef}
+          >
+            <div className="flex min-w-0 flex-col gap-1">
+              <ConversationMessageContent
+                citations={citations}
+                type="user"
+                className={cn(shouldShowBiggerUserMessage && "@sm:min-w-100")}
+                reversed={isCurrentUser}
+                showContent={!shouldHideMessageContent}
+              >
+                <div
+                  className={cn(
+                    "flex gap-2",
+                    isPending ? "items-start" : "items-center"
+                  )}
+                >
+                  {isPending && (
+                    <Icon
+                      visual={Clock}
+                      size="xs"
+                      className="mt-1 shrink-0 text-faint"
+                    />
+                  )}
+                  {isDeleted ? (
+                    <DeletedMessage />
+                  ) : isEmpty ? (
+                    <div className="text-faint text-sm">(no message)</div>
+                  ) : (
+                    <div
+                      className={cn(
+                        "min-w-0",
+                        isPending && "text-muted-foreground"
+                      )}
+                    >
+                      <UserMessageMarkdown
+                        owner={owner}
+                        message={message}
+                        isLastMessage={isLastMessage}
+                      />
+                    </div>
+                  )}
+                </div>
+              </ConversationMessageContent>
+              {showBottomActionMenu && (
+                <ActionMenu
+                  mode="bottom"
+                  isCurrentUser={isCurrentUser}
+                  isDeleted={isDeleted}
+                  showActions={showActions}
+                  isUserMessageHovered={isUserMessageHovered}
+                  message={message}
+                  onReactionToggle={onReactionToggle}
+                  disableReactions={disableReactions}
+                  handleEditMessage={handleEditMessage}
+                  handleDeleteMessage={handleDeleteMessage}
+                  canDelete={canDelete}
+                  canEdit={canEdit}
+                  conversationId={conversationId}
+                  owner={owner}
+                />
+              )}
+            </div>
+            {showSideActionMenu && (
+              <ActionMenu
+                mode="side"
+                isCurrentUser={isCurrentUser}
+                isDeleted={isDeleted}
+                showActions={showActions}
+                isUserMessageHovered={isUserMessageHovered}
+                message={message}
+                onReactionToggle={onReactionToggle}
+                disableReactions={disableReactions}
+                handleEditMessage={handleEditMessage}
+                handleDeleteMessage={handleDeleteMessage}
+                canDelete={canDelete}
+                canEdit={canEdit}
+                conversationId={conversationId}
+                owner={owner}
+              />
+            )}
+          </ConversationMessageContainer>
+        </div>
+      )}
+      {isLastMessage && pendingMessageCount > 0 && (
+        <div
+          className={cn(
+            "mt-1 mr-3 flex items-center gap-1 text-xs text-muted-foreground",
+            isCurrentUser && "justify-end"
+          )}
+        >
+          <Icon visual={Clock} size="xs" />
+          {`Message${pluralize(pendingMessageCount)} queued`}
+        </div>
+      )}
+    </>
+  );
+}
+
+function getChipDateFormat(date: Date) {
+  return date.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function Label({ message }: { message?: UserMessageType }) {
+  if (message?.context.lastTriggerRunAt) {
+    return (
+      <div className="flex flex-col gap-1 text-sm">
+        <span className="font-bold">Scheduled and sent automatically</span>
+        {message?.created && (
+          <span>
+            <span className="font-semibold">Current execution</span>:{" "}
+            {getChipDateFormat(new Date(message?.created))}
+          </span>
+        )}
+        {message?.context.lastTriggerRunAt && (
+          <span>
+            <span className="font-semibold">Previous run</span>:{" "}
+            {getChipDateFormat(new Date(message?.context.lastTriggerRunAt))}
+          </span>
+        )}
+      </div>
+    );
+  } else {
+    return <span className="font-bold">Triggered and sent automatically</span>;
+  }
+}
+
+function TriggerChip({ message }: { message?: UserMessageType }) {
+  return (
+    <Tooltip
+      label={<Label message={message} />}
+      trigger={<Icon size="xs" visual={Zap} className="h-3.5 w-3.5" />}
+    />
+  );
+}
+
+// When the conversation container is narrow, the action menu sits below the message bubble.
+// When the conversation container is wider, it floats to the left (current user) or right (other user).
+const actionMenuContainerVariants = cva("flex items-center gap-1", {
+  variants: {
+    mode: {
+      side: "absolute left-0 bottom-0",
+      bottom: "",
+    },
+    isCurrentUser: {
+      true: "",
+      false: "",
+    },
+  },
+  compoundVariants: [
+    {
+      mode: "side",
+      isCurrentUser: true,
+      className: "-translate-x-full pr-2",
+    },
+    {
+      mode: "side",
+      isCurrentUser: false,
+      className: "left-auto right-0 translate-x-full pl-2",
+    },
+  ],
+});
+
+interface ActionMenuProps {
+  mode: "side" | "bottom";
+  isCurrentUser: boolean;
+  isDeleted: boolean;
+  showActions: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
+  handleEditMessage: () => void;
+  handleDeleteMessage: () => void;
+  message: UserMessageTypeWithContentFragments;
+  onReactionToggle: (emoji: string) => void;
+  disableReactions: boolean;
+  isUserMessageHovered: boolean;
+  conversationId: string;
+  owner: WorkspaceType;
+}
+
+function ActionMenu({
+  mode,
+  isCurrentUser,
+  isDeleted,
+  showActions,
+  canEdit,
+  canDelete,
+  handleEditMessage,
+  handleDeleteMessage,
+  message,
+  onReactionToggle,
+  disableReactions,
+  isUserMessageHovered,
+  conversationId,
+  owner,
+}: ActionMenuProps) {
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isEmojiPickerOpen, setIsEmojiPickerOpen] = useState(false);
+  const sendNotification = useSendNotification();
+  const { ref: isReactionsHoveredRef, isHovering: isReactionsHovered } =
+    useHover();
+  // In bottom mode (reactions or mobile), buttons are always visible.
+  // In side mode, buttons fade in/out on hover.
+  const shouldHideActions =
+    mode === "side" &&
+    !isUserMessageHovered &&
+    !isReactionsHovered &&
+    !isMenuOpen &&
+    !isEmojiPickerOpen;
+
+  const handleCopyMessageLink = () => {
+    const messageUrl = `${getConversationRoute(
+      owner.sId,
+      conversationId,
+      undefined,
+      config.getAppUrl()
+    )}#${message.sId}`;
+    void navigator.clipboard.writeText(messageUrl);
+    sendNotification({
+      type: "success",
+      title: "Message link copied to clipboard",
+    });
+  };
+
+  const actions = showActions
+    ? [
+        {
+          icon: Link01,
+          label: "Copy message link",
+          onClick: handleCopyMessageLink,
+        },
+        ...(canEdit
+          ? [
+              {
+                icon: Edit04,
+                label: "Edit message",
+                onClick: handleEditMessage,
+              },
+            ]
+          : []),
+        ...(canDelete
+          ? [
+              {
+                icon: Trash01,
+                label: "Delete message",
+                onClick: handleDeleteMessage,
+              },
+            ]
+          : []),
+      ]
+    : [];
+
+  // In a wide conversation container, side mode buttons float beside the bubble — fade in/out on hover.
+  // In a narrow container (and in bottom mode), buttons sit below the bubble — always visible.
+  const sideItemVisibilityClass = cn(
+    "transition-opacity duration-300",
+    mode === "side" && shouldHideActions && "@sm-conversation:opacity-0"
+  );
+
+  return (
+    <div
+      className={actionMenuContainerVariants({ mode, isCurrentUser })}
+      ref={isReactionsHoveredRef}
+    >
+      {mode === "bottom" && (
+        <MessageReactions
+          reactions={message.reactions ?? []}
+          onReactionClick={onReactionToggle}
+        />
+      )}
+      {!isDeleted && (
+        <div className={cn("flex items-center gap-1", sideItemVisibilityClass)}>
+          {!disableReactions && (
+            <MessageEmojiPicker
+              key="emoji-picker"
+              onEmojiSelect={onReactionToggle}
+              onOpenChange={setIsEmojiPickerOpen}
+            />
+          )}
+          {actions.length > 0 && (
+            <DropdownMenu
+              open={isMenuOpen}
+              onOpenChange={(open) => setIsMenuOpen(open)}
+            >
+              <DropdownMenuTrigger asChild>
+                <Button
+                  icon={DotsHorizontal}
+                  size="icon-xs"
+                  variant="outline"
+                  aria-label="Message actions"
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                {actions.map((action, index) => (
+                  <DropdownMenuItem
+                    key={index}
+                    icon={action.icon}
+                    label={action.label}
+                    onClick={action.onClick}
+                  />
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

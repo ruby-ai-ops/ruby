@@ -1,0 +1,172 @@
+import config from "@app/lib/api/config";
+import { getWorkspaceInfos } from "@app/lib/api/workspace";
+import { AppModel } from "@app/lib/resources/storage/models/apps";
+import type { SpaceModel } from "@app/lib/resources/storage/models/spaces";
+import logger from "@app/logger/logger";
+import type { CoreAppAPIRelocationBlob } from "@app/temporal/relocation/activities/types";
+import { writeToRelocationStorage } from "@app/temporal/relocation/lib/file_storage/relocation";
+import type { CoreAPIDataset } from "@app/types/core/core_api";
+import { CoreAPI } from "@app/types/core/core_api";
+import type { RegionType } from "@app/types/region";
+import type { ModelId } from "@app/types/shared/model_id";
+import assert from "assert";
+import type { WhereOptions } from "sequelize";
+import { Op } from "sequelize";
+
+const BATCH_SIZE = 10;
+
+export async function retrieveAppsCoreIdsBatch({
+  lastId,
+  workspaceId,
+}: {
+  lastId?: ModelId;
+  workspaceId: string;
+}): Promise<{
+  rubyAPIProjectIds: string[];
+  hasMore: boolean;
+  lastId: ModelId | undefined;
+}> {
+  const localLogger = logger.child({
+    lastId,
+    workspaceId,
+  });
+
+  localLogger.info("[Core] Retrieving core apps ids");
+
+  const workspace = await getWorkspaceInfos(workspaceId);
+  assert(workspace, "Workspace not found.");
+
+  const whereClause: WhereOptions<SpaceModel> = {
+    workspaceId: workspace.id,
+  };
+
+  if (lastId) {
+    whereClause.id = {
+      [Op.gt]: lastId,
+    };
+  }
+
+  const apps = await AppModel.findAll({
+    where: whereClause,
+    order: [["id", "ASC"]],
+    limit: BATCH_SIZE,
+  });
+
+  localLogger.info({ appsCount: apps.length }, "[Core] Retrieved apps");
+
+  return {
+    rubyAPIProjectIds: apps.map((a) => a.rubyAPIProjectId),
+    hasMore: apps.length === BATCH_SIZE,
+    lastId: apps.length > 0 ? apps[apps.length - 1].id : undefined,
+  };
+}
+
+export async function getApp({
+  rubyAPIProjectId,
+  workspaceId,
+  sourceRegion,
+}: {
+  rubyAPIProjectId: string;
+  workspaceId: string;
+  sourceRegion: RegionType;
+}): Promise<{
+  dataPath: string;
+}> {
+  const localLogger = logger.child({
+    rubyAPIProjectId,
+    sourceRegion,
+  });
+
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+  const coreSpec = await coreAPI.getSpecificationHashes({
+    projectId: rubyAPIProjectId,
+  });
+  if (coreSpec.isErr()) {
+    throw new Error("Failed to get core specification hashes");
+  }
+
+  localLogger.info({ coreSpec }, "coreAPI.getSpecificationHashes");
+
+  const specsToFetch = coreSpec.value.hashes;
+
+  const coreSpecifications: Record<string, string> = {};
+
+  if (specsToFetch) {
+    for (const hash of specsToFetch) {
+      const coreSpecification = await coreAPI.getSpecification({
+        projectId: rubyAPIProjectId,
+        specificationHash: hash,
+      });
+
+      if (coreSpecification.isErr()) {
+        throw new Error("Failed to get core specification");
+      }
+      coreSpecifications[hash] = coreSpecification.value.specification.data;
+    }
+  }
+
+  const dataSetsToFetch = await coreAPI.getDatasets({
+    projectId: rubyAPIProjectId,
+  });
+
+  localLogger.info({ dataSetsToFetch }, "coreAPI.getDatasets");
+
+  if (dataSetsToFetch.isErr()) {
+    throw new Error("Failed to get datasets");
+  }
+
+  const datasets: CoreAPIDataset[] = [];
+  for (const datasetId of Object.keys(dataSetsToFetch.value.datasets)) {
+    const dataSetVersions = dataSetsToFetch.value.datasets[datasetId];
+    for (const dataSetVersion of dataSetVersions) {
+      const apiDataset = await coreAPI.getDataset({
+        projectId: rubyAPIProjectId,
+        datasetName: datasetId,
+        datasetHash: dataSetVersion.hash,
+      });
+
+      if (apiDataset.isErr()) {
+        logger.error(
+          {
+            projectId: rubyAPIProjectId,
+            datasetName: datasetId,
+            datasetHash: dataSetVersion.hash,
+            error: apiDataset.error,
+          },
+          "Failed to get datasets"
+        );
+        throw new Error(
+          `Failed to get dataset ${datasetId}: ${apiDataset.error.message}`
+        );
+      } else {
+        datasets.push(apiDataset.value.dataset);
+      }
+    }
+  }
+
+  const blobs: CoreAppAPIRelocationBlob = {
+    blobs: {
+      apps: [
+        {
+          coreSpecifications,
+          datasets,
+        },
+      ],
+    },
+  };
+
+  const dataPath = await writeToRelocationStorage(blobs, {
+    workspaceId,
+    type: "core",
+    operation: "apps_blobs",
+  });
+
+  localLogger.info(
+    {
+      dataPath,
+    },
+    "[Core] Retrieved app"
+  );
+
+  return { dataPath };
+}

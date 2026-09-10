@@ -1,0 +1,134 @@
+import config from "@app/lib/api/config";
+import type { Authenticator } from "@app/lib/auth";
+import { AppResource } from "@app/lib/resources/app_resource";
+import type { SpaceResource } from "@app/lib/resources/space_resource";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import tracer from "@app/logger/tracer";
+import { CoreAPI } from "@app/types/core/core_api";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import type { LightWorkspaceType } from "@app/types/user";
+
+type AppDeploymentCheck = {
+  appId: string;
+  appHash: string;
+};
+
+export async function softDeleteApp(
+  auth: Authenticator,
+  app: AppResource
+): Promise<Result<void, Error>> {
+  const usage = await app.getUsagesByAgents(auth);
+  if (usage.isErr()) {
+    return usage;
+  } else if (usage.value.count > 0) {
+    const { agents } = usage.value;
+    const agentNames = agents.map((a) => a.name);
+    return new Err(
+      new Error(
+        "Cannot delete app in use by " +
+          `agent${agentNames.length > 1 ? "s" : ""}: ${agentNames.join(", ")}.`
+      )
+    );
+  }
+
+  const res = await app.delete(auth, { hardDelete: false });
+  if (res.isErr()) {
+    return res;
+  }
+
+  return new Ok(undefined);
+}
+
+export async function hardDeleteApp(
+  auth: Authenticator,
+  app: AppResource
+): Promise<Result<void, Error>> {
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+  const deleteProjectRes = await tracer.trace(
+    "apps.hard_delete_app",
+    async (span) => {
+      span?.setTag("workspace.id", auth.workspace()?.sId ?? "unknown");
+      span?.setTag("app.s_id", app.sId);
+      span?.setTag("core.project_id", app.rubyAPIProjectId);
+      return coreAPI.deleteProject({
+        projectId: app.rubyAPIProjectId,
+        caller: "apps-api-hard-delete",
+      });
+    }
+  );
+  if (deleteProjectRes.isErr()) {
+    return new Err(new Error(deleteProjectRes.error.message));
+  }
+
+  const res = await app.delete(auth, { hardDelete: true });
+  if (res.isErr()) {
+    return res;
+  }
+
+  return new Ok(undefined);
+}
+
+export async function checkAppsDeployment(
+  auth: Authenticator,
+  apps: AppDeploymentCheck[]
+): Promise<(AppDeploymentCheck & { deployed: boolean })[]> {
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+  const appResources = await AppResource.fetchByIds(auth, [
+    ...new Set(apps.map((appRequest) => appRequest.appId)),
+  ]);
+  const appById = new Map(appResources.map((app) => [app.sId, app]));
+
+  return concurrentExecutor(
+    apps,
+    async (appRequest) => {
+      const app = appById.get(appRequest.appId);
+      if (!app) {
+        return { ...appRequest, deployed: false };
+      }
+      const coreSpec = await coreAPI.getSpecification({
+        projectId: app.rubyAPIProjectId,
+        specificationHash: appRequest.appHash,
+      });
+      if (coreSpec.isErr()) {
+        return { ...appRequest, deployed: false };
+      }
+
+      return { ...appRequest, deployed: true };
+    },
+    { concurrency: 5 }
+  );
+}
+
+export async function cloneAppToWorkspace(
+  auth: Authenticator,
+  app: AppResource,
+  targetWorkspace: LightWorkspaceType,
+  targetSpace: SpaceResource
+): Promise<Result<AppResource, Error>> {
+  // Only ruby super users can clone apps. Authenticator has no write permissions
+  // on the target workspace.
+  if (!auth.isRubySuperUser()) {
+    throw new Error("Only ruby super users can clone apps");
+  }
+  if (targetWorkspace.id !== targetSpace.workspaceId) {
+    return new Err(new Error("Target space must belong to target workspace"));
+  }
+
+  // Handle CoreAPI project cloning.
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+  const cloneRes = await coreAPI.cloneProject({
+    projectId: app.rubyAPIProjectId,
+  });
+  if (cloneRes.isErr()) {
+    return new Err(new Error(cloneRes.error.message));
+  }
+
+  // Use the resource to handle the clone operation.
+  return app.clone(auth, targetWorkspace, targetSpace, {
+    rubyAPIProjectId: cloneRes.value.project.project_id.toString(),
+  });
+}

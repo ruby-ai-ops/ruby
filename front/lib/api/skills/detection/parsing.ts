@@ -1,0 +1,147 @@
+import { getSkillAttachmentContentType } from "@app/lib/api/files/use_cases/skill_attachment";
+import type {
+  DetectedSkillAttachment,
+  FileEntry,
+  SkillDirectory,
+} from "@app/lib/api/skills/detection/types";
+import * as yaml from "js-yaml";
+import path from "path";
+import { z } from "zod";
+
+const SKILL_MD_FILENAME = "skill.md";
+
+const SkillFrontmatterSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().min(1),
+});
+
+/**
+ * Parses a SKILL.md file per the Agent Skills spec
+ * (https://agentskills.io/specification). Extracts required `name` and
+ * `description` from YAML frontmatter; returns the body as instructions.
+ * Empty `name`/`description` means the frontmatter is missing or invalid.
+ */
+export function parseSkillMarkdown(markdown: string): {
+  name: string;
+  description: string;
+  instructions: string;
+} {
+  const frontmatter = extractFrontmatter(markdown);
+
+  if (!frontmatter) {
+    return { name: "", description: "", instructions: markdown };
+  }
+
+  let raw: unknown;
+  try {
+    raw = yaml.load(frontmatter.yaml);
+  } catch {
+    // The lib throws on malformed YAML.
+    return { name: "", description: "", instructions: frontmatter.body };
+  }
+
+  const parsed = SkillFrontmatterSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { name: "", description: "", instructions: frontmatter.body };
+  }
+
+  return {
+    name: parsed.data.name.trim(),
+    description: parsed.data.description.trim(),
+    instructions: frontmatter.body,
+  };
+}
+
+/**
+ * Extracts YAML frontmatter (between `---` markers) and the remaining body.
+ * Returns null if the file doesn't start with a `---` line. The closing `---`
+ * must also be on its own line (not embedded in other content).
+ */
+function extractFrontmatter(
+  markdown: string
+): { yaml: string; body: string } | null {
+  const lines = markdown.split("\n");
+
+  if (!lines[0] || lines[0].trim() !== "---") {
+    return null;
+  }
+
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trim() === "---") {
+      return {
+        yaml: lines.slice(1, i).join("\n").trim(),
+        body: lines
+          .slice(i + 1)
+          .join("\n")
+          .trimStart(),
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Scans file entries for directories containing a SKILL.md (case-insensitive).
+ * Prefers nested skill directories, and falls back to a root-level SKILL.md
+ * only when no nested skills were found. This avoids treating a whole
+ * multi-skill repository as attachments for a root skill.
+ */
+export function findSkillDirectories(entries: FileEntry[]): SkillDirectory[] {
+  const skillDirs: SkillDirectory[] = [];
+  const seenDirs = new Set<string>();
+  let rootSkillDir: SkillDirectory | null = null;
+
+  for (const entry of entries) {
+    if (path.basename(entry.path).toLowerCase() !== SKILL_MD_FILENAME) {
+      continue;
+    }
+
+    const dirPath = path.dirname(entry.path);
+    if (dirPath === ".") {
+      rootSkillDir ??= { dirPath, skillMdPath: entry.path };
+      continue;
+    }
+
+    // Avoid duplicates if a directory has both skill.md and SKILL.md.
+    if (seenDirs.has(dirPath)) {
+      continue;
+    }
+    seenDirs.add(dirPath);
+
+    skillDirs.push({ dirPath, skillMdPath: entry.path });
+  }
+
+  if (skillDirs.length === 0 && rootSkillDir) {
+    return [rootSkillDir];
+  }
+
+  return skillDirs;
+}
+
+export function collectAttachments(
+  entries: FileEntry[],
+  skillDir: SkillDirectory
+): DetectedSkillAttachment[] {
+  const attachments: DetectedSkillAttachment[] = [];
+
+  for (const entry of entries) {
+    if (entry.path === skillDir.skillMdPath) {
+      continue;
+    }
+    const rel = path.relative(skillDir.dirPath, entry.path);
+    if (rel.startsWith("..")) {
+      continue;
+    }
+    const contentType = getSkillAttachmentContentType(entry);
+    if (contentType) {
+      attachments.push({
+        path: entry.path,
+        sizeBytes: entry.sizeBytes,
+        contentType,
+      });
+    }
+  }
+
+  return attachments;
+}

@@ -1,0 +1,416 @@
+import type { Authenticator } from "@app/lib/auth";
+import { AgentConfigurationModel } from "@app/lib/models/agent/agent";
+import { TagAgentModel } from "@app/lib/models/agent/tag_agent";
+import { TagModel } from "@app/lib/models/tags";
+import { BaseResource } from "@app/lib/resources/base_resource";
+import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
+import { getResourceIdFromSId, makeSId } from "@app/lib/resources/string_ids";
+import type { ResourceFindOptions } from "@app/lib/resources/types";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type { TagKind, TagTypeWithUsage } from "@app/types/tag";
+import groupBy from "lodash/groupBy";
+import keyBy from "lodash/keyBy";
+import mapValues from "lodash/mapValues";
+import type {
+  Attributes,
+  CreationAttributes,
+  ModelStatic,
+  Transaction,
+} from "sequelize";
+import sequelize from "sequelize/lib/sequelize";
+
+export type GetTagsUsageResponseBody = {
+  tags: TagTypeWithUsage[];
+};
+
+// Attributes are marked as read-only to reflect the stateless nature of our Resource.
+// This design will be moved up to BaseResource once we transition away from Sequelize.
+
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface TagResource extends ReadonlyAttributesType<TagModel> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class TagResource extends BaseResource<TagModel> {
+  static model: ModelStatic<TagModel> = TagModel;
+
+  constructor(model: ModelStatic<TagModel>, blob: Attributes<TagModel>) {
+    super(TagModel, blob);
+  }
+
+  static async makeNew(
+    auth: Authenticator,
+    blob: CreationAttributes<TagModel>
+  ) {
+    const tag = await TagModel.create({
+      ...blob,
+      workspaceId: auth.getNonNullableWorkspace().id,
+    });
+
+    return new this(TagModel, tag.get());
+  }
+
+  private static async baseFetch(
+    auth: Authenticator,
+    options?: ResourceFindOptions<TagModel>
+  ) {
+    const { where, ...otherOptions } = options ?? {};
+
+    const tags = await TagModel.findAll({
+      where: {
+        ...where,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      ...otherOptions,
+    });
+
+    return tags.map((tag) => new this(TagModel, tag.get()));
+  }
+
+  static async fetchByIds(
+    auth: Authenticator,
+    ids: string[]
+  ): Promise<TagResource[]> {
+    return this.baseFetch(auth, {
+      where: {
+        id: removeNulls(ids.map(getResourceIdFromSId)),
+      },
+    });
+  }
+
+  static async fetchById(
+    auth: Authenticator,
+    id: string
+  ): Promise<TagResource | null> {
+    const [tag] = await this.fetchByIds(auth, [id]);
+    return tag ?? null;
+  }
+
+  static async findByPk(
+    auth: Authenticator,
+    id: string,
+    options?: ResourceFindOptions<TagModel>
+  ): Promise<TagResource | null> {
+    const tags = await this.baseFetch(auth, {
+      where: {
+        id,
+      },
+      ...options,
+    });
+    return tags.length > 0 ? tags[0] : null;
+  }
+
+  static async findByName(
+    auth: Authenticator,
+    name: string,
+    options?: ResourceFindOptions<TagModel>
+  ): Promise<TagResource | null> {
+    const tags = await this.baseFetch(auth, {
+      where: {
+        name,
+      },
+      ...options,
+    });
+    return tags.length > 0 ? tags[0] : null;
+  }
+
+  static async findByNames(
+    auth: Authenticator,
+    names: string[]
+  ): Promise<TagResource[]> {
+    return this.baseFetch(auth, {
+      where: {
+        name: names,
+      },
+    });
+  }
+
+  static async findAll(auth: Authenticator, { kind }: { kind?: TagKind } = {}) {
+    return this.baseFetch(auth, {
+      where: {
+        ...(kind ? { kind } : {}),
+      },
+      order: [["name", "ASC"]],
+    });
+  }
+
+  static async findAllWithUsage(
+    auth: Authenticator
+  ): Promise<TagTypeWithUsage[]> {
+    const tags = await this.model.findAll({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      attributes: [
+        "id",
+        "name",
+        "kind",
+        "createdAt",
+        "updatedAt",
+        [
+          sequelize.literal(`
+            (
+              SELECT COUNT(DISTINCT ac."sId")
+              FROM tag_agents ta
+              JOIN agent_configurations ac ON ac.id = ta."agentConfigurationId" 
+              WHERE ta."tagId" = tags.id AND ac.status = 'active'
+            )
+          `),
+          "usage",
+        ],
+      ],
+      order: [[sequelize.literal("usage"), "DESC"]],
+    });
+
+    return tags.map((tag) => {
+      return {
+        sId: this.modelIdToSId({
+          id: tag.id,
+          workspaceId: auth.getNonNullableWorkspace().id,
+        }),
+        name: tag.name,
+        usage: (tag.get({ plain: true }) as any).usage as number,
+        kind: tag.kind,
+      };
+    });
+  }
+
+  static async listForAgent(
+    auth: Authenticator,
+    agentConfigurationId: number
+  ): Promise<TagResource[]> {
+    const tags = await TagAgentModel.findAll({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        agentConfigurationId,
+      },
+    });
+    return this.baseFetch(auth, {
+      where: {
+        id: tags.map((t) => t.tagId),
+      },
+    });
+  }
+
+  static async listForAgents(
+    auth: Authenticator,
+    agentConfigurationIds: number[]
+  ): Promise<Record<number, TagResource[]>> {
+    const tagAgents = await TagAgentModel.findAll({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        agentConfigurationId: agentConfigurationIds,
+      },
+    });
+    const tagIds = [...new Set(tagAgents.map((t) => t.tagId))];
+    if (tagIds.length === 0) {
+      return {};
+    }
+    const tags = await this.baseFetch(auth, {
+      where: {
+        id: tagIds,
+      },
+    });
+
+    const tagsMap = keyBy(tags, "id");
+    return mapValues(groupBy(tagAgents, "agentConfigurationId"), (group) =>
+      group.map((tagAgent) => tagsMap[tagAgent.tagId])
+    );
+  }
+
+  /**
+   * List the tags attached to a specific agent configuration version, identified
+   * by its sId and version.
+   */
+  static async listForAgentVersion(
+    auth: Authenticator,
+    agentConfigurationId: string,
+    agentConfigurationVersion: number
+  ): Promise<TagResource[]> {
+    const tagAgents = await TagAgentModel.findAll({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      include: [
+        {
+          model: AgentConfigurationModel,
+          required: true,
+          attributes: [],
+          where: {
+            sId: agentConfigurationId,
+            version: agentConfigurationVersion,
+          },
+        },
+      ],
+    });
+
+    if (tagAgents.length === 0) {
+      return [];
+    }
+
+    return this.baseFetch(auth, {
+      where: {
+        id: tagAgents.map((tagAgent) => tagAgent.tagId),
+      },
+    });
+  }
+
+  async addToAgent(
+    auth: Authenticator,
+    agentConfiguration: LightAgentConfigurationType
+  ) {
+    if (!agentConfiguration.canEdit && !auth.isAdmin()) {
+      throw new Error("You are not allowed to add tags to this agent");
+    }
+
+    await TagAgentModel.create({
+      workspaceId: auth.getNonNullableWorkspace().id,
+      tagId: this.id,
+      agentConfigurationId: agentConfiguration.id,
+    });
+  }
+
+  static async addToAgents(
+    auth: Authenticator,
+    tags: TagResource[],
+    agentConfigurations: LightAgentConfigurationType[]
+  ): Promise<Result<undefined, Error>> {
+    if (
+      !auth.isAdmin() &&
+      agentConfigurations.some(
+        (agentConfiguration) => !agentConfiguration.canEdit
+      )
+    ) {
+      return new Err(
+        new Error("You are not allowed to add tags to this agent")
+      );
+    }
+
+    if (tags.length === 0 || agentConfigurations.length === 0) {
+      return new Ok(undefined);
+    }
+
+    await TagAgentModel.bulkCreate(
+      agentConfigurations.flatMap((agentConfiguration) =>
+        tags.map((tag) => ({
+          workspaceId: auth.getNonNullableWorkspace().id,
+          tagId: tag.id,
+          agentConfigurationId: agentConfiguration.id,
+        }))
+      ),
+      { ignoreDuplicates: true }
+    );
+    return new Ok(undefined);
+  }
+
+  async removeFromAgent(
+    auth: Authenticator,
+    agentConfiguration: LightAgentConfigurationType
+  ) {
+    if (!agentConfiguration.canEdit && !auth.isAdmin()) {
+      throw new Error("You are not allowed to remove tags from this agent");
+    }
+
+    await TagAgentModel.destroy({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        tagId: this.id,
+        agentConfigurationId: agentConfiguration.id,
+      },
+    });
+  }
+
+  static async removeFromAgents(
+    auth: Authenticator,
+    tags: TagResource[],
+    agentConfigurations: LightAgentConfigurationType[]
+  ): Promise<Result<undefined, Error>> {
+    if (
+      !auth.isAdmin() &&
+      agentConfigurations.some(
+        (agentConfiguration) => !agentConfiguration.canEdit
+      )
+    ) {
+      return new Err(
+        new Error("You are not allowed to remove tags from this agent")
+      );
+    }
+
+    if (tags.length === 0 || agentConfigurations.length === 0) {
+      return new Ok(undefined);
+    }
+
+    await TagAgentModel.destroy({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        tagId: tags.map((tag) => tag.id),
+        agentConfigurationId: agentConfigurations.map(
+          (agentConfiguration) => agentConfiguration.id
+        ),
+      },
+    });
+    return new Ok(undefined);
+  }
+
+  async updateTag({ name, kind }: { name: string; kind: TagKind }) {
+    await this.update({ name, kind });
+  }
+
+  async delete(
+    auth: Authenticator,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<Result<undefined, Error>> {
+    try {
+      await TagAgentModel.destroy({
+        where: {
+          tagId: this.id,
+          workspaceId: auth.getNonNullableWorkspace().id,
+        },
+        transaction,
+      });
+
+      await this.model.destroy({
+        where: {
+          workspaceId: auth.getNonNullableWorkspace().id,
+          id: this.id,
+        },
+        transaction,
+      });
+
+      return new Ok(undefined);
+    } catch (err) {
+      return new Err(normalizeError(err));
+    }
+  }
+
+  get sId(): string {
+    return TagResource.modelIdToSId({
+      id: this.id,
+      workspaceId: this.workspaceId,
+    });
+  }
+
+  static modelIdToSId({
+    id,
+    workspaceId,
+  }: {
+    id: ModelId;
+    workspaceId: ModelId;
+  }): string {
+    return makeSId("tag", {
+      id,
+      workspaceId,
+    });
+  }
+
+  toJSON() {
+    return {
+      sId: this.sId,
+      name: this.name,
+      kind: this.kind,
+    };
+  }
+}

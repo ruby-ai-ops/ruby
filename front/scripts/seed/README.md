@@ -1,0 +1,30 @@
+# Seed Scripts
+
+Scripts to populate the development environment with mock data.
+
+Each folder contains a `seed.ts` file. Run with:
+
+```bash
+npx tsx scripts/seed/<folder>/seed.ts --execute
+```
+
+By default, seeds target the `DevWkSpace` workspace created by ruby-hive. To target a different workspace, set `DEV_WORKSPACE_SID`:
+
+```bash
+DEV_WORKSPACE_SID=MyWorkspace npx tsx scripts/seed/<folder>/seed.ts --execute
+```
+
+## Folders
+
+- `analytics/` - Creates members, teams, skills, agents and triggers, then fills the consumption index behind the Analytics page
+- `basics/` - Creates a custom agent with skills and sample conversations
+- `byok/` - Setup workspace to test Bring your own key
+- `governance/` - Creates users and skills for testing admin governance
+- `mcp_tools/` - Creates data-source-backed agents with internal MCP tools
+- `reinforcement/` - Creates skills with conversations, feedbacks, Ruby conversations with JIT skills for testing reinforcement
+- `sidekick/` - Creates agents and conversations for testing the agent builder sidekick feature
+- `triggers/` - Creates schedule triggers for basics agents
+
+## Shared Factories
+
+The `factories/` folder contains reusable functions for creating seed data.

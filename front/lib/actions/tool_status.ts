@@ -1,0 +1,228 @@
+import type { MCPToolStakeLevelType } from "@app/lib/actions/constants";
+import type { MCPToolConfigurationType } from "@app/lib/actions/mcp";
+import type { Authenticator } from "@app/lib/auth";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { isNumberOrBoolean, isString } from "@app/types/shared/utils/general";
+
+interface ToolInputContext {
+  toolInputs: Record<string, unknown>;
+}
+
+type StakeCheckConfiguration = Pick<
+  MCPToolConfigurationType,
+  "permission" | "toolServerId" | "name" | "argumentsRequiringApproval"
+>;
+
+export async function getExecutionStatusFromConfig(
+  auth: Authenticator,
+  {
+    actionConfiguration,
+    skipToolsValidation = false,
+    context,
+  }: {
+    actionConfiguration: StakeCheckConfiguration;
+    skipToolsValidation?: boolean;
+    context?: ToolInputContext;
+  }
+): Promise<{
+  stake?: MCPToolStakeLevelType;
+  status: "ready_allowed_implicitly" | "blocked_validation_required";
+  serverId?: string;
+}> {
+  // Explicit validation bypasses take precedence over the tool permission.
+  if (skipToolsValidation) {
+    return { status: "ready_allowed_implicitly" };
+  }
+
+  // Permissions:
+  // - "never_ask": Automatically approved
+  // - "low": Ask user for approval and allow to automatically approve next time
+  // - "medium": Ask user for approval per argument-values combination
+  // - "high": Ask for approval each time
+  // - undefined: Use default permission ("never_ask" for default tools, "high" for other tools)
+  switch (actionConfiguration.permission) {
+    case "never_ask":
+      return { status: "ready_allowed_implicitly" };
+    case "low": {
+      // The user may not be populated, notably when using the public API.
+      const user = auth.user();
+
+      if (user) {
+        const userHasAlwaysApproved = await hasUserAlwaysApprovedTool(auth, {
+          mcpServerId: actionConfiguration.toolServerId,
+          functionCallName: actionConfiguration.name,
+        });
+        if (userHasAlwaysApproved) {
+          return { status: "ready_allowed_implicitly" };
+        }
+      }
+      return { status: "blocked_validation_required" };
+    }
+    case "medium": {
+      // Medium stake requires per-argument approval.
+      // If context is missing, we block.
+      const user = auth.user();
+      if (!user || !context) {
+        return { status: "blocked_validation_required" };
+      }
+      const { toolInputs } = context;
+      const argumentsRequiringApproval =
+        actionConfiguration.argumentsRequiringApproval ?? [];
+      const argsAndValues = extractArgRequiringApprovalValues(
+        argumentsRequiringApproval,
+        toolInputs
+      );
+
+      const userHasApproved = await user.hasApprovedTool(auth, {
+        mcpServerId: actionConfiguration.toolServerId,
+        toolName: actionConfiguration.name,
+        argsAndValues,
+      });
+
+      if (userHasApproved) {
+        return { status: "ready_allowed_implicitly" };
+      }
+      return { status: "blocked_validation_required" };
+    }
+    case "high":
+      return { status: "blocked_validation_required" };
+    default:
+      assertNever(actionConfiguration.permission);
+  }
+}
+
+// The function call name is scoped by MCP servers so that the same tool name on different servers
+// does not conflict, which is why we use it here instead of the tool name.
+export async function setUserAlwaysApprovedTool(
+  auth: Authenticator,
+  {
+    mcpServerId,
+    functionCallName,
+  }: {
+    mcpServerId: string;
+    functionCallName: string;
+  }
+) {
+  if (!functionCallName) {
+    throw new Error("functionCallName is required");
+  }
+  if (!mcpServerId) {
+    throw new Error("mcpServerId is required");
+  }
+
+  const user = auth.getNonNullableUser();
+
+  await user.createToolApproval(auth, {
+    mcpServerId,
+    toolName: functionCallName,
+    argsAndValues: null,
+  });
+}
+
+export async function hasUserAlwaysApprovedTool(
+  auth: Authenticator,
+  {
+    mcpServerId,
+    functionCallName,
+  }: {
+    mcpServerId: string;
+    functionCallName: string;
+  }
+) {
+  if (!mcpServerId) {
+    throw new Error("mcpServerId is required");
+  }
+
+  if (!functionCallName) {
+    throw new Error("functionCallName is required");
+  }
+
+  const user = auth.getNonNullableUser();
+
+  return user.hasApprovedTool(auth, {
+    mcpServerId,
+    toolName: functionCallName,
+    argsAndValues: null,
+  });
+}
+
+// Extracts the values of the approval-requiring arguments from the tool inputs,
+// converting them to strings for storage. Skips any arguments that are not provided.
+export function extractArgRequiringApprovalValues(
+  argumentsRequiringApproval: string[],
+  toolInputs: Record<string, unknown>
+): Record<string, string> {
+  const result: Record<string, string> = {};
+
+  for (const argName of argumentsRequiringApproval) {
+    const value = toolInputs[argName];
+    if (value === undefined || value === null) {
+      // Skip optional args that are not provided
+      continue;
+    }
+
+    if (isString(value)) {
+      result[argName] = value;
+    } else if (isNumberOrBoolean(value)) {
+      result[argName] = String(value);
+    } else if (
+      Array.isArray(value) &&
+      value.length === 1 &&
+      (isString(value[0]) || isNumberOrBoolean(value[0]))
+    ) {
+      // Handle single-element arrays (e.g., ["adrien@ruby.ad"]).
+      result[argName] = value[0].toString();
+    } else {
+      const stableValue = stableStringify(value);
+      if (stableValue !== null) {
+        result[argName] = stableValue;
+      }
+    }
+  }
+
+  return result;
+}
+
+function stableStringify(value: unknown): string | null {
+  const normalizedValue = normalizeForStableStringify(value);
+  if (normalizedValue === undefined) {
+    return null;
+  }
+
+  return JSON.stringify(normalizedValue);
+}
+
+function normalizeForStableStringify(value: unknown): unknown {
+  if (value === null || isString(value) || isNumberOrBoolean(value)) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeForStableStringify(entry));
+  }
+
+  if (isPlainObject(value)) {
+    const sortedKeys = Object.keys(value).sort();
+    const normalizedObject: Record<string, unknown> = {};
+
+    for (const key of sortedKeys) {
+      const normalizedProperty = normalizeForStableStringify(value[key]);
+      if (normalizedProperty !== undefined) {
+        normalizedObject[key] = normalizedProperty;
+      }
+    }
+
+    return normalizedObject;
+  }
+
+  return undefined;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}

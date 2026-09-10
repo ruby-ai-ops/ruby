@@ -1,0 +1,349 @@
+import { randomUUID } from "node:crypto";
+import { REDIS_CACHE_CONCURRENCY } from "@app/lib/api/redis";
+import type { Authenticator } from "@app/lib/auth";
+import { getPrivateUploadBucket } from "@app/lib/file_storage";
+import type { AgentMCPActionResource } from "@app/lib/resources/agent_mcp_action_resource";
+import { makeSId } from "@app/lib/resources/string_ids";
+import { concurrentExecutor, withRetry } from "@app/lib/utils/async_utils";
+import { cacheWithRedis, warmCacheWithRedis } from "@app/lib/utils/cache";
+import logger from "@app/logger/logger";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+
+export const MCP_OUTPUT_ITEMS_PREFIX = "mcp_output_items";
+const GCS_CONCURRENCY = 4;
+
+export const GCS_CONTENT_CACHE_TTL_MS = 15 * 60 * 1000;
+
+type OutputContent = CallToolResult["content"][number];
+
+// Writes live under the workspace prefix `w/<wsId>/...` so they are included by the
+// workspace-relocation file transfer.
+function getActionOutputGcsPrefix(
+  auth: Authenticator,
+  actionId: ModelId
+): string {
+  const workspace = auth.getNonNullableWorkspace();
+  const actionIdString = makeSId("mcp_action", {
+    id: actionId,
+    workspaceId: workspace.id,
+  });
+  return `w/${workspace.sId}/${MCP_OUTPUT_ITEMS_PREFIX}/${actionIdString}/`;
+}
+
+function getGcsPath(
+  auth: Authenticator,
+  action: AgentMCPActionResource,
+  objectName: string
+): string {
+  return `${getActionOutputGcsPrefix(auth, action.id)}${objectName}.json`;
+}
+
+async function batchWriteContentsToGcsAtPaths(
+  action: AgentMCPActionResource,
+  itemsWithPaths: Array<{ content: OutputContent; gcsPath: string }>
+): Promise<Result<string[], Error>> {
+  let firstError: Error | null = null;
+  let successCount = 0;
+
+  await concurrentExecutor(
+    itemsWithPaths,
+    async ({ content, gcsPath }) => {
+      const bucket = getPrivateUploadBucket();
+      const file = bucket.file(gcsPath);
+      const json = JSON.stringify(content);
+
+      const writeResult = await withRetry(() =>
+        file.save(Buffer.from(json, "utf-8"), {
+          contentType: "application/json",
+        })
+      );
+
+      if (writeResult.isErr()) {
+        if (!firstError) {
+          firstError = writeResult.error;
+        }
+        return;
+      }
+
+      successCount += 1;
+    },
+    { concurrency: GCS_CONCURRENCY }
+  );
+
+  if (firstError) {
+    logger.error(
+      {
+        err: firstError,
+        itemCount: itemsWithPaths.length,
+        successCount,
+      },
+      "Failed to write MCP output items to GCS"
+    );
+
+    // A failed save may still have persisted its object before returning an error. Delete every
+    // attempted path so callers never have to reason about partial GCS writes.
+    const cleanupResult = await deleteContentsFromGcs(
+      itemsWithPaths.map(({ gcsPath }) => gcsPath)
+    );
+    if (cleanupResult.isErr()) {
+      logger.error(
+        { err: cleanupResult.error, actionId: action.sId },
+        "Failed to clean up partially written MCP output items"
+      );
+    }
+
+    return new Err(firstError);
+  }
+
+  return new Ok(itemsWithPaths.map(({ gcsPath }) => gcsPath));
+}
+
+/**
+ * Writes new output contents to UUID-backed GCS objects concurrently.
+ * Paths are returned in the same order as the provided contents.
+ */
+export async function batchWriteContentsToGcs(
+  auth: Authenticator,
+  action: AgentMCPActionResource,
+  contents: OutputContent[]
+): Promise<Result<string[], Error>> {
+  return batchWriteContentsToGcsAtPaths(
+    action,
+    contents.map((content) => ({
+      content,
+      gcsPath: getGcsPath(auth, action, randomUUID()),
+    }))
+  );
+}
+
+/**
+ * Rewrites existing output items at deterministic paths so backfill retries are idempotent.
+ */
+export async function batchRewriteContentsToGcs(
+  auth: Authenticator,
+  action: AgentMCPActionResource,
+  items: Array<{ itemId: ModelId; content: OutputContent }>
+): Promise<Result<string[], Error>> {
+  return batchWriteContentsToGcsAtPaths(
+    action,
+    items.map(({ itemId, content }) => ({
+      content,
+      gcsPath: getGcsPath(auth, action, itemId.toString()),
+    }))
+  );
+}
+
+/**
+ * Fetches content from GCS. Throws on failure (cacheWithRedis propagates the error).
+ */
+// itemId is unused in the fetch logic but passed to populate the cache key.
+async function fetchGcsContent(
+  auth: Authenticator,
+  gcsPath: string,
+  _itemId: ModelId
+): Promise<OutputContent> {
+  const bucket = getPrivateUploadBucket();
+  const file = bucket.file(gcsPath);
+
+  const [buffer] = await file.download();
+
+  return JSON.parse(buffer.toString("utf-8"));
+}
+
+// Bump the `:v1` suffix any time the cached value shape changes, so stale entries from previous
+// formats are orphaned instead of mis-parsed.
+export const gcsContentCacheKey = (
+  auth: Authenticator,
+  _gcsPath: string,
+  itemId: ModelId
+) => `w:${auth.getNonNullableWorkspace().sId}:mcp_output:${itemId}:v1`;
+
+const fetchGcsContentCached = cacheWithRedis(
+  fetchGcsContent,
+  gcsContentCacheKey,
+  {
+    cacheNullValues: false,
+    ttlMs: GCS_CONTENT_CACHE_TTL_MS,
+  }
+);
+
+const warmOneGcsContent = warmCacheWithRedis(
+  fetchGcsContent,
+  gcsContentCacheKey,
+  { ttlMs: GCS_CONTENT_CACHE_TTL_MS }
+);
+
+export async function warmGcsContentCache(
+  auth: Authenticator,
+  items: Array<{
+    itemId: ModelId;
+    gcsPath: string;
+    content: OutputContent;
+  }>
+): Promise<void> {
+  if (items.length === 0) {
+    return;
+  }
+  await concurrentExecutor(
+    items,
+    async ({ itemId, gcsPath, content }) => {
+      await warmOneGcsContent(content, auth, gcsPath, itemId);
+    },
+    { concurrency: REDIS_CACHE_CONCURRENCY }
+  );
+}
+
+/**
+ * Fetches content for a single item from cache (LRU) or GCS.
+ *
+ * TODO(2026-03-15 PERF): Add retry with exponential backoff to handle transient GCS failures.
+ */
+async function fetchContentFromGcs(
+  auth: Authenticator,
+  gcsPath: string,
+  itemId: ModelId
+): Promise<Result<OutputContent, Error>> {
+  try {
+    const content = await fetchGcsContentCached(auth, gcsPath, itemId);
+    return new Ok(content);
+  } catch (err) {
+    logger.error(
+      { err: normalizeError(err), gcsPath },
+      "Failed to fetch MCP output content from GCS"
+    );
+
+    return new Err(normalizeError(err));
+  }
+}
+
+/**
+ * Batch-fetches content for multiple items from cache/GCS.
+ */
+export async function batchFetchContentsFromGcs(
+  auth: Authenticator,
+  items: Array<{
+    itemId: ModelId;
+    gcsPath: string;
+  }>
+): Promise<Result<Map<ModelId, OutputContent>, Error>> {
+  const results = new Map<ModelId, OutputContent>();
+  let firstError: Error | null = null;
+
+  await concurrentExecutor(
+    items,
+    async ({ itemId, gcsPath }) => {
+      const result = await fetchContentFromGcs(auth, gcsPath, itemId);
+      if (result.isOk()) {
+        results.set(itemId, result.value);
+      } else if (!firstError) {
+        firstError = result.error;
+      }
+    },
+    { concurrency: GCS_CONCURRENCY }
+  );
+
+  if (firstError) {
+    return new Err(firstError);
+  }
+
+  return new Ok(results);
+}
+
+/**
+ * Deletes GCS files by path. Not-found errors are ignored (already deleted).
+ * Returns Err if any deletion fails for other reasons.
+ *
+ * Prefer {@link deleteActionOutputsFromGcs} when deleting all outputs for
+ * one or more actions — prefix delete is far cheaper than per-object deletes.
+ */
+export async function deleteContentsFromGcs(
+  gcsPaths: string[]
+): Promise<Result<void, Error>> {
+  if (gcsPaths.length === 0) {
+    return new Ok(undefined);
+  }
+
+  try {
+    const bucket = getPrivateUploadBucket();
+    await concurrentExecutor(
+      gcsPaths,
+      async (gcsPath) => {
+        await bucket.delete(gcsPath, { ignoreNotFound: true });
+      },
+      { concurrency: GCS_CONCURRENCY }
+    );
+  } catch (err) {
+    logger.error(
+      { err: normalizeError(err), pathCount: gcsPaths.length },
+      "Failed to delete MCP output content from GCS"
+    );
+    return new Err(normalizeError(err));
+  }
+
+  return new Ok(undefined);
+}
+
+/**
+ * Deletes all GCS objects under each action's output prefix via a single
+ * `deleteFiles({ prefix })` call per action (GCS batches internally).
+ * Empty prefixes are a no-op. Failures are logged and returned as Err.
+ */
+async function deleteActionOutputPrefixesFromGcs(
+  auth: Authenticator,
+  actionIds: ModelId[]
+): Promise<Result<void, Error>> {
+  if (actionIds.length === 0) {
+    return new Ok(undefined);
+  }
+
+  const prefixes = actionIds.map((actionId) =>
+    getActionOutputGcsPrefix(auth, actionId)
+  );
+
+  try {
+    const bucket = getPrivateUploadBucket();
+    await concurrentExecutor(
+      prefixes,
+      async (prefix) => {
+        await bucket.deleteByPrefix(prefix);
+      },
+      { concurrency: GCS_CONCURRENCY }
+    );
+  } catch (err) {
+    logger.error(
+      { err: normalizeError(err), actionCount: actionIds.length },
+      "Failed to delete MCP output prefixes from GCS"
+    );
+    return new Err(normalizeError(err));
+  }
+
+  return new Ok(undefined);
+}
+
+/**
+ * Deletes GCS outputs for the given actions: one prefix delete per action,
+ * plus per-object deletes for leftover/legacy paths outside those prefixes.
+ */
+export async function deleteActionOutputsFromGcs(
+  auth: Authenticator,
+  actionIds: ModelId[],
+  gcsPaths: string[]
+): Promise<Result<void, Error>> {
+  const prefixResult = await deleteActionOutputPrefixesFromGcs(auth, actionIds);
+  if (prefixResult.isErr()) {
+    return prefixResult;
+  }
+
+  const prefixes = actionIds.map((actionId) =>
+    getActionOutputGcsPrefix(auth, actionId)
+  );
+  const uncoveredPaths = gcsPaths.filter(
+    (gcsPath) => !prefixes.some((prefix) => gcsPath.startsWith(prefix))
+  );
+
+  return deleteContentsFromGcs(uncoveredPaths);
+}

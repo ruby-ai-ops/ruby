@@ -1,0 +1,46 @@
+import { Authenticator } from "@app/lib/auth";
+import { WebhookSourceResource } from "@app/lib/resources/webhook_source_resource";
+import type {
+  WebhookProvider,
+  WebhookSourceSignatureAlgorithm,
+} from "@app/types/triggers/webhooks";
+import type { WorkspaceType } from "@app/types/user";
+import { faker } from "@faker-js/faker";
+
+export class WebhookSourceFactory {
+  private workspace: WorkspaceType;
+
+  constructor(workspace: WorkspaceType) {
+    this.workspace = workspace;
+  }
+
+  async create(
+    options: {
+      name?: string;
+      secret?: string;
+      urlSecret?: string;
+      signatureHeader?: string;
+      signatureAlgorithm?: WebhookSourceSignatureAlgorithm;
+      provider?: WebhookProvider;
+      subscribedEvents?: string[];
+    } = {}
+  ) {
+    const cachedName =
+      options.name ?? `Test WebhookSource${faker.string.alphanumeric(8)}`;
+
+    const auth = await Authenticator.internalAdminForWorkspace(
+      this.workspace.sId
+    );
+
+    return WebhookSourceResource.makeNew(auth, {
+      workspaceId: this.workspace.id,
+      name: cachedName,
+      urlSecret: options.urlSecret ?? faker.string.alphanumeric(64),
+      secret: options.secret ?? null,
+      signatureHeader: options.signatureHeader ?? null,
+      signatureAlgorithm: options.signatureAlgorithm ?? null,
+      provider: options.provider ?? null,
+      subscribedEvents: options.subscribedEvents ?? [],
+    });
+  }
+}

@@ -1,0 +1,163 @@
+import type { ViewMode } from "@app/components/file_explorer/FileExplorerItem";
+import {
+  ContentNodeCard,
+  FileExplorerEmptyState,
+  FileExplorerFileCard,
+  FileExplorerFolderCard,
+  FileExplorerFramePackageCard,
+} from "@app/components/file_explorer/FileExplorerItem";
+import type {
+  ContentNodeEntry,
+  FileEntry,
+  FileExplorerDownloadEntry,
+  FileExplorerEntry,
+  FileExplorerMenuAction,
+  FileSystemTreeNode,
+  FolderEntry,
+  FramePackageEntry,
+} from "@app/components/file_explorer/types";
+import { isFileExplorerMovableFile } from "@app/components/file_explorer/utils";
+import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
+import { CardGrid, ScrollArea, Spinner } from "@ruby-ai/sparkle";
+import type React from "react";
+
+const cardGridClasses =
+  "grid-cols-2 @xxs:grid-cols-3 @sm:grid-cols-4 @md:grid-cols-5 @lg:grid-cols-6";
+
+interface FileExplorerContentProps {
+  isLoading: boolean;
+  sortedNodes: FileSystemTreeNode[];
+  entryByRelativePath: Map<string, FileExplorerEntry>;
+  viewMode: ViewMode;
+  isEmpty: boolean;
+  emptyState?: React.ReactNode;
+  fileDragEnabled?: boolean;
+  onFolderNavigate: (node: FileSystemTreeNode) => void;
+  onFileOpen: (entry: FileEntry) => void;
+  onFramePackageOpen: (entry: FramePackageEntry) => void;
+  onDownload: (entry: FileExplorerDownloadEntry) => Promise<void>;
+  onMoveFileDrop?: (scopedFilePath: string, parentRelativePath: string) => void;
+  onNodeOpen: (entry: ContentNodeEntry) => void;
+  getFileMenuItems?: (entry: FileExplorerEntry) => FileExplorerMenuAction[];
+  /** When set, file cards show paths relative to this folder (search mode). */
+  searchFolderPath?: string;
+}
+
+export function FileExplorerContent({
+  isLoading,
+  sortedNodes,
+  entryByRelativePath,
+  viewMode,
+  isEmpty,
+  emptyState,
+  fileDragEnabled,
+  onFolderNavigate,
+  onFileOpen,
+  onFramePackageOpen,
+  onDownload,
+  onMoveFileDrop,
+  onNodeOpen,
+  getFileMenuItems,
+  searchFolderPath,
+}: FileExplorerContentProps) {
+  const items = sortedNodes.map((node) => {
+    if (node.isDirectory) {
+      const folderEntry: FolderEntry = {
+        kind: "folder",
+        path: node.canonicalPath,
+        name: node.name,
+      };
+      return (
+        <FileExplorerFolderCard
+          key={`dir:${node.path}`}
+          node={node}
+          viewMode={viewMode}
+          onDownload={() => onDownload(folderEntry)}
+          onNavigate={onFolderNavigate}
+          onMoveFileDrop={onMoveFileDrop}
+          extraMenuItems={getFileMenuItems?.(folderEntry)}
+        />
+      );
+    }
+
+    const entry = entryByRelativePath.get(node.path);
+    if (!entry) {
+      return null;
+    }
+
+    switch (entry.kind) {
+      case "node":
+        return (
+          <ContentNodeCard
+            key={`node:${entry.path}`}
+            entry={entry}
+            viewMode={viewMode}
+            onOpen={onNodeOpen}
+            extraMenuItems={getFileMenuItems?.(entry)}
+          />
+        );
+
+      case "file":
+        return (
+          <FileExplorerFileCard
+            key={`file:${entry.path}`}
+            draggable={fileDragEnabled && isFileExplorerMovableFile(entry)}
+            entry={entry}
+            searchFolderPath={searchFolderPath}
+            viewMode={viewMode}
+            onOpen={onFileOpen}
+            onDownload={onDownload}
+            extraMenuItems={getFileMenuItems?.(entry)}
+          />
+        );
+
+      case "frame_package":
+        return (
+          <FileExplorerFramePackageCard
+            key={`frame-package:${entry.sourceFolderPath}`}
+            entry={entry}
+            searchFolderPath={searchFolderPath}
+            viewMode={viewMode}
+            onDownload={() => onDownload(entry)}
+            onOpen={onFramePackageOpen}
+            extraMenuItems={getFileMenuItems?.(entry)}
+          />
+        );
+
+      case "folder":
+        return null;
+
+      default:
+        assertNeverAndIgnore(entry);
+        return null;
+    }
+  });
+
+  if (isLoading) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-4">
+        <Spinner />
+      </div>
+    );
+  }
+
+  if (isEmpty) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-4">
+        {emptyState ?? <FileExplorerEmptyState />}
+      </div>
+    );
+  }
+
+  return (
+    <ScrollArea className="min-h-0 flex-1">
+      <div className="flex flex-col gap-5 px-4 pb-4">
+        {viewMode === "list" ? (
+          <div className="flex flex-col gap-0.5">{items}</div>
+        ) : (
+          <CardGrid gridClassName={cardGridClasses}>{items}</CardGrid>
+        )}
+      </div>
+    </ScrollArea>
+  );
+}

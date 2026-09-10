@@ -1,0 +1,103 @@
+import { CreateOrEditSpaceModal } from "@app/components/spaces/CreateOrEditSpaceModal";
+import { GlobalSpaceSettingsModal } from "@app/components/spaces/GlobalSpaceSettingsModal";
+import { SpaceCategoriesList } from "@app/components/spaces/SpaceCategoriesList";
+import { SpaceSearchInput } from "@app/components/spaces/SpaceSearchLayout";
+import { useAuth, useWorkspace } from "@app/lib/auth/AuthContext";
+import { useAppRouter, useRequiredPathParam } from "@app/lib/platform";
+import { useSpaceInfo } from "@app/lib/swr/spaces";
+import { Page, Spinner } from "@ruby-ai/sparkle";
+import React, { useEffect } from "react";
+
+export function SpacePage() {
+  const [showSpaceEditionModal, setShowSpaceEditionModal] =
+    React.useState(false);
+
+  const router = useAppRouter();
+  const spaceId = useRequiredPathParam("spaceId");
+  const owner = useWorkspace();
+  const { isAdmin } = useAuth();
+
+  const {
+    spaceInfo: space,
+    canReadInSpace,
+    canWriteInSpace,
+    isSpaceInfoLoading,
+  } = useSpaceInfo({
+    workspaceId: owner.sId,
+    spaceId,
+  });
+
+  // Redirect system spaces to managed category
+  useEffect(() => {
+    if (space && space.kind === "system") {
+      void router.replace(
+        `/w/${owner.sId}/spaces/${space.sId}/categories/managed`
+      );
+    }
+  }, [space, owner.sId, router]);
+
+  if (isSpaceInfoLoading || !space) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Spinner />
+      </div>
+    );
+  }
+
+  // Don't render if system space (redirect is happening)
+  if (space.kind === "system") {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Spinner />
+      </div>
+    );
+  }
+
+  return (
+    <SpaceSearchInput
+      category={undefined}
+      canReadInSpace={canReadInSpace}
+      canWriteInSpace={canWriteInSpace}
+      owner={owner}
+      space={space}
+      dataSourceView={undefined}
+      parentId={undefined}
+      useBackendSearch
+    >
+      <Page.Vertical gap="xl" align="stretch">
+        <SpaceCategoriesList
+          owner={owner}
+          canWriteInSpace={canWriteInSpace}
+          space={space}
+          onSelect={(category) => {
+            void router.push(
+              `/w/${owner.sId}/spaces/${space.sId}/categories/${category}`
+            );
+          }}
+          isAdmin={isAdmin}
+          onButtonClick={() => setShowSpaceEditionModal(true)}
+        />
+        {/* The global space's settings are admin-only, and it is the admin-only "Space settings"
+            button that opens them, so the panel is not mounted for anyone else. */}
+        {space.kind === "global" ? (
+          isAdmin && (
+            <GlobalSpaceSettingsModal
+              owner={owner}
+              isOpen={showSpaceEditionModal}
+              onClose={() => setShowSpaceEditionModal(false)}
+              space={space}
+            />
+          )
+        ) : (
+          <CreateOrEditSpaceModal
+            owner={owner}
+            isOpen={showSpaceEditionModal}
+            onClose={() => setShowSpaceEditionModal(false)}
+            space={space}
+            isAdmin={isAdmin}
+          />
+        )}
+      </Page.Vertical>
+    </SpaceSearchInput>
+  );
+}

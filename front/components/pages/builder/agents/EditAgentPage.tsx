@@ -1,0 +1,94 @@
+import AgentBuilder from "@app/components/agent_builder/AgentBuilder";
+import { AgentBuilderProvider } from "@app/components/agent_builder/AgentBuilderContext";
+import { RedactedAgentMessage } from "@app/components/assistant/details/tabs/AgentInfoTab/RedactedAgentMessage";
+import { NotAvailableErrorPage } from "@app/components/pages/builder/agents/NotAvailableErrorPage";
+import Custom404 from "@app/components/pages/Custom404";
+import { useAuth, useWorkspace } from "@app/lib/auth/AuthContext";
+import { useRequiredPathParam } from "@app/lib/platform";
+import { useAgentConfiguration } from "@app/lib/swr/assistants";
+import { hasHealthyProviders } from "@app/lib/utils/providersHealth";
+import { Spinner } from "@ruby-ai/sparkle";
+
+export function EditAgentPage() {
+  const owner = useWorkspace();
+  const { user, isAdmin, providersHealth } = useAuth();
+  const agentId = useRequiredPathParam("aId");
+
+  const {
+    agentConfiguration,
+    isAgentConfigurationLoading,
+    isAgentConfigurationError,
+    mutateAgentConfiguration,
+  } = useAgentConfiguration({
+    workspaceId: owner.sId,
+    agentConfigurationId: agentId,
+  });
+
+  if (
+    isAgentConfigurationError ||
+    (!isAgentConfigurationLoading && !agentConfiguration) ||
+    (agentConfiguration && !agentConfiguration.canEdit && !isAdmin)
+  ) {
+    return <Custom404 />;
+  }
+
+  if (!hasHealthyProviders(providersHealth)) {
+    return <NotAvailableErrorPage isAdmin={isAdmin} owner={owner} />;
+  }
+
+  if (isAgentConfigurationLoading || !agentConfiguration) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Spinner size="lg" />
+      </div>
+    );
+  }
+
+  if (agentConfiguration.scope === "global") {
+    throw new Error("Cannot edit global agent");
+  }
+
+  if (agentConfiguration.status === "archived") {
+    throw new Error("Cannot edit archived agent");
+  }
+
+  const builder = (
+    <AgentBuilderProvider
+      owner={owner}
+      user={user}
+      isAdmin={isAdmin}
+      assistantTemplate={null}
+    >
+      <AgentBuilder
+        agentConfiguration={agentConfiguration}
+        onSaved={mutateAgentConfiguration}
+      />
+    </AgentBuilderProvider>
+  );
+
+  // The API redacts the private fields of the agents an admin cannot read (`canRead` false): the
+  // builder would show an empty prompt. Keep it as a blurred, inert backdrop and show the details
+  // panel's message and actions on top. Once access is granted, the refetch lifts the overlay.
+  if (!agentConfiguration.canRead) {
+    return (
+      <div className="relative">
+        <div
+          aria-hidden="true"
+          className="pointer-events-none select-none blur-sm"
+        >
+          {builder}
+        </div>
+        <div className="absolute inset-0 z-10 flex items-start justify-center p-8">
+          <div className="w-full max-w-2xl">
+            <RedactedAgentMessage
+              agentConfiguration={agentConfiguration}
+              owner={owner}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return builder;
+}

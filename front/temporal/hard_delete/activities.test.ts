@@ -1,0 +1,336 @@
+import { createPendingAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
+import type { Authenticator } from "@app/lib/auth";
+import { AgentConfigurationModel } from "@app/lib/models/agent/agent";
+import { GroupAgentModel } from "@app/lib/models/agent/group_agent";
+import { GroupPermissionResource } from "@app/lib/resources/group_permission_resource";
+import { GroupResource } from "@app/lib/resources/group_resource";
+import { SkillSuggestionResource } from "@app/lib/resources/skill_suggestion_resource";
+import {
+  purgeExpiredPendingAgentsActivity,
+  purgeExpiredSyntheticSkillSuggestionsActivity,
+} from "@app/temporal/hard_delete/activities";
+import {
+  PENDING_AGENTS_RETENTION_HOURS,
+  SYNTHETIC_SUGGESTIONS_RETENTION_DAYS,
+} from "@app/temporal/hard_delete/utils";
+import { AgentConfigurationFactory } from "@app/tests/utils/AgentConfigurationFactory";
+import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
+import { SkillFactory } from "@app/tests/utils/SkillFactory";
+import { SkillSuggestionFactory } from "@app/tests/utils/SkillSuggestionFactory";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@temporalio/activity", () => ({
+  Context: {
+    current: vi.fn(() => ({
+      heartbeat: vi.fn(),
+      info: { attempt: 1 },
+      cancellationSignal: { aborted: false },
+    })),
+  },
+}));
+
+const PAST_THRESHOLD_MS = (PENDING_AGENTS_RETENTION_HOURS + 1) * 3600 * 1000;
+
+beforeEach(() => {
+  // Only fake Date — leave setImmediate/setTimeout real for async work.
+  vi.useFakeTimers({ toFake: ["Date"] });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+async function createPendingAgent(
+  authenticator: Authenticator
+): Promise<{ sId: string }> {
+  const res = await createPendingAgentConfiguration(authenticator);
+  if (res.isErr()) {
+    throw res.error;
+  }
+  return res.value;
+}
+
+async function getEditorGroupId(
+  agentConfigurationId: number,
+  workspaceId: number
+): Promise<number> {
+  const groupAgent = await GroupAgentModel.findOne({
+    where: { agentConfigurationId, workspaceId },
+  });
+  expect(groupAgent).not.toBeNull();
+  return groupAgent!.groupId;
+}
+
+describe("purgeExpiredPendingAgentsActivity", () => {
+  it("deletes pending agents older than threshold with their editor groups", async () => {
+    const { authenticator, workspace } = await createResourceTest({
+      role: "admin",
+    });
+
+    const { sId } = await createPendingAgent(authenticator);
+    const agent = await AgentConfigurationModel.findOne({
+      where: { sId, workspaceId: workspace.id },
+    });
+    if (!agent) {
+      throw new Error("Pending agent was not created");
+    }
+    const editorGroupId = await getEditorGroupId(agent.id, workspace.id);
+    const grantGroup =
+      await GroupPermissionResource.findRegularAutoGroupForGrant(
+        authenticator,
+        {
+          grantType: "editor",
+          resourceType: "agent",
+          resourceId: agent.agentId,
+        }
+      );
+    if (!grantGroup) {
+      throw new Error("Agent editor grant was not created");
+    }
+
+    // Advance time past the retention threshold.
+    vi.advanceTimersByTime(PAST_THRESHOLD_MS);
+
+    await purgeExpiredPendingAgentsActivity();
+
+    // Agent should be deleted.
+    const agentAfter = await AgentConfigurationModel.findOne({
+      where: { sId, workspaceId: workspace.id },
+    });
+    expect(agentAfter).toBeNull();
+
+    // Editor group should be deleted too.
+    const groupsAfter = await GroupResource.dangerouslyFetchByModelIds(
+      authenticator,
+      [editorGroupId, grantGroup.id]
+    );
+    expect(groupsAfter).toHaveLength(0);
+  });
+
+  it("does not delete pending agents younger than threshold", async () => {
+    const { authenticator, workspace } = await createResourceTest({
+      role: "admin",
+    });
+
+    const { sId } = await createPendingAgent(authenticator);
+    const agent = await AgentConfigurationModel.findOne({
+      where: { sId, workspaceId: workspace.id },
+    });
+    const editorGroupId = await getEditorGroupId(agent!.id, workspace.id);
+
+    await purgeExpiredPendingAgentsActivity();
+
+    // Agent should survive.
+    const agentAfter = await AgentConfigurationModel.findOne({
+      where: { sId, workspaceId: workspace.id },
+    });
+    expect(agentAfter).not.toBeNull();
+    expect(agentAfter!.status).toBe("pending");
+
+    // Editor group should survive too.
+    const groupsAfter = await GroupResource.dangerouslyFetchByModelIds(
+      authenticator,
+      [editorGroupId]
+    );
+    expect(groupsAfter).toHaveLength(1);
+  });
+
+  it("deletes all expired agents across multiple batches", async () => {
+    const { authenticator, workspace } = await createResourceTest({
+      role: "admin",
+    });
+
+    const sIds: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { sId } = await createPendingAgent(authenticator);
+      sIds.push(sId);
+    }
+
+    // Advance time past the retention threshold.
+    vi.advanceTimersByTime(PAST_THRESHOLD_MS);
+
+    // Use batchSize=1 to force multiple pagination loops.
+    await purgeExpiredPendingAgentsActivity(1);
+
+    const remaining = await AgentConfigurationModel.findAll({
+      where: { sId: sIds, workspaceId: workspace.id },
+    });
+    expect(remaining).toHaveLength(0);
+  });
+
+  it("does not delete active agents or their groups", async () => {
+    const { authenticator, workspace } = await createResourceTest({
+      role: "admin",
+    });
+
+    const agentConfig = await AgentConfigurationFactory.createTestAgent(
+      authenticator,
+      { name: "Active Agent" }
+    );
+    const editorGroupId = await getEditorGroupId(agentConfig.id, workspace.id);
+
+    // Advance time past the retention threshold.
+    vi.advanceTimersByTime(PAST_THRESHOLD_MS);
+
+    await purgeExpiredPendingAgentsActivity();
+
+    // Active agent should survive.
+    const agents = await AgentConfigurationModel.findAll({
+      where: { name: "Active Agent", workspaceId: workspace.id },
+    });
+    expect(agents).toHaveLength(1);
+    expect(agents[0].status).toBe("active");
+
+    // Its editor group should survive too.
+    const groupsAfter = await GroupResource.dangerouslyFetchByModelIds(
+      authenticator,
+      [editorGroupId]
+    );
+    expect(groupsAfter).toHaveLength(1);
+  });
+
+  it("only deletes expired pending agents, leaves fresh pending and active intact", async () => {
+    const { authenticator, workspace } = await createResourceTest({
+      role: "admin",
+    });
+
+    // Create a pending agent that will expire.
+    const { sId: expiredId } = await createPendingAgent(authenticator);
+    const expiredAgent = await AgentConfigurationModel.findOne({
+      where: { sId: expiredId, workspaceId: workspace.id },
+    });
+    const expiredGroupId = await getEditorGroupId(
+      expiredAgent!.id,
+      workspace.id
+    );
+
+    // Advance time past the threshold.
+    vi.advanceTimersByTime(PAST_THRESHOLD_MS);
+
+    // Create a fresh pending agent (after time advance, so it's young).
+    const { sId: freshId } = await createPendingAgent(authenticator);
+    const freshAgent = await AgentConfigurationModel.findOne({
+      where: { sId: freshId, workspaceId: workspace.id },
+    });
+    const freshGroupId = await getEditorGroupId(freshAgent!.id, workspace.id);
+
+    // Create an active agent.
+    const activeAgent = await AgentConfigurationFactory.createTestAgent(
+      authenticator,
+      { name: "Survivor" }
+    );
+    const activeGroupId = await getEditorGroupId(activeAgent.id, workspace.id);
+
+    await purgeExpiredPendingAgentsActivity();
+
+    // Expired pending agent + group: deleted.
+    expect(
+      await AgentConfigurationModel.findOne({
+        where: { sId: expiredId, workspaceId: workspace.id },
+      })
+    ).toBeNull();
+    expect(
+      await GroupResource.dangerouslyFetchByModelIds(authenticator, [
+        expiredGroupId,
+      ])
+    ).toHaveLength(0);
+
+    // Fresh pending agent + group: survived.
+    const freshAfter = await AgentConfigurationModel.findOne({
+      where: { sId: freshId, workspaceId: workspace.id },
+    });
+    expect(freshAfter).not.toBeNull();
+    expect(freshAfter!.status).toBe("pending");
+    expect(
+      await GroupResource.dangerouslyFetchByModelIds(authenticator, [
+        freshGroupId,
+      ])
+    ).toHaveLength(1);
+
+    // Active agent + group: survived.
+    expect(
+      await AgentConfigurationModel.findAll({
+        where: { name: "Survivor", workspaceId: workspace.id },
+      })
+    ).toHaveLength(1);
+    expect(
+      await GroupResource.dangerouslyFetchByModelIds(authenticator, [
+        activeGroupId,
+      ])
+    ).toHaveLength(1);
+  });
+});
+
+const PAST_SYNTHETIC_THRESHOLD_MS =
+  (SYNTHETIC_SUGGESTIONS_RETENTION_DAYS + 1) * 24 * 3600 * 1000;
+
+describe("purgeExpiredSyntheticSkillSuggestionsActivity", () => {
+  it("deletes synthetic skill suggestions older than threshold", async () => {
+    const { authenticator } = await createResourceTest({
+      role: "admin",
+    });
+
+    const skill = await SkillFactory.create(authenticator);
+    const suggestion = await SkillSuggestionFactory.create(
+      authenticator,
+      skill,
+      { source: "synthetic" }
+    );
+
+    // Advance time past the synthetic retention threshold.
+    vi.advanceTimersByTime(PAST_SYNTHETIC_THRESHOLD_MS);
+
+    await purgeExpiredSyntheticSkillSuggestionsActivity();
+
+    const remaining = await SkillSuggestionResource.fetchById(
+      authenticator,
+      suggestion.sId
+    );
+    expect(remaining).toBeNull();
+  });
+
+  it("does not delete synthetic skill suggestions younger than threshold", async () => {
+    const { authenticator } = await createResourceTest({
+      role: "admin",
+    });
+
+    const skill = await SkillFactory.create(authenticator);
+    const suggestion = await SkillSuggestionFactory.create(
+      authenticator,
+      skill,
+      { source: "synthetic" }
+    );
+
+    await purgeExpiredSyntheticSkillSuggestionsActivity();
+
+    const remaining = await SkillSuggestionResource.fetchById(
+      authenticator,
+      suggestion.sId
+    );
+    expect(remaining).not.toBeNull();
+  });
+
+  it("does not delete non-synthetic skill suggestions older than threshold", async () => {
+    const { authenticator } = await createResourceTest({
+      role: "admin",
+    });
+
+    const skill = await SkillFactory.create(authenticator);
+    const suggestion = await SkillSuggestionFactory.create(
+      authenticator,
+      skill,
+      { source: "reinforcement" }
+    );
+
+    // Advance time past the synthetic retention threshold.
+    vi.advanceTimersByTime(PAST_SYNTHETIC_THRESHOLD_MS);
+
+    await purgeExpiredSyntheticSkillSuggestionsActivity();
+
+    const remaining = await SkillSuggestionResource.fetchById(
+      authenticator,
+      suggestion.sId
+    );
+    expect(remaining).not.toBeNull();
+  });
+});

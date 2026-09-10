@@ -1,0 +1,708 @@
+import { MAX_DISCOUNT_PERCENT } from "@app/lib/api/assistant/token_pricing";
+import type { Authenticator } from "@app/lib/auth";
+import { createMetronomeCommit } from "@app/lib/metronome/client";
+import {
+  getCreditTypeProgrammaticUsdId,
+  getProductPrepaidCommitId,
+} from "@app/lib/metronome/constants";
+import type { CustomerFacingInvoiceInfo } from "@app/lib/plans/stripe";
+import {
+  ENTERPRISE_N30_PAYMENTS_DAYS,
+  finalizeInvoice,
+  getCreditAmountFromInvoice,
+  getCreditPurchaseCouponId,
+  isCreditPurchaseInvoice,
+  MAX_PRO_INVOICE_ATTEMPTS_BEFORE_VOIDED,
+  makeCreditPurchaseOneOffInvoiceForCustomer,
+  makeCreditPurchaseOneOffInvoiceForSubscription,
+  payInvoice,
+  voidInvoiceWithReason,
+} from "@app/lib/plans/stripe";
+import { CreditResource } from "@app/lib/resources/credit_resource";
+import { statsDMetrics } from "@app/lib/utils/statsd";
+import logger from "@app/logger/logger";
+import type { SupportedCurrency } from "@app/types/currency";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import assert from "assert";
+import type Stripe from "stripe";
+
+export async function startCreditFromProOneOffInvoice({
+  auth,
+  invoice,
+}: {
+  auth: Authenticator;
+  invoice: Stripe.Invoice;
+}): Promise<Result<undefined, Error>> {
+  if (!isCreditPurchaseInvoice(invoice)) {
+    throw new Error(
+      `Cannot process this invoice for credit purchase: ${invoice.id}`
+    );
+  }
+
+  const workspace = auth.getNonNullableWorkspace();
+  const creditAmountCents = getCreditAmountFromInvoice(invoice);
+
+  if (creditAmountCents === null) {
+    logger.error(
+      {
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+        creditAmountCents: invoice.metadata?.credit_amount_cents,
+      },
+      "[Credit Purchase] Invalid credit amount in invoice metadata"
+    );
+    statsDMetrics.increment("credits.top_up.error", 1, [
+      `workspace_id:${workspace.sId}`,
+      "type:committed",
+      "customer:pro",
+    ]);
+    return new Err(new Error("Invalid credit amount in invoice metadata"));
+  }
+
+  const credit = await CreditResource.fetchByInvoiceOrLineItemId(
+    auth,
+    invoice.id
+  );
+
+  if (!credit) {
+    logger.error(
+      {
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+      },
+      "[Credit Purchase] Credit not found for invoice"
+    );
+    statsDMetrics.increment("credits.top_up.error", 1, [
+      `workspace_id:${workspace.sId}`,
+      "type:committed",
+      "customer:pro",
+    ]);
+    return new Err(new Error("Credit not found for invoice"));
+  }
+
+  const startResult = await credit.start(auth);
+  if (startResult.isErr()) {
+    logger.error(
+      {
+        workspaceId: workspace.sId,
+        creditAmountCents,
+        invoiceId: invoice.id,
+        creditId: credit.id,
+        expirationDate: credit.expirationDate,
+      },
+      "[Credit Purchase] Error starting credit"
+    );
+    statsDMetrics.increment("credits.top_up.error", 1, [
+      `workspace_id:${workspace.sId}`,
+      "type:committed",
+      "customer:pro",
+    ]);
+    return new Err(startResult.error);
+  }
+  statsDMetrics.increment("credits.top_up.success", 1, [
+    `workspace_id:${workspace.sId}`,
+    "type:committed",
+    "customer:pro",
+  ]);
+
+  if (creditAmountCents) {
+    const metronomeResult = await addMetronomeCommitsForWorkspace({
+      auth,
+      credit,
+      amountCredits: creditAmountCents / 100,
+      startDate: startResult.value.startDate,
+      expirationDate: startResult.value.expirationDate,
+    });
+    if (metronomeResult.isErr()) {
+      return new Err(metronomeResult.error);
+    }
+  }
+
+  logger.info(
+    {
+      workspaceId: workspace.sId,
+      creditAmountCents,
+      invoiceId: invoice.id,
+      creditId: credit.id,
+    },
+    "[Credit Purchase] Successfully activated credit for Pro subscription"
+  );
+  return new Ok(undefined);
+}
+
+// We added this method because even though it's super rare, ENT customer
+// can self-serve credits, and if their plan/account was not correctly configured it can fail
+// with no path to recovery (other than manual eng intervention)
+export async function startCreditFromEnterpriseOneOffInvoice({
+  auth,
+  invoice,
+}: {
+  auth: Authenticator;
+  invoice: Stripe.Invoice;
+}): Promise<Result<{ alreadyStarted: boolean }, Error>> {
+  if (!isCreditPurchaseInvoice(invoice)) {
+    throw new Error(
+      `Cannot process this invoice for enterprise credit purchase: ${invoice.id}`
+    );
+  }
+
+  const workspace = auth.getNonNullableWorkspace();
+  const creditAmountCents = getCreditAmountFromInvoice(invoice);
+
+  if (creditAmountCents === null) {
+    logger.error(
+      {
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+        creditAmountCents: invoice.metadata?.credit_amount_cents,
+      },
+      "[Credit Purchase] Invalid credit amount in invoice metadata"
+    );
+    statsDMetrics.increment("credits.top_up.error", 1, [
+      `workspace_id:${workspace.sId}`,
+      "type:committed",
+      "customer:enterprise",
+    ]);
+    return new Err(new Error("Invalid credit amount in invoice metadata"));
+  }
+
+  const credit = await CreditResource.fetchByInvoiceOrLineItemId(
+    auth,
+    invoice.id
+  );
+
+  if (!credit) {
+    logger.error(
+      {
+        panic: true,
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+      },
+      "[Credit Purchase] Credit not found for paid enterprise invoice"
+    );
+    statsDMetrics.increment("credits.top_up.error", 1, [
+      `workspace_id:${workspace.sId}`,
+      "type:committed",
+      "customer:enterprise",
+    ]);
+    return new Err(new Error("Credit not found for invoice"));
+  }
+
+  // For enterprise, the credit is normally started optimistically at invoice creation
+  // (see createEnterpriseCreditPurchase). The webhook firing later just
+  // confirms payment, so finding a started credit is the expected case.
+  if (credit.startDate !== null) {
+    logger.info(
+      {
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+        creditId: credit.id,
+      },
+      "[Credit Purchase] Enterprise credit already started, ack only"
+    );
+    return new Ok({ alreadyStarted: true });
+  }
+
+  // Edge case: optimistic start did not happen. Recover by starting the credit now.
+  const startResult = await credit.start(auth);
+  if (startResult.isErr()) {
+    logger.error(
+      {
+        workspaceId: workspace.sId,
+        creditAmountCents,
+        invoiceId: invoice.id,
+        creditId: credit.id,
+        expirationDate: credit.expirationDate,
+      },
+      "[Credit Purchase] Error starting enterprise credit from webhook"
+    );
+    statsDMetrics.increment("credits.top_up.error", 1, [
+      `workspace_id:${workspace.sId}`,
+      "type:committed",
+      "customer:enterprise",
+    ]);
+    return new Err(startResult.error);
+  }
+  statsDMetrics.increment("credits.top_up.success", 1, [
+    `workspace_id:${workspace.sId}`,
+    "type:committed",
+    "customer:enterprise",
+  ]);
+
+  const metronomeResult = await addMetronomeCommitsForWorkspace({
+    auth,
+    credit,
+    amountCredits: creditAmountCents / 100,
+    startDate: startResult.value.startDate,
+    expirationDate: startResult.value.expirationDate,
+  });
+  if (metronomeResult.isErr()) {
+    return new Err(metronomeResult.error);
+  }
+
+  logger.info(
+    {
+      workspaceId: workspace.sId,
+      creditAmountCents,
+      invoiceId: invoice.id,
+      creditId: credit.id,
+    },
+    "[Credit Purchase] Recovered and started enterprise credit from webhook"
+  );
+  return new Ok({ alreadyStarted: false });
+}
+
+export async function voidFailedProCreditPurchaseInvoice({
+  auth,
+  invoice,
+}: {
+  auth: Authenticator;
+  invoice: Stripe.Invoice;
+}): Promise<Result<{ voided: boolean }, Error>> {
+  const workspace = auth.getNonNullableWorkspace();
+
+  if (invoice.attempt_count < MAX_PRO_INVOICE_ATTEMPTS_BEFORE_VOIDED) {
+    return new Ok({ voided: false });
+  }
+
+  const voidResult = await voidInvoiceWithReason(
+    invoice.id,
+    "failed_upfront_pro_credit_purchase"
+  );
+  if (voidResult.isErr()) {
+    return new Err(voidResult.error);
+  }
+
+  const credit = await CreditResource.fetchByInvoiceOrLineItemId(
+    auth,
+    invoice.id
+  );
+
+  if (credit) {
+    await credit.delete(auth);
+  } else {
+    logger.warn(
+      {
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+        attemptCount: invoice.attempt_count,
+      },
+      "[Credit Purchase] Credit not found for failed pro invoice"
+    );
+  }
+
+  logger.info(
+    {
+      workspaceId: workspace.sId,
+      invoiceId: invoice.id,
+      attemptCount: invoice.attempt_count,
+    },
+    "[Credit Purchase] Voided failed invoice and deleted pending credit"
+  );
+
+  return new Ok({ voided: true });
+}
+
+export async function createEnterpriseCreditPurchase({
+  auth,
+  billingTarget,
+  amountMicroUsd,
+  discountPercent,
+  startDate,
+  expirationDate,
+  boughtByUserId,
+  customerFacingInfo,
+}: {
+  auth: Authenticator;
+  billingTarget: CreditPurchaseBillingTarget;
+  amountMicroUsd: number;
+  discountPercent?: number;
+  startDate?: Date;
+  expirationDate?: Date;
+  boughtByUserId?: number;
+  customerFacingInfo?: CustomerFacingInvoiceInfo;
+}): Promise<
+  Result<{ credit: CreditResource; invoiceOrLineItemId: string }, Error>
+> {
+  if (discountPercent !== undefined && discountPercent > MAX_DISCOUNT_PERCENT) {
+    return new Err(
+      new Error(
+        `Discount cannot exceed ${MAX_DISCOUNT_PERCENT}% (would result in selling below cost)`
+      )
+    );
+  }
+
+  const workspace = auth.getNonNullableWorkspace();
+
+  let couponId;
+  if (discountPercent) {
+    const couponResult = await getCreditPurchaseCouponId(discountPercent);
+    if (couponResult.isErr()) {
+      logger.error(
+        {
+          panic: true,
+          error: couponResult.error.message,
+          workspaceId: workspace.sId,
+          discountPercent,
+        },
+        "[Credit Purchase] Failed to create or retrieve coupon"
+      );
+      return couponResult;
+    }
+    couponId = couponResult.value;
+  } else {
+    couponId = undefined;
+  }
+
+  const invoiceResult =
+    billingTarget.type === "stripe-subscription"
+      ? await makeCreditPurchaseOneOffInvoiceForSubscription({
+          stripeSubscriptionId: billingTarget.stripeSubscriptionId,
+          amountMicroUsd,
+          couponId,
+          customerFacingInfo,
+          collectionMethod: "send_invoice",
+          daysUntilDue: ENTERPRISE_N30_PAYMENTS_DAYS,
+        })
+      : await makeCreditPurchaseOneOffInvoiceForCustomer({
+          stripeCustomerId: billingTarget.stripeCustomerId,
+          workspaceId: workspace.sId,
+          currency: billingTarget.currency,
+          amountMicroUsd,
+          couponId,
+          customerFacingInfo,
+          collectionMethod: "send_invoice",
+          daysUntilDue: ENTERPRISE_N30_PAYMENTS_DAYS,
+        });
+
+  if (invoiceResult.isErr()) {
+    logger.error(
+      {
+        error: invoiceResult.error.error_message,
+        workspaceId: workspace.sId,
+        amountMicroUsd,
+        discountPercent,
+        billingTarget: billingTarget.type,
+      },
+      "[Credit Purchase] Failed to create enterprise credit purchase invoice"
+    );
+    return new Err(new Error(invoiceResult.error.error_message));
+  }
+
+  const invoice = invoiceResult.value;
+
+  const credit = await CreditResource.makeNew(auth, {
+    type: "committed",
+    initialAmountMicroUsd: amountMicroUsd,
+    consumedAmountMicroUsd: 0,
+    discount: discountPercent,
+    invoiceOrLineItemId: invoice.id,
+    boughtByUserId,
+  });
+
+  const finalizeResult = await finalizeInvoice(invoice);
+  if (finalizeResult.isErr()) {
+    logger.error(
+      {
+        error: finalizeResult.error.error_message,
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+      },
+      "[Credit Purchase] Failed to finalize enterprise credit purchase invoice"
+    );
+    return new Err(new Error(finalizeResult.error.error_message));
+  }
+
+  const startResult = await credit.start(auth, {
+    startDate,
+    expirationDate,
+  });
+
+  if (startResult.isErr()) {
+    logger.error(
+      {
+        error: startResult.error.message,
+        workspaceId: workspace.sId,
+        invoiceOrLineItemId: invoice.id,
+      },
+      "[Credit Purchase] Failed to start credit after creation"
+    );
+    statsDMetrics.increment("credits.top_up.error", 1, [
+      `workspace_id:${workspace.sId}`,
+      "type:committed",
+      "customer:enterprise",
+    ]);
+    return new Err(startResult.error);
+  }
+
+  statsDMetrics.increment("credits.top_up.success", 1, [
+    `workspace_id:${workspace.sId}`,
+    "type:committed",
+    "customer:enterprise",
+  ]);
+
+  const metronomeResult = await addMetronomeCommitsForWorkspace({
+    auth,
+    credit,
+    amountCredits: amountMicroUsd / 1_000_000,
+    startDate: startResult.value.startDate,
+    expirationDate: startResult.value.expirationDate,
+  });
+  if (metronomeResult.isErr()) {
+    return new Err(metronomeResult.error);
+  }
+
+  logger.info(
+    {
+      workspaceId: workspace.sId,
+      amountMicroUsd,
+      discountPercent,
+      invoiceOrLineItemId: invoice.id,
+      expirationDate: credit.expirationDate,
+    },
+    "[Credit Purchase] Enterprise credit purchase invoice created and credit activated"
+  );
+
+  return new Ok({ credit, invoiceOrLineItemId: invoice.id });
+}
+
+// Where the Stripe one-off credit-purchase invoice lives:
+// - `stripe-subscription`: attached to the workspace's Stripe subscription.
+// - `metronome`: issued directly on the Stripe customer linked through the
+//   Metronome billing config (no Stripe subscription).
+export type CreditPurchaseBillingTarget =
+  | { type: "stripe-subscription"; stripeSubscriptionId: string }
+  | {
+      type: "metronome";
+      stripeCustomerId: string;
+      currency: SupportedCurrency;
+    };
+
+export async function createProCreditPurchase({
+  auth,
+  billingTarget,
+  amountMicroUsd,
+  discountPercent,
+  boughtByUserId,
+}: {
+  auth: Authenticator;
+  billingTarget: CreditPurchaseBillingTarget;
+  amountMicroUsd: number;
+  discountPercent?: number;
+  boughtByUserId?: number;
+}): Promise<Result<{ invoiceId: string; paymentUrl: string | null }, Error>> {
+  if (discountPercent !== undefined && discountPercent > MAX_DISCOUNT_PERCENT) {
+    return new Err(
+      new Error(
+        `Discount cannot exceed ${MAX_DISCOUNT_PERCENT}% (would result in selling below cost)`
+      )
+    );
+  }
+
+  const workspace = auth.getNonNullableWorkspace();
+
+  let couponId;
+  if (discountPercent) {
+    const couponResult = await getCreditPurchaseCouponId(discountPercent);
+    if (couponResult.isErr()) {
+      logger.error(
+        {
+          panic: true,
+          error: couponResult.error.message,
+          workspaceId: workspace.sId,
+          discountPercent,
+        },
+        "[Credit Purchase] Failed to create or retrieve coupon"
+      );
+      return couponResult;
+    }
+    couponId = couponResult.value;
+  }
+
+  const invoiceResult =
+    billingTarget.type === "stripe-subscription"
+      ? await makeCreditPurchaseOneOffInvoiceForSubscription({
+          stripeSubscriptionId: billingTarget.stripeSubscriptionId,
+          amountMicroUsd,
+          couponId,
+          collectionMethod: "charge_automatically",
+          requestThreeDSecure: "challenge",
+        })
+      : await makeCreditPurchaseOneOffInvoiceForCustomer({
+          stripeCustomerId: billingTarget.stripeCustomerId,
+          workspaceId: workspace.sId,
+          currency: billingTarget.currency,
+          amountMicroUsd,
+          couponId,
+          collectionMethod: "charge_automatically",
+          requestThreeDSecure: "challenge",
+        });
+
+  if (invoiceResult.isErr()) {
+    logger.warn(
+      {
+        error: invoiceResult.error.error_message,
+        workspaceId: workspace.sId,
+        amountMicroUsd,
+        billingTarget: billingTarget.type,
+      },
+      "[Credit Purchase] Failed to process credit purchase"
+    );
+    return new Err(new Error(invoiceResult.error.error_message));
+  }
+
+  const invoice = invoiceResult.value;
+
+  await CreditResource.makeNew(auth, {
+    type: "committed",
+    initialAmountMicroUsd: amountMicroUsd,
+    consumedAmountMicroUsd: 0,
+    discount: discountPercent,
+    invoiceOrLineItemId: invoice.id,
+    boughtByUserId,
+  });
+
+  const finalizeResult = await finalizeInvoice(invoice);
+  if (finalizeResult.isErr()) {
+    logger.error(
+      {
+        panic: true,
+        error: finalizeResult.error.error_message,
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+        amountMicroUsd,
+      },
+      "[Credit Purchase] Failed to finalize credit purchase invoice"
+    );
+    return new Err(new Error(finalizeResult.error.error_message));
+  }
+
+  const payResult = await payInvoice(finalizeResult.value);
+  if (payResult.isErr()) {
+    logger.warn(
+      {
+        error: payResult.error.error_message,
+        workspaceId: workspace.sId,
+        invoiceId: invoice.id,
+        amountMicroUsd,
+      },
+      "[Credit Purchase] Failed to pay credit purchase invoice"
+    );
+    return new Err(new Error(payResult.error.error_message));
+  }
+
+  const { paymentUrl } = payResult.value;
+
+  logger.info(
+    {
+      workspaceId: workspace.sId,
+      amountMicroUsd,
+      discountPercent,
+      invoiceId: invoice.id,
+      requiresAction: paymentUrl !== null,
+      billingTarget: billingTarget.type,
+    },
+    "[Credit Purchase] Credit purchase invoice created, credit will be started via webhook"
+  );
+
+  return new Ok({ invoiceId: invoice.id, paymentUrl });
+}
+
+type DeleteCreditError =
+  | { type: "credit_not_found" }
+  | { type: "credit_already_started"; credit: CreditResource };
+
+export async function deleteCreditFromVoidedInvoice({
+  auth,
+  invoice,
+}: {
+  auth: Authenticator;
+  invoice: Stripe.Invoice;
+}): Promise<Result<undefined, DeleteCreditError>> {
+  assert(
+    isCreditPurchaseInvoice(invoice),
+    "deleteCreditFromVoidedInvoice called with non-credit-purchase invoice"
+  );
+
+  const credit = await CreditResource.fetchByInvoiceOrLineItemId(
+    auth,
+    invoice.id
+  );
+
+  if (!credit) {
+    return new Err({ type: "credit_not_found" });
+  }
+
+  if (credit.startDate !== null) {
+    return new Err({ type: "credit_already_started", credit });
+  }
+
+  await credit.delete(auth);
+
+  return new Ok(undefined);
+}
+
+async function addMetronomeCommitsForWorkspace({
+  auth,
+  credit,
+  amountCredits,
+  startDate,
+  expirationDate,
+}: {
+  auth: Authenticator;
+  credit: CreditResource;
+  /** Amount in custom credit units (not cents). */
+  amountCredits: number;
+  startDate: Date;
+  expirationDate: Date;
+}): Promise<Result<void, Error>> {
+  const workspace = auth.getNonNullableWorkspace();
+  const metronomeCustomerId = workspace.metronomeCustomerId;
+
+  if (!metronomeCustomerId) {
+    logger.info(
+      { workspaceId: workspace.sId },
+      "[Commit Purchase] Workspace not provisioned in Metronome, skipping credit addition"
+    );
+    return new Ok(undefined);
+  }
+
+  const productId = getProductPrepaidCommitId();
+
+  const result = await createMetronomeCommit({
+    metronomeCustomerId,
+    productId,
+    creditTypeId: getCreditTypeProgrammaticUsdId(),
+    amount: amountCredits,
+    startingAt: startDate,
+    endingBefore: expirationDate,
+    name: `Prepaid commit (${startDate.toISOString()})`,
+    idempotencyKey: `createCommit-${workspace.sId}-${startDate.getTime()}-${expirationDate.getTime()}`,
+    priority: 2, // Committed credits should be applied after any free credits (priority 1) but before any PAYG commits (priority 3)
+  });
+
+  if (result.isErr()) {
+    logger.error(
+      {
+        workspaceId: workspace.sId,
+        metronomeCustomerId,
+        amountCredits,
+        error: result.error.message,
+      },
+      "[Commit Purchase] Failed to add commits to Metronome"
+    );
+    return new Ok(undefined);
+  }
+
+  if (result.value) {
+    await credit.setMetronomeCreditId(result.value.id);
+  } else {
+    logger.warn(
+      { workspaceId: workspace.sId, metronomeCustomerId },
+      "[Commit Purchase] Metronome commit already exists (idempotency conflict), metronomeCreditId not updated"
+    );
+  }
+
+  return new Ok(undefined);
+}

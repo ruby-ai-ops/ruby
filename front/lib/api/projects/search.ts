@@ -1,0 +1,157 @@
+import { default as config } from "@app/lib/api/config";
+import {
+  getLlmCredentials,
+  MISSING_EMBEDDING_API_KEY_ERROR_MESSAGE,
+} from "@app/lib/api/provider_credentials";
+import type { Authenticator } from "@app/lib/auth";
+import { RubyError } from "@app/lib/error";
+import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import logger from "@app/logger/logger";
+import { CoreAPI } from "@app/types/core/core_api";
+import type { LLMCredentialsType } from "@app/types/provider_credential";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+
+interface SearchProjectConversationsOptions {
+  query: string;
+  spaceIds: string[];
+  topK: number;
+}
+
+interface ConversationSearchResult {
+  conversationId: string;
+  score: number;
+  spaceId: string;
+}
+
+// TODO(2026-09-01 SEARCH): sub-conversations (depth > 0) are indexed and consume
+// the topK budget; callers filter them out post-fetch. Exclude them at sync time
+// instead (listSpaceConversationsForSync) and clean up already-indexed documents.
+export async function searchProjectConversations(
+  auth: Authenticator,
+  options: SearchProjectConversationsOptions
+): Promise<
+  Result<
+    ConversationSearchResult[],
+    RubyError<"core_api_error" | "invalid_request_error">
+  >
+> {
+  const { query, spaceIds, topK } = options;
+
+  if (spaceIds.length === 0) {
+    return new Ok([]);
+  }
+
+  const spaces = (await SpaceResource.fetchByIds(auth, spaceIds)).filter(
+    (space) => auth.can("read", space)
+  );
+
+  if (spaces.length === 0) {
+    return new Ok([]);
+  }
+
+  const dataSourceViews = await DataSourceViewResource.listBySpaces(
+    auth,
+    spaces
+  );
+  const viewBySpaceId = new Map(
+    dataSourceViews.map((dsv) => [dsv.space.sId, dsv])
+  );
+
+  const validProjects = spaces
+    .map((space) => {
+      const dsv = viewBySpaceId.get(space.sId);
+      return dsv ? { space, dataSourceView: dsv } : null;
+    })
+    .filter((p) => p !== null);
+
+  if (validProjects.length === 0) {
+    return new Ok([]);
+  }
+
+  const searches = validProjects.map(({ dataSourceView }) => ({
+    projectId: dataSourceView.dataSource.rubyAPIProjectId,
+    dataSourceId: dataSourceView.dataSource.rubyAPIDataSourceId,
+    view_filter: dataSourceView.toViewFilter(),
+  }));
+
+  const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+  let credentials: LLMCredentialsType;
+  try {
+    credentials = await getLlmCredentials(auth);
+  } catch (err) {
+    logger.error(
+      { error: normalizeError(err) },
+      "Failed to get LLM credentials to search project conversations"
+    );
+    return new Err(
+      new RubyError(
+        "invalid_request_error",
+        MISSING_EMBEDDING_API_KEY_ERROR_MESSAGE
+      )
+    );
+  }
+  const searchResult = await coreAPI.bulkSearchDataSources(
+    query,
+    topK,
+    credentials,
+    false,
+    searches
+  );
+
+  if (searchResult.isErr()) {
+    return new Err(new RubyError("core_api_error", searchResult.error.message));
+  }
+
+  const dataSourceIdToSpaceId = new Map<string, string>();
+  for (const { space, dataSourceView } of validProjects) {
+    dataSourceIdToSpaceId.set(
+      dataSourceView.dataSource.rubyAPIDataSourceId,
+      space.sId
+    );
+  }
+
+  const getDocumentMaxScore = (doc: {
+    chunks: Array<{ score?: number | null }>;
+  }): number => {
+    return Math.max(...doc.chunks.map((chunk) => chunk.score ?? 0), 0);
+  };
+
+  const sortedDocuments = [...searchResult.value.documents].sort(
+    (a, b) => getDocumentMaxScore(b) - getDocumentMaxScore(a)
+  );
+
+  const seen = new Set<string>();
+  const results: ConversationSearchResult[] = [];
+
+  for (const doc of sortedDocuments) {
+    const spaceId = dataSourceIdToSpaceId.get(doc.data_source_id);
+    if (!spaceId) {
+      continue;
+    }
+
+    // O(n*m) acceptable: tags array is small (< 10 elements per document)
+    const conversationTag = doc.tags.find((tag) =>
+      tag.startsWith("conversation:")
+    );
+    if (!conversationTag) {
+      continue;
+    }
+
+    const conversationId = conversationTag.replace("conversation:", "");
+    if (seen.has(conversationId)) {
+      continue;
+    }
+
+    seen.add(conversationId);
+    results.push({
+      conversationId,
+      score: getDocumentMaxScore(doc),
+      spaceId,
+    });
+  }
+
+  return new Ok(results);
+}

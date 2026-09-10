@@ -1,0 +1,723 @@
+import { CustomHeadersConfigurationSection } from "@app/components/actions/mcp/create/CustomHeadersConfigurationSection";
+import { InternalBearerTokenSection } from "@app/components/actions/mcp/create/InternalBearerTokenSection";
+import { RemoteMCPServerConfigurationSection } from "@app/components/actions/mcp/create/RemoteMCPServerConfigurationSection";
+import { getStaticCredentialForm } from "@app/components/actions/mcp/create/static_credential_forms";
+import {
+  isCreateServerError,
+  submitCreateMCPServerDialogForm,
+} from "@app/components/actions/mcp/forms/submitCreateMCPServerDialogForm";
+import type { CreateMCPServerDialogFormValues } from "@app/components/actions/mcp/forms/types";
+import { createMCPServerDialogFormSchema } from "@app/components/actions/mcp/forms/types";
+import {
+  getCreateMCPServerDialogDefaultValues,
+  getMCPServerViewNameError,
+  handleCreateMCPServerDialogSubmitError,
+} from "@app/components/actions/mcp/forms/utils";
+import type {
+  StaticCredentialConfig,
+  StaticCredentialFormHandle,
+} from "@app/components/actions/mcp/MCPServerAuthConnection";
+import { MCPServerAuthConnection } from "@app/components/actions/mcp/MCPServerAuthConnection";
+import { getAvatarFromIcon } from "@app/components/resources/resources_icons";
+import { FormProvider } from "@app/components/sparkle/FormProvider";
+import { useSendNotification } from "@app/hooks/useNotification";
+import {
+  getMcpServerDisplayName,
+  requiresBearerTokenConfiguration,
+} from "@app/lib/actions/mcp_helper";
+import { DEFAULT_MCP_SERVER_ICON } from "@app/lib/actions/mcp_icons";
+import type { DefaultRemoteMCPServerConfig } from "@app/lib/actions/mcp_internal_actions/remote_servers";
+import { getTokenFieldLabel } from "@app/lib/actions/mcp_internal_actions/server_token_labels";
+import type { AuthorizationInfo } from "@app/lib/actions/mcp_metadata_extraction";
+import type {
+  MCPServerType,
+  MCPServerViewNameConflictDetails,
+} from "@app/lib/api/mcp";
+import { useCellContext } from "@app/lib/auth/CellContext";
+import {
+  useCreateInternalMCPServer,
+  useCreateMCPServerConnection,
+  useCreateRemoteMCPServer,
+  useDiscoverOAuthMetadata,
+} from "@app/lib/swr/mcp_servers";
+import datadogLogger from "@app/logger/datadogLogger";
+import type { HostDerivedOAuthConfig } from "@app/types/oauth/lib";
+import {
+  getHostDerivedOAuthCredentialInputs,
+  validateOAuthCredentials,
+} from "@app/types/oauth/lib";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { WorkspaceType } from "@app/types/user";
+import {
+  AlertCircle,
+  ContentMessage,
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Input,
+  Label,
+} from "@ruby-ai/sparkle";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useForm, useWatch } from "react-hook-form";
+
+/**
+ * Generate a unique view name for a multi-instance MCP server by trying
+ * incrementing suffixes until one is not already taken.
+ */
+function generateUniqueViewName(
+  baseName: string,
+  existingViewNames: string[]
+): string {
+  const existingSet = new Set(existingViewNames);
+  let index = 2;
+  let candidate = `${baseName}_${index}`;
+  while (existingSet.has(candidate)) {
+    index += 1;
+    candidate = `${baseName}_${index}`;
+  }
+  return candidate;
+}
+
+function getSubmitButtonLabel(
+  isLoading: boolean,
+  authorization: AuthorizationInfo | null,
+  defaultServerConfig: DefaultRemoteMCPServerConfig | undefined,
+  oauthConnectionId: string | null
+): string {
+  if (isLoading) {
+    return "Loading...";
+  }
+  if (oauthConnectionId) {
+    return "Save";
+  }
+  if (authorization) {
+    return "Setup connection";
+  }
+  // Use "Next" for OAuth servers, "Save" for others
+  if (defaultServerConfig?.authMethod === "oauth-dynamic") {
+    return "Next";
+  }
+  return "Save";
+}
+
+function getServerErrorDomain(
+  values: CreateMCPServerDialogFormValues,
+  hostDerivedOAuth?: HostDerivedOAuthConfig
+): string {
+  const raw =
+    values.remoteServerUrl ||
+    (hostDerivedOAuth
+      ? values.authCredentials?.[hostDerivedOAuth.hostCredential]
+      : undefined) ||
+    "";
+  if (!raw) {
+    return "the server";
+  }
+  try {
+    return new URL(raw).hostname;
+  } catch {
+    return raw;
+  }
+}
+
+interface CreateMCPServerDialogProps {
+  owner: WorkspaceType;
+  internalMCPServer?: MCPServerType;
+  setMCPServerToShow: (server: MCPServerType) => void;
+  setIsLoading: (isCreating: boolean) => void;
+  isOpen: boolean;
+  setIsOpen: (isOpen: boolean) => void;
+  defaultServerConfig?: DefaultRemoteMCPServerConfig;
+  existingViewNames?: string[];
+}
+
+export function CreateMCPServerDialog({
+  owner,
+  internalMCPServer,
+  setMCPServerToShow,
+  setIsLoading: setExternalIsLoading,
+  isOpen = false,
+  setIsOpen,
+  defaultServerConfig,
+  existingViewNames = [],
+}: CreateMCPServerDialogProps) {
+  const sendNotification = useSendNotification();
+  const cellContext = useCellContext();
+
+  // Determine if this is a multi-instance server that already has an existing instance.
+  const needsCustomName = useMemo(
+    () =>
+      !!internalMCPServer?.allowMultipleInstances &&
+      existingViewNames.includes(internalMCPServer.name),
+    [internalMCPServer, existingViewNames]
+  );
+
+  const suggestedViewName = useMemo(
+    () =>
+      needsCustomName && internalMCPServer
+        ? generateUniqueViewName(internalMCPServer.name, existingViewNames)
+        : undefined,
+    [needsCustomName, internalMCPServer, existingViewNames]
+  );
+
+  const tokenLabel = internalMCPServer
+    ? getTokenFieldLabel(internalMCPServer.name)
+    : undefined;
+  const predefinedHeaders = tokenLabel?.predefinedHeaders;
+  const showBearerTokenSection = tokenLabel?.showBearerTokenSection ?? true;
+
+  const defaultValues = useMemo<CreateMCPServerDialogFormValues>(() => {
+    return {
+      ...getCreateMCPServerDialogDefaultValues(defaultServerConfig),
+      viewName: suggestedViewName ?? "",
+      // Pre-fill headers and store their keys so the form can lock them as non-removable.
+      ...(predefinedHeaders && {
+        useCustomHeaders: true,
+        customHeaders: predefinedHeaders.map((key) => ({ key, value: "" })),
+        predefinedHeaderKeys: predefinedHeaders,
+      }),
+    };
+  }, [defaultServerConfig, suggestedViewName, predefinedHeaders]);
+
+  const form = useForm<CreateMCPServerDialogFormValues>({
+    resolver: zodResolver(createMCPServerDialogFormSchema),
+    defaultValues,
+    mode: "onChange",
+    shouldUnregister: false,
+  });
+
+  const useCase = useWatch({
+    control: form.control,
+    name: "useCase",
+  });
+
+  const authCredentials = useWatch({
+    control: form.control,
+    name: "authCredentials",
+  });
+
+  const viewName = useWatch({
+    control: form.control,
+    name: "viewName",
+  });
+
+  const selectedScopes = useWatch({
+    control: form.control,
+    name: "selectedScopes",
+  });
+
+  const [nameConflict, setNameConflict] = useState<{
+    name: string;
+    conflictDetails?: MCPServerViewNameConflictDetails;
+    oauthConnectionId: string | null;
+  } | null>(null);
+
+  // Client-side validation for the view name field.
+  const viewNameError = getMCPServerViewNameError({
+    viewName,
+    needsCustomName,
+    nameConflict: nameConflict?.name ?? null,
+    conflictDetails: nameConflict?.conflictDetails ?? null,
+    existingViewNames,
+  });
+
+  const [isLoading, setIsLoading] = useState(false);
+  const [serverError, setServerError] = useState<{
+    message: string;
+    domain: string;
+    isRemoteServerError: boolean;
+  } | null>(null);
+
+  // Workflow state - managed via useState, not form state.
+  // These are server-derived values (from OAuth discovery or internal server config),
+  // not user input. Keeping them separate maintains clear separation of concerns.
+  const [authorization, setAuthorization] = useState<AuthorizationInfo | null>(
+    null
+  );
+  const [
+    remoteMCPServerOAuthDiscoveryDone,
+    setRemoteMCPServerOAuthDiscoveryDone,
+  ] = useState(false);
+  const { discoverOAuthMetadata } = useDiscoverOAuthMetadata(owner);
+  const { createWithURL } = useCreateRemoteMCPServer(owner);
+  const { createInternalMCPServer } = useCreateInternalMCPServer(owner);
+  const { createMCPServerConnection } = useCreateMCPServerConnection({
+    owner,
+    connectionType: "workspace",
+  });
+
+  // Only reset on the closed→open transition. Resetting whenever
+  // `defaultValues` changes is unsafe: SWR mutations triggered during submit
+  // (e.g. `createInternalMCPServer` invalidating the servers list) bubble up
+  // to `existingViewNames`, which recomputes `defaultValues` here and would
+  // clobber in-flight user state — most visibly, it resets `useCase` to null
+  // and unmounts the static credential form mid-submit.
+  const prevIsOpenRef = useRef(false);
+  const defaultValuesRef = useRef(defaultValues);
+  defaultValuesRef.current = defaultValues;
+  useEffect(() => {
+    if (isOpen && !prevIsOpenRef.current) {
+      form.reset(defaultValuesRef.current);
+    }
+    prevIsOpenRef.current = isOpen;
+  }, [isOpen, form]);
+
+  // Initialize authorization from internalMCPServer when dialog opens.
+  useEffect(() => {
+    if (internalMCPServer && isOpen) {
+      setAuthorization(internalMCPServer.authorization);
+    }
+  }, [internalMCPServer, isOpen]);
+
+  // Initialize authorization for oauth-static remote servers when dialog opens.
+  useEffect(() => {
+    if (defaultServerConfig?.authMethod === "oauth-static" && isOpen) {
+      setAuthorization({
+        provider: "mcp_static",
+        supported_use_cases: defaultServerConfig.supportedOAuthUseCases ?? [],
+      });
+    }
+  }, [defaultServerConfig, isOpen]);
+
+  // Initialize selectedScopes to all available scopes when authorization changes.
+  useEffect(() => {
+    if (authorization?.availableScopes) {
+      form.setValue(
+        "selectedScopes",
+        authorization.availableScopes.map((s) => s.value)
+      );
+    }
+  }, [authorization, form]);
+
+  const resetState = () => {
+    setIsLoading(false);
+    setExternalIsLoading(false);
+    // Reset workflow state (useState).
+    setAuthorization(null);
+    setRemoteMCPServerOAuthDiscoveryDone(false);
+    setNameConflict(null);
+    setIsStaticFormValid(false);
+    setServerError(null);
+    // Reset form state.
+    form.reset(defaultValues);
+  };
+
+  const handleSave = async (values: CreateMCPServerDialogFormValues) => {
+    // Guard: handleSubmit only checks Zod schema errors, not manual setError errors.
+    if (credentialError || viewNameError) {
+      return;
+    }
+
+    setIsLoading(true);
+    setServerError(null);
+
+    const submitRes = await submitCreateMCPServerDialogForm({
+      owner,
+      internalMCPServer,
+      defaultServerId: defaultServerConfig?.id,
+      values,
+      // Pass workflow state as separate params (not from form).
+      authorization,
+      remoteMCPServerOAuthDiscoveryDone,
+      oauthConnectionId: nameConflict?.oauthConnectionId ?? null,
+      discoverOAuthMetadata,
+      createWithURL,
+      createInternalMCPServer,
+      onBeforeCreateServer: () => setExternalIsLoading(true),
+      cellInfo: cellContext.cellInfo,
+    });
+
+    if (submitRes.isErr()) {
+      const err = submitRes.error;
+      if (isCreateServerError(err)) {
+        setIsLoading(false);
+        setExternalIsLoading(false);
+        setRemoteMCPServerOAuthDiscoveryDone(
+          err.remoteMCPServerOAuthDiscoveryDone
+        );
+        setServerError({
+          message: err.message,
+          domain: getServerErrorDomain(
+            values,
+            defaultServerConfig?.hostDerivedOAuth
+          ),
+          isRemoteServerError: err.isRemoteServerError,
+        });
+        return;
+      }
+      handleCreateMCPServerDialogSubmitError({
+        error: err,
+        context: {
+          remoteServerUrl: values.remoteServerUrl,
+          provider: authorization?.provider ?? null,
+        },
+        sendNotification: (title, description) =>
+          sendNotification({ type: "error", title, description }),
+        loading: {
+          setIsLoading,
+          setExternalIsLoading,
+          setRemoteMCPServerOAuthDiscoveryDone,
+        },
+      });
+      return;
+    }
+
+    // Update workflow state from submit result.
+    setRemoteMCPServerOAuthDiscoveryDone(
+      submitRes.value.remoteMCPServerOAuthDiscoveryDone
+    );
+
+    if (submitRes.value.type === "oauth_required") {
+      setAuthorization(submitRes.value.authorization);
+      form.setValue("authCredentials", submitRes.value.authCredentials);
+      // Returning here as now the user must select the use case.
+      setIsLoading(false);
+      return;
+    }
+
+    if (submitRes.value.type === "name_conflict") {
+      setNameConflict({
+        name: submitRes.value.name,
+        conflictDetails: submitRes.value.conflictDetails,
+        oauthConnectionId: submitRes.value.oauthConnectionId,
+      });
+      setExternalIsLoading(false);
+      setIsLoading(false);
+      return;
+    }
+
+    sendNotification({
+      title: "Success",
+      type: "success",
+      description: `${getMcpServerDisplayName(submitRes.value.server)} added successfully.`,
+    });
+    setMCPServerToShow(submitRes.value.server);
+    setExternalIsLoading(false);
+    setIsLoading(false);
+    setIsOpen(false);
+    resetState();
+  };
+
+  const toolName = useMemo(() => {
+    if (internalMCPServer) {
+      return getMcpServerDisplayName(internalMCPServer);
+    }
+    if (defaultServerConfig) {
+      return defaultServerConfig.name;
+    }
+    return "MCP Server";
+  }, [internalMCPServer, defaultServerConfig]);
+
+  const toolIcon = useMemo(() => {
+    if (internalMCPServer) {
+      return internalMCPServer.icon;
+    }
+    if (defaultServerConfig) {
+      return defaultServerConfig.icon;
+    }
+    return DEFAULT_MCP_SERVER_ICON;
+  }, [internalMCPServer, defaultServerConfig]);
+
+  // Host-derived static-OAuth servers show a single host URL + client ID/secret;
+  // the OAuth endpoints, scope and MCP URL are derived from the host at submit.
+  const credentialInputsOverride = useMemo(
+    () =>
+      defaultServerConfig?.hostDerivedOAuth
+        ? getHostDerivedOAuthCredentialInputs(
+            defaultServerConfig.hostDerivedOAuth
+          )
+        : undefined,
+    [defaultServerConfig]
+  );
+
+  const staticFormRef = useRef<StaticCredentialFormHandle>(null);
+  const [isStaticFormValid, setIsStaticFormValid] = useState(false);
+
+  const staticFormComponent =
+    authorization && useCase
+      ? getStaticCredentialForm(authorization.provider, useCase)
+      : null;
+  const hasStaticForm = !!staticFormComponent;
+
+  const staticCredentialConfig: StaticCredentialConfig | undefined =
+    staticFormComponent
+      ? {
+          owner,
+          formRef: staticFormRef,
+          onValidityChange: setIsStaticFormValid,
+          FormComponent: staticFormComponent,
+        }
+      : undefined;
+
+  // Synchronous validation — no race condition with useEffect.
+  const credentialError = useMemo(
+    () =>
+      authorization
+        ? validateOAuthCredentials({
+            provider: authorization.provider,
+            useCase: useCase ?? null,
+            authCredentials: authCredentials ?? null,
+            credentialInputs: credentialInputsOverride ?? null,
+          })
+        : null,
+    [authorization, useCase, authCredentials, credentialInputsOverride]
+  );
+
+  const handleCreateServerAndSubmitStaticCredentials = async () => {
+    if (!internalMCPServer || !authorization || !useCase) {
+      return;
+    }
+
+    const isValid = await form.trigger("viewName");
+    if (!isValid || viewNameError) {
+      return;
+    }
+
+    // Capture the form handle before any async work. SWR mutations that fire
+    // during submit (e.g. `createInternalMCPServer` invalidating the servers
+    // list) can re-render the dialog and unmount the static credential form,
+    // which nulls `staticFormRef.current`. Grabbing it up front avoids that
+    // race.
+    const formHandle = staticFormRef.current;
+    if (!formHandle) {
+      sendNotification({
+        type: "error",
+        title: "Cannot submit credentials",
+        description: "The credentials form is not ready. Please retry.",
+      });
+      datadogLogger.error(
+        {
+          workspaceId: owner.sId,
+          hasAuthorization: !!authorization,
+          useCase,
+        },
+        "Static credential form ref is null at submit time"
+      );
+      return;
+    }
+
+    setIsLoading(true);
+    setExternalIsLoading(true);
+
+    try {
+      const viewName = form.getValues("viewName")?.trim();
+
+      // Create the internal server without an OAuth connection.
+      const createRes = await createInternalMCPServer({
+        name: internalMCPServer.name,
+        useCase,
+        includeGlobal: true,
+        ...(viewName ? { viewName } : {}),
+      });
+
+      if (createRes.isErr()) {
+        sendNotification({
+          type: "error",
+          title: "Failed to create server",
+          description: createRes.error.message,
+        });
+        return;
+      }
+
+      const createdServer = createRes.value.server;
+
+      const credentialId = await formHandle.submit();
+      if (!credentialId) {
+        // The form surfaced its own notification for the specific failure;
+        // log here so we also have a parent-side breadcrumb.
+        datadogLogger.warn(
+          {
+            workspaceId: owner.sId,
+            mcpServerId: createdServer.sId,
+          },
+          "Static credential form submit returned null"
+        );
+        return;
+      }
+
+      const connectionCreationRes = await createMCPServerConnection({
+        credentialId,
+        mcpServerId: createdServer.sId,
+        mcpServerDisplayName: getMcpServerDisplayName(createdServer),
+        provider: authorization.provider,
+      });
+      if (!connectionCreationRes) {
+        datadogLogger.error(
+          {
+            workspaceId: owner.sId,
+            mcpServerId: createdServer.sId,
+            credentialId,
+          },
+          "createMCPServerConnection returned falsy result"
+        );
+        return;
+      }
+
+      sendNotification({
+        title: "Success",
+        type: "success",
+        description: `${getMcpServerDisplayName(createdServer)} added successfully.`,
+      });
+      setMCPServerToShow(createdServer);
+      setIsOpen(false);
+      resetState();
+    } catch (err) {
+      const e = normalizeError(err);
+      sendNotification({
+        type: "error",
+        title: "Failed to add the tool",
+        description: e.message,
+      });
+      datadogLogger.error(
+        { workspaceId: owner.sId, err: e },
+        "Unexpected error in handleCreateServerAndSubmitStaticCredentials"
+      );
+    } finally {
+      setIsLoading(false);
+      setExternalIsLoading(false);
+    }
+  };
+
+  // When OAuth is required (authorization is set), form is valid when:
+  // - use case is selected AND either static form or OAuth credentials are valid.
+  // When no OAuth needed (no authorization), form is always valid for OAuth fields.
+  const isOAuthValid = authorization
+    ? !!useCase && (hasStaticForm ? isStaticFormValid : !credentialError)
+    : true;
+  const isSubmitDisabled = !isOAuthValid || isLoading || !!viewNameError;
+
+  return (
+    <Dialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        setIsOpen(open);
+        resetState();
+      }}
+    >
+      <DialogContent size="lg" onClick={(e) => e.stopPropagation()}>
+        <FormProvider form={form} asForm={false}>
+          <DialogHeader>
+            <DialogTitle visual={getAvatarFromIcon(toolIcon, "sm")}>
+              Configure {toolName}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="overflow-y-auto px-5 py-4">
+            <div className="space-y-4">
+              {serverError && (
+                <ContentMessage
+                  variant="warning"
+                  icon={AlertCircle}
+                  size="lg"
+                  title={
+                    serverError.isRemoteServerError
+                      ? `Server error from ${serverError.domain}`
+                      : "Failed to connect to the server"
+                  }
+                >
+                  {serverError.message}
+                </ContentMessage>
+              )}
+              {(needsCustomName || nameConflict) && (
+                <div className="space-y-2">
+                  <Label htmlFor="viewName">Tool name</Label>
+                  <Input
+                    id="viewName"
+                    placeholder={
+                      needsCustomName
+                        ? "Enter a name for this instance"
+                        : "Enter a different name"
+                    }
+                    {...form.register("viewName")}
+                    isError={!!viewNameError}
+                    message={
+                      viewNameError ??
+                      (needsCustomName
+                        ? `${toolName} is already installed. This name tells them apart.`
+                        : "Choose a name that distinguishes this Tool.")
+                    }
+                    messageStatus={viewNameError ? "error" : "info"}
+                  />
+                </div>
+              )}
+
+              {!internalMCPServer &&
+                (!authorization || authorization.provider === "mcp_static") && (
+                  <RemoteMCPServerConfigurationSection
+                    defaultServerConfig={defaultServerConfig}
+                    onAuthorizationChange={setAuthorization}
+                  />
+                )}
+
+              {authorization && (
+                <MCPServerAuthConnection
+                  toolName={toolName}
+                  authorization={authorization}
+                  documentationUrl={
+                    internalMCPServer?.documentationUrl ??
+                    defaultServerConfig?.documentationUrl ??
+                    undefined
+                  }
+                  staticCredentialConfig={staticCredentialConfig}
+                  selectedScopes={selectedScopes}
+                  onSelectedScopesChange={(scopes) =>
+                    form.setValue("selectedScopes", scopes)
+                  }
+                  serverId={defaultServerConfig?.id}
+                  credentialInputsOverride={credentialInputsOverride}
+                />
+              )}
+
+              {internalMCPServer &&
+                requiresBearerTokenConfiguration(internalMCPServer) &&
+                showBearerTokenSection && (
+                  <InternalBearerTokenSection
+                    serverName={internalMCPServer.name}
+                  />
+                )}
+
+              <CustomHeadersConfigurationSection
+                defaultServerConfig={defaultServerConfig}
+                internalMCPServer={internalMCPServer}
+              />
+            </div>
+          </div>
+          <DialogFooter
+            leftButtonProps={{
+              label: "Cancel",
+              variant: "ghost",
+              onClick: () => {
+                setIsOpen(false);
+                resetState();
+              },
+            }}
+            rightButtonProps={{
+              isLoading: isLoading,
+              label: hasStaticForm
+                ? "Connect"
+                : getSubmitButtonLabel(
+                    isLoading,
+                    authorization,
+                    defaultServerConfig,
+                    nameConflict?.oauthConnectionId ?? null
+                  ),
+              variant: "primary",
+              disabled: isSubmitDisabled,
+              onClick: (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (hasStaticForm) {
+                  void handleCreateServerAndSubmitStaticCredentials();
+                } else {
+                  void form.handleSubmit(handleSave)();
+                }
+              },
+            }}
+          />
+        </FormProvider>
+      </DialogContent>
+    </Dialog>
+  );
+}

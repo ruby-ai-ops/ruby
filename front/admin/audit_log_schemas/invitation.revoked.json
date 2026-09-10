@@ -1,0 +1,15 @@
+{
+  "action": "invitation.revoked",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "invitation"
+    }
+  ],
+  "metadata": {
+    "invited_email": "string",
+    "actor_type": "string"
+  }
+}

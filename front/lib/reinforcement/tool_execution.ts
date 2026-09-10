@@ -1,0 +1,272 @@
+import { AGENT_SIDEKICK_CONTEXT_TOOL_NAME } from "@app/lib/api/actions/servers/agent_sidekick_context/metadata";
+import type { Authenticator, AuthenticatorType } from "@app/lib/auth";
+import type {
+  ExploratoryToolCallInfo,
+  ReinforcedSkillsToolCallInfo,
+  TerminalToolCallFailure,
+  TerminalToolCallSuccess,
+} from "@app/lib/reinforcement/types";
+import { AgentMCPActionResource } from "@app/lib/resources/agent_mcp_action_resource";
+import { AgentStepContentResource } from "@app/lib/resources/agent_step_content_resource";
+import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import type { AgentFunctionCallContentType } from "@app/types/assistant/agent_message_content";
+import type {
+  ConversationWithoutContentType,
+  UserMessageOrigin,
+} from "@app/types/assistant/conversation";
+import type { ModelId } from "@app/types/shared/model_id";
+
+/**
+ * Info needed by the workflow to call runRetryableToolActivity and
+ * then read back the results.
+ */
+export interface ReinforcedToolActionInfo {
+  authType: AuthenticatorType;
+  agentLoopArgs: {
+    agentMessageId: string;
+    agentMessageVersion: number;
+    conversationId: string;
+    conversationTitle: string | null;
+    userMessageId: string;
+    userMessageVersion: number;
+    userMessageOrigin: UserMessageOrigin;
+    initialStartTime: number;
+  };
+  actionIds: ModelId[];
+  exploratoryToolCalls: ExploratoryToolCallInfo[];
+}
+
+async function fetchStepContentByCallId(
+  auth: Authenticator,
+  agentMessageModelId: ModelId
+): Promise<
+  Map<
+    string,
+    AgentStepContentResource & { value: AgentFunctionCallContentType }
+  >
+> {
+  const stepContents = await AgentStepContentResource.fetchByAgentMessages(
+    auth,
+    { agentMessageIds: [agentMessageModelId] }
+  );
+
+  const functionCallStepContents = stepContents.filter(
+    (
+      s
+    ): s is AgentStepContentResource & {
+      value: AgentFunctionCallContentType;
+    } => s.type === "function_call"
+  );
+
+  return new Map(functionCallStepContents.map((s) => [s.value.value.id, s]));
+}
+
+async function getAgentSidekickContextViewId(
+  auth: Authenticator
+): Promise<string> {
+  const view = await MCPServerViewResource.getMCPServerViewForAutoInternalTool(
+    auth,
+    AGENT_SIDEKICK_CONTEXT_TOOL_NAME
+  );
+  if (!view) {
+    throw new Error(
+      "MCPServerView not found for agent_sidekick_context internal server"
+    );
+  }
+  return view.sId;
+}
+
+async function createReinforcedAction(
+  auth: Authenticator,
+  {
+    agentMessageModelId,
+    conversation,
+    mcpServerViewId,
+    stepContent,
+    toolCall,
+  }: {
+    agentMessageModelId: ModelId;
+    conversation: ConversationWithoutContentType;
+    mcpServerViewId: string;
+    stepContent: AgentStepContentResource;
+    toolCall: ReinforcedSkillsToolCallInfo;
+  }
+): Promise<AgentMCPActionResource> {
+  return AgentMCPActionResource.makeNew(
+    auth,
+    { conversation, stepContent },
+    {
+      agentMessageId: agentMessageModelId,
+      augmentedInputs: toolCall.arguments,
+      citationsAllocated: 0,
+      mcpServerConfigurationId: "agent_sidekick_context",
+      status: "ready_allowed_explicitly",
+      stepContext: {
+        citationsCount: 0,
+        citationsOffset: 0,
+        resumeState: null,
+        retrievalTopK: 0,
+        websearchResultCount: 0,
+      },
+      toolConfiguration: {
+        id: -1,
+        sId: generateRandomModelSId(),
+        type: "mcp_configuration",
+        name: toolCall.name,
+        originalName: toolCall.name,
+        mcpServerName: "agent_sidekick_context",
+        dataSources: null,
+        tables: null,
+        childAgentId: null,
+        timeFrame: null,
+        jsonSchema: null,
+        additionalConfiguration: {},
+        mcpServerViewId,
+        rubyAppConfiguration: null,
+        internalMCPServerId: "agent_sidekick_context",
+        secretName: null,
+        rubyProject: null,
+        availability: "auto",
+        permission: "never_ask",
+        toolServerId: "agent_sidekick_context",
+        retryPolicy: "no_retry",
+      },
+    }
+  );
+}
+
+/**
+ * Create AgentMCPActionResource records for each exploratory tool call.
+ * Returns the info needed by the workflow to call runRetryableToolActivity.
+ */
+export async function prepareReinforcedToolActions(
+  auth: Authenticator,
+  {
+    agentMessageId,
+    agentMessageModelId,
+    conversation,
+    exploratoryToolCalls,
+    userMessageId,
+  }: {
+    agentMessageId: string;
+    agentMessageModelId: ModelId;
+    conversation: ConversationWithoutContentType;
+    exploratoryToolCalls: ExploratoryToolCallInfo[];
+    userMessageId: string;
+  }
+): Promise<ReinforcedToolActionInfo> {
+  const [stepContentByCallId, mcpServerViewId] = await Promise.all([
+    fetchStepContentByCallId(auth, agentMessageModelId),
+    getAgentSidekickContextViewId(auth),
+  ]);
+
+  const actionIds: ModelId[] = [];
+  for (const tc of exploratoryToolCalls) {
+    const stepContent = stepContentByCallId.get(tc.id);
+    if (!stepContent) {
+      throw new Error(
+        `Step content not found for function call ${tc.id} (${tc.name})`
+      );
+    }
+
+    const action = await createReinforcedAction(auth, {
+      toolCall: tc,
+      conversation,
+      agentMessageModelId,
+      stepContent,
+      mcpServerViewId,
+    });
+
+    actionIds.push(action.id);
+  }
+
+  return {
+    authType: auth.toJSON(),
+    agentLoopArgs: {
+      agentMessageId: agentMessageId,
+      agentMessageVersion: 0,
+      conversationId: conversation.sId,
+      conversationTitle: null,
+      userMessageId: userMessageId,
+      userMessageVersion: 0,
+      userMessageOrigin: "reinforcement",
+      initialStartTime: Date.now(),
+    },
+    actionIds,
+    exploratoryToolCalls,
+  };
+}
+
+/**
+ * Store results for all terminal tool calls in the reinforcement conversation.
+ * Creates AgentMCPActionResource records with output items so the rendering pipeline
+ * picks them up as function results. This allows the LLM to see which calls succeeded
+ * and which failed, so it can retry only the failed ones on the next iteration.
+ */
+export async function storeTerminalToolCallResults(
+  auth: Authenticator,
+  {
+    successfulToolCalls,
+    failedToolCalls,
+    agentMessageModelId,
+    conversation,
+  }: {
+    successfulToolCalls: TerminalToolCallSuccess[];
+    failedToolCalls: TerminalToolCallFailure[];
+    agentMessageModelId: ModelId;
+    conversation: ConversationWithoutContentType;
+  }
+): Promise<void> {
+  const [stepContentByCallId, mcpServerViewId] = await Promise.all([
+    fetchStepContentByCallId(auth, agentMessageModelId),
+    getAgentSidekickContextViewId(auth),
+  ]);
+
+  for (const { toolCall, message } of successfulToolCalls) {
+    const stepContent = stepContentByCallId.get(toolCall.id);
+    if (!stepContent) {
+      continue;
+    }
+
+    const action = await createReinforcedAction(auth, {
+      conversation,
+      toolCall,
+      agentMessageModelId,
+      stepContent,
+      mcpServerViewId,
+    });
+
+    const outputRes = await action.createOutputItems(auth, [
+      { content: { type: "text", text: message } },
+    ]);
+    if (outputRes.isErr()) {
+      throw outputRes.error;
+    }
+    await action.markAsSucceeded({ executionDurationMs: 0 });
+  }
+
+  for (const { toolCall, errorMessage } of failedToolCalls) {
+    const stepContent = stepContentByCallId.get(toolCall.id);
+    if (!stepContent) {
+      continue;
+    }
+
+    const action = await createReinforcedAction(auth, {
+      conversation,
+      toolCall,
+      agentMessageModelId,
+      stepContent,
+      mcpServerViewId,
+    });
+
+    const outputRes = await action.createOutputItems(auth, [
+      { content: { type: "text", text: errorMessage } },
+    ]);
+    if (outputRes.isErr()) {
+      throw outputRes.error;
+    }
+
+    await action.markAsErrored({ executionDurationMs: 0 });
+  }
+}

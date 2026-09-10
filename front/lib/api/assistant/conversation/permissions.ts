@@ -1,0 +1,317 @@
+import { getAgentConfigurations } from "@app/lib/api/assistant/configuration/agent";
+import { getContentFragmentsSpaceIds } from "@app/lib/api/assistant/permissions";
+import { listUsersWithoutAccessToSpaceResources } from "@app/lib/api/spaces/access";
+import { Authenticator } from "@app/lib/auth";
+import type { ConversationAccessType } from "@app/lib/resources/conversation_resource";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { getResourceIdFromSId } from "@app/lib/resources/string_ids";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import { isPodConversation } from "@app/types/assistant/conversation";
+import uniq from "lodash/uniq";
+import type { Transaction } from "sequelize";
+
+/**
+ * Check if a user can access a conversation based on space permissions.
+ * Returns true if the user has read access to all required spaces.
+ */
+export async function canUserAccessConversation(
+  auth: Authenticator,
+  {
+    userId,
+    conversationId,
+  }: {
+    userId: string;
+    conversationId: string;
+  }
+): Promise<ConversationAccessType> {
+  const workspace = auth.getNonNullableWorkspace();
+  const fakeAuth = await Authenticator.fromUserIdAndWorkspaceId(
+    userId,
+    workspace.sId
+  );
+
+  const access = await ConversationResource.canAccess(fakeAuth, conversationId);
+
+  return access;
+}
+
+/**
+ * Check if a user is a member of a space (project).
+ */
+export async function isUserMemberOfSpace(
+  auth: Authenticator,
+  {
+    userId,
+    spaceId,
+  }: {
+    userId: string;
+    spaceId: string;
+  }
+): Promise<boolean> {
+  const space = await SpaceResource.fetchById(auth, spaceId);
+  if (!space) {
+    return false;
+  }
+
+  const userAuth = await Authenticator.fromUserIdAndWorkspaceId(
+    userId,
+    auth.getNonNullableWorkspace().sId
+  );
+
+  if (!userAuth) {
+    return false;
+  }
+
+  return space.isMember(userAuth);
+}
+
+/**
+ * Check if the current user can add members to a project space.
+ */
+export async function canCurrentUserAddProjectMembers(
+  auth: Authenticator,
+  spaceId: string,
+  mentionedUserId: string
+): Promise<boolean> {
+  const space = await SpaceResource.fetchById(auth, spaceId);
+  if (!space) {
+    return false;
+  }
+  return space.canAddMember(auth, mentionedUserId);
+}
+
+export async function canAgentBeUsedInProjectConversation(
+  auth: Authenticator,
+  {
+    configuration,
+    conversation,
+    transaction,
+  }: {
+    configuration: LightAgentConfigurationType;
+    conversation: ConversationWithoutContentType;
+    transaction?: Transaction;
+  }
+): Promise<boolean> {
+  if (!isPodConversation(conversation)) {
+    throw new Error("Unexpected: conversation is not a project conversation");
+  }
+
+  // In case of Project's conversation, we need to check if the agent configuration is using only the project spaces or open spaces, otherwise we reject the mention and do not create the agent message.
+  // Check to skip heavy work if the agent configuration is only using the project space.
+  if (
+    configuration.requestedSpaceIds.some(
+      (spaceId) => spaceId !== conversation.spaceId
+    )
+  ) {
+    // Need to load all the spaces to check if they are restricted.
+    const spaces = await SpaceResource.fetchByIds(
+      auth,
+      // Ensure we have the project's space in the list of spaces to check.
+      uniq([conversation.spaceId, ...configuration.requestedSpaceIds]),
+      { transaction }
+    );
+    const openIds = await SpaceResource.listOpenSpaceModelIds(auth, spaces);
+    if (
+      spaces
+        // Exclude the project's space from the check.
+        .filter((space) => space.sId !== conversation.spaceId)
+        // Check if any of the other spaces are restricted.
+        .some((space) => !openIds.has(space.id))
+    ) {
+      const project = spaces.find(
+        (space) => space.sId === conversation.spaceId
+      );
+      if (!project) {
+        throw new Error("Unexpected: project not found");
+      }
+
+      // Special case for restricted projects whose members all belong to every
+      // restricted space required by the agent, we can use the agent directly.
+      if (!openIds.has(project.id)) {
+        const restrictedAgentSpaces = spaces.filter(
+          (space) =>
+            space.sId !== conversation.spaceId && !openIds.has(space.id)
+        );
+        const projectMembers =
+          await project.fetchDistinctActiveManualGroupMembers(auth);
+
+        if (restrictedAgentSpaces.length > 0 && projectMembers.length > 0) {
+          const membersWithoutAccess =
+            await listUsersWithoutAccessToSpaceResources(auth, {
+              spaces: restrictedAgentSpaces,
+              users: projectMembers,
+            });
+          return membersWithoutAccess.length === 0;
+        }
+      }
+
+      // Otherwises, we cannot use the agent directly.
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export async function isAgentRestrictedBySpaceUsage(
+  auth: Authenticator,
+  {
+    configuration,
+    conversation,
+  }: {
+    configuration: LightAgentConfigurationType | null;
+    conversation: ConversationWithoutContentType;
+  }
+): Promise<boolean> {
+  if (!configuration || !isPodConversation(conversation)) {
+    return false;
+  }
+
+  return !(await canAgentBeUsedInProjectConversation(auth, {
+    configuration,
+    conversation,
+  }));
+}
+
+/**
+ * Update the conversation requestedSpaceIds based on the mentioned agents. This function is purely
+ * additive - requirements are never removed.
+ *
+ * Each agent's requestedSpaceIds represents a set of requirements that must be satisfied. When an
+ * agent is mentioned in a conversation, its requirements are added to the conversation's
+ * requirements.
+ *
+ * - Within each requirement (sub-array), groups are combined with OR logic.
+ * - Different requirements (different sub-arrays) are combined with AND logic.
+ */
+export async function updateConversationRequirements(
+  auth: Authenticator,
+  {
+    agents,
+    contentFragmentDatasourceViewIds,
+    conversation,
+    t,
+  }: {
+    agents?: LightAgentConfigurationType[];
+    contentFragmentDatasourceViewIds?: string[];
+    conversation: ConversationWithoutContentType;
+    t?: Transaction;
+  }
+): Promise<void> {
+  // !!! IMPORTANT !!!
+  // By design, project conversations are always visible to everyone that have READ permission to the project.
+  // Therefor we strip all the space requirements from the conversation.
+  // It means that we rely on agents and content fragments permissions checking to have happened before.
+  // It also means that if we "move" a conversation to a project, we need to update the conversation requirements and we make it visibel
+  if (isPodConversation(conversation)) {
+    const spaceModelId = getResourceIdFromSId(conversation.spaceId);
+    if (spaceModelId === null) {
+      throw new Error("Unexpected: invalid space sId in conversation.");
+    }
+    if (
+      conversation.requestedSpaceIds.length !== 1 ||
+      conversation.requestedSpaceIds[0] !== conversation.spaceId
+    ) {
+      await ConversationResource.updateRequirements(
+        auth,
+        conversation.sId,
+        [spaceModelId],
+        t
+      );
+    }
+    return;
+  }
+
+  let newSpaceRequirements: string[] = [];
+
+  if (agents) {
+    newSpaceRequirements = agents.flatMap((agent) => agent.requestedSpaceIds);
+  }
+  if (!!contentFragmentDatasourceViewIds?.length) {
+    const requestedSpaceIds = await getContentFragmentsSpaceIds(
+      auth,
+      contentFragmentDatasourceViewIds
+    );
+    newSpaceRequirements.push(...requestedSpaceIds);
+  }
+
+  newSpaceRequirements = uniq(newSpaceRequirements);
+
+  const currentSpaceRequirements = conversation.requestedSpaceIds;
+
+  const areAllSpaceRequirementsPresent = newSpaceRequirements.every((newReq) =>
+    currentSpaceRequirements.includes(newReq)
+  );
+
+  // Early return if all new requirements are already present.
+  if (areAllSpaceRequirementsPresent) {
+    return;
+  }
+
+  // Get missing requirements.
+  const spaceRequirementsToAdd = newSpaceRequirements.filter(
+    (newReq) => !currentSpaceRequirements.includes(newReq)
+  );
+
+  // Convert all sIds to modelIds.
+  const sIdToModelId = new Map<string, number>();
+  const getModelId = (sId: string) => {
+    if (!sIdToModelId.has(sId)) {
+      const id = getResourceIdFromSId(sId);
+      if (id === null) {
+        throw new Error("Unexpected: invalid group id");
+      }
+      sIdToModelId.set(sId, id);
+    }
+    return sIdToModelId.get(sId)!;
+  };
+
+  const allSpaceRequirements = [
+    ...currentSpaceRequirements.map(getModelId),
+    ...spaceRequirementsToAdd.map(getModelId),
+  ];
+
+  await ConversationResource.updateRequirements(
+    auth,
+    conversation.sId,
+    allSpaceRequirements,
+    t
+  );
+}
+
+/**
+ * Rebuild the requestedSpaceIds for a conversation by collecting space requirements
+ * from all agents mentioned and all content fragments with content nodes.
+ *
+ * This function recalculates the full set of requirements from scratch. Used when moving
+ * a conversation out of a project, since project conversations have their requirements
+ * set to [projectSpaceId] only.
+ */
+export async function rebuildConversationRequirements(
+  auth: Authenticator,
+  conversationResource: ConversationResource
+): Promise<void> {
+  // Clear existing requirements so that updateConversationRequirements starts from a clean state.
+  await conversationResource.updateRequirements(auth, []);
+
+  const { agentConfigurationIds, contentFragmentDatasourceViewIds } =
+    await conversationResource.fetchAgentConfigurationAndContentFragmentIds(
+      auth
+    );
+
+  const agents =
+    agentConfigurationIds.length > 0
+      ? await getAgentConfigurations(auth, {
+          agentIds: agentConfigurationIds,
+          variant: "light",
+        })
+      : [];
+
+  await updateConversationRequirements(auth, {
+    agents,
+    contentFragmentDatasourceViewIds,
+    conversation: conversationResource.toJSON(),
+  });
+}

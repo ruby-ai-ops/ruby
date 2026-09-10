@@ -1,0 +1,285 @@
+import type { Authenticator } from "@app/lib/auth";
+import { ExtensionConfigurationResource } from "@app/lib/resources/extension";
+import { UserResource } from "@app/lib/resources/user_resource";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { renderLightWorkspaceType } from "@app/lib/workspace";
+import logger from "@app/logger/logger";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import type {
+  UserType,
+  UserTypeWithExtensionWorkspaces,
+  UserTypeWithWorkspaces,
+} from "@app/types/user";
+
+import { MembershipResource } from "../resources/membership_resource";
+import { findWorkOSOrganizationsForUserId } from "./workos/organization_membership";
+
+/**
+ * Returns the acting user for an authenticated request. Falls back to looking up the user by
+ * email when auth is an API key (used by the Slack integration to attribute actions to the
+ * Slack user via the user-email header).
+ */
+export async function getActiveUserFromAuthOrEmail(
+  auth: Authenticator,
+  fallbackEmail: string | null | undefined
+): Promise<UserType | null> {
+  const authUser = auth.user();
+  if (authUser) {
+    return authUser.toJSON();
+  }
+
+  if (!auth.isKey() || !fallbackEmail) {
+    return null;
+  }
+
+  const users = await UserResource.listByEmail(fallbackEmail);
+  if (users.length === 0) {
+    return null;
+  }
+
+  const workspace = auth.getNonNullableWorkspace();
+  const { memberships } = await MembershipResource.getActiveMemberships({
+    users,
+    workspace,
+  });
+  const activeUserIds = new Set(memberships.map((m) => m.userId));
+  const firstActive = users.find((u) => activeUserIds.has(u.id));
+  return firstActive ? firstActive.toJSON() : null;
+}
+
+export async function getUserForWorkspace(
+  auth: Authenticator,
+  { userId }: { userId: string }
+): Promise<UserResource | null> {
+  const owner = auth.workspace();
+  if (!owner) {
+    return null;
+  }
+
+  const authUser = auth.user();
+  if (!authUser) {
+    return null;
+  }
+
+  const user = await UserResource.fetchById(userId);
+  if (!user) {
+    return null;
+  }
+
+  const shouldReturnUser = await hasSharedMembership(auth, { user });
+
+  return shouldReturnUser ? user : null;
+}
+
+/**
+ * Batch version of hasSharedMembership: filters users that share at least one
+ * workspace with the authenticated user and have a membership in the auth workspace.
+ * Returns the subset of `users` that pass the privacy check.
+ */
+export async function filterUsersWithSharedMembership(
+  auth: Authenticator,
+  users: UserResource[]
+): Promise<UserResource[]> {
+  if (users.length === 0) {
+    return [];
+  }
+
+  const workspace = auth.workspace();
+  const authUser = auth.user();
+  if (!workspace || !authUser) {
+    return [];
+  }
+
+  // Check which users have a membership in the auth workspace.
+  const { memberships: workspaceMemberships } =
+    await MembershipResource.getActiveMemberships({
+      users,
+      workspace,
+    });
+  const usersInWorkspace = new Set(workspaceMemberships.map((m) => m.userId));
+
+  const usersWithWorkspaceMembership = users.filter((u) =>
+    usersInWorkspace.has(u.id)
+  );
+
+  if (usersWithWorkspaceMembership.length === 0) {
+    return [];
+  }
+
+  // Superusers can see all users that have a workspace membership.
+  if (auth.isRubySuperUser()) {
+    return usersWithWorkspaceMembership;
+  }
+
+  // For regular users: check shared workspaces.
+  const { memberships: authUserMemberships } =
+    await MembershipResource.getActiveMemberships({
+      users: [authUser],
+    });
+  const authUserWorkspaceIds = new Set(
+    authUserMemberships.map((m) => m.workspaceId)
+  );
+
+  const { memberships: candidateMemberships } =
+    await MembershipResource.getActiveMemberships({
+      users: usersWithWorkspaceMembership,
+    });
+
+  // Collect user IDs that share at least one workspace with the auth user.
+  const visibleUserIds = new Set<number>();
+  for (const m of candidateMemberships) {
+    if (authUserWorkspaceIds.has(m.workspaceId)) {
+      visibleUserIds.add(m.userId);
+    }
+  }
+
+  return usersWithWorkspaceMembership.filter((u) => visibleUserIds.has(u.id));
+}
+
+/**
+ * This function checks that both the auth user and the requested user share at least one
+ * workspace membership, and that the requested user had at least one membership in the past
+ * for the auth workspace. Returns false otherwise.
+ */
+export async function hasSharedMembership(
+  auth: Authenticator,
+  { user }: { user: UserResource }
+): Promise<boolean> {
+  const owner = auth.workspace();
+  if (!owner) {
+    return false;
+  }
+
+  const authUser = auth.user();
+  if (!authUser) {
+    return false;
+  }
+
+  // Check that the requested user had at least one membership in the auth workspace.
+  const membership =
+    await MembershipResource.getLatestMembershipOfUserInWorkspace({
+      user,
+      workspace: owner,
+    });
+
+  if (!membership) {
+    return false;
+  }
+
+  // Special case for superusers: they can see all users.
+  if (auth.isRubySuperUser()) {
+    return true;
+  }
+
+  // Check that the auth user is part of at least one workspace that the requested user is in.
+  const { memberships: authUserMemberships } =
+    await MembershipResource.getActiveMemberships({
+      users: [authUser],
+    });
+
+  const authUserWorkspaceIds = new Set(
+    authUserMemberships.map((m) => m.workspaceId)
+  );
+
+  const { memberships: requestedUserMemberships } =
+    await MembershipResource.getActiveMemberships({
+      users: [user],
+    });
+
+  const hasSharedWorkspace = requestedUserMemberships.some((m) =>
+    authUserWorkspaceIds.has(m.workspaceId)
+  );
+
+  if (!hasSharedWorkspace) {
+    return false;
+  }
+
+  return true;
+}
+
+export async function fetchRevokedWorkspace(
+  user: UserTypeWithWorkspaces
+): Promise<Result<WorkspaceResource, Error>> {
+  // TODO(@fontanierh): this doesn't look very solid as it will start to behave
+  // weirdly if a user has multiple revoked memberships.
+  const u = await UserResource.fetchByModelId(user.id);
+
+  if (!u) {
+    const message = "Unreachable: user not found.";
+    logger.error({ userId: user.id }, message);
+    return new Err(new Error(message));
+  }
+
+  const { memberships, total } = await MembershipResource.getLatestMemberships({
+    users: [u],
+  });
+
+  if (total === 0) {
+    const message = "Unreachable: user has no memberships.";
+    logger.error({ userId: user.id }, message);
+    return new Err(new Error(message));
+  }
+
+  const revokedWorkspaceId = memberships[0].workspaceId;
+  const workspace = await WorkspaceResource.fetchByModelId(revokedWorkspaceId);
+
+  if (!workspace) {
+    const message = "Unreachable: workspace not found.";
+    logger.error({ userId: user.id, workspaceId: revokedWorkspaceId }, message);
+    return new Err(new Error(message));
+  }
+
+  return new Ok(workspace);
+}
+
+export async function getUserWithWorkspaces<T extends boolean>(
+  user: UserResource,
+  /** @deprecated Will be removed once all extension clients use the new config endpoint. */
+  populateExtensionConfig: T = false as T
+): Promise<
+  T extends true ? UserTypeWithExtensionWorkspaces : UserTypeWithWorkspaces
+> {
+  const { memberships } = await MembershipResource.getActiveMemberships({
+    users: [user],
+  });
+  const workspaceModelIds = memberships.map((m) => m.workspaceId);
+  const workspaces = await WorkspaceResource.fetchByModelIds(workspaceModelIds);
+
+  const configs = populateExtensionConfig
+    ? await ExtensionConfigurationResource.internalFetchForWorkspaces(
+        workspaceModelIds
+      )
+    : [];
+
+  const organizations = user.workOSUserId
+    ? await findWorkOSOrganizationsForUserId(user.workOSUserId)
+    : [];
+
+  return {
+    ...user.toJSON(),
+    organizations: organizations.map((org) => ({
+      id: org.id,
+      name: org.name,
+      createdAt: org.createdAt,
+      updatedAt: org.updatedAt,
+      metadata: org.metadata,
+      externalId: org.externalId,
+    })),
+    workspaces: workspaces.map((w) => {
+      return {
+        ...renderLightWorkspaceType({
+          workspace: w,
+          role: memberships.find((m) => m.workspaceId === w.id)?.role ?? "none",
+        }),
+        ssoEnforced: w.ssoEnforced,
+        workOSOrganizationId: w.workOSOrganizationId,
+        ...(populateExtensionConfig && {
+          blacklistedDomains:
+            configs.find((c) => c.workspaceId === w.id)?.blacklistedDomains ??
+            null,
+        }),
+      };
+    }),
+  };
+}

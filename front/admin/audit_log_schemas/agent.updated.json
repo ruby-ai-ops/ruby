@@ -1,0 +1,17 @@
+{
+  "action": "agent.updated",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "agent"
+    }
+  ],
+  "metadata": {
+    "agent_name": "string",
+    "scope": "string",
+    "model": "string",
+    "actor_type": "string"
+  }
+}

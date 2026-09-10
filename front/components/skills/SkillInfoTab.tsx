@@ -1,0 +1,296 @@
+import { KnowledgeChip } from "@app/components/editor/extensions/skill_builder/KnowledgeChip";
+import type { KnowledgeItem } from "@app/components/editor/extensions/skill_builder/KnowledgeNodeView";
+import { isFullKnowledgeItem } from "@app/components/editor/extensions/skill_builder/KnowledgeNodeView";
+import { SkillDescriptionReadOnlyEditor } from "@app/components/editor/SkillDescriptionEditor";
+import { RedactedSkillMessage } from "@app/components/skills/RedactedSkillMessage";
+import { SkillInstructionsReadOnlyEditor } from "@app/components/skills/SkillInstructionsReadOnlyEditor";
+import {
+  getMcpServerViewDescription,
+  getMcpServerViewDisplayName,
+} from "@app/lib/actions/mcp_helper";
+import { getAvatar } from "@app/lib/actions/mcp_icons";
+import type { MCPServerViewType } from "@app/lib/api/mcp";
+import { getSkillAvatarIcon } from "@app/lib/skill";
+import { SKILL_INVOCATION_LABEL } from "@app/lib/skills/labels";
+import { getSpaceIcon, getSpaceName } from "@app/lib/spaces";
+import { useSkills } from "@app/lib/swr/skill_configurations";
+import { useSpaces, useSpacesAsAdmin } from "@app/lib/swr/spaces";
+import type {
+  SkillRelations,
+  SkillType,
+} from "@app/types/assistant/skill_configuration";
+import type { EnrichedSpaceType } from "@app/types/space";
+import type { LightWorkspaceType } from "@app/types/user";
+import { isAdmin } from "@app/types/user";
+import {
+  AttachmentChip,
+  Chip,
+  File02,
+  Separator,
+  Spinner,
+  Tooltip,
+} from "@ruby-ai/sparkle";
+import sortBy from "lodash/sortBy";
+import { useCallback, useMemo, useState } from "react";
+
+interface SkillInfoTabProps {
+  skill: SkillType & { relations?: Pick<SkillRelations, "childSkills"> };
+  owner: LightWorkspaceType;
+  spaces?: EnrichedSpaceType[];
+  showDescription?: boolean;
+}
+
+export function SkillInfoTab({
+  skill,
+  owner,
+  spaces,
+  showDescription = true,
+}: SkillInfoTabProps) {
+  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
+
+  const showDiscoverableSkills = skill.sId === "discover_skills";
+
+  const { skills: discoverableSkills, isSkillsLoading: isDiscoverableLoading } =
+    useSkills({
+      owner,
+      status: "active",
+      availability: "users_and_agents",
+      disabled: !showDiscoverableSkills,
+    });
+
+  const shouldLoadSpaces = skill.requestedSpaceIds.length > 0;
+  const { spaces: spacesFromHook, isSpacesLoading } = useSpaces({
+    workspaceId: owner.sId,
+    kinds: ["global", "regular", "project"],
+    disabled: !shouldLoadSpaces || !!spaces,
+  });
+  // A redacted skill (admin, see `canRead`) requests spaces the caller is not a member of, which
+  // the member listing above does not return: resolve them through the admin listing.
+  const { spaces: spacesAsAdmin } = useSpacesAsAdmin({
+    workspaceId: owner.sId,
+    disabled: !isAdmin(owner) || skill.canRead || !shouldLoadSpaces || !!spaces,
+  });
+
+  const resolvedSpaces = useMemo(
+    () =>
+      spaces ??
+      Array.from(
+        new Map(
+          [...spacesFromHook, ...spacesAsAdmin].map((s) => [s.sId, s])
+        ).values()
+      ),
+    [spaces, spacesFromHook, spacesAsAdmin]
+  );
+
+  const sortedMCPServerViews = useMemo(
+    () => sortBy(skill.tools.map(renderMCPServerView), "title"),
+    [skill.tools]
+  );
+
+  const requestedSpaces = useMemo(
+    () =>
+      resolvedSpaces
+        .filter((s) => skill.requestedSpaceIds.includes(s.sId))
+        .map((space) => ({
+          space,
+          name: getSpaceName(space),
+          Icon: getSpaceIcon(space),
+        })),
+    [resolvedSpaces, skill.requestedSpaceIds]
+  );
+
+  const sortedSpaces = useMemo(
+    () => sortBy(requestedSpaces, "name"),
+    [requestedSpaces]
+  );
+
+  const childSkills = useMemo(
+    () => sortBy(skill.relations?.childSkills ?? [], "name"),
+    [skill.relations?.childSkills]
+  );
+
+  const showChildSkills = childSkills.length > 0;
+
+  const handleKnowledgeItemsChange = useCallback((items: KnowledgeItem[]) => {
+    setKnowledgeItems(items);
+  }, []);
+
+  const showSeparator =
+    !!skill.instructions ||
+    knowledgeItems.length > 0 ||
+    skill.fileAttachments.length > 0 ||
+    sortedMCPServerViews.length > 0 ||
+    showChildSkills ||
+    showDiscoverableSkills ||
+    shouldLoadSpaces;
+
+  return (
+    <div className="flex flex-col gap-4">
+      {showDescription && skill.userFacingDescription ? (
+        <div className="text-sm text-foreground">
+          {skill.userFacingDescription}
+        </div>
+      ) : null}
+
+      {/* The API redacts the private fields of the skills an admin cannot read and flags it with
+          `canRead: false`; only admins ever get such a skill. */}
+      {!skill.canRead && <RedactedSkillMessage skill={skill} owner={owner} />}
+
+      {showSeparator ? <Separator /> : null}
+
+      {skill.instructions && skill.agentFacingDescription && (
+        <div className="flex flex-col gap-4">
+          <div className="heading-lg text-foreground">
+            {SKILL_INVOCATION_LABEL}
+          </div>
+          <SkillDescriptionReadOnlyEditor
+            content={skill.agentFacingDescription}
+          />
+        </div>
+      )}
+
+      {skill.instructions && (
+        <div className="dd-privacy-mask flex flex-col gap-4">
+          <div className="heading-lg text-foreground">Guidelines</div>
+          <SkillInstructionsReadOnlyEditor
+            content={skill.instructions}
+            htmlContent={skill.instructionsHtml ?? ""}
+            owner={owner}
+            onKnowledgeItemsChange={handleKnowledgeItemsChange}
+            className="max-h-150 overflow-y-auto"
+          />
+        </div>
+      )}
+      {knowledgeItems.length > 0 && (
+        <div className="flex flex-col gap-4">
+          <div className="heading-lg text-foreground">Knowledge</div>
+          <div className="flex flex-wrap gap-2">
+            {knowledgeItems.filter(isFullKnowledgeItem).map((item) => (
+              <KnowledgeChip
+                key={item.nodeId}
+                node={item.node}
+                title={item.label}
+                color="primary"
+              />
+            ))}
+          </div>
+        </div>
+      )}
+      {skill.fileAttachments.length > 0 && (
+        <div className="flex flex-col gap-4">
+          <div className="heading-lg text-foreground">Files</div>
+          <div className="flex flex-wrap gap-2">
+            {skill.fileAttachments.map((file) => (
+              <AttachmentChip
+                key={file.fileId}
+                label={file.fileName}
+                icon={{ visual: File02 }}
+                color="primary"
+                size="xs"
+              />
+            ))}
+          </div>
+        </div>
+      )}
+      {showChildSkills && (
+        <div className="flex flex-col gap-4">
+          <div className="heading-lg text-foreground">Skills</div>
+          <div className="grid grid-cols-2 gap-2">
+            {childSkills.map((childSkill) => {
+              const SkillAvatar = getSkillAvatarIcon(childSkill);
+
+              return (
+                <Tooltip
+                  key={childSkill.sId}
+                  label={childSkill.userFacingDescription || childSkill.name}
+                  trigger={
+                    <div className="flex min-w-0 flex-row items-center gap-2">
+                      <SkillAvatar size="xs" />
+                      <div className="min-w-0 truncate">{childSkill.name}</div>
+                    </div>
+                  }
+                  tooltipTriggerAsChild
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {sortedMCPServerViews.length > 0 && (
+        <div className="flex flex-col gap-4">
+          <div className="heading-lg text-foreground">Tools</div>
+          <div className="grid grid-cols-2 gap-2">
+            {sortedMCPServerViews.map((view) => (
+              <Tooltip
+                key={view.title}
+                label={view.description ?? view.title}
+                trigger={
+                  <div className="flex flex-row items-center gap-2">
+                    {view.avatar}
+                    <div className="truncate">{view.title}</div>
+                  </div>
+                }
+                tooltipTriggerAsChild
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showDiscoverableSkills && (
+        <div className="flex flex-col gap-4">
+          <div className="heading-lg text-foreground">Discoverable Skills</div>
+          {isDiscoverableLoading ? (
+            <div className="flex flex-row items-center gap-2">
+              <Spinner size="xs" />
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-2">
+              {discoverableSkills.map((s) => {
+                const SkillAvatar = getSkillAvatarIcon(s);
+                return (
+                  <Tooltip
+                    key={s.sId}
+                    label={s.userFacingDescription}
+                    trigger={
+                      <div className="flex flex-row items-center gap-2">
+                        <SkillAvatar size="xs" />
+                        <div className="truncate">{s.name}</div>
+                      </div>
+                    }
+                    tooltipTriggerAsChild
+                  />
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {shouldLoadSpaces ? (
+        <div className="flex flex-col gap-4">
+          <div className="heading-lg text-foreground">Spaces and Pods</div>
+          {isSpacesLoading ? (
+            <div className="flex flex-row items-center gap-2">
+              <Spinner size="xs" />
+            </div>
+          ) : sortedSpaces.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              {sortedSpaces.map(({ space, name, Icon }) => (
+                <Chip key={space.sId} label={name} size="sm">
+                  <Icon className="h-4 w-4 text-muted-foreground" />
+                </Chip>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+const renderMCPServerView = (view: MCPServerViewType) => ({
+  title: getMcpServerViewDisplayName(view),
+  description: getMcpServerViewDescription(view),
+  avatar: getAvatar(view.server, "xs"),
+});

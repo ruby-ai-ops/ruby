@@ -1,0 +1,72 @@
+import { getModelMakerLogo } from "@app/components/providers/types";
+import {
+  getIcon,
+  isCustomResourceIconType,
+  isInternalAllowedIcon,
+} from "@app/components/resources/resources_icons";
+import { useTheme } from "@app/components/sparkle/ThemeContext";
+import type { UsageFilterOption } from "@app/components/workspace/analytics/usageFilter";
+import { getSkillIcon } from "@app/lib/skill";
+import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
+import { Avatar, Icon, Lock01, Tooltip } from "@ruby-ai/sparkle";
+
+interface UsageFilterOptionIconProps {
+  option: UsageFilterOption;
+}
+
+export function UsageFilterOptionIcon({ option }: UsageFilterOptionIconProps) {
+  const { isDark } = useTheme();
+
+  switch (option.kind) {
+    case "agent":
+      return option.scope === "hidden" ? (
+        <Tooltip
+          label="This agent is private"
+          tooltipTriggerAsChild
+          trigger={
+            <span className="flex shrink-0">
+              <Avatar
+                icon={Lock01}
+                iconColor="text-muted-foreground"
+                size="xxs"
+              />
+            </span>
+          }
+        />
+      ) : (
+        <Avatar
+          name={option.name}
+          visual={option.image ?? undefined}
+          size="xxs"
+        />
+      );
+    case "member":
+      return (
+        <Avatar
+          name={option.name}
+          visual={option.image ?? undefined}
+          size="xxs"
+          isRounded
+        />
+      );
+    case "model":
+      return option.lab ? (
+        <Icon visual={getModelMakerLogo(option.lab, isDark)} size="sm" />
+      ) : null;
+    case "tool":
+      return option.icon &&
+        (isCustomResourceIconType(option.icon) ||
+          isInternalAllowedIcon(option.icon)) ? (
+        <Icon visual={getIcon(option.icon)} size="sm" />
+      ) : null;
+    case "skill":
+      return <Icon visual={getSkillIcon(option.icon)} size="sm" />;
+    case "source":
+    case "group":
+    case "api_key":
+      return null;
+    default:
+      assertNeverAndIgnore(option);
+      return null;
+  }
+}

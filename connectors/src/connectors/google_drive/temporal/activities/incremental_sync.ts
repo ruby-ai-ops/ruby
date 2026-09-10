@@ -1,0 +1,602 @@
+import {
+  updateFolderMetadata,
+  updateParentsField,
+} from "@connectors/connectors/google_drive/lib";
+import { getFileParentsMemoized } from "@connectors/connectors/google_drive/lib/hierarchy";
+import {
+  deleteFile,
+  deleteOneFile,
+  getSyncPageToken,
+  objectIsInFolderSelection,
+} from "@connectors/connectors/google_drive/temporal/activities/common/utils";
+import { getFoldersToSync } from "@connectors/connectors/google_drive/temporal/activities/get_folders_to_sync";
+import { syncOneFile } from "@connectors/connectors/google_drive/temporal/file";
+import { getMimeTypesToSync } from "@connectors/connectors/google_drive/temporal/mime_types";
+import {
+  driveObjectToRubyType,
+  getAuthObject,
+  getCachedLabels,
+  getDriveClient,
+  getInternalId,
+  isGoogleDriveRateLimitError,
+  isSharedDriveNotFoundError,
+} from "@connectors/connectors/google_drive/temporal/utils";
+import { dataSourceConfigFromConnector } from "@connectors/lib/api/data_source_config";
+import { concurrentExecutor } from "@connectors/lib/async_utils";
+import {
+  GoogleDriveConfigModel,
+  GoogleDriveFilesModel,
+  GoogleDriveSyncTokenModel,
+} from "@connectors/lib/models/google_drive";
+import { heartbeat } from "@connectors/lib/temporal";
+import type { Logger } from "@connectors/logger/logger";
+import { getActivityLogger } from "@connectors/logger/logger";
+import { ConnectorResource } from "@connectors/resources/connector_resource";
+import type { GoogleDriveObjectType, ModelId } from "@connectors/types";
+import { FILE_ATTRIBUTES_TO_FETCH, WithRetriesError } from "@connectors/types";
+import { redisClient } from "@connectors/types/shared/redis_client";
+import { uuid4 } from "@temporalio/workflow";
+import tracer from "dd-trace";
+import type { drive_v3 } from "googleapis";
+import type { GaxiosResponse } from "googleapis-common";
+import { GaxiosError } from "googleapis-common";
+import type { RedisClientType } from "redis";
+
+const PAGE_SIZE = 500;
+const UPDATE_PARENTS_BATCH_SIZE = 1_000;
+const UPDATE_PARENTS_CONCURRENCY = 8;
+
+type ParentsUpdate = {
+  file: GoogleDriveFilesModel;
+  parentIds: string[];
+};
+
+type EnqueueParentsUpdate = (update: ParentsUpdate) => Promise<void>;
+
+export async function incrementalSync(
+  connectorId: ModelId,
+  driveId: string,
+  isSharedDrive: boolean,
+  startSyncTs: number,
+  nextPageToken?: string
+): Promise<
+  { nextPageToken: string | undefined; newFolders: string[] } | undefined
+> {
+  const connector = await ConnectorResource.fetchById(connectorId);
+  if (!connector) {
+    throw new Error(`Connector ${connectorId} not found`);
+  }
+  const localLogger = getActivityLogger(connector).child({
+    driveId: driveId,
+    runInstance: uuid4(),
+  });
+  localLogger.info(
+    {
+      connectorId,
+      driveId,
+      isSharedDrive,
+      startSyncTs,
+      nextPageToken,
+    },
+    "Starting incremental sync"
+  );
+  const redisCli = await redisClient({
+    origin: "google_drive_incremental_sync",
+  });
+  const newFolders = [];
+  let hadRelevantChange = false;
+  try {
+    if (!nextPageToken) {
+      nextPageToken = await getSyncPageToken(
+        connectorId,
+        driveId,
+        isSharedDrive
+      );
+    }
+    const config = await GoogleDriveConfigModel.findOne({
+      where: {
+        connectorId: connectorId,
+      },
+    });
+    const mimeTypesToSync = getMimeTypesToSync({
+      pdfEnabled: config?.pdfEnabled || false,
+      csvEnabled: config?.csvEnabled || false,
+    });
+
+    const selectedFoldersIds = await getFoldersToSync(connectorId);
+
+    const authCredentials = await getAuthObject(connector.connectionId);
+    const labels = await getCachedLabels(connectorId, authCredentials);
+    const driveClient = await getDriveClient(authCredentials);
+
+    let opts: drive_v3.Params$Resource$Changes$List = {
+      pageToken: nextPageToken,
+      pageSize: PAGE_SIZE,
+      fields: `nextPageToken, newStartPageToken, changes(changeType, fileId, time, removed, file(${FILE_ATTRIBUTES_TO_FETCH.join(",")}))`,
+      includeItemsFromAllDrives: true,
+      supportsAllDrives: true,
+      includeLabels: labels.map((l) => l.id).join(","),
+    };
+    if (isSharedDrive) {
+      opts = {
+        ...opts,
+        driveId: driveId,
+      };
+    }
+
+    await heartbeat();
+    const changesRes: GaxiosResponse<drive_v3.Schema$ChangeList> =
+      await driveClient.changes.list(opts);
+
+    if (changesRes.status !== 200) {
+      throw new Error(
+        `Error getting changes. status_code: ${changesRes.status}. status_text: ${changesRes.statusText}`
+      );
+    }
+
+    if (changesRes.data.changes === undefined) {
+      throw new Error(`changes list is undefined`);
+    }
+
+    if (changesRes.data.changes.length > 0) {
+      localLogger.info(
+        {
+          nbChanges: changesRes.data.changes.length,
+        },
+        `Got changes.`
+      );
+    }
+
+    for (const change of changesRes.data.changes) {
+      await heartbeat();
+
+      if (change.changeType !== "file") {
+        continue;
+      }
+
+      if (change.removed && change.fileId) {
+        const localFile = await GoogleDriveFilesModel.findOne({
+          where: {
+            connectorId: connectorId,
+            driveFileId: change.fileId,
+          },
+        });
+        if (localFile) {
+          await deleteFile(localFile);
+          hadRelevantChange = true;
+        }
+        continue;
+      }
+
+      if (!change.file) {
+        continue;
+      }
+      if (
+        !change.file.mimeType ||
+        !mimeTypesToSync.includes(change.file.mimeType)
+      ) {
+        continue;
+      }
+      if (!change.file.id) {
+        continue;
+      }
+
+      if (
+        await alreadySeenAndIgnored({
+          fileId: change.file.id,
+          connectorId,
+          startSyncTs,
+          redisCli,
+        })
+      ) {
+        continue;
+      }
+
+      const file = await driveObjectToRubyType(
+        connectorId,
+        change.file,
+        authCredentials
+      );
+      if (
+        !(await objectIsInFolderSelection(
+          connectorId,
+          authCredentials,
+          file,
+          selectedFoldersIds,
+          startSyncTs
+        )) ||
+        change.file.trashed
+      ) {
+        // The current file is not in the list of selected folders.
+        // If we have it locally, we need to garbage collect it.
+        const localFile = await GoogleDriveFilesModel.findOne({
+          where: {
+            connectorId: connectorId,
+            driveFileId: change.file.id,
+          },
+        });
+        if (localFile) {
+          await deleteOneFile(connectorId, file);
+          hadRelevantChange = true;
+        }
+        await markAsSeenAndIgnored({
+          fileId: change.file.id,
+          connectorId,
+          startSyncTs,
+          redisCli,
+        });
+        continue;
+      }
+
+      if (!change.file.createdTime || !change.file.name || !change.file.id) {
+        throw new Error(
+          `Invalid file. File is: ${JSON.stringify(change.file)}`
+        );
+      }
+      localLogger.info(
+        {
+          fileId: change.file.id,
+          createdTime: change.file.createdTime,
+          modifiedTime: change.file.modifiedTime,
+          trashed: change.file.trashed,
+          mimeType: change.file.mimeType,
+          size: change.file.size,
+        },
+        "will sync file"
+      );
+
+      const dataSourceConfig = dataSourceConfigFromConnector(connector);
+
+      await heartbeat();
+      const driveFile: GoogleDriveObjectType = await driveObjectToRubyType(
+        connectorId,
+        change.file,
+        authCredentials
+      );
+      if (driveFile.mimeType === "application/vnd.google-apps.folder") {
+        const parentGoogleIds = await getFileParentsMemoized(
+          connectorId,
+          authCredentials,
+          driveFile,
+          startSyncTs
+        );
+        const localFolder = await GoogleDriveFilesModel.findOne({
+          where: {
+            connectorId: connectorId,
+            driveFileId: change.file.id,
+          },
+        });
+
+        const parents = parentGoogleIds.map((parent) => getInternalId(parent));
+        const moved =
+          localFolder && localFolder.parentId !== parentGoogleIds[1];
+
+        // Drive change events do not tell us which folder field changed, so we
+        // refresh folder metadata on every seen folder change.
+        if (localFolder && moved) {
+          await localFolder.update({
+            name: driveFile.name,
+            mimeType: driveFile.mimeType,
+            lastSeenTs: new Date(),
+          });
+          localLogger.info(
+            {
+              fileId: change.file.id,
+              localParentId: localFolder.parentId,
+              parentId: parentGoogleIds[1],
+            },
+            "Folder moved"
+          );
+          if (localFolder.skipReason) {
+            localLogger.info(
+              `Google Drive folder skipped with skip reason ${localFolder.skipReason}`
+            );
+          } else {
+            await recurseUpdateParents(
+              connector,
+              localFolder,
+              parents,
+              localLogger
+            );
+            hadRelevantChange = true;
+          }
+        } else if (localFolder) {
+          if (localFolder.skipReason) {
+            await localFolder.update({
+              name: driveFile.name,
+              mimeType: driveFile.mimeType,
+              lastSeenTs: new Date(),
+            });
+            localLogger.info(
+              `Google Drive folder skipped with skip reason ${localFolder.skipReason}`
+            );
+          } else {
+            await updateFolderMetadata(
+              connector,
+              localFolder,
+              driveFile,
+              parents,
+              localLogger
+            );
+            hadRelevantChange = true;
+          }
+        }
+
+        if (!localFolder) {
+          localLogger.info(
+            { folderId: driveFile.id },
+            "Adding new folder to sync"
+          );
+          newFolders.push(driveFile.id);
+          hadRelevantChange = true;
+        }
+
+        localLogger.info({ fileId: change.file.id }, "done syncing file");
+
+        continue;
+      } else {
+        await heartbeat();
+        await syncOneFile(
+          connectorId,
+          authCredentials,
+          dataSourceConfig,
+          driveFile,
+          startSyncTs
+        );
+        hadRelevantChange = true;
+      }
+      localLogger.info({ fileId: change.file.id }, "done syncing file");
+    }
+
+    nextPageToken = changesRes.data.nextPageToken
+      ? changesRes.data.nextPageToken
+      : undefined;
+    if (changesRes.data.newStartPageToken) {
+      await upsertCompletedSyncToken({
+        connectorId: connectorId,
+        driveId: driveId,
+        syncToken: changesRes.data.newStartPageToken,
+        hadRelevantChange,
+      });
+    }
+
+    return { nextPageToken, newFolders };
+  } catch (e) {
+    // A 403 can also mean a transient rate-limit/quota exhaustion ("User rate limit
+    // exceeded."). Those must be re-thrown so Temporal retries with backoff, not
+    // treated as a permanent loss of access to the drive (which would silently skip
+    // the drive and leave it stale).
+    if (
+      isGoogleDriveRateLimitError(e) ||
+      (e instanceof WithRetriesError &&
+        e.errors.every((error) => isGoogleDriveRateLimitError(error.error)))
+    ) {
+      throw e;
+    } else if (
+      (e instanceof GaxiosError && e.response?.status === 403) ||
+      (e instanceof WithRetriesError &&
+        e.errors.every(
+          (error) =>
+            error.error instanceof GaxiosError &&
+            error.error.response?.status === 403
+        ))
+    ) {
+      localLogger.error(
+        {
+          error: e.message,
+        },
+        `Looks like we lost access to this drive. Skipping`
+      );
+      return undefined;
+    } else if (
+      isSharedDriveNotFoundError(e) ||
+      (e instanceof WithRetriesError &&
+        e.errors.every((error) => isSharedDriveNotFoundError(error.error)))
+    ) {
+      localLogger.error(
+        {
+          error: e instanceof Error ? e.message : "Unknown error",
+          driveId,
+        },
+        `Shared drive not found. Skipping`
+      );
+      return undefined;
+    } else {
+      throw e;
+    }
+  }
+}
+
+async function upsertCompletedSyncToken({
+  connectorId,
+  driveId,
+  syncToken,
+  hadRelevantChange,
+}: {
+  connectorId: ModelId;
+  driveId: string;
+  syncToken: string;
+  hadRelevantChange: boolean;
+}) {
+  const completedAt = new Date();
+  const lastRelevantChangeAt = hadRelevantChange
+    ? completedAt
+    : await getQuietDriveBaselineAt(connectorId, driveId, completedAt);
+
+  await GoogleDriveSyncTokenModel.upsert({
+    connectorId,
+    driveId,
+    syncToken,
+    lastSyncAt: completedAt,
+    lastRelevantChangeAt,
+  });
+}
+
+async function getQuietDriveBaselineAt(
+  connectorId: ModelId,
+  driveId: string,
+  completedAt: Date
+) {
+  const syncToken = await GoogleDriveSyncTokenModel.findOne({
+    attributes: ["lastSyncAt", "lastRelevantChangeAt"],
+    where: { connectorId, driveId },
+  });
+
+  return (
+    syncToken?.lastRelevantChangeAt ?? syncToken?.lastSyncAt ?? completedAt
+  );
+}
+
+async function recurseUpdateParents(
+  connector: ConnectorResource,
+  file: GoogleDriveFilesModel,
+  parentIds: string[],
+  logger: Logger
+) {
+  return tracer.trace(
+    "gdrive",
+    {
+      resource: "recurseUpdateParents",
+    },
+    async (span) => {
+      span?.setTag("connectorId", connector.id);
+      span?.setTag("workspaceId", connector.workspaceId);
+      span?.setTag("fileId", file.driveFileId);
+
+      let updateBatch: ParentsUpdate[] = [];
+      const flushUpdateBatch = async () => {
+        await updateParentsFieldForBatch(connector, updateBatch, logger);
+        updateBatch = [];
+      };
+      const enqueueUpdate = async (update: ParentsUpdate) => {
+        if (updateBatch.length >= UPDATE_PARENTS_BATCH_SIZE) {
+          await flushUpdateBatch();
+        }
+        updateBatch.push(update);
+      };
+
+      await recurseUpdateParentsInner(
+        connector,
+        file,
+        parentIds,
+        logger,
+        enqueueUpdate
+      );
+      const initialFolderUpdate = updateBatch.pop();
+      await flushUpdateBatch();
+
+      if (!initialFolderUpdate) {
+        return;
+      }
+
+      await updateParentsField(
+        connector,
+        initialFolderUpdate.file,
+        initialFolderUpdate.parentIds,
+        logger
+      );
+    }
+  );
+}
+
+async function recurseUpdateParentsInner(
+  connector: ConnectorResource,
+  file: GoogleDriveFilesModel,
+  parentIds: string[],
+  logger: Logger,
+  enqueueUpdate: EnqueueParentsUpdate
+) {
+  await heartbeat();
+  const children = await GoogleDriveFilesModel.findAll({
+    where: {
+      connectorId: connector.id,
+      parentId: file.driveFileId,
+      skipReason: null,
+    },
+  });
+
+  logger.info(
+    {
+      fileId: file.driveFileId,
+      parentIds,
+      name: file.name,
+      count: children.length,
+    },
+    "Updating parents recursively"
+  );
+
+  // Move updates recurse from the moved folder itself, so `parentIds[0]` is
+  // the current node and only deeper repeats indicate a real parent cycle.
+  if (parentIds.slice(1).includes(file.rubyFileId)) {
+    logger.warn(
+      {
+        fileId: file.driveFileId,
+        parentIds,
+        name: file.name,
+        count: children.length,
+      },
+      "Infinite parent loop."
+    );
+    return;
+  }
+
+  for (const child of children) {
+    await recurseUpdateParentsInner(
+      connector,
+      child,
+      [child.rubyFileId, ...parentIds],
+      logger,
+      enqueueUpdate
+    );
+  }
+
+  await enqueueUpdate({ file, parentIds });
+}
+
+async function updateParentsFieldForBatch(
+  connector: ConnectorResource,
+  updateBatch: ParentsUpdate[],
+  logger: Logger
+) {
+  await concurrentExecutor(
+    updateBatch,
+    async ({ file, parentIds }) => {
+      await updateParentsField(connector, file, parentIds, logger);
+    },
+    { concurrency: UPDATE_PARENTS_CONCURRENCY, onBatchComplete: heartbeat }
+  );
+}
+
+async function alreadySeenAndIgnored({
+  fileId,
+  connectorId,
+  startSyncTs,
+  redisCli,
+}: {
+  fileId: string;
+  connectorId: ModelId;
+  startSyncTs: number;
+  redisCli: RedisClientType;
+}) {
+  const key = `google_drive_seen_and_ignored_${connectorId}_${startSyncTs}_${fileId}`;
+  const val = await redisCli.get(key);
+  return val !== null;
+}
+
+async function markAsSeenAndIgnored({
+  fileId,
+  connectorId,
+  startSyncTs,
+  redisCli,
+}: {
+  fileId: string;
+  connectorId: ModelId;
+  startSyncTs: number;
+  redisCli: RedisClientType;
+}) {
+  const key = `google_drive_seen_and_ignored_${connectorId}_${startSyncTs}_${fileId}`;
+  await redisCli.set(key, "1", {
+    PX: 1000 * 60 * 60 * 24, // 1 day
+  });
+  return;
+}

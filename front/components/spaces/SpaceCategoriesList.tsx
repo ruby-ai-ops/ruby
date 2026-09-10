@@ -1,0 +1,246 @@
+import { AgentDetailsSheet } from "@app/components/assistant/details/AgentDetailsSheet";
+import { SkillDetailsSheetById } from "@app/components/command_palette/SkillDetailsSheetById";
+import { ACTION_BUTTONS_CONTAINER_ID } from "@app/components/spaces/SpacePageHeaders";
+import { SpaceSearchContext } from "@app/components/spaces/search/SpaceSearchContext";
+import { UsedByButton } from "@app/components/spaces/UsedByButton";
+import { useActionButtonsPortal } from "@app/hooks/useActionButtonsPortal";
+import { MCP_SPECIFICATION } from "@app/lib/actions/utils_ui";
+import { useAuth, useFeatureFlags } from "@app/lib/auth/AuthContext";
+import { CATEGORY_DETAILS } from "@app/lib/spaces";
+import { useWorkspacePermissions } from "@app/lib/swr/permissions";
+import { useSpaceInfo } from "@app/lib/swr/spaces";
+import { DATA_SOURCE_VIEW_CATEGORIES } from "@app/types/api/public/spaces";
+import type { AgentsAndSkillsUsageType } from "@app/types/data_source";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type { SpaceType } from "@app/types/space";
+import type { WorkspaceType } from "@app/types/user";
+import {
+  Button,
+  CloudArrowLeftRight,
+  cn,
+  DataTable,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  Globe01,
+  Plus,
+  Settings01,
+  Spinner,
+  Terminal,
+  Upload01,
+} from "@ruby-ai/sparkle";
+import type { CellContext } from "@tanstack/react-table";
+import type { ComponentType } from "react";
+import React from "react";
+
+type RowData = {
+  category: string;
+  name: string;
+  icon: ComponentType;
+  usage: AgentsAndSkillsUsageType;
+  count: number;
+  onClick?: () => void;
+};
+
+type Info = CellContext<RowData, unknown>;
+
+const getTableColumns = (
+  onAgentClick: (agentId: string | null) => void,
+  onSkillClick: (skillId: string | null) => void
+) => {
+  return [
+    {
+      header: "Name",
+      accessorKey: "name",
+      cell: (info: Info) => (
+        <DataTable.CellContent
+          icon={info.row.original.icon}
+          description={`(${info.row.original.count})`}
+        >
+          {info.row.original.name}
+        </DataTable.CellContent>
+      ),
+    },
+    {
+      header: "Used by",
+      accessorFn: (row: RowData) => row.usage.count,
+      meta: {
+        className: "w-24",
+      },
+      cell: (info: Info) => (
+        <DataTable.CellContent>
+          <UsedByButton
+            usage={info.row.original.usage}
+            onItemClick={onAgentClick}
+            onSkillClick={onSkillClick}
+          />
+        </DataTable.CellContent>
+      ),
+    },
+  ];
+};
+
+type SpaceCategoriesListProps = {
+  isAdmin: boolean;
+  canWriteInSpace: boolean;
+  onButtonClick?: () => void;
+  onSelect: (category: string) => void;
+  owner: WorkspaceType;
+  space: SpaceType;
+};
+
+export const SpaceCategoriesList = ({
+  isAdmin,
+  onButtonClick,
+  canWriteInSpace,
+  onSelect,
+  owner,
+  space,
+}: SpaceCategoriesListProps) => {
+  const { spaceInfo, isSpaceInfoLoading } = useSpaceInfo({
+    workspaceId: owner.sId,
+    spaceId: space.sId,
+  });
+
+  const { user } = useAuth();
+  const { hasFeature } = useFeatureFlags();
+  const { hasPermission } = useWorkspacePermissions();
+  const canAdministrateApps = hasPermission("admin", "ruby_app");
+  const { setIsSearchDisabled } = React.useContext(SpaceSearchContext);
+
+  const [agentId, setAgentId] = React.useState<string | null>(null);
+  const [skillId, setSkillId] = React.useState<string | null>(null);
+
+  const rows: RowData[] = spaceInfo
+    ? removeNulls(
+        DATA_SOURCE_VIEW_CATEGORIES.map((category) =>
+          spaceInfo.categories[category] &&
+          spaceInfo.categories[category].count > 0 &&
+          hasFeature(CATEGORY_DETAILS[category].flag)
+            ? {
+                category,
+                ...spaceInfo.categories[category],
+                name: CATEGORY_DETAILS[category].label,
+                icon: CATEGORY_DETAILS[category].icon,
+                onClick: () => onSelect(category),
+              }
+            : null
+        )
+      )
+    : [];
+
+  React.useEffect(() => {
+    if (rows.length === 0) {
+      setIsSearchDisabled(true);
+    } else {
+      setIsSearchDisabled(false);
+    }
+  }, [rows.length, setIsSearchDisabled]);
+
+  const { portalToHeader } = useActionButtonsPortal({
+    containerId: ACTION_BUTTONS_CONTAINER_ID,
+  });
+
+  if (isSpaceInfoLoading) {
+    return (
+      <div className="mt-8 flex justify-center">
+        <Spinner />
+      </div>
+    );
+  }
+
+  const actionButtons = (
+    <>
+      {isAdmin &&
+        onButtonClick &&
+        (space.kind === "regular" || space.kind === "global") && (
+          <Button
+            label="Space settings"
+            icon={Settings01}
+            onClick={onButtonClick}
+            variant="outline"
+          />
+        )}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button label="Add data" icon={Plus} />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent>
+          <DropdownMenuItem
+            disabled={!isAdmin && !canWriteInSpace}
+            href={`/w/${owner.sId}/spaces/${space.sId}/categories/managed?modal=managed`}
+            icon={CloudArrowLeftRight}
+            label="Connected Data"
+          />
+          <DropdownMenuItem
+            disabled={!canWriteInSpace}
+            href={`/w/${owner.sId}/spaces/${space.sId}/categories/folder`}
+            icon={Upload01}
+            label="Upload Data"
+          />
+          <DropdownMenuItem
+            disabled={!canWriteInSpace}
+            href={`/w/${owner.sId}/spaces/${space.sId}/categories/website?modal=website`}
+            icon={Globe01}
+            label="Scrape a website"
+          />
+          {hasFeature("legacy_ruby_apps") && (
+            <DropdownMenuItem
+              disabled={!canAdministrateApps || !canWriteInSpace}
+              href={`/w/${owner.sId}/spaces/${space.sId}/categories/apps?modal=apps`}
+              icon={Terminal}
+              label="Create a Ruby App"
+            />
+          )}
+          <DropdownMenuItem
+            disabled={!isAdmin}
+            href={`/w/${owner.sId}/spaces/${space.sId}/categories/actions?modal=tools`}
+            icon={MCP_SPECIFICATION.cardIcon}
+            label="Tools"
+          />
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </>
+  );
+
+  const isEmpty = rows.length === 0;
+
+  return (
+    <>
+      <AgentDetailsSheet
+        owner={owner}
+        user={user}
+        agentId={agentId}
+        onClose={() => setAgentId(null)}
+      />
+      <SkillDetailsSheetById
+        owner={owner}
+        user={user}
+        skillId={skillId}
+        onClose={() => setSkillId(null)}
+      />
+      {isEmpty && (
+        <div
+          className={cn(
+            "flex h-36 w-full items-center justify-center gap-2 rounded-xl",
+            "bg-muted-background"
+          )}
+        >
+          {actionButtons}
+        </div>
+      )}
+      {!isEmpty && portalToHeader(actionButtons)}
+      {rows.length > 0 && (
+        <DataTable
+          data={rows}
+          columns={getTableColumns(setAgentId, setSkillId)}
+          className="pb-4"
+          columnsBreakpoints={{
+            usage: "md",
+          }}
+        />
+      )}
+    </>
+  );
+};

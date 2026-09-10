@@ -1,0 +1,18 @@
+{
+  "action": "space.accessed",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "space"
+    }
+  ],
+  "metadata": {
+    "space_name": "string",
+    "space_kind": "string",
+    "is_restricted": "string",
+    "access_method": "string",
+    "actor_type": "string"
+  }
+}

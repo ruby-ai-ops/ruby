@@ -1,0 +1,133 @@
+data MATHD {
+  dataset_id: mathd_train
+  hash: b71a4fbe7b2b7c28c33fb9bdc1293a0bd1a0c4eeb6a59a13170041c581408e3c
+}
+
+input INPUT {
+  expected: {problem, type, level, solution, answer}
+}
+
+code RETRIEVAL {
+  code:
+```
+_fun = (env) => {
+  let l = env['state']['INPUT']['level'];
+  let t = env['state']['INPUT']['type'];
+  return env['state']['MATHD'].filter((r) => (
+    r['type'] == t &&
+    r['level'] == l &&
+    r['problem'].length < 1024 &&
+    r['solution'].length < 1024
+  )).slice(0, 16);
+};
+```
+}
+
+code MATHD {
+  code:
+```
+_fun = (env) => {
+  return null;
+}
+```
+}
+
+map LOOP {
+  from: INPUT
+  repeat: 4
+}
+
+code SHUFFLE {
+  code:
+```
+// Extremely trivial seeded number generator.
+mini_rand = (i, j) => {
+  return 19*i + 23*j;
+};
+
+_fun = (env) => {
+  let i = env["map"]["iteration"];
+  let chosen = [];
+  let data = env["state"]["RETRIEVAL"];
+  for (let j = 0; j < data.length; j++) {
+    let r = mini_rand(i, j) % data.length;
+    chosen.push(data.splice(r, 1)[0]);
+  }
+  return chosen;
+}
+```
+}
+
+llm MODEL {
+  max_tokens: 1024
+  temperature: 0.7
+  few_shot_count: 5
+  few_shot_prompt:
+```
+PROBLEM: ${SHUFFLE.problem}
+SOLUTION: ${SHUFFLE.solution}
+ANSWER: ${SHUFFLE.answer}
+
+
+```
+  prompt:
+```
+PROBLEM: ${LOOP.problem}
+SOLUTION:
+```
+  stop:
+```
+PROBLEM:
+```
+}
+
+code POSTPROCESS {
+  code:
+```
+_fun = (env) => {
+  // console.log("POSTPROCESS");
+  // console.log(JSON.stringify(env['state']['MODEL']['completion']['text']));
+  let split = env['state']['MODEL']['completion']['text'].split("\nANSWER:");
+  if (split.length > 1) {
+    return {
+      "solution": split[0].trim(),
+      "answer": split[1].trim(),
+    };
+  } else {
+    return {
+      "solution": split[0].trim(),
+      "answer": null,
+    };
+  }
+}
+```
+}
+
+reduce LOOP { }
+
+code CONSENSUS {
+  code:
+```
+_fun = (env) => {
+  let counts = {};
+  env['state']['POSTPROCESS'].forEach(d => {
+    if (d['answer'] !== null) {
+      if (!(d['answer'] in counts)) {
+        counts[d['answer']] = 0
+      }
+      counts[d['answer']] += 1
+    }
+  });
+
+  let answer = env['state']['POSTPROCESS'][0]['answer'];
+  let max_count = 0;
+  Object.keys(counts).forEach(a => {
+    if (max_count < counts[a]) {
+      max_count = counts[a];
+      answer = a;
+    }
+  });
+  return { "answer": answer, "ground_truth": env['state']['INPUT']['answer'] };
+};
+```
+}

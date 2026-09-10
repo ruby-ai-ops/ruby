@@ -1,0 +1,15 @@
+{
+  "action": "membership.revoked",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "user"
+    }
+  ],
+  "metadata": {
+    "previous_role": "string",
+    "actor_type": "string"
+  }
+}

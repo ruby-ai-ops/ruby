@@ -1,0 +1,57 @@
+import { useSkillBuilderContext } from "@app/components/skill_builder/SkillBuilderContext";
+import type { SkillBuilderFormData } from "@app/components/skill_builder/SkillBuilderFormContext";
+import { InfoCircle, SliderToggle, Tooltip } from "@ruby-ai/sparkle";
+import { useFormContext, useFormState } from "react-hook-form";
+
+interface SkillBuilderEnableSuggestionsSectionProps {
+  selfImprovementLock: boolean;
+}
+
+export function SkillBuilderEnableSuggestionsSection({
+  selfImprovementLock,
+}: SkillBuilderEnableSuggestionsSectionProps) {
+  const { owner } = useSkillBuilderContext();
+  const isAllowedByWorkspace = owner.metadata?.allowReinforcement === true;
+  const isDisabled = !isAllowedByWorkspace || selfImprovementLock;
+
+  const { watch, setValue } = useFormContext<SkillBuilderFormData>();
+  const { disabled: isReadOnly } = useFormState<SkillBuilderFormData>();
+  const reinforcement = watch("reinforcement");
+  const enabled = reinforcement !== "off";
+
+  const handleToggle = () => {
+    if (isReadOnly || isDisabled) {
+      return;
+    }
+    setValue("reinforcement", enabled ? "off" : "on", { shouldDirty: true });
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      {isDisabled && (
+        <div className="flex items-start gap-1.5 text-xs text-muted-foreground">
+          <InfoCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            {!isAllowedByWorkspace
+              ? "Self-improving skills are disabled in your workspace. Ask your admin to enable this feature."
+              : "Admin has disabled self-improvement for this skill."}
+          </span>
+        </div>
+      )}
+      <div
+        className={`flex items-center gap-2 ${isReadOnly || isDisabled ? "cursor-not-allowed opacity-50" : ""}`}
+      >
+        <SliderToggle
+          disabled={isReadOnly || isDisabled}
+          selected={enabled && !isDisabled}
+          onClick={handleToggle}
+        />
+        <span className="text-sm text-foreground">Self-improve</span>
+        <Tooltip
+          label="Ruby will analyze how this skill is used and suggest improvements to its instructions over time."
+          trigger={<InfoCircle className="text-muted-foreground h-4 w-4" />}
+        />
+      </div>
+    </div>
+  );
+}

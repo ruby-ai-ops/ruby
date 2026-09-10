@@ -1,0 +1,222 @@
+import { ConfirmContext } from "@app/components/Confirm";
+import { getIcon } from "@app/components/resources/resources_icons";
+import type { BuilderAction } from "@app/components/shared/tools_picker/types";
+import { getMcpServerViewDisplayName } from "@app/lib/actions/mcp_helper";
+import { getAvatar } from "@app/lib/actions/mcp_icons";
+import type { MCPServerViewType } from "@app/lib/api/mcp";
+import { getSkillAvatarIcon, getSkillIcon } from "@app/lib/skill";
+import { getSpaceName } from "@app/lib/spaces";
+import type { SpaceType } from "@app/types/space";
+import { Chip, File02, Icon, ShapesPlus } from "@ruby-ai/sparkle";
+import React, { useContext } from "react";
+
+function getActionDisplayName(
+  action: BuilderAction,
+  mcpServerViews: MCPServerViewType[]
+): string {
+  const mcpServerView = mcpServerViews.find(
+    (view) => view.sId === action.configuration.mcpServerViewId
+  );
+  if (mcpServerView) {
+    return getMcpServerViewDisplayName(mcpServerView, action);
+  }
+  return action.name;
+}
+
+function getActionIcon(
+  action: BuilderAction,
+  mcpServerViews: MCPServerViewType[]
+): React.ReactNode {
+  const mcpServerView = mcpServerViews.find(
+    (view) => view.sId === action.configuration.mcpServerViewId
+  );
+  if (mcpServerView?.server) {
+    return getAvatar(mcpServerView.server, "xs");
+  }
+  return null;
+}
+
+function getActionChipIcon(
+  action: BuilderAction,
+  mcpServerViews: MCPServerViewType[]
+) {
+  const mcpServerView = mcpServerViews.find(
+    (view) => view.sId === action.configuration.mcpServerViewId
+  );
+  if (!mcpServerView?.server) {
+    return ShapesPlus;
+  }
+
+  return getIcon(mcpServerView.server.icon);
+}
+
+function getSkillInlineIcon(skill: SkillToRemove): React.ReactNode {
+  return React.createElement(getSkillAvatarIcon(skill.icon));
+}
+
+interface ItemToRemove {
+  id: string;
+  name: string;
+  icon: React.ReactNode;
+}
+
+interface SkillToRemove {
+  sId: string;
+  name: string;
+  icon: string | null;
+}
+
+interface KnowledgeToRemove {
+  nodeId: string;
+  title: string;
+}
+
+interface UseRemoveSpaceConfirmParams {
+  entityName: "agent" | "skill";
+  mcpServerViews: MCPServerViewType[];
+}
+
+interface ConfirmRemoveSpaceParams {
+  space: SpaceType;
+  actions: BuilderAction[];
+  knowledge?: KnowledgeToRemove[];
+  skills?: SkillToRemove[];
+}
+
+interface ConfirmBlockedSkillSpaceRemovalParams {
+  space: SpaceType;
+  actions: BuilderAction[];
+  knowledge: KnowledgeToRemove[];
+  skills?: SkillToRemove[];
+}
+
+export function useRemoveSpaceConfirm({
+  entityName,
+  mcpServerViews,
+}: UseRemoveSpaceConfirmParams) {
+  const confirm = useContext(ConfirmContext);
+
+  return ({
+    space,
+    actions,
+    knowledge = [],
+    skills = [],
+  }: ConfirmRemoveSpaceParams): Promise<boolean> => {
+    const allItems: ItemToRemove[] = [
+      ...knowledge.map((k) => ({
+        id: k.nodeId,
+        name: k.title,
+        icon: <Icon visual={File02} size="xs" />,
+      })),
+      ...skills.map((skill) => ({
+        id: skill.sId,
+        name: skill.name,
+        icon: getSkillInlineIcon(skill),
+      })),
+      ...actions.map((action) => ({
+        id: action.id,
+        name: getActionDisplayName(action, mcpServerViews),
+        icon: getActionIcon(action, mcpServerViews),
+      })),
+    ];
+
+    const hasKnowledge = knowledge.length > 0;
+
+    return confirm({
+      title: `Remove ${getSpaceName(space)} ${space.kind === "project" ? "Pod" : "space"}`,
+      message: (
+        <div className="space-y-3">
+          <p className="text-sm">
+            {hasKnowledge
+              ? `The following elements from this ${space.kind === "project" ? "Pod" : "space"} are used in the ${entityName}:`
+              : `This will remove the following elements from the ${entityName}:`}
+          </p>
+          <span className="flex flex-wrap items-center gap-1">
+            {allItems.map((item, index) => (
+              <span key={item.id} className="inline-flex items-center gap-1">
+                {item.icon}
+                <span className="text-sm text-foreground">{item.name}</span>
+                {index < allItems.length - 1 && (
+                  <span className="text-sm text-muted-foreground">,</span>
+                )}
+              </span>
+            ))}
+          </span>
+          {hasKnowledge && (
+            <p className="text-sm">
+              To remove this {space.kind === "project" ? "Pod" : "space"}, first
+              update your instructions to remove the knowledge references.
+            </p>
+          )}
+        </div>
+      ),
+      validateLabel: "OK",
+      validateVariant: "warning",
+      validateDisabled: hasKnowledge,
+    });
+  };
+}
+
+export function useBlockedSkillSpaceRemovalConfirm({
+  mcpServerViews,
+}: {
+  mcpServerViews: MCPServerViewType[];
+}) {
+  const confirm = useContext(ConfirmContext);
+
+  return ({
+    space,
+    actions,
+    knowledge,
+    skills = [],
+  }: ConfirmBlockedSkillSpaceRemovalParams): Promise<boolean> => {
+    return confirm({
+      title: `${getSpaceName(space)} can't be removed`,
+      message: (
+        <div className="space-y-3">
+          <p className="text-sm">
+            This space can't be removed from the skill because the skill uses
+            knowledge or capabilities that belong to it.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {knowledge.map((knowledgeItem) => (
+              <Chip
+                key={`knowledge-${knowledgeItem.nodeId}`}
+                size="xs"
+                color="primary"
+                icon={File02}
+                label={knowledgeItem.title}
+              />
+            ))}
+            {skills.map((skill) => (
+              <Chip
+                key={`skill-${skill.sId}`}
+                size="xs"
+                color="primary"
+                icon={getSkillIcon(skill.icon)}
+                label={skill.name}
+              />
+            ))}
+            {actions.map((action) => (
+              <Chip
+                key={`action-${action.id}`}
+                size="xs"
+                color="primary"
+                icon={getActionChipIcon(action, mcpServerViews)}
+                label={getActionDisplayName(action, mcpServerViews)}
+              />
+            ))}
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Update the skill to stop relying on these items, then remove the
+            space.
+          </p>
+        </div>
+      ),
+      cancelLabel: "Close",
+      validateLabel: "Remove",
+      validateVariant: "warning",
+      validateDisabled: true,
+    });
+  };
+}

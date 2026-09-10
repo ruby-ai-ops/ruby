@@ -1,0 +1,18 @@
+{
+  "action": "api_key.updated",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "api_key"
+    }
+  ],
+  "metadata": {
+    "previous_spending_cap": "string",
+    "new_spending_cap": "string",
+    "previous_spending_cap_awu_credits": "string",
+    "new_spending_cap_awu_credits": "string",
+    "actor_type": "string"
+  }
+}

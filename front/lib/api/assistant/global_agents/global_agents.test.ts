@@ -1,0 +1,590 @@
+import { getGlobalAgents } from "@app/lib/api/assistant/global_agents/global_agents";
+import { Authenticator } from "@app/lib/auth";
+import { setUserMaxAllowedTier } from "@app/lib/model_tiers/allowed_tiers";
+import { FeatureFlagFactory } from "@app/tests/utils/FeatureFlagFactory";
+import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
+import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
+import { UserFactory } from "@app/tests/utils/UserFactory";
+import { WorkspaceFactory } from "@app/tests/utils/WorkspaceFactory";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
+import {
+  CLAUDE_OPUS_5_MODEL_ID,
+  CLAUDE_SONNET_5_MODEL_ID,
+} from "@app/types/assistant/models/anthropic";
+import {
+  AUTO_FAST_MODEL_ID,
+  AUTO_MODEL_ID,
+} from "@app/types/assistant/models/auto";
+import { GEMINI_3_1_PRO_MODEL_ID } from "@app/types/assistant/models/google_ai_studio";
+import {
+  GPT_5_5_MODEL_ID,
+  GPT_5_6_LUNA_MODEL_ID,
+  GPT_5_6_SOL_MODEL_ID,
+} from "@app/types/assistant/models/openai";
+import type { WhitelistableFeature } from "@app/types/shared/feature_flags";
+import { describe, expect, it, vi } from "vitest";
+
+const CUSTOM_MODEL_ID = vi.hoisted(() => "custom-model-for-global-agent-test");
+const UNBOUND_CUSTOM_MODEL_ID = vi.hoisted(
+  () => "custom-model-unbound-for-global-agent-test"
+);
+// Shared reference to the mocked CUSTOM_MODEL_CONFIGS array so tests can
+// simulate a model index missing from the generated config.
+const mockCustomModels = vi.hoisted(() => ({
+  configs: [] as unknown[],
+}));
+
+vi.mock("@app/types/assistant/models/custom_models.generated", async () => {
+  const { GPT_5_5_MODEL_CONFIG } = await vi.importActual<
+    typeof import("@app/types/assistant/models/openai")
+  >("@app/types/assistant/models/openai");
+
+  const baseCustomModelConfig = {
+    ...GPT_5_5_MODEL_CONFIG,
+    availableIfOneOf: {
+      featureFlag: "custom_model_feature" as const,
+    },
+    customAvailableIf: {
+      featureFlag: "custom_model_feature" as const,
+    },
+  };
+
+  // Mirrors the infra config layout: index 0 is bound to the ruby-next agents,
+  // index 1 is unbound.
+  mockCustomModels.configs = [
+    {
+      ...baseCustomModelConfig,
+      modelId: CUSTOM_MODEL_ID,
+      displayName: "Custom Model Test",
+    },
+    {
+      ...baseCustomModelConfig,
+      modelId: UNBOUND_CUSTOM_MODEL_ID,
+      displayName: "Unbound Custom Model Test",
+    },
+  ];
+
+  return {
+    CUSTOM_MODEL_CONFIGS: mockCustomModels.configs,
+    CUSTOM_MODEL_IDS: [CUSTOM_MODEL_ID, UNBOUND_CUSTOM_MODEL_ID],
+    CUSTOM_OPENAI_MODEL_IDS: [CUSTOM_MODEL_ID, UNBOUND_CUSTOM_MODEL_ID],
+    CUSTOM_ANTHROPIC_MODEL_IDS: [],
+  };
+});
+
+async function createAuthenticatorWithFlags(flags: WhitelistableFeature[]) {
+  const { authenticator } = await createResourceTest({ role: "admin" });
+
+  for (const flag of flags) {
+    await FeatureFlagFactory.basic(authenticator, flag);
+  }
+
+  return authenticator;
+}
+
+describe("getGlobalAgents custom model agents", () => {
+  it("routes Ruby support intent through the Ruby Support skill", async () => {
+    const auth = await createAuthenticatorWithFlags([]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.RUBY],
+      "full"
+    );
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].instructions).toContain(
+      'For clear Ruby platform support requests, enable the "Ruby Support" skill before answering.'
+    );
+    expect(agents[0].instructions).toContain(
+      "This includes Ruby usage, capabilities, limits"
+    );
+    expect(agents[0].instructions).toContain(
+      'Do not enable it for generic help requests, non-Ruby products, or ambiguous mentions of "ruby".'
+    );
+    expect(agents[0].instructions).not.toContain(
+      "https://ruby-community.tightknit.community/join"
+    );
+    expect(agents[0].codeDefinedSkillIds).toContain("discover_skills");
+    expect(agents[0].codeDefinedSkillIds).toContain("support");
+  });
+
+  it("reserves Go Deep for explicit deep research requests", async () => {
+    const auth = await createAuthenticatorWithFlags([]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.RUBY],
+      "full"
+    );
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].instructions).toContain(
+      "only when the user explicitly asks to use Go Deep"
+    );
+    expect(agents[0].instructions).toContain(
+      "Do not infer that Go Deep is needed from task complexity alone"
+    );
+    expect(agents[0].instructions).toContain("When in doubt, do not enable it");
+    expect(agents[0].instructions).not.toContain("3+ steps of tool use");
+  });
+
+  it("hides custom Ruby agents without the custom model feature flag", async () => {
+    const auth = await createAuthenticatorWithFlags([
+      "ruby_internal_global_agents",
+    ]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.RUBY_NEXT],
+      "light"
+    );
+
+    expect(agents).toEqual([]);
+  });
+
+  it("resolves custom Ruby agent variants to the generated custom model", async () => {
+    const auth = await createAuthenticatorWithFlags([
+      "ruby_internal_global_agents",
+      "custom_model_feature",
+    ]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [
+        GLOBAL_AGENTS_SID.RUBY_NEXT,
+        GLOBAL_AGENTS_SID.RUBY_NEXT_MEDIUM,
+        GLOBAL_AGENTS_SID.RUBY_NEXT_HIGH,
+      ],
+      "light"
+    );
+
+    expect(
+      agents.map((agent) => ({
+        sId: agent.sId,
+        providerId: agent.model.providerId,
+        modelId: agent.model.modelId,
+        reasoningEffort: agent.model.reasoningEffort,
+      }))
+    ).toEqual([
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_NEXT,
+        providerId: "openai",
+        modelId: CUSTOM_MODEL_ID,
+        reasoningEffort: "light",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_NEXT_MEDIUM,
+        providerId: "openai",
+        modelId: CUSTOM_MODEL_ID,
+        reasoningEffort: "medium",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_NEXT_HIGH,
+        providerId: "openai",
+        modelId: CUSTOM_MODEL_ID,
+        reasoningEffort: "high",
+      },
+    ]);
+  });
+
+  it("resolves retired chawi agent variants to the GPT-5.5 fallback", async () => {
+    const auth = await createAuthenticatorWithFlags([
+      "ruby_internal_global_agents",
+    ]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [
+        GLOBAL_AGENTS_SID.RUBY_CHAWI,
+        GLOBAL_AGENTS_SID.RUBY_CHAWI_MEDIUM,
+        GLOBAL_AGENTS_SID.RUBY_CHAWI_HIGH,
+      ],
+      "light"
+    );
+
+    expect(
+      agents.map((agent) => ({
+        sId: agent.sId,
+        modelId: agent.model.modelId,
+        reasoningEffort: agent.model.reasoningEffort,
+      }))
+    ).toEqual([
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_CHAWI,
+        modelId: GPT_5_5_MODEL_ID,
+        reasoningEffort: "light",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_CHAWI_MEDIUM,
+        modelId: GPT_5_5_MODEL_ID,
+        reasoningEffort: "medium",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_CHAWI_HIGH,
+        modelId: GPT_5_5_MODEL_ID,
+        reasoningEffort: "high",
+      },
+    ]);
+  });
+
+  it("resolves retired soupinou agent variants to the GPT-5.5 fallback", async () => {
+    const auth = await createAuthenticatorWithFlags([
+      "ruby_internal_global_agents",
+    ]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [
+        GLOBAL_AGENTS_SID.RUBY_SOUPINOU,
+        GLOBAL_AGENTS_SID.RUBY_SOUPINOU_MEDIUM,
+        GLOBAL_AGENTS_SID.RUBY_SOUPINOU_HIGH,
+        GLOBAL_AGENTS_SID.RUBY_SOUPINOU_NONE,
+      ],
+      "light"
+    );
+
+    expect(
+      agents.map((agent) => ({
+        sId: agent.sId,
+        modelId: agent.model.modelId,
+        reasoningEffort: agent.model.reasoningEffort,
+      }))
+    ).toEqual([
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_SOUPINOU,
+        modelId: GPT_5_5_MODEL_ID,
+        reasoningEffort: "light",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_SOUPINOU_MEDIUM,
+        modelId: GPT_5_5_MODEL_ID,
+        reasoningEffort: "medium",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_SOUPINOU_HIGH,
+        modelId: GPT_5_5_MODEL_ID,
+        reasoningEffort: "high",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_SOUPINOU_NONE,
+        modelId: GPT_5_5_MODEL_ID,
+        reasoningEffort: "none",
+      },
+    ]);
+  });
+
+  it("hides agents whose model index is missing from the generated config", async () => {
+    const auth = await createAuthenticatorWithFlags([
+      "ruby_internal_global_agents",
+      "custom_model_feature",
+    ]);
+
+    // The hiding comes from the sId filter in getGlobalAgents, not from the
+    // ruby-next getter, which falls back to a concrete model on its own.
+    const removed = mockCustomModels.configs.splice(0);
+    try {
+      const agents = await getGlobalAgents(
+        auth,
+        [
+          GLOBAL_AGENTS_SID.RUBY_NEXT,
+          GLOBAL_AGENTS_SID.RUBY_NEXT_MEDIUM,
+          GLOBAL_AGENTS_SID.RUBY_NEXT_HIGH,
+        ],
+        "light"
+      );
+
+      expect(agents).toEqual([]);
+    } finally {
+      mockCustomModels.configs.push(...removed);
+    }
+  });
+});
+
+describe("getGlobalAgents OpenAI Ruby agents", () => {
+  it("uses the member's Auto stream as the Ruby default", async () => {
+    const auth = await createAuthenticatorWithFlags([]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.RUBY],
+      "light"
+    );
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].model).toMatchObject({
+      providerId: AUTO_MODEL_ID,
+      modelId: AUTO_MODEL_ID,
+      reasoningEffort: "none",
+    });
+  });
+
+  it("keeps the Auto stream default over the Sonnet 5 default flag", async () => {
+    const auth = await createAuthenticatorWithFlags([
+      "ruby_agent_sonnet_5_default",
+    ]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.RUBY],
+      "light"
+    );
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].model).toMatchObject({
+      providerId: AUTO_MODEL_ID,
+      modelId: AUTO_MODEL_ID,
+      reasoningEffort: "none",
+    });
+  });
+
+  it("hides Luna variants without the internal global agents feature flag", async () => {
+    const auth = await createAuthenticatorWithFlags([]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [
+        GLOBAL_AGENTS_SID.RUBY_OAI_LUNA,
+        GLOBAL_AGENTS_SID.RUBY_OAI_LUNA_MEDIUM,
+        GLOBAL_AGENTS_SID.RUBY_OAI_LUNA_HIGH,
+      ],
+      "light"
+    );
+
+    expect(agents).toEqual([]);
+  });
+
+  it("resolves Sol and Luna variants with light, medium, and high reasoning", async () => {
+    const auth = await createAuthenticatorWithFlags([
+      "claude_4_5_opus_feature",
+      "ruby_internal_global_agents",
+    ]);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [
+        GLOBAL_AGENTS_SID.RUBY_OAI,
+        GLOBAL_AGENTS_SID.RUBY_OAI_MEDIUM,
+        GLOBAL_AGENTS_SID.RUBY_OAI_HIGH,
+        GLOBAL_AGENTS_SID.RUBY_OAI_LUNA,
+        GLOBAL_AGENTS_SID.RUBY_OAI_LUNA_MEDIUM,
+        GLOBAL_AGENTS_SID.RUBY_OAI_LUNA_HIGH,
+      ],
+      "light"
+    );
+
+    expect(
+      agents.map((agent) => ({
+        sId: agent.sId,
+        modelId: agent.model.modelId,
+        reasoningEffort: agent.model.reasoningEffort,
+      }))
+    ).toEqual([
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_OAI,
+        modelId: GPT_5_6_SOL_MODEL_ID,
+        reasoningEffort: "light",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_OAI_MEDIUM,
+        modelId: GPT_5_6_SOL_MODEL_ID,
+        reasoningEffort: "medium",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_OAI_HIGH,
+        modelId: GPT_5_6_SOL_MODEL_ID,
+        reasoningEffort: "high",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_OAI_LUNA,
+        modelId: GPT_5_6_LUNA_MODEL_ID,
+        reasoningEffort: "light",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_OAI_LUNA_MEDIUM,
+        modelId: GPT_5_6_LUNA_MODEL_ID,
+        reasoningEffort: "medium",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_OAI_LUNA_HIGH,
+        modelId: GPT_5_6_LUNA_MODEL_ID,
+        reasoningEffort: "high",
+      },
+    ]);
+  });
+});
+
+describe("getGlobalAgents Deep Dive model routing", () => {
+  it("uses Sol with medium reasoning as the Deep Dive primary model", async () => {
+    const workspace = await WorkspaceFactory.creditPriced({
+      whiteListedProviders: ["anthropic", "openai"],
+    });
+    const auth = await Authenticator.internalAdminForWorkspace(workspace.sId);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.DEEP_DIVE],
+      "light"
+    );
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].model).toMatchObject({
+      modelId: GPT_5_6_SOL_MODEL_ID,
+      reasoningEffort: "medium",
+    });
+  });
+
+  it("uses Sol medium for Deep Dive while using Sol high for planning and Luna high for tasks", async () => {
+    const workspace = await WorkspaceFactory.enterprise({
+      whiteListedProviders: ["openai"],
+    });
+    const auth = await Authenticator.internalAdminForWorkspace(workspace.sId);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [
+        GLOBAL_AGENTS_SID.DEEP_DIVE,
+        GLOBAL_AGENTS_SID.RUBY_TASK,
+        GLOBAL_AGENTS_SID.RUBY_PLANNING,
+      ],
+      "light"
+    );
+
+    expect(
+      agents.map((agent) => ({
+        sId: agent.sId,
+        modelId: agent.model.modelId,
+        reasoningEffort: agent.model.reasoningEffort,
+      }))
+    ).toEqual([
+      {
+        sId: GLOBAL_AGENTS_SID.DEEP_DIVE,
+        modelId: GPT_5_6_SOL_MODEL_ID,
+        reasoningEffort: "medium",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_TASK,
+        modelId: GPT_5_6_LUNA_MODEL_ID,
+        reasoningEffort: "high",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_PLANNING,
+        modelId: GPT_5_6_SOL_MODEL_ID,
+        reasoningEffort: "high",
+      },
+    ]);
+  });
+
+  it("falls back to Opus 5 light for enterprise Deep Dive", async () => {
+    const workspace = await WorkspaceFactory.enterprise({
+      whiteListedProviders: ["anthropic"],
+    });
+    const auth = await Authenticator.internalAdminForWorkspace(workspace.sId);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [
+        GLOBAL_AGENTS_SID.DEEP_DIVE,
+        GLOBAL_AGENTS_SID.RUBY_TASK,
+        GLOBAL_AGENTS_SID.RUBY_PLANNING,
+      ],
+      "light"
+    );
+
+    expect(
+      agents.map((agent) => ({
+        sId: agent.sId,
+        modelId: agent.model.modelId,
+        reasoningEffort: agent.model.reasoningEffort,
+      }))
+    ).toEqual([
+      {
+        sId: GLOBAL_AGENTS_SID.DEEP_DIVE,
+        modelId: CLAUDE_OPUS_5_MODEL_ID,
+        reasoningEffort: "light",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_TASK,
+        modelId: CLAUDE_SONNET_5_MODEL_ID,
+        reasoningEffort: "light",
+      },
+      {
+        sId: GLOBAL_AGENTS_SID.RUBY_PLANNING,
+        modelId: CLAUDE_OPUS_5_MODEL_ID,
+        reasoningEffort: "high",
+      },
+    ]);
+  });
+
+  it("falls back to Sonnet 5 light for non-enterprise Deep Dive", async () => {
+    const workspace = await WorkspaceFactory.basic({
+      whiteListedProviders: ["anthropic"],
+    });
+    const auth = await Authenticator.internalAdminForWorkspace(workspace.sId);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.DEEP_DIVE],
+      "light"
+    );
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].model).toMatchObject({
+      modelId: CLAUDE_SONNET_5_MODEL_ID,
+      reasoningEffort: "light",
+    });
+  });
+
+  it("uses the generic large fallback when preferred Deep Dive models are unavailable", async () => {
+    const workspace = await WorkspaceFactory.basic({
+      whiteListedProviders: ["google_ai_studio"],
+    });
+    const auth = await Authenticator.internalAdminForWorkspace(workspace.sId);
+
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.DEEP_DIVE],
+      "light"
+    );
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].model).toMatchObject({
+      modelId: GEMINI_3_1_PRO_MODEL_ID,
+      reasoningEffort: "light",
+    });
+  });
+});
+
+// @ruby is not editable by members, so a Basic-capped member defaulted to the
+// Standard stream would get an agent that only ever fails the tier check.
+describe("getGlobalAgents Ruby Auto default", () => {
+  it.each([
+    ["premium", AUTO_MODEL_ID],
+    ["cost_efficient", AUTO_FAST_MODEL_ID],
+  ] as const)("defaults @ruby to %s member's highest allowed stream", async (tierName, expectedModelId) => {
+    const workspace = await WorkspaceFactory.basic();
+    const adminAuth = await Authenticator.internalAdminForWorkspace(
+      workspace.sId
+    );
+
+    const user = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, user, { role: "user" });
+    await setUserMaxAllowedTier(adminAuth, {
+      userId: user.sId,
+      tierName,
+    });
+
+    const auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+    const agents = await getGlobalAgents(
+      auth,
+      [GLOBAL_AGENTS_SID.RUBY],
+      "light"
+    );
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].model).toMatchObject({ modelId: expectedModelId });
+  });
+});

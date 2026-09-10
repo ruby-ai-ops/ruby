@@ -1,0 +1,549 @@
+import { createPublicApiMockRequest } from "@app/tests/utils/generic_public_api_tests";
+import { Ok } from "@app/types/shared/result";
+import { honoApp } from "@front-api/app";
+import { ENSURE_IS_ADMIN_ERROR_MESSAGE } from "@front-api/middlewares/ensure_role";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@app/lib/api/analytics/usage_metrics_export", async () => ({
+  fetchUsageMetricsExportRows: vi.fn(
+    async () =>
+      new Ok([
+        {
+          date: "2024-06-01",
+          messages: 12,
+          conversations: 3,
+          activeUsers: 2,
+        },
+      ])
+  ),
+}));
+
+vi.mock("@app/lib/api/analytics/active_users_export", async () => ({
+  fetchActiveUsersExportRows: vi.fn(
+    async () =>
+      new Ok([
+        {
+          date: "2024-06-01",
+          dau: 5,
+          wau: 10,
+          mau: 20,
+        },
+      ])
+  ),
+}));
+
+vi.mock(
+  "@app/lib/api/assistant/observability/context_origin",
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import("@app/lib/api/assistant/observability/context_origin")
+    >()),
+    fetchContextOriginDailyBreakdown: vi.fn(
+      async () =>
+        new Ok([{ date: "2024-06-01", origin: "web", messageCount: 10 }])
+    ),
+  })
+);
+
+vi.mock("@app/lib/api/analytics/agents_export", async () => ({
+  AGENT_EXPORT_HEADERS: ["agentId", "name", "messages"],
+  fetchAgentExportRows: vi.fn(
+    async () =>
+      new Ok([{ agentId: "agent-123", name: "TestAgent", messages: 5 }])
+  ),
+  toAgentExportCsvRow: (row: unknown) => row,
+}));
+
+vi.mock("@app/lib/api/analytics/users_export", async () => ({
+  USER_EXPORT_HEADERS: ["userName", "messageCount"],
+  fetchUserExportRows: vi.fn(
+    async () => new Ok([{ userName: "Alice", messageCount: 7 }])
+  ),
+}));
+
+vi.mock("@app/lib/api/analytics/skills_export", async () => ({
+  SKILL_EXPORT_HEADERS: [
+    "skillId",
+    "name",
+    "description",
+    "editedByEmail",
+    "createdAt",
+    "lastEdit",
+  ],
+  fetchSkillExportRows: vi.fn(
+    async () =>
+      new Ok([
+        {
+          skillId: "skill-123",
+          name: "Research",
+          description: "Looks things up",
+          editedByEmail: "alice@example.com",
+          createdAt: "2024-05-01",
+          lastEdit: "2024-06-01",
+        },
+      ])
+  ),
+}));
+
+vi.mock("@app/lib/api/analytics/skill_usage_export", async () => ({
+  fetchSkillUsageExportRows: vi.fn(async () => new Ok([])),
+}));
+
+vi.mock("@app/lib/api/analytics/tool_usage_export", async () => ({
+  fetchToolUsageExportRows: vi.fn(async () => new Ok([])),
+}));
+
+vi.mock("@app/lib/api/analytics/messages_export", async () => ({
+  MESSAGE_EXPORT_HEADERS: [
+    "messageId",
+    "createdAt",
+    "assistantId",
+    "assistantName",
+    "assistantSettings",
+    "conversationId",
+    "userId",
+    "userEmail",
+    "source",
+    "toolsUsed",
+    "skillsUsed",
+  ],
+  fetchMessageExportRows: vi.fn(
+    async () =>
+      new Ok([
+        {
+          messageId: "msg-1",
+          createdAt: "2024-06-01 10:00:00",
+          assistantId: "agent-1",
+          assistantName: "TestAgent",
+          assistantSettings: "published",
+          conversationId: "conv-1",
+          userId: "user-1",
+          userEmail: "alice@example.com",
+          source: "web",
+          toolsUsed: "Slack__post_message,Slack__search_messages",
+          skillsUsed: "research",
+        },
+      ])
+  ),
+}));
+
+vi.mock("@app/lib/api/analytics/feedback_export", async () => ({
+  FEEDBACK_EXPORT_HEADERS: [
+    "feedbackId",
+    "createdAt",
+    "assistantId",
+    "assistantName",
+    "conversationUrl",
+    "userId",
+    "userEmail",
+    "thumb",
+    "content",
+    "dismissed",
+  ],
+  fetchFeedbackExportRows: vi.fn(
+    async () =>
+      new Ok([
+        {
+          feedbackId: "42",
+          createdAt: "2024-06-01 10:00:00",
+          assistantId: "agent-1",
+          assistantName: "TestAgent",
+          conversationUrl: "https://ruby.ad/w/ws-1/conversation/conv-1",
+          userId: "user-1",
+          userEmail: "alice@example.com",
+          thumb: "up",
+          content: "great answer",
+          dismissed: "false",
+        },
+      ])
+  ),
+}));
+
+async function setupTest({
+  table = "usage_metrics",
+  startDate = "2024-06-01",
+  endDate = "2024-06-30",
+  timezone,
+  format,
+  role = "admin",
+  method = "GET",
+}: {
+  table?: string;
+  startDate?: string;
+  endDate?: string;
+  timezone?: string;
+  format?: string;
+  role?: "user" | "admin";
+  method?: string;
+} = {}) {
+  const { workspace, key } = await createPublicApiMockRequest({ role });
+
+  const query: Record<string, string> = { table, startDate, endDate };
+  if (timezone) {
+    query.timezone = timezone;
+  }
+  if (format) {
+    query.format = format;
+  }
+
+  const response = await exportRequest({ workspace, key, query, method });
+  return { response };
+}
+
+function exportRequest({
+  workspace,
+  key,
+  query = {},
+  method = "GET",
+}: {
+  workspace: { sId: string };
+  key: { secret: string };
+  query?: Record<string, string>;
+  method?: string;
+}) {
+  const qs = new URLSearchParams(query).toString();
+  return honoApp.request(
+    `/api/v1/w/${workspace.sId}/analytics/export${qs ? `?${qs}` : ""}`,
+    {
+      method,
+      headers: { authorization: `Bearer ${key.secret}` },
+    }
+  );
+}
+
+describe("GET /api/v1/w/[wId]/analytics/export", () => {
+  it("returns 200 for admin API key", async () => {
+    const { response } = await setupTest();
+
+    expect(response.status).toBe(200);
+  });
+
+  it("returns 403 for read-only API key (insufficient scope)", async () => {
+    const { response } = await setupTest({ role: "user" });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: {
+        type: "workspace_auth_error",
+        message: ENSURE_IS_ADMIN_ERROR_MESSAGE,
+      },
+    });
+  });
+
+  it("returns 400 for missing required query params", async () => {
+    const { workspace, key } = await createPublicApiMockRequest({
+      role: "admin",
+    });
+
+    const response = await exportRequest({ workspace, key });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("returns 400 for invalid table value", async () => {
+    const { response } = await setupTest({ table: "invalid_table" });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("returns 400 for invalid date format", async () => {
+    const { response } = await setupTest({ startDate: "2024-13-01" });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("returns 400 when startDate is after endDate", async () => {
+    const { response } = await setupTest({
+      startDate: "2024-06-30",
+      endDate: "2024-06-01",
+    });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("returns 405 for unsupported methods", async () => {
+    for (const method of ["POST", "PUT", "DELETE", "PATCH"] as const) {
+      const { workspace, key } = await createPublicApiMockRequest({
+        method,
+        role: "admin",
+      });
+
+      const response = await exportRequest({
+        workspace,
+        key,
+        query: {
+          table: "usage_metrics",
+          startDate: "2024-06-01",
+          endDate: "2024-06-30",
+        },
+        method,
+      });
+
+      expect(response.status).toBe(405);
+    }
+  });
+
+  it("returns CSV for usage_metrics table", async () => {
+    const { response } = await setupTest({ table: "usage_metrics" });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("text/csv");
+    expect(response.headers.get("Content-Disposition")).toContain(
+      "ruby_usage_metrics_2024-06-01_2024-06-30.csv"
+    );
+    const csv = await response.text();
+    expect(csv).toContain("date,messages,conversations,activeUsers");
+  });
+
+  it("returns CSV for active_users table", async () => {
+    const { response } = await setupTest({ table: "active_users" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain("date,dau,wau,mau");
+  });
+
+  it("returns CSV for source table", async () => {
+    const { response } = await setupTest({ table: "source" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain("date,source,messageCount");
+  });
+
+  it("returns CSV for agents table", async () => {
+    const { response } = await setupTest({ table: "agents" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain("agentId,name,messages");
+  });
+
+  it("returns CSV for users table", async () => {
+    const { response } = await setupTest({ table: "users" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain("userName,messageCount");
+  });
+
+  it("returns CSV for skills table", async () => {
+    const { response } = await setupTest({ table: "skills" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain(
+      "skillId,name,description,editedByEmail,createdAt,lastEdit"
+    );
+    expect(csv).toContain("Research");
+    expect(csv).toContain("alice@example.com");
+  });
+
+  it("returns CSV for skill_usage table", async () => {
+    const { response } = await setupTest({ table: "skill_usage" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain("date,skillName,executions,uniqueUsers");
+  });
+
+  it("returns CSV for tool_usage table", async () => {
+    const { response } = await setupTest({ table: "tool_usage" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain("date,toolName,executions,uniqueUsers");
+  });
+
+  it("returns CSV for messages table", async () => {
+    const { response } = await setupTest({ table: "messages" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain(
+      "messageId,createdAt,assistantId,assistantName,assistantSettings,conversationId,userId,userEmail,source,toolsUsed,skillsUsed"
+    );
+    expect(csv).toContain("msg-1");
+    expect(csv).toContain("alice@example.com");
+    expect(csv).toContain('"Slack__post_message,Slack__search_messages"');
+  });
+
+  it("returns CSV for feedback table", async () => {
+    const { response } = await setupTest({ table: "feedback" });
+
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain(
+      "feedbackId,createdAt,assistantId,assistantName,conversationUrl,userId,userEmail,thumb,content,dismissed"
+    );
+    expect(csv).toContain("great answer");
+    expect(csv).toContain("alice@example.com");
+  });
+
+  it("returns typed JSON for feedback", async () => {
+    const { response } = await setupTest({
+      table: "feedback",
+      format: "json",
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data[0]).toEqual({
+      feedbackId: "42",
+      createdAt: "2024-06-01 10:00:00",
+      assistantId: "agent-1",
+      assistantName: "TestAgent",
+      conversationUrl: "https://ruby.ad/w/ws-1/conversation/conv-1",
+      userId: "user-1",
+      userEmail: "alice@example.com",
+      thumb: "up",
+      content: "great answer",
+      dismissed: "false",
+    });
+  });
+
+  it("returns typed JSON when format=json for usage_metrics", async () => {
+    const { response } = await setupTest({
+      table: "usage_metrics",
+      format: "json",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toContain("application/json");
+    const data = await response.json();
+    expect(Array.isArray(data)).toBe(true);
+    expect(data[0]).toEqual({
+      date: "2024-06-01",
+      messages: 12,
+      conversations: 3,
+      activeUsers: 2,
+    });
+  });
+
+  it("returns typed JSON for active_users", async () => {
+    const { response } = await setupTest({
+      table: "active_users",
+      format: "json",
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data[0]).toEqual({
+      date: "2024-06-01",
+      dau: 5,
+      wau: 10,
+      mau: 20,
+    });
+  });
+
+  it("returns typed JSON for source", async () => {
+    const { response } = await setupTest({
+      table: "source",
+      format: "json",
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data[0]).toEqual({
+      date: "2024-06-01",
+      source: "web",
+      messageCount: 10,
+    });
+  });
+
+  it("returns typed JSON for agents", async () => {
+    const { response } = await setupTest({
+      table: "agents",
+      format: "json",
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data[0]).toEqual({
+      agentId: "agent-123",
+      name: "TestAgent",
+      messages: 5,
+    });
+  });
+
+  it("returns typed JSON for skills", async () => {
+    const { response } = await setupTest({
+      table: "skills",
+      format: "json",
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data[0]).toEqual({
+      skillId: "skill-123",
+      name: "Research",
+      description: "Looks things up",
+      editedByEmail: "alice@example.com",
+      createdAt: "2024-05-01",
+      lastEdit: "2024-06-01",
+    });
+  });
+
+  it("returns typed JSON for users", async () => {
+    const { response } = await setupTest({
+      table: "users",
+      format: "json",
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data[0]).toEqual({
+      userName: "Alice",
+      messageCount: 7,
+    });
+  });
+
+  it("returns typed JSON for messages", async () => {
+    const { response } = await setupTest({
+      table: "messages",
+      format: "json",
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data[0]).toEqual({
+      messageId: "msg-1",
+      createdAt: "2024-06-01 10:00:00",
+      assistantId: "agent-1",
+      assistantName: "TestAgent",
+      assistantSettings: "published",
+      conversationId: "conv-1",
+      userId: "user-1",
+      userEmail: "alice@example.com",
+      source: "web",
+      toolsUsed: "Slack__post_message,Slack__search_messages",
+      skillsUsed: "research",
+    });
+  });
+
+  it("returns CSV by default (no format param)", async () => {
+    const { response } = await setupTest({ table: "usage_metrics" });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("text/csv");
+  });
+
+  it("returns CSV when format=csv", async () => {
+    const { response } = await setupTest({
+      table: "usage_metrics",
+      format: "csv",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("text/csv");
+  });
+
+  it("returns 400 for invalid format value", async () => {
+    const { response } = await setupTest({
+      table: "usage_metrics",
+      format: "xml",
+    });
+
+    expect(response.status).toBe(400);
+  });
+});

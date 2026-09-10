@@ -1,0 +1,98 @@
+import type { ServerSideMCPServerConfigurationType } from "@app/lib/actions/mcp";
+import type { AutoInternalMCPServerNameType } from "@app/lib/actions/mcp_internal_actions/constants";
+import { CONVERSATION_FILES_SERVER_NAME } from "@app/lib/api/actions/servers/conversation_files/metadata";
+import type { Authenticator } from "@app/lib/auth";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import assert from "assert";
+
+/**
+ * Get MCP server configurations for conversation-specific tools.
+ * These are tools explicitly attached to the conversation.
+ */
+export async function getConversationMCPServers(
+  auth: Authenticator,
+  conversation: ConversationWithoutContentType,
+  agentConfigurationId?: string
+): Promise<ServerSideMCPServerConfigurationType[]> {
+  const conversationMCPServerViews =
+    await ConversationResource.fetchMCPServerViews(auth, conversation, {
+      onlyEnabled: true,
+      agentConfigurationId,
+    });
+
+  // Batch-fetch all MCP server views.
+  const mcpServerViewIds = conversationMCPServerViews.map(
+    (v) => v.mcpServerViewId
+  );
+  const mcpServerViews = await MCPServerViewResource.fetchByModelIds(
+    auth,
+    mcpServerViewIds
+  );
+
+  return mcpServerViews.map((mcpServerView) => {
+    const serverDisplayMetadata = mcpServerView.getServerDisplayMetadata();
+
+    return {
+      id: -1,
+      sId: generateRandomModelSId(),
+      type: "mcp_server_configuration",
+      name: mcpServerView.name ?? serverDisplayMetadata.name,
+      description:
+        mcpServerView.description ?? serverDisplayMetadata.description,
+      icon: serverDisplayMetadata.icon,
+      dataSources: null,
+      tables: null,
+      childAgentId: null,
+      timeFrame: null,
+      jsonSchema: null,
+      secretName: null,
+      rubyProject: null,
+      additionalConfiguration: {},
+      mcpServerViewId: mcpServerView.sId,
+      rubyAppConfiguration: null,
+      internalMCPServerId:
+        mcpServerView.serverType === "internal"
+          ? mcpServerView.mcpServerId
+          : null,
+    };
+  });
+}
+
+/**
+ * Get the conversation_files MCP server for accessing conversation files.
+ * Caller must only invoke this when the conversation_files view was prefetched.
+ */
+export async function getConversationFilesServer(
+  auth: Authenticator,
+  autoInternalViews: Map<AutoInternalMCPServerNameType, MCPServerViewResource>
+): Promise<ServerSideMCPServerConfigurationType> {
+  const conversationFilesView =
+    autoInternalViews.get("conversation_files") ?? null;
+
+  assert(
+    conversationFilesView,
+    "MCP server view not found for conversation_files. Ensure auto tools are created."
+  );
+
+  return {
+    id: -1,
+    sId: generateRandomModelSId(),
+    type: "mcp_server_configuration",
+    name: CONVERSATION_FILES_SERVER_NAME,
+    description: "Access and include files from the conversation",
+    dataSources: null,
+    tables: null,
+    childAgentId: null,
+    timeFrame: null,
+    jsonSchema: null,
+    secretName: null,
+    rubyProject: null,
+    additionalConfiguration: {},
+    mcpServerViewId: conversationFilesView.sId,
+    rubyAppConfiguration: null,
+    internalMCPServerId: conversationFilesView.mcpServerId,
+  };
+}

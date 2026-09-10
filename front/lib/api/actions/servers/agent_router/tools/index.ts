@@ -1,0 +1,135 @@
+import { MCPError } from "@app/lib/actions/mcp_errors";
+import type { ToolHandlers } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { buildTools } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { AGENT_ROUTER_TOOLS_METADATA } from "@app/lib/api/actions/servers/agent_router/metadata";
+import { getSuggestedAgentsForContent } from "@app/lib/api/assistant/agent_suggestion";
+import apiConfig from "@app/lib/api/config";
+import { getApiKeyNameHeader, prodAPICredentialsForOwner } from "@app/lib/auth";
+import { serializeMention } from "@app/lib/mentions/format";
+import logger from "@app/logger/logger";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import { Err, Ok } from "@app/types/shared/result";
+import { getHeaderFromUserEmail } from "@app/types/user";
+import { RubyAPI } from "@ruby-ai/client";
+
+const MAX_INSTRUCTIONS_LENGTH = 1000;
+
+const handlers: ToolHandlers<typeof AGENT_ROUTER_TOOLS_METADATA> = {
+  list_all_published_agents: async (_, { auth }) => {
+    const owner = auth.getNonNullableWorkspace();
+    const user = auth.user();
+
+    const prodCredentials = await prodAPICredentialsForOwner(owner);
+    const api = new RubyAPI(
+      apiConfig.getRubyAPIConfig(),
+      {
+        ...prodCredentials,
+        extraHeaders: {
+          ...getHeaderFromUserEmail(user?.email),
+          ...getApiKeyNameHeader(auth),
+        },
+      },
+      logger
+    );
+
+    // We cannot call the internal getAgentConfigurations() here because it causes a circular dependency.
+    // Instead, we call the public API endpoint.
+    // When the user is available, use the "list" view to include the user's unpublished agents
+    // (the x-api-user-email header allows the API to resolve the user from the system key).
+    const res = await api.getAgentConfigurations({
+      view: user ? "list" : "all",
+    });
+    if (res.isErr()) {
+      return new Err(new MCPError("Error fetching agent configurations"));
+    }
+
+    const agents = res.value;
+    const formattedAgents = agents
+      .map((agent) => {
+        let result = `## ${agent.name}\n\n`;
+        result += `**Mention:** ${serializeMention(agent)}\n\n`;
+        result += `**Description:** ${agent.description}\n`;
+        return result;
+      })
+      .join("\n");
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: `# Available Agents\n\n${formattedAgents}`,
+      },
+    ]);
+  },
+
+  suggest_agents_for_content: async ({ userMessage }, { auth }) => {
+    const owner = auth.getNonNullableWorkspace();
+    const user = auth.user();
+
+    const prodCredentials = await prodAPICredentialsForOwner(owner);
+    const api = new RubyAPI(
+      apiConfig.getRubyAPIConfig(),
+      {
+        ...prodCredentials,
+        extraHeaders: {
+          ...getHeaderFromUserEmail(user?.email),
+          ...getApiKeyNameHeader(auth),
+        },
+      },
+      logger
+    );
+
+    // We cannot call the internal getAgentConfigurations() here because it causes a circular dependency.
+    // Instead, we call the public API endpoint.
+    // When the user is available, use the "list" view to include the user's unpublished agents
+    // (the x-api-user-email header allows the API to resolve the user from the system key).
+    const getAgentsRes = await api.getAgentConfigurations({
+      view: user ? "list" : "all",
+    });
+    if (getAgentsRes.isErr()) {
+      logger.error(
+        { err: getAgentsRes.error },
+        "suggest_agents_for_content: error fetching agent configurations"
+      );
+      return new Err(new MCPError("Error fetching agent configurations"));
+    }
+    const agents = getAgentsRes.value as LightAgentConfigurationType[];
+
+    const suggestedAgentsRes = await getSuggestedAgentsForContent(auth, {
+      agents,
+      content: userMessage,
+    });
+
+    if (suggestedAgentsRes.isErr()) {
+      return new Err(
+        new MCPError(`Error suggesting agents: ${suggestedAgentsRes.error}`)
+      );
+    }
+
+    const formattedSuggestedAgents = suggestedAgentsRes.value
+      .filter((agent) => agent.sId !== "ruby")
+      .map((agent) => {
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+        const instructions = agent.instructions || "";
+        const truncatedInstructions =
+          instructions.length > MAX_INSTRUCTIONS_LENGTH
+            ? instructions.slice(0, MAX_INSTRUCTIONS_LENGTH) + " (truncated)"
+            : instructions;
+
+        let result = `## ${agent.name}\n\n`;
+        result += `**Mention:** ${serializeMention(agent)}\n\n`;
+        result += `**Description:** ${agent.description}\n\n`;
+        result += `**Instructions:** ${truncatedInstructions.trim()}\n`;
+        return result;
+      })
+      .join("\n");
+
+    return new Ok([
+      {
+        type: "text" as const,
+        text: `# Suggested Agents\n\n${formattedSuggestedAgents}`,
+      },
+    ]);
+  },
+};
+
+export const TOOLS = buildTools(AGENT_ROUTER_TOOLS_METADATA, handlers);

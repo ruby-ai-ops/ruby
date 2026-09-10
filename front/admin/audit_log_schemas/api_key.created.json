@@ -1,0 +1,16 @@
+{
+  "action": "api_key.created",
+  "targets": [
+    {
+      "type": "workspace"
+    },
+    {
+      "type": "api_key"
+    }
+  ],
+  "metadata": {
+    "group_ids": "string",
+    "actor_type": "string",
+    "role": "string"
+  }
+}

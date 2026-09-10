@@ -1,0 +1,248 @@
+/**
+ * Message rendering logic shared between legacy and enhanced implementations
+ */
+
+import { getAttachmentCapabilityContext } from "@app/lib/api/assistant/conversation/attachment_capabilities";
+import type { Step } from "@app/lib/api/assistant/conversation_rendering/helpers";
+import {
+  getSteps,
+  renderCompactionMessage,
+  renderContentFragment,
+  renderOtherAgentMessageAsUserMessage,
+  renderUserMessage,
+} from "@app/lib/api/assistant/conversation_rendering/helpers";
+import type { EnabledSkill } from "@app/lib/api/assistant/skills_rendering";
+import type { Authenticator } from "@app/lib/auth";
+import logger from "@app/logger/logger";
+import type { AgentTextContentType } from "@app/types/assistant/agent_message_content";
+import type { AgentLoopExecutionData } from "@app/types/assistant/agent_run";
+import type {
+  AgentMessageType,
+  ConversationType,
+} from "@app/types/assistant/conversation";
+import {
+  isAgentMessageType,
+  isCompactionMessageType,
+  isUserMessageType,
+} from "@app/types/assistant/conversation";
+import type {
+  AssistantContentMessageTypeModel,
+  AssistantFunctionCallMessageTypeModel,
+  ModelMessageTypeMultiActions,
+} from "@app/types/assistant/generation";
+import type { ModelConfigurationType } from "@app/types/assistant/models/types";
+import { isContentFragmentType } from "@app/types/content_fragment";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+
+/**
+ * Renders agent message steps into model messages
+ */
+function renderAgentSteps(
+  steps: Step[],
+  message: AgentMessageType,
+  conversation: ConversationType,
+  excludeActions: boolean
+): ModelMessageTypeMultiActions[] {
+  const messages: ModelMessageTypeMultiActions[] = [];
+
+  if (excludeActions) {
+    // In Exclude Actions mode, we only render the last step that has text content.
+    const stepsWithContent = steps.filter((s) =>
+      s?.contents.some((c) => c.type === "text_content")
+    );
+    if (stepsWithContent.length) {
+      const lastStepWithContent = stepsWithContent[stepsWithContent.length - 1];
+      const textContents: AgentTextContentType[] = [];
+      for (const content of lastStepWithContent.contents) {
+        if (content.type === "text_content") {
+          textContents.push(content);
+        }
+      }
+      // Filter out function_call contents since we're not including their outputs.
+      // Including function_calls without outputs causes OpenAI's responses API to error.
+      const filteredContents = lastStepWithContent.contents.filter(
+        (c) => c.type !== "function_call"
+      );
+      messages.push({
+        role: "assistant",
+        name: message.configuration.name,
+        content: textContents.map((c) => c.value).join("\n"),
+        contents: filteredContents,
+      } satisfies AssistantContentMessageTypeModel);
+    }
+  } else {
+    // In regular mode, we render all steps.
+    for (const step of steps) {
+      if (!step) {
+        logger.error(
+          {
+            workspaceId: conversation.owner.sId,
+            conversationId: conversation.sId,
+            agentMessageId: message.sId,
+            panic: true,
+          },
+          "Unexpected state, agent message step is empty"
+        );
+        continue;
+      }
+      const textContents: AgentTextContentType[] = [];
+      for (const content of step.contents) {
+        if (content.type === "text_content") {
+          textContents.push(content);
+        }
+      }
+      if (!step.actions.length && !textContents.length) {
+        logger.error(
+          {
+            workspaceId: conversation.owner.sId,
+            conversationId: conversation.sId,
+            agentMessageId: message.sId,
+          },
+          "Unexpected state, agent message step with no actions and no contents"
+        );
+        continue;
+      }
+
+      if (step.actions.length) {
+        messages.push({
+          role: "assistant",
+          function_calls: step.actions.map((s) => s.call),
+          content: textContents.map((c) => c.value).join("\n"),
+          contents: step.contents,
+        } satisfies AssistantFunctionCallMessageTypeModel);
+      } else {
+        messages.push({
+          role: "assistant",
+          content: textContents.map((c) => c.value).join("\n"),
+          name: message.configuration.name,
+          contents: step.contents,
+        } satisfies AssistantContentMessageTypeModel);
+      }
+
+      // Tool calls must be immediately followed by their results; skill messages come after.
+      for (const { result } of step.actions) {
+        messages.push(result);
+      }
+      for (const { enabledSkillMessages } of step.actions) {
+        messages.push(...enabledSkillMessages);
+      }
+    }
+  }
+
+  return messages;
+}
+
+/**
+ * Renders all conversation messages into model messages
+ *
+ * When `agentConfiguration` is provided, agent messages from other agents are rendered as user
+ * messages with system tags, showing only the final output (not the full agentic loop).
+ */
+export async function renderAllMessages(
+  auth: Authenticator,
+  {
+    conversation,
+    model,
+    excludeActions,
+    excludeImages,
+    onMissingAction,
+    agentConfiguration,
+    enabledSkills,
+  }: {
+    conversation: ConversationType;
+    model: ModelConfigurationType;
+    excludeActions?: boolean;
+    excludeImages?: boolean;
+    onMissingAction: "inject-placeholder" | "skip";
+    agentConfiguration?: AgentLoopExecutionData["agentConfiguration"];
+    enabledSkills: EnabledSkill[];
+  }
+): Promise<ModelMessageTypeMultiActions[]> {
+  const capabilities = await getAttachmentCapabilityContext(auth, conversation);
+  const messages: ModelMessageTypeMultiActions[] = [];
+  const enabledSkillById = new Map(
+    enabledSkills.map((skill) => [skill.sId, skill])
+  );
+
+  // Find the last succeeded compaction to use as a history boundary. Messages before it are
+  // already summarized in the compaction content, so we skip them to avoid redundancy and
+  // reduce token usage.
+  let startIndex = 0;
+  for (let i = conversation.content.length - 1; i >= 0; i--) {
+    const m = conversation.content[i][conversation.content[i].length - 1];
+    if (isCompactionMessageType(m) && m.status === "succeeded") {
+      startIndex = i;
+      break;
+    }
+  }
+
+  // Render loop: render messages from the compaction boundary onward.
+  for (let idx = startIndex; idx < conversation.content.length; idx++) {
+    const versions = conversation.content[idx];
+    const m = versions[versions.length - 1];
+
+    if (isAgentMessageType(m)) {
+      if (m.visibility === "visible") {
+        // Check if this is the current agent's message.
+        const isCurrentAgentMessage =
+          !agentConfiguration || m.configuration.sId === agentConfiguration.sId;
+
+        if (isCurrentAgentMessage) {
+          // Render the current agent's messages normally with full agentic loop.
+          const steps = await getSteps(auth, {
+            model,
+            message: m,
+            workspaceId: conversation.owner.sId,
+            conversationId: conversation.sId,
+            onMissingAction,
+            enabledSkillById,
+            capabilities,
+          });
+
+          const agentMessages = renderAgentSteps(
+            steps,
+            m,
+            conversation,
+            !!excludeActions
+          );
+          messages.push(...agentMessages);
+        } else {
+          // Render other agent messages as user messages with system tags, showing only the final
+          // output (not the full agentic loop).
+          const userMessage = renderOtherAgentMessageAsUserMessage(m);
+          if (userMessage) {
+            messages.push(userMessage);
+          }
+        }
+      }
+    } else if (isUserMessageType(m)) {
+      if (m.visibility === "visible") {
+        messages.push(renderUserMessage(conversation, m));
+      }
+    } else if (isContentFragmentType(m)) {
+      if (m.visibility === "visible") {
+        const renderedContentFragment = await renderContentFragment(
+          auth,
+          m,
+          model,
+          {
+            excludeImages: !!excludeImages,
+            capabilities,
+          }
+        );
+        if (renderedContentFragment) {
+          messages.push(renderedContentFragment);
+        }
+      }
+    } else if (isCompactionMessageType(m)) {
+      const rendered = renderCompactionMessage(m);
+      if (rendered) {
+        messages.push(rendered);
+      }
+    } else {
+      assertNever(m);
+    }
+  }
+
+  return messages;
+}

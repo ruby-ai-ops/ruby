@@ -1,0 +1,156 @@
+import { useSpacesContext } from "@app/components/agent_builder/SpacesContext";
+import { SkillDetailsButtonBar } from "@app/components/skills/SkillDetailsButtonBar";
+import { SkillEditorsTab } from "@app/components/skills/SkillEditorsTab";
+import { SkillInfoTab } from "@app/components/skills/SkillInfoTab";
+import { hasRelations } from "@app/lib/skill";
+import { formatTimestampToFriendlyDate } from "@app/lib/utils";
+import type { SkillWithRelationsType } from "@app/types/assistant/skill_configuration";
+import type { UserType, WorkspaceType } from "@app/types/user";
+import {
+  Avatar,
+  InfoCircle,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  Users01,
+} from "@ruby-ai/sparkle";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React, { useMemo, useState } from "react";
+
+type SkillTabType = "info" | "editors";
+
+interface SkillInfoPageProps {
+  skill: SkillWithRelationsType;
+  owner: WorkspaceType;
+  user: UserType;
+  onClose: () => void;
+}
+
+export function SkillInfoPage({
+  skill,
+  owner,
+  user,
+  onClose,
+}: SkillInfoPageProps) {
+  const [selectedTab, setSelectedTab] = useState<SkillTabType>("info");
+  const showEditorsTabs = skill.canAdministrate;
+
+  return (
+    <div className="flex h-full flex-col gap-4">
+      {skill.status !== "archived" && (
+        <div className="-ml-1.5">
+          <SkillDetailsButtonBar
+            owner={owner}
+            skill={skill}
+            onClose={onClose}
+          />
+        </div>
+      )}
+
+      {showEditorsTabs ? (
+        <Tabs value={selectedTab}>
+          <TabsList border={false}>
+            <TabsTrigger
+              value="info"
+              label="Info"
+              icon={InfoCircle}
+              onClick={() => setSelectedTab("info")}
+            />
+            <TabsTrigger
+              value="editors"
+              label="Editors"
+              icon={Users01}
+              onClick={() => setSelectedTab("editors")}
+            />
+          </TabsList>
+          <div className="mt-4">
+            <TabsContent value="info">
+              <SkillInfoContent owner={owner} skill={skill} />
+            </TabsContent>
+            <TabsContent value="editors">
+              {hasRelations(skill) && (
+                <SkillEditorsTab
+                  key={skill.sId}
+                  skill={skill}
+                  owner={owner}
+                  user={user}
+                />
+              )}
+            </TabsContent>
+          </div>
+        </Tabs>
+      ) : (
+        <SkillInfoContent owner={owner} skill={skill} />
+      )}
+    </div>
+  );
+}
+
+function SkillInfoContent({
+  owner,
+  skill,
+}: {
+  owner: WorkspaceType;
+  skill: SkillWithRelationsType;
+}) {
+  const { spaces } = useSpacesContext();
+
+  const editedAt = useMemo(() => {
+    if (!skill.updatedAt) {
+      return null;
+    }
+    return formatTimestampToFriendlyDate(skill.updatedAt, "compactWithDay");
+  }, [skill.updatedAt]);
+
+  const editedBy = useMemo(
+    () => skill.relations.editedByUser?.fullName ?? null,
+    [skill.relations.editedByUser?.fullName]
+  );
+
+  const editorAvatars = useMemo(() => {
+    const seen = new Set<string>();
+    const users: UserType[] = [];
+    const maybePush = (u: UserType | null | undefined) => {
+      if (!u || seen.has(u.sId)) {
+        return;
+      }
+      seen.add(u.sId);
+      users.push(u);
+    };
+    maybePush(skill.relations.editedByUser);
+    for (const editor of skill.relations.editors ?? []) {
+      maybePush(editor);
+    }
+    return users.map((editor) => ({
+      name: editor.fullName,
+      visual: editor.image ?? undefined,
+      isRounded: true,
+    }));
+  }, [skill.relations.editedByUser, skill.relations.editors]);
+
+  return (
+    <div className="flex flex-col gap-4">
+      {editedBy && editedAt && (
+        <div className="flex items-center justify-between gap-3 text-sm text-muted-foreground">
+          <div>
+            Last edited {editedAt} by {editedBy}
+          </div>
+          {editorAvatars.length > 0 && (
+            <Avatar.Stack
+              avatars={editorAvatars}
+              nbVisibleItems={3}
+              size="sm"
+            />
+          )}
+        </div>
+      )}
+      <SkillInfoTab
+        owner={owner}
+        skill={skill}
+        showDescription={false}
+        spaces={spaces}
+      />
+    </div>
+  );
+}

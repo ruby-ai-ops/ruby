@@ -1,0 +1,1408 @@
+import type { AttachmentUsageHints } from "@app/lib/api/assistant/conversation/attachments";
+import {
+  attachmentUsageHintsFor,
+  conversationAttachmentId,
+  getAttachmentFromContentFragment,
+  isFileAttachmentType,
+  renderAttachmentXml,
+  renderLargePasteXml,
+} from "@app/lib/api/assistant/conversation/attachments";
+import appConfig from "@app/lib/api/config";
+import config from "@app/lib/api/config";
+import { SCOPED_PREFIX_CONVERSATION } from "@app/lib/api/file_system";
+import {
+  isPastedContentOverInlineLimit,
+  TRUNCATED_SNIPPET_SIZE,
+  TRUNCATED_SUFFIX,
+  truncateLegacyPastedSnippet,
+  truncateSnippet,
+} from "@app/lib/api/files/snippet";
+import { getFileContent } from "@app/lib/api/files/utils";
+import type { Authenticator } from "@app/lib/auth";
+import { getPrivateUploadBucket } from "@app/lib/file_storage";
+import {
+  getCachedPrivateUploadSignedUrl,
+  MODEL_INPUT_SIGNED_URL_EXPIRATION_DELAY_MS,
+} from "@app/lib/file_storage/signed_url_cache";
+import { isPastedFile } from "@app/lib/files";
+import type { MessageModel } from "@app/lib/models/agent/conversation";
+import { BaseResource } from "@app/lib/resources/base_resource";
+import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
+import type { FileVersion } from "@app/lib/resources/file_resource";
+import { FileResource } from "@app/lib/resources/file_resource";
+import type { SpaceResource } from "@app/lib/resources/space_resource";
+import { frontSequelize } from "@app/lib/resources/storage";
+import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
+import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
+import { getResourceNameAndIdFromSId } from "@app/lib/resources/string_ids";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import type {
+  AttachmentCapabilityContext,
+  ConversationAttachmentType,
+} from "@app/types/api/assistant/conversation/attachments";
+import type { ContentFragmentMessageTypeModel } from "@app/types/assistant/generation";
+import type { ModelConfigurationType } from "@app/types/assistant/models/types";
+import type {
+  BaseContentFragmentType,
+  ContentFragmentType,
+  ContentFragmentVersion,
+  ContentNodeContentFragmentType,
+  FileContentFragmentType,
+  SupportedContentFragmentType,
+} from "@app/types/content_fragment";
+import type { ContentNodeType } from "@app/types/core/content_node";
+import { CoreAPI } from "@app/types/core/core_api";
+import { isLLMVisionSupportedImageContentType } from "@app/types/files";
+import { getConversationFilesBasePath } from "@app/types/mount_path";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { removeNulls } from "@app/types/shared/utils/general";
+import assert from "assert";
+import type {
+  Attributes,
+  CreationAttributes,
+  ModelStatic,
+  Transaction,
+} from "sequelize";
+import { Op } from "sequelize";
+
+/** How to build the message envelope and resolve the file when rendering a DB fragment to {@link ContentFragmentType}. */
+type RenderContentFragmentToTypeSource =
+  | {
+      kind: "conversation_message";
+      conversationId: string;
+      message: MessageModel;
+      file?: FileResource;
+      dataSourceView?: DataSourceViewResource;
+    }
+  | {
+      kind: "project_context";
+      file: FileResource | null;
+    };
+
+export const CONTENT_OUTDATED_MSG =
+  "Content is outdated. Please refer to the latest version of this content.";
+
+function getConversationFilePath({
+  conversationId,
+  mountFilePath,
+  workspaceId,
+}: {
+  conversationId: string | null | undefined;
+  mountFilePath: string | null;
+  workspaceId: string;
+}): string | null {
+  if (!mountFilePath || !conversationId) {
+    return null;
+  }
+
+  const prefix = getConversationFilesBasePath({ workspaceId, conversationId });
+  if (!mountFilePath.startsWith(prefix)) {
+    return null;
+  }
+
+  const rel = mountFilePath.slice(prefix.length);
+  return `${SCOPED_PREFIX_CONVERSATION}${conversationId}/${rel}`;
+}
+
+// Attributes are marked as read-only to reflect the stateless nature of our Resource.
+// This design will be moved up to BaseResource once we transition away from Sequelize.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface ContentFragmentResource
+  extends ReadonlyAttributesType<ContentFragmentModel> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class ContentFragmentResource extends BaseResource<ContentFragmentModel> {
+  static model: ModelStatic<ContentFragmentModel> = ContentFragmentModel;
+
+  // TODO(2024-02-20 flav): Delete Model from the constructor, once `update` has been migrated.
+  constructor(
+    model: ModelStatic<ContentFragmentModel>,
+    blob: Attributes<ContentFragmentModel>
+  ) {
+    super(ContentFragmentModel, blob);
+  }
+
+  getContentFragmentType(): ContentFragmentType["contentFragmentType"] {
+    if (this.nodeType) {
+      return "content_node";
+    }
+
+    return "file";
+  }
+
+  static async makeNew(
+    blob: Omit<CreationAttributes<ContentFragmentModel>, "sId" | "version">,
+    transaction?: Transaction
+  ) {
+    const contentFragment = await ContentFragmentModel.create(
+      {
+        ...blob,
+        sId: generateRandomModelSId("cf"),
+        version: "latest",
+        workspaceId: blob.workspaceId,
+      },
+      {
+        transaction,
+      }
+    );
+
+    return new this(ContentFragmentModel, contentFragment.get());
+  }
+
+  static async makeNewVersion(
+    sId: string,
+    blob: Omit<CreationAttributes<ContentFragmentModel>, "sId" | "version">,
+    transaction?: Transaction
+  ): Promise<ContentFragmentResource> {
+    const t = transaction ?? (await frontSequelize.transaction());
+
+    try {
+      // First, mark all existing content fragments with this sId as superseded
+      await ContentFragmentModel.update(
+        { version: "superseded" },
+        {
+          where: { sId },
+          transaction: t,
+        }
+      );
+
+      // Create new content fragment with "latest" version
+      const contentFragment = await ContentFragmentModel.create(
+        {
+          ...blob,
+          sId,
+          version: "latest",
+          workspaceId: blob.workspaceId,
+        },
+        {
+          transaction: t,
+        }
+      );
+
+      // If we created our own transaction, commit it
+      if (!transaction) {
+        await t.commit();
+      }
+
+      return new this(ContentFragmentModel, contentFragment.get());
+    } catch (error) {
+      // If we created our own transaction, roll it back
+      if (!transaction) {
+        await t.rollback();
+      }
+      throw error;
+    }
+  }
+
+  static fromMessage(
+    message: MessageModel & { contentFragment?: ContentFragmentModel }
+  ) {
+    if (!message.contentFragment) {
+      throw new Error(
+        "ContentFragmentResource.fromMessage must be called with a content fragment"
+      );
+    }
+    return new ContentFragmentResource(
+      ContentFragmentResource.model,
+      message.contentFragment.get()
+    );
+  }
+
+  static async fromStringIdAndVersion(
+    auth: Authenticator,
+    sId: string,
+    version: ContentFragmentVersion
+  ) {
+    const contentFragment = await ContentFragmentModel.findOne({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        sId,
+        version,
+      },
+    });
+    if (!contentFragment) {
+      throw new Error(
+        `Content fragment not found for sId ${sId} and version ${version}`
+      );
+    }
+    return new ContentFragmentResource(
+      ContentFragmentResource.model,
+      contentFragment.get()
+    );
+  }
+
+  static async fetchManyByModelIds(auth: Authenticator, ids: Array<ModelId>) {
+    const blobs = await ContentFragmentResource.model.findAll({
+      where: {
+        id: ids,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+
+    return blobs.map(
+      // Use `.get` to extract model attributes, omitting Sequelize instance metadata.
+      (b: ContentFragmentModel) =>
+        new ContentFragmentResource(ContentFragmentResource.model, b.get())
+    );
+  }
+
+  /**
+   * Latest project-context content fragments tagged with this space: file-backed and/or
+   * content-node references (`nodeId` + `nodeDataSourceViewId`).
+   */
+  static async listBySpace(
+    auth: Authenticator,
+    space: SpaceResource
+  ): Promise<ContentFragmentResource[]> {
+    const workspace = auth.getNonNullableWorkspace();
+    if (space.workspaceId !== workspace.id) {
+      throw new Error("Space does not belong to the authenticated workspace.");
+    }
+
+    const rows = await ContentFragmentResource.model.findAll({
+      where: {
+        workspaceId: workspace.id,
+        spaceId: space.id,
+        version: "latest",
+        [Op.or]: [
+          { fileId: { [Op.not]: null } },
+          {
+            nodeId: { [Op.not]: null },
+            nodeDataSourceViewId: { [Op.not]: null },
+          },
+        ],
+      },
+      order: [["createdAt", "DESC"]],
+    });
+
+    return rows.map(
+      (row) =>
+        new ContentFragmentResource(ContentFragmentResource.model, row.get())
+    );
+  }
+
+  /**
+   * Create a latest-version content fragment row for a project context file.
+   * Callers (e.g. upsert path) are responsible for idempotency / superseding duplicates.
+   */
+  static async makeProjectFragment(
+    auth: Authenticator,
+    space: SpaceResource,
+    file: FileResource,
+    transaction?: Transaction
+  ): Promise<Result<ContentFragmentResource, Error>> {
+    const workspace = auth.getNonNullableWorkspace();
+    if (
+      space.workspaceId !== workspace.id ||
+      file.workspaceId !== workspace.id
+    ) {
+      return new Err(
+        new Error("Space and file must belong to the authenticated workspace.")
+      );
+    }
+
+    if (file.useCase !== "project_context") {
+      return new Err(
+        new Error(
+          "File must be a project context file (useCase project_context)."
+        )
+      );
+    }
+
+    const metadataSpaceId = file.useCaseMetadata?.spaceId;
+    if (!metadataSpaceId || metadataSpaceId !== space.sId) {
+      return new Err(
+        new Error("File project metadata spaceId must match the target space.")
+      );
+    }
+
+    if (!file.isReady) {
+      return new Err(
+        new Error(
+          "File is not ready; cannot create a project content fragment."
+        )
+      );
+    }
+
+    const sourceUrl = file.getPrivateUrl(auth);
+    const user = auth.user();
+
+    const fragment = await ContentFragmentResource.makeNew(
+      {
+        workspaceId: workspace.id,
+        spaceId: space.id,
+        fileId: file.id,
+        title: file.fileName,
+        contentType: file.contentType,
+        sourceUrl,
+        textBytes: file.fileSize,
+        userId: user?.id ?? null,
+        userContextUsername: user?.username ?? null,
+        userContextFullName: user?.fullName() ?? null,
+        userContextEmail: user?.email ?? null,
+        userContextProfilePictureUrl: user?.imageUrl ?? null,
+        nodeId: null,
+        nodeDataSourceViewId: null,
+        nodeType: null,
+        expiredReason: null,
+      },
+      transaction
+    );
+
+    return new Ok(fragment);
+  }
+
+  /**
+   * Latest project content fragment for this file + space: update if present or insert.
+   * Supersedes extra `version: latest` rows for the same file/space (duplicate cleanup).
+   */
+  static async upsertLatestProjectFileFragment(
+    auth: Authenticator,
+    space: SpaceResource,
+    file: FileResource,
+    transaction?: Transaction
+  ): Promise<Result<ContentFragmentResource, Error>> {
+    const workspace = auth.getNonNullableWorkspace();
+    if (
+      space.workspaceId !== workspace.id ||
+      file.workspaceId !== workspace.id
+    ) {
+      return new Err(
+        new Error("Space and file must belong to the authenticated workspace.")
+      );
+    }
+
+    if (file.useCase !== "project_context") {
+      return new Err(
+        new Error(
+          "File must be a project context file (useCase project_context)."
+        )
+      );
+    }
+
+    const metadataSpaceId = file.useCaseMetadata?.spaceId;
+    if (!metadataSpaceId || metadataSpaceId !== space.sId) {
+      return new Err(
+        new Error("File project metadata spaceId must match the target space.")
+      );
+    }
+
+    if (!file.isReady) {
+      return new Err(
+        new Error(
+          "File is not ready; cannot create a project content fragment."
+        )
+      );
+    }
+
+    const sourceUrl = file.getPrivateUrl(auth);
+    const user = auth.user();
+    const blob: {
+      title: string;
+      contentType: SupportedContentFragmentType;
+      sourceUrl: string;
+      textBytes: number;
+      userId: number | null;
+      userContextUsername: string | null;
+      userContextFullName: string | null;
+      userContextEmail: string | null;
+      userContextProfilePictureUrl: string | null;
+    } = {
+      title: file.fileName,
+      contentType: file.contentType,
+      sourceUrl,
+      textBytes: file.fileSize,
+      userId: user?.id ?? null,
+      userContextUsername: user?.username ?? null,
+      userContextFullName: user?.fullName() ?? null,
+      userContextEmail: user?.email ?? null,
+      userContextProfilePictureUrl: user?.imageUrl ?? null,
+    };
+
+    const rows = await ContentFragmentResource.model.findAll({
+      where: {
+        workspaceId: workspace.id,
+        spaceId: space.id,
+        fileId: file.id,
+        version: "latest",
+      },
+      order: [["id", "DESC"]],
+      transaction,
+    });
+
+    if (rows.length > 1) {
+      await ContentFragmentResource.model.update(
+        { version: "superseded" },
+        {
+          where: {
+            id: { [Op.in]: rows.slice(1).map((r) => r.id) },
+          },
+          transaction,
+        }
+      );
+    }
+
+    const existing = rows[0];
+    if (existing) {
+      await existing.update(blob, { transaction });
+      return new Ok(
+        new ContentFragmentResource(
+          ContentFragmentResource.model,
+          existing.get()
+        )
+      );
+    }
+
+    return ContentFragmentResource.makeProjectFragment(
+      auth,
+      space,
+      file,
+      transaction
+    );
+  }
+
+  /**
+   * Create a latest-version content fragment row for a project context content node.
+   */
+  static async makeProjectContentNodeFragment(
+    auth: Authenticator,
+    space: SpaceResource,
+    resolved: {
+      title: string;
+      contentType: SupportedContentFragmentType;
+      sourceUrl: string | null;
+      textBytes: number | null;
+      nodeId: string;
+      nodeDataSourceViewId: ModelId;
+      nodeType: ContentNodeType;
+    },
+    transaction?: Transaction
+  ): Promise<Result<ContentFragmentResource, Error>> {
+    const workspace = auth.getNonNullableWorkspace();
+    if (space.workspaceId !== workspace.id) {
+      return new Err(
+        new Error("Space must belong to the authenticated workspace.")
+      );
+    }
+
+    const user = auth.user();
+    const fragment = await ContentFragmentResource.makeNew(
+      {
+        workspaceId: workspace.id,
+        spaceId: space.id,
+        fileId: null,
+        title: resolved.title,
+        contentType: resolved.contentType,
+        sourceUrl: resolved.sourceUrl,
+        textBytes: resolved.textBytes,
+        userId: user?.id ?? null,
+        userContextUsername: user?.username ?? null,
+        userContextFullName: user?.fullName() ?? null,
+        userContextEmail: user?.email ?? null,
+        userContextProfilePictureUrl: user?.imageUrl ?? null,
+        nodeId: resolved.nodeId,
+        nodeDataSourceViewId: resolved.nodeDataSourceViewId,
+        nodeType: resolved.nodeType,
+        expiredReason: null,
+      },
+      transaction
+    );
+
+    return new Ok(fragment);
+  }
+
+  /**
+   * Latest project content fragment for this content node + space: update if present or insert.
+   * Supersedes extra `version: latest` rows for the same node/space (duplicate cleanup).
+   */
+  static async upsertLatestProjectContentNodeFragment(
+    auth: Authenticator,
+    space: SpaceResource,
+    resolved: {
+      title: string;
+      contentType: SupportedContentFragmentType;
+      sourceUrl: string | null;
+      textBytes: number | null;
+      nodeId: string;
+      nodeDataSourceViewId: ModelId;
+      nodeType: ContentNodeType;
+    },
+    transaction?: Transaction
+  ): Promise<Result<ContentFragmentResource, Error>> {
+    const workspace = auth.getNonNullableWorkspace();
+    if (space.workspaceId !== workspace.id) {
+      return new Err(
+        new Error("Space must belong to the authenticated workspace.")
+      );
+    }
+
+    const user = auth.user();
+    const blob: {
+      title: string;
+      contentType: SupportedContentFragmentType;
+      sourceUrl: string | null;
+      textBytes: number | null;
+      userId: number | null;
+      userContextUsername: string | null;
+      userContextFullName: string | null;
+      userContextEmail: string | null;
+      userContextProfilePictureUrl: string | null;
+      nodeType: ContentNodeType;
+    } = {
+      title: resolved.title,
+      contentType: resolved.contentType,
+      sourceUrl: resolved.sourceUrl,
+      textBytes: resolved.textBytes,
+      userId: user?.id ?? null,
+      userContextUsername: user?.username ?? null,
+      userContextFullName: user?.fullName() ?? null,
+      userContextEmail: user?.email ?? null,
+      userContextProfilePictureUrl: user?.imageUrl ?? null,
+      nodeType: resolved.nodeType,
+    };
+
+    const rows = await ContentFragmentResource.model.findAll({
+      where: {
+        workspaceId: workspace.id,
+        spaceId: space.id,
+        fileId: null,
+        nodeId: resolved.nodeId,
+        nodeDataSourceViewId: resolved.nodeDataSourceViewId,
+        version: "latest",
+      },
+      order: [["id", "DESC"]],
+      transaction,
+    });
+
+    if (rows.length > 1) {
+      await ContentFragmentResource.model.update(
+        { version: "superseded" },
+        {
+          where: {
+            id: { [Op.in]: rows.slice(1).map((r) => r.id) },
+          },
+          transaction,
+        }
+      );
+    }
+
+    const existing = rows[0];
+    if (existing) {
+      await existing.update(blob, { transaction });
+      return new Ok(
+        new ContentFragmentResource(
+          ContentFragmentResource.model,
+          existing.get()
+        )
+      );
+    }
+
+    return ContentFragmentResource.makeProjectContentNodeFragment(
+      auth,
+      space,
+      resolved,
+      transaction
+    );
+  }
+
+  /**
+   * Batch render content fragments from messages with optimized file fetching.
+   * This method fetches all files in a single query to avoid N+1 queries.
+   *
+   * This is the recommended way to render content fragments.
+   */
+  static async batchRenderFromMessages(
+    auth: Authenticator,
+    {
+      conversationId,
+      messages,
+    }: {
+      conversationId: string;
+      messages: MessageModel[];
+    }
+  ): Promise<ContentFragmentType[]> {
+    const messagesWithContentFragment = messages.filter(
+      (m) => !!m.contentFragment
+    );
+
+    if (messagesWithContentFragment.length === 0) {
+      return [];
+    }
+
+    // Batch fetch all files to avoid N+1 queries.
+    const fileIds = removeNulls(
+      messagesWithContentFragment.map((m) => m.contentFragment?.fileId)
+    );
+    const nodeDataSourceViewIds = [
+      ...new Set(
+        removeNulls(
+          messagesWithContentFragment.map(
+            (m) => m.contentFragment?.nodeDataSourceViewId
+          )
+        )
+      ),
+    ];
+
+    const [files, dataSourceViews] = await Promise.all([
+      FileResource.fetchByModelIdsWithAuth(auth, fileIds),
+      nodeDataSourceViewIds.length > 0
+        ? DataSourceViewResource.fetchByModelIds(auth, nodeDataSourceViewIds)
+        : Promise.resolve([]),
+    ]);
+    const filesByModelId = new Map(files.map((f) => [f.id, f]));
+    const dataSourceViewsByModelId = new Map(
+      dataSourceViews.map((dsv) => [dsv.id, dsv])
+    );
+
+    // Render all content fragments with pre-fetched files.
+    return concurrentExecutor(
+      messagesWithContentFragment,
+      async (message: MessageModel) => {
+        const contentFragment = ContentFragmentResource.fromMessage(message);
+        const file = contentFragment.fileId
+          ? filesByModelId.get(contentFragment.fileId)
+          : undefined;
+        const dataSourceView = contentFragment.nodeDataSourceViewId
+          ? dataSourceViewsByModelId.get(contentFragment.nodeDataSourceViewId)
+          : undefined;
+
+        return contentFragment.renderFromMessage(auth, {
+          conversationId,
+          message,
+          file,
+          dataSourceView,
+        });
+      },
+      { concurrency: 4 }
+    );
+  }
+
+  /**
+   * Content fragment GCS + DB cleanup lives in destroyConversation (one
+   * conversation-level GCS prefix delete, then batched DB deletes).
+   */
+  delete(): Promise<Result<undefined, Error>> {
+    throw new Error("Method not implemented.");
+  }
+
+  async setSourceUrl(sourceUrl: string | null) {
+    return this.update({ sourceUrl });
+  }
+
+  /**
+   * Renders a stored content fragment row into API {@link ContentFragmentType}.
+   * Same logic for conversation messages and project-space fragments; differences are only
+   * the message envelope (ids, ranks, …) and how the backing file / `textUrl` are resolved.
+   */
+  static async renderToContentFragmentType(
+    auth: Authenticator,
+    fr: ContentFragmentResource,
+    source: RenderContentFragmentToTypeSource
+  ): Promise<ContentFragmentType> {
+    const workspace =
+      source.kind === "project_context"
+        ? auth.getNonNullableWorkspace()
+        : auth.workspace();
+    if (!workspace) {
+      throw new Error(
+        "Authenticator must have a workspace to render a content fragment"
+      );
+    }
+
+    const contentFragmentType = fr.getContentFragmentType();
+
+    const baseContentFragment: BaseContentFragmentType =
+      source.kind === "conversation_message"
+        ? {
+            type: "content_fragment",
+            id: source.message.id,
+            sId: source.message.sId,
+            created: source.message.createdAt.getTime(),
+            visibility: source.message.visibility,
+            version: source.message.version,
+            rank: source.message.rank,
+            sourceUrl: fr.sourceUrl,
+            title: fr.title,
+            contentType: fr.contentType,
+            context: {
+              profilePictureUrl: fr.userContextProfilePictureUrl,
+              fullName: fr.userContextFullName,
+              email: fr.userContextEmail,
+              username: fr.userContextUsername,
+            },
+            contentFragmentId: fr.sId,
+            contentFragmentVersion: fr.version,
+            expiredReason: fr.expiredReason,
+          }
+        : {
+            type: "content_fragment",
+            id: fr.id,
+            sId: fr.sId,
+            created: fr.createdAt.getTime(),
+            visibility: "visible",
+            version: 0,
+            rank: 0,
+            sourceUrl: fr.sourceUrl,
+            title: fr.title,
+            contentType: fr.contentType,
+            context: {
+              profilePictureUrl: fr.userContextProfilePictureUrl,
+              fullName: fr.userContextFullName,
+              email: fr.userContextEmail,
+              username: fr.userContextUsername,
+            },
+            contentFragmentId: fr.sId,
+            contentFragmentVersion: fr.version,
+            expiredReason: fr.expiredReason,
+          };
+
+    if (fr.expiredReason) {
+      if (contentFragmentType === "file") {
+        return {
+          ...baseContentFragment,
+          contentFragmentType: "file",
+          expiredReason: fr.expiredReason,
+          path: null,
+          processedPath: null,
+          skipFileProcessing: false,
+          fileId: null,
+          snippet: null,
+          generatedTables: [],
+          textUrl: null,
+          textBytes: null,
+          sourceProvider: null,
+          sourceIcon: null,
+          isInProjectContext: null,
+          hidden: true,
+        };
+      }
+      if (contentFragmentType === "content_node") {
+        return {
+          ...baseContentFragment,
+          contentFragmentType: "content_node",
+          expiredReason: fr.expiredReason,
+          nodeId: null,
+          nodeDataSourceViewId: null,
+          nodeType: null,
+          contentNodeData: null,
+        };
+      }
+      assertNever(contentFragmentType);
+    }
+
+    if (contentFragmentType === "file") {
+      if (source.kind === "project_context") {
+        assert(source.file, "Project file fragment requires FileResource");
+      }
+
+      const location =
+        source.kind === "conversation_message"
+          ? fileAttachmentLocation({
+              workspaceId: workspace.sId,
+              conversationId: source.conversationId,
+              messageId: source.message.sId,
+              contentFormat: "text",
+            })
+          : null;
+
+      const fileResource =
+        source.kind === "conversation_message"
+          ? (source.file ??
+            (fr.fileId
+              ? await FileResource.fetchByModelIdWithAuth(auth, fr.fileId)
+              : null))
+          : source.file;
+
+      let title: string = fr.title;
+      let fileStringId: string | null = null;
+      let snippet: string | null = null;
+      let generatedTables: string[] = [];
+      let sourceProvider: string | null = null;
+      let sourceIcon: string | null = null;
+      let isInProjectContext = false;
+      let hidden = true;
+      let path: string | null = null;
+      let processedPath: string | null = null;
+      let skipFileProcessing = false;
+
+      if (fileResource) {
+        title = fileResource.fileName;
+        fileStringId = fileResource.sId;
+        snippet = fileResource.snippet;
+        generatedTables = fileResource.useCaseMetadata?.generatedTables ?? [];
+        sourceProvider = fileResource.useCaseMetadata?.sourceProvider ?? null;
+        sourceIcon = fileResource.useCaseMetadata?.sourceIcon ?? null;
+        isInProjectContext = !!fileResource.useCaseMetadata?.spaceId;
+        hidden = !!fileResource.useCaseMetadata?.hideFromUser;
+        skipFileProcessing =
+          fileResource.useCaseMetadata?.skipFileProcessing === true;
+        path = getConversationFilePath({
+          workspaceId: workspace.sId,
+          conversationId: fileResource.useCaseMetadata?.conversationId,
+          mountFilePath: fileResource.mountFilePath,
+        });
+        processedPath = getConversationFilePath({
+          workspaceId: workspace.sId,
+          conversationId: fileResource.useCaseMetadata?.conversationId,
+          mountFilePath: fileResource.getTextProcessedMountFilePath(),
+        });
+      }
+
+      if (source.kind === "project_context") {
+        isInProjectContext = true;
+      }
+
+      const textUrl =
+        source.kind === "conversation_message" ? location!.downloadUrl : "";
+
+      return {
+        ...baseContentFragment,
+        title,
+        contentFragmentType: "file",
+        expiredReason: null,
+        path,
+        processedPath,
+        skipFileProcessing,
+        fileId: fileStringId,
+        snippet,
+        generatedTables,
+        textUrl,
+        textBytes: fr.textBytes,
+        sourceProvider,
+        sourceIcon,
+        isInProjectContext,
+        hidden,
+      } satisfies FileContentFragmentType;
+    }
+
+    if (contentFragmentType === "content_node") {
+      assert(
+        fr.nodeId,
+        `Invalid content node content fragment (sId: ${fr.sId})`
+      );
+      assert(
+        fr.nodeDataSourceViewId,
+        `Invalid content node content fragment (sId: ${fr.sId})`
+      );
+      assert(
+        fr.nodeType,
+        `Invalid content node content fragment (sId: ${fr.sId})`
+      );
+
+      const nodeId: string = fr.nodeId;
+      const nodeDataSourceViewId: string = DataSourceViewResource.modelIdToSId({
+        id: fr.nodeDataSourceViewId,
+        workspaceId: workspace.id,
+      });
+      const nodeType: ContentNodeType = fr.nodeType;
+
+      const dsView =
+        (source.kind === "conversation_message"
+          ? source.dataSourceView
+          : undefined) ??
+        (
+          await DataSourceViewResource.fetchByModelIds(auth, [
+            fr.nodeDataSourceViewId,
+          ])
+        )[0];
+      assert(
+        dsView,
+        `Data source view not found for content node content fragment (sId: ${fr.sId})`
+      );
+
+      const contentNodeData = {
+        nodeId,
+        nodeDataSourceViewId,
+        nodeType: fr.nodeType,
+        provider: dsView.dataSource.connectorProvider,
+        spaceName: dsView.space.name,
+      };
+
+      return {
+        ...baseContentFragment,
+        contentFragmentType: "content_node",
+        expiredReason: null,
+        nodeId,
+        nodeDataSourceViewId,
+        nodeType,
+        contentNodeData,
+      } satisfies ContentNodeContentFragmentType;
+    }
+
+    assertNever(contentFragmentType);
+  }
+
+  /**
+   * Use batchRenderFromMessages instead to avoid N+1 queries.
+   */
+  async renderFromMessage(
+    auth: Authenticator,
+    {
+      conversationId,
+      message,
+      file,
+      dataSourceView,
+    }: {
+      conversationId: string;
+      message: MessageModel;
+      file?: FileResource;
+      dataSourceView?: DataSourceViewResource;
+    }
+  ): Promise<ContentFragmentType> {
+    return ContentFragmentResource.renderToContentFragmentType(auth, this, {
+      kind: "conversation_message",
+      conversationId,
+      message,
+      file,
+      dataSourceView,
+    });
+  }
+}
+
+export function getContentFragmentBaseCloudStorageForWorkspace(
+  workspaceId: string
+) {
+  return `content_fragments/w/${workspaceId}/assistant/conversations/`;
+}
+
+// TODO(2024-03-22 pr): Move as method of message resource after migration of
+// message to resource pattern
+export function fileAttachmentLocation({
+  workspaceId,
+  conversationId,
+  messageId,
+  contentFormat,
+}: {
+  workspaceId: string;
+  conversationId: string;
+  messageId: string;
+  contentFormat: "raw" | "text";
+}) {
+  const filePath = `${getContentFragmentBaseCloudStorageForWorkspace(workspaceId)}${conversationId}/content_fragment/${messageId}/${contentFormat}`;
+
+  return {
+    filePath,
+    internalUrl: `https://storage.googleapis.com/${getPrivateUploadBucket().name}/${filePath}`,
+    downloadUrl: `${appConfig.getApiBaseUrl()}/api/w/${workspaceId}/assistant/conversations/${conversationId}/messages/${messageId}/raw_content_fragment?format=${contentFormat}`,
+  };
+}
+
+async function getSignedUrlForVersion(
+  auth: Authenticator,
+  fileId: string,
+  version: FileVersion
+): Promise<string> {
+  const fileCloudStoragePath = FileResource.getCloudStoragePathForId({
+    fileId,
+    workspaceId: auth.getNonNullableWorkspace().sId,
+    version,
+  });
+
+  return getCachedPrivateUploadSignedUrl(fileCloudStoragePath, {
+    expirationDelayMs: MODEL_INPUT_SIGNED_URL_EXPIRATION_DELAY_MS,
+  });
+}
+
+/**
+ * Retrieves an attachment's content for the `cat` tool. The rendered XML therefore never carries a
+ * usage line: the content is already here, and the caller slices offset/limit over this text.
+ */
+export async function getContentFragmentFromAttachmentFile(
+  auth: Authenticator,
+  {
+    attachment,
+    excludeImages,
+    model,
+  }: {
+    attachment: ConversationAttachmentType;
+    excludeImages: boolean;
+    model: ModelConfigurationType;
+  }
+): Promise<Result<ContentFragmentMessageTypeModel, Error>> {
+  // At time of writing, passed resourceId can be either a file or a content fragment.
+  // TODO(durable agents): check if this is actually true (seems false)
+  const { resourceName } = getResourceNameAndIdFromSId(
+    conversationAttachmentId(attachment)
+  ) ?? {
+    resourceName: "content_fragment",
+  };
+
+  const { fileStringId, nodeId, nodeDataSourceViewId } =
+    resourceName === "file"
+      ? {
+          fileStringId: conversationAttachmentId(attachment),
+          nodeId: null,
+          nodeDataSourceViewId: null,
+        }
+      : await getIncludeFileIdsFromContentFragmentResourceId(
+          auth,
+          conversationAttachmentId(attachment)
+        );
+
+  if (isLLMVisionSupportedImageContentType(attachment.contentType)) {
+    if (excludeImages || !model.supportsVision) {
+      return new Ok({
+        role: "content_fragment",
+        name: `inject_${attachment.contentType}`,
+        content: [
+          {
+            type: "text",
+            text: renderAttachmentXml({ attachment, usage: null }),
+          },
+        ],
+      });
+    }
+
+    if (!fileStringId) {
+      throw new Error(
+        `Unreachable code path: fileStringId is null. This would mean that the content fragment is a content node image, but we don't allow images as content nodes yet.`
+      );
+    }
+
+    // Images always have real processing (resize), so we always use "processed".
+    const signedUrl = await getSignedUrlForVersion(
+      auth,
+      fileStringId,
+      "processed"
+    );
+
+    return new Ok({
+      role: "content_fragment",
+      name: `inject_${attachment.contentType}`,
+      content: [
+        {
+          type: "image_url",
+          image_url: {
+            url: signedUrl,
+          },
+        },
+      ],
+    });
+  } else if (nodeId && nodeDataSourceViewId) {
+    const coreAPI = new CoreAPI(config.getCoreAPIConfig(), logger);
+
+    const [dataSourceView] = await DataSourceViewResource.fetchByModelIds(
+      auth,
+      [nodeDataSourceViewId]
+    );
+    if (!dataSourceView) {
+      throw new Error(
+        `Data source view not found for id ${nodeDataSourceViewId}`
+      );
+    }
+
+    const { dataSource } = dataSourceView;
+
+    const documentRes = await coreAPI.getDataSourceDocument({
+      dataSourceId: dataSource.rubyAPIDataSourceId,
+      documentId: nodeId,
+      projectId: dataSource.rubyAPIProjectId,
+    });
+
+    if (documentRes.isErr()) {
+      return new Err(
+        new Error(
+          `Failed to retrieve document for content node ${nodeId} in data source ${nodeDataSourceViewId}`
+        )
+      );
+    }
+
+    const document = documentRes.value;
+
+    return new Ok({
+      role: "content_fragment",
+      name: `inject_${attachment.contentType}`,
+      content: [
+        {
+          type: "text",
+          text: renderAttachmentXml({
+            attachment,
+            content: document.document.text ?? null,
+            usage: null,
+          }),
+        },
+      ],
+    });
+  } else if (fileStringId) {
+    const file = await FileResource.fetchById(auth, fileStringId);
+    if (!file) {
+      return new Err(new Error(`File not found: ${fileStringId}`));
+    }
+    const content = (await getFileContent(auth, file)) ?? "";
+
+    // Check if this is a pasted content (large paste) - use simplified XML format
+    if (isPastedFile(attachment.contentType)) {
+      const truncated = isPastedContentOverInlineLimit(content);
+      const truncatedContent = truncated ? truncateSnippet(content) : content;
+
+      return new Ok({
+        role: "content_fragment",
+        name: `inject_pasted_content`,
+        content: [
+          {
+            type: "text",
+            text: renderLargePasteXml({
+              largePaste: { title: attachment.title },
+              content: truncatedContent,
+              truncated,
+              // Show path only when truncated so the model can read the full file.
+              path:
+                truncated && isFileAttachmentType(attachment)
+                  ? (attachment.path ?? undefined)
+                  : undefined,
+            }),
+          },
+        ],
+      });
+    }
+
+    return new Ok({
+      role: "content_fragment",
+      name: `inject_${attachment.contentType}`,
+      content: [
+        {
+          type: "text",
+          text: renderAttachmentXml({
+            attachment,
+            content,
+            usage: null,
+          }),
+        },
+      ],
+    });
+  } else {
+    throw new Error(
+      `Unreachable: fileId === null and nodeId / nodeDataSourceViewId === null either.`
+    );
+  }
+}
+
+function renderFileOrAttachmentXml(
+  attachment: ConversationAttachmentType,
+  {
+    content,
+    isNewFileExplorer,
+    usage,
+  }: {
+    content?: string | null;
+    isNewFileExplorer: boolean;
+    usage: AttachmentUsageHints;
+  }
+): string {
+  if (isNewFileExplorer) {
+    const path = "path" in attachment ? attachment.path : null;
+    const pathAttr = path ? ` path="${path}"` : "";
+    // Binary originals with a text processed version (audio transcripts) are mounted next to the
+    // original. Point the model at the sibling: no tool of ours can read the original.
+    const processedPath =
+      "processedPath" in attachment ? attachment.processedPath : null;
+    const processedPathAttr = processedPath
+      ? ` processedPath="${processedPath}"`
+      : "";
+    return content
+      ? `<file name="${attachment.title}"${pathAttr}${processedPathAttr}>${content}\n</file>`
+      : `<file name="${attachment.title}"${pathAttr}${processedPathAttr}/>`;
+  }
+
+  return renderAttachmentXml({ attachment, content: content ?? null, usage });
+}
+
+// Render only a tag to specify that a content fragment was injected at a given position except for
+// images when the model support them.
+export async function renderLightContentFragmentForModel(
+  auth: Authenticator,
+  message: ContentFragmentType,
+  model: ModelConfigurationType,
+  {
+    excludeImages,
+    capabilities,
+  }: {
+    excludeImages: boolean;
+    capabilities: AttachmentCapabilityContext;
+  }
+): Promise<ContentFragmentMessageTypeModel | null> {
+  const { contentType } = message;
+
+  if (message.expiredReason) {
+    return {
+      role: "content_fragment",
+      name: `attach_${contentType}`,
+      content: [
+        {
+          type: "text",
+          text: `The content of this file is no longer available. Reason: ${message.expiredReason}`,
+        },
+      ],
+    };
+  }
+
+  const rawAttachment = getAttachmentFromContentFragment({
+    cf: message,
+    capabilities,
+  });
+  if (!rawAttachment) {
+    return null;
+  }
+  const attachment = truncateLegacyPastedSnippet(rawAttachment);
+
+  // Get fileId directly from the message based on content fragment type.
+  const fileStringId =
+    message.contentFragmentType === "file" ? message.fileId : null;
+
+  // Whether this specific attachment lives on the file mount. Content nodes never do, even in a
+  // file system conversation, so they keep the attachment XML rendering.
+  const isNewFileExplorer = fileStringId
+    ? capabilities.isNewFileExplorer
+    : false;
+  // Tool availability is conversation-wide, so it follows the context and not the attachment.
+  const usage = attachmentUsageHintsFor(capabilities);
+
+  // Pasted content is always inlined regardless of feature flags.
+  if (fileStringId && isPastedFile(contentType)) {
+    const snippet = attachment.snippet ?? "";
+    const hasMissingSnippet = attachment.snippet === null;
+    const truncated =
+      hasMissingSnippet ||
+      (snippet.length === TRUNCATED_SNIPPET_SIZE &&
+        snippet.endsWith(TRUNCATED_SUFFIX));
+    return {
+      role: "content_fragment",
+      name: `attach_pasted_content`,
+      content: [
+        {
+          type: "text",
+          text: renderLargePasteXml({
+            largePaste: { title: attachment.title },
+            content: snippet,
+            truncated,
+            // Show path only when truncated so the model can read the full file.
+            path:
+              truncated && isFileAttachmentType(attachment)
+                ? (attachment.path ?? undefined)
+                : undefined,
+          }),
+        },
+      ],
+    };
+  }
+
+  // Images: send pixel data to vision models, always include a <file> tag so the model
+  // can reference the path in subsequent tool calls (e.g. generate_image referenceImages).
+  if (fileStringId && isLLMVisionSupportedImageContentType(contentType)) {
+    if (excludeImages || !model.supportsVision) {
+      return {
+        role: "content_fragment",
+        name: `inject_${contentType}`,
+        content: [
+          {
+            type: "text",
+            text: renderFileOrAttachmentXml(attachment, {
+              isNewFileExplorer,
+              usage,
+              content:
+                "[Image content interpreted by a vision-enabled model. " +
+                "Description not available in this context.",
+            }),
+          },
+        ],
+      };
+    }
+
+    // Images always have real processing (resize), so we always use "processed".
+    const signedUrl = await getSignedUrlForVersion(
+      auth,
+      fileStringId,
+      "processed"
+    );
+
+    return {
+      role: "content_fragment",
+      name: `inject_${contentType}`,
+      content: [
+        {
+          type: "image_url",
+          image_url: {
+            url: signedUrl,
+          },
+        },
+        {
+          type: "text" as const,
+          text: renderFileOrAttachmentXml(attachment, {
+            isNewFileExplorer,
+            usage,
+          }),
+        },
+      ],
+    };
+  }
+
+  // When the conversation uses the new file system, every regular file attachment is reached by
+  // path through the `files` server, tabular ones included (the Computer analyzes those). Emit a
+  // slim <file> tag so the model knows the file exists and how to reach it. `isNewFileExplorer` is
+  // already false for content nodes, which have no path and keep the attachment XML below.
+  if (isNewFileExplorer) {
+    return {
+      role: "content_fragment",
+      name: `attach_${contentType}`,
+      content: [
+        {
+          type: "text",
+          text: renderFileOrAttachmentXml(attachment, {
+            isNewFileExplorer,
+            usage,
+            content: attachment.snippet,
+          }),
+        },
+      ],
+    };
+  }
+
+  return {
+    role: "content_fragment",
+    name: `attach_${contentType}`,
+    content: [
+      {
+        type: "text",
+        text: renderAttachmentXml({
+          // Use fileId as contentFragmentId to provide a consistent identifier for the model
+          // to reference content fragments across different actions like include_file.
+          attachment,
+          usage,
+        }),
+      },
+    ],
+  };
+}
+
+async function getIncludeFileIdsFromContentFragmentResourceId(
+  auth: Authenticator,
+  resourceId: string
+) {
+  const contentFragment = await ContentFragmentResource.fromStringIdAndVersion(
+    auth,
+    resourceId,
+    "latest"
+  );
+  if (!contentFragment) {
+    throw new Error(`Content fragment not found for sId ${resourceId}`);
+  }
+
+  if (!contentFragment.fileId) {
+    return {
+      fileStringId: null,
+      nodeId: contentFragment.nodeId,
+      nodeDataSourceViewId: contentFragment.nodeDataSourceViewId,
+    };
+  }
+
+  const fileStringId = FileResource.modelIdToSId({
+    id: contentFragment.fileId,
+    workspaceId: auth.getNonNullableWorkspace().id,
+  });
+
+  return { fileStringId, nodeId: null, nodeDataSourceViewId: null };
+}

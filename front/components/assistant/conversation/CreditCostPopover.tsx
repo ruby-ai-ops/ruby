@@ -1,0 +1,330 @@
+import { getActionStepIcon } from "@app/components/assistant/conversation/actions/inline/utils";
+import { useConversationSidePanelContext } from "@app/components/assistant/conversation/ConversationSidePanelContext";
+import { InternalActionIcons } from "@app/components/resources/resources_icons";
+import { useAgentMessageConsumption } from "@app/hooks/conversations/useAgentMessageConsumption";
+import { formatCreditValue, toolUsageLabel } from "@app/lib/client/credits";
+import {
+  TRACKING_ACTIONS,
+  TRACKING_AREAS,
+  trackEvent,
+} from "@app/lib/tracking";
+import type { AgentMessageConsumptionToolDetails } from "@app/types/assistant/agent_message_consumption";
+import {
+  Button,
+  Chip,
+  cn,
+  Icon,
+  LoadingBlock,
+  Plus,
+  PopoverContent,
+  PopoverRoot,
+  PopoverTrigger,
+  Tooltip,
+} from "@ruby-ai/sparkle";
+import type { ComponentType, ReactElement } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+
+const MAX_VISIBLE_TOOLS = 3;
+
+function toolDescription(tool: AgentMessageConsumptionToolDetails): string {
+  const descriptions = [toolUsageLabel(tool.callCount)];
+
+  if (tool.pending) {
+    descriptions.push("Still running");
+  }
+
+  return descriptions.join(" · ");
+}
+
+interface CreditDetailRowProps {
+  description?: string;
+  expandLabelOnHover?: boolean;
+  icon?: ComponentType<{ className?: string }>;
+  label: string;
+  value: string;
+}
+
+function CreditDetailRow({
+  description,
+  expandLabelOnHover = false,
+  icon,
+  label,
+  value,
+}: CreditDetailRowProps) {
+  const rowRef = useRef<HTMLDivElement>(null);
+  const labelRef = useRef<HTMLSpanElement>(null);
+  const [isLabelExpanded, setIsLabelExpanded] = useState(false);
+
+  useEffect(() => {
+    const rowElement = rowRef.current;
+    const labelElement = labelRef.current;
+    if (!expandLabelOnHover || !rowElement || !labelElement) {
+      return;
+    }
+
+    rowElement.style.setProperty(
+      "--credit-label-collapsed-width",
+      `${labelElement.clientWidth}px`
+    );
+  }, [expandLabelOnHover]);
+
+  return (
+    <div
+      ref={rowRef}
+      className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 py-2 text-sm"
+      onPointerEnter={(event) => {
+        const labelElement = labelRef.current;
+        if (
+          expandLabelOnHover &&
+          event.pointerType === "mouse" &&
+          labelElement &&
+          labelElement.scrollWidth > labelElement.clientWidth
+        ) {
+          setIsLabelExpanded(true);
+        }
+      }}
+      onPointerLeave={() => setIsLabelExpanded(false)}
+    >
+      {/* Two spans keep the prefix fixed, then put the full name on top for selection. */}
+      <dt
+        className={cn(
+          "col-span-2 col-start-1 row-start-1",
+          "grid grid-cols-subgrid items-start",
+          "font-medium text-foreground"
+        )}
+      >
+        <span className="col-start-1 row-start-1 flex items-center gap-2">
+          {icon && (
+            <Icon visual={icon} size="xs" className="text-muted-foreground" />
+          )}
+          <span
+            ref={labelRef}
+            className={cn(
+              "overflow-hidden whitespace-nowrap",
+              isLabelExpanded
+                ? "pointer-events-none z-10 bg-overlay-background select-none"
+                : "text-ellipsis"
+            )}
+          >
+            {label}
+          </span>
+          {description && (
+            <Chip
+              size="mini"
+              label={description}
+              className={cn(
+                "shrink-0 font-normal",
+                isLabelExpanded && "invisible"
+              )}
+            />
+          )}
+        </span>
+        {isLabelExpanded && (
+          <span
+            aria-hidden
+            className={cn(
+              "col-span-2 col-start-1 row-start-1 z-20",
+              "break-all bg-overlay-background select-text",
+              "animate-credit-label-reveal motion-reduce:animate-none",
+              icon && "ml-6"
+            )}
+          >
+            {label}
+          </span>
+        )}
+      </dt>
+      <dd
+        className={cn(
+          "col-start-2 row-start-1 text-muted-foreground",
+          isLabelExpanded && "invisible"
+        )}
+      >
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+interface CreditCostPopoverProps {
+  conversationId: string;
+  credits: number | null | undefined;
+  messageId: string;
+  subAgentCredits: number | null | undefined;
+  trigger: ReactElement;
+  workspaceId: string;
+}
+
+export function CreditCostPopover({
+  conversationId,
+  credits,
+  messageId,
+  subAgentCredits,
+  trigger,
+  workspaceId,
+}: CreditCostPopoverProps) {
+  const headingId = useId();
+  const [hasOpened, setHasOpened] = useState(false);
+  const [isOpen, setIsOpen] = useState(false);
+  // Avoid reopening the trigger tooltip when switching to the credits drawer.
+  const preventTriggerFocusOnCloseRef = useRef(false);
+  const { currentPanel, openPanel } = useConversationSidePanelContext();
+  const { consumption, isConsumptionLoading, mutateConsumption } =
+    useAgentMessageConsumption({
+      conversationId,
+      workspaceId,
+      messageId,
+      disabled: !hasOpened,
+    });
+
+  const totalCredits =
+    consumption?.totalBilledCredits ??
+    (consumption?.billedCredits ?? credits ?? 0) + (subAgentCredits ?? 0);
+  const details = consumption?.details;
+
+  if (totalCredits <= 0) {
+    return null;
+  }
+
+  const rankedTools = details
+    ? [...details.tools].sort(
+        (left, right) => right.attributedCredits - left.attributedCredits
+      )
+    : [];
+  const visibleTools = rankedTools.slice(0, MAX_VISIBLE_TOOLS);
+  const remainingTools = rankedTools.slice(MAX_VISIBLE_TOOLS);
+  const remainingToolCredits = remainingTools.reduce(
+    (total, tool) => total + tool.attributedCredits,
+    0
+  );
+  const remainingToolCallCount = remainingTools.reduce(
+    (total, tool) => total + tool.callCount,
+    0
+  );
+
+  return (
+    <PopoverRoot
+      open={isOpen}
+      onOpenChange={(open) => {
+        setIsOpen(open);
+        if (!open) {
+          return;
+        }
+        trackEvent({
+          area: TRACKING_AREAS.ANALYTICS,
+          object: "message_breakdown",
+          action: TRACKING_ACTIONS.VIEW,
+          extra: {
+            workspace_id: workspaceId,
+            conversation_id: conversationId,
+            message_id: messageId,
+          },
+        });
+        if (hasOpened) {
+          void mutateConsumption();
+        } else {
+          setHasOpened(true);
+        }
+      }}
+    >
+      <Tooltip
+        label="View consumption breakdown"
+        tooltipTriggerAsChild
+        trigger={<PopoverTrigger asChild>{trigger}</PopoverTrigger>}
+      />
+      <PopoverContent
+        role="dialog"
+        aria-labelledby={headingId}
+        align="start"
+        className="w-80 rounded-2xl px-3 py-2 shadow-sm"
+        preventAutoFocusOnClose={false}
+        onCloseAutoFocus={(event) => {
+          if (preventTriggerFocusOnCloseRef.current) {
+            event.preventDefault();
+            preventTriggerFocusOnCloseRef.current = false;
+          }
+        }}
+      >
+        <h2
+          id={headingId}
+          className="mb-1 text-sm font-semibold text-muted-foreground"
+        >
+          Message consumption
+        </h2>
+        <section aria-label="Charge summary">
+          <dl>
+            <CreditDetailRow
+              label="Charged"
+              value={formatCreditValue(totalCredits)}
+            />
+          </dl>
+        </section>
+
+        <hr className="-mx-3 border-t border-border" />
+
+        <section aria-label="Consumption breakdown">
+          {isConsumptionLoading && !consumption ? (
+            <div
+              aria-busy="true"
+              aria-live="polite"
+              className="flex min-h-9 items-center text-sm text-muted-foreground"
+            >
+              <span className="flex-1">Loading details</span>
+              <LoadingBlock className="h-3 w-8" />
+            </div>
+          ) : details ? (
+            <dl>
+              <CreditDetailRow
+                label="Context and reasoning"
+                value={formatCreditValue(details.agentWorkCredits)}
+                icon={InternalActionIcons.ActionBrainIcon}
+              />
+              {visibleTools.map((tool) => (
+                <CreditDetailRow
+                  key={`${tool.internalMCPServerName ?? "external"}:${tool.toolName}:${tool.label}`}
+                  label={tool.label}
+                  description={toolDescription(tool)}
+                  expandLabelOnHover
+                  value={formatCreditValue(tool.attributedCredits)}
+                  icon={getActionStepIcon(tool)}
+                />
+              ))}
+              {remainingTools.length > 0 && (
+                <CreditDetailRow
+                  label={`${remainingTools.length} other ${remainingTools.length === 1 ? "tool" : "tools"}`}
+                  description={toolUsageLabel(remainingToolCallCount)}
+                  value={formatCreditValue(remainingToolCredits)}
+                  icon={Plus}
+                />
+              )}
+            </dl>
+          ) : (
+            <div className="py-2 text-sm">
+              <p className="font-medium text-foreground">
+                Detailed explanation unavailable
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The exact charge above is authoritative.
+              </p>
+            </div>
+          )}
+        </section>
+
+        {currentPanel !== "credits" && (
+          <div className="-mx-3 -mb-2 border-t border-border px-3 py-1">
+            <Button
+              variant="highlight-ghost"
+              size="sm"
+              label="Credit usage"
+              className="w-full"
+              onClick={() => {
+                preventTriggerFocusOnCloseRef.current = true;
+                setIsOpen(false);
+                openPanel({ type: "credits" });
+              }}
+            />
+          </div>
+        )}
+      </PopoverContent>
+    </PopoverRoot>
+  );
+}

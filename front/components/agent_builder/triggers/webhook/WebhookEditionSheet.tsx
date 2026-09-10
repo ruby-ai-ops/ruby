@@ -1,0 +1,382 @@
+import type { AgentBuilderWebhookTriggerType } from "@app/components/agent_builder/AgentBuilderFormContext";
+import { RecentWebhookRequests } from "@app/components/agent_builder/triggers/RecentWebhookRequests";
+import { TriggerPodSelector } from "@app/components/agent_builder/triggers/TriggerPodSelector";
+import { TriggerPoolSelector } from "@app/components/agent_builder/triggers/TriggerPoolSelector";
+import { TriggerStatusToggle } from "@app/components/agent_builder/triggers/TriggerStatusToggle";
+import type { TriggerViewsSheetFormValues } from "@app/components/agent_builder/triggers/triggerViewsSheetFormSchema";
+import { WebhookEditionFilters } from "@app/components/agent_builder/triggers/webhook/WebhookEditionFilters";
+import { useAuth } from "@app/lib/auth/AuthContext";
+import { isCreditPricedPlan } from "@app/types/plan";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import type { WebhookSourceViewType } from "@app/types/triggers/webhooks";
+import { WEBHOOK_PRESETS } from "@app/types/triggers/webhooks";
+import type {
+  BaseWebhookPreset,
+  WebhookEvent,
+} from "@app/types/triggers/webhooks_source_preset";
+import type { LightWorkspaceType } from "@app/types/user";
+import {
+  Button,
+  Checkbox,
+  ContentMessage,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+  Input,
+  Label,
+  LinkWrapper,
+  Separator,
+  TextArea,
+} from "@ruby-ai/sparkle";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React, { useMemo } from "react";
+import { useController, useFormContext } from "react-hook-form";
+
+interface WebhookEditionNameInputProps {
+  isEditor: boolean;
+}
+
+function WebhookEditionNameInput({ isEditor }: WebhookEditionNameInputProps) {
+  const { control } = useFormContext<TriggerViewsSheetFormValues>();
+  const {
+    field,
+    fieldState: { error },
+  } = useController({ control, name: "webhook.name" });
+
+  return (
+    <div className="flex-grow space-y-1">
+      <Label htmlFor="webhook-name">Name</Label>
+      <Input
+        id="webhook-name"
+        placeholder="Enter trigger name"
+        disabled={!isEditor}
+        {...field}
+        isError={!!error}
+        message={error?.message}
+        messageStatus="error"
+      />
+    </div>
+  );
+}
+
+function getQuotaDescription({
+  isCreditPooled,
+  executionMode,
+}: {
+  isCreditPooled: boolean;
+  executionMode: "user_pool" | "workspace_pool";
+}) {
+  if (isCreditPooled) {
+    switch (executionMode) {
+      case "user_pool":
+        return "personal credit pool.";
+      case "workspace_pool":
+        return "workspace's credit pool.";
+      default:
+        return assertNever(executionMode);
+    }
+  } else {
+    switch (executionMode) {
+      case "user_pool":
+        return "personal fair use limits.";
+      case "workspace_pool":
+        return "workspace's programmatic usage.";
+      default:
+        return assertNever(executionMode);
+    }
+  }
+}
+
+interface WebhookEditionExecutionLimitProps {
+  isEditor: boolean;
+}
+
+function WebhookEditionExecutionLimit({
+  isEditor,
+}: WebhookEditionExecutionLimitProps) {
+  const { control } = useFormContext<TriggerViewsSheetFormValues>();
+  const { subscription } = useAuth();
+  const {
+    field: limitField,
+    fieldState: { error },
+  } = useController({
+    control,
+    name: "webhook.executionPerDayLimitOverride",
+  });
+  const {
+    field: { value: executionMode },
+  } = useController({ control, name: "webhook.executionMode" });
+
+  return (
+    <div className="flex flex-col space-y-1">
+      <Label htmlFor="execution-limit">Rate limits</Label>
+      <p className="text-sm text-muted-foreground">
+        Maximum number of runs over a 24-hour window. This will count towards
+        your{" "}
+        {getQuotaDescription({
+          isCreditPooled: isCreditPricedPlan(subscription.plan),
+          executionMode,
+        })}{" "}
+        (
+        <LinkWrapper
+          href="https://docs.ruby.ad/docs/user-documentation/agents/triggers/credits-usage"
+          target="_blank"
+          rel="noreferrer"
+          className="underline"
+        >
+          Learn more
+        </LinkWrapper>
+        )
+      </p>
+      <Input
+        id="execution-limit"
+        type="number"
+        className="w-32"
+        disabled={!isEditor}
+        name={limitField.name}
+        value={String(limitField.value)}
+        onChange={(event) => limitField.onChange(event.target.valueAsNumber)}
+        onBlur={limitField.onBlur}
+        isError={!!error}
+        message={error?.message}
+        messageStatus="error"
+      />
+    </div>
+  );
+}
+
+interface WebhookEditionEventSelectorProps {
+  isEditor: boolean;
+  selectedPreset: BaseWebhookPreset | null;
+  availableEvents: WebhookEvent[];
+}
+
+function WebhookEditionEventSelector({
+  isEditor,
+  selectedPreset,
+  availableEvents,
+}: WebhookEditionEventSelectorProps) {
+  const { control } = useFormContext<TriggerViewsSheetFormValues>();
+  const {
+    field: { value: selectedEvent, onChange: setSelectedEvent },
+    fieldState: { error },
+  } = useController({ control, name: "webhook.event" });
+
+  if (!selectedPreset || availableEvents.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="flex flex-col space-y-1">
+      <Label htmlFor="webhook-event">Listen for</Label>
+      <p className="text-sm text-muted-foreground">
+        External event that will trigger a run of this agent.
+      </p>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            id="webhook-event"
+            variant="outline"
+            isSelect
+            className="w-fit"
+            disabled={!isEditor}
+            label={
+              availableEvents.find((e) => e.value === selectedEvent)?.name ??
+              "Select event"
+            }
+          />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent>
+          <DropdownMenuLabel label="Select" />
+          {availableEvents.map((event) => (
+            <DropdownMenuItem
+              key={event.value}
+              label={event.name}
+              disabled={!isEditor}
+              onClick={() => setSelectedEvent(event.value)}
+            />
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {error && <p className="text-sm text-warning">{error.message}</p>}
+    </div>
+  );
+}
+
+interface WebhookEditionIncludePayloadProps {
+  isEditor: boolean;
+}
+
+function WebhookEditionIncludePayload({
+  isEditor,
+}: WebhookEditionIncludePayloadProps) {
+  const { control } = useFormContext<TriggerViewsSheetFormValues>();
+  const {
+    field: { value: includePayload, onChange: setIncludePayload },
+  } = useController({ control, name: "webhook.includePayload" });
+
+  return (
+    <div className="flex items-center gap-2">
+      <Checkbox
+        checked={includePayload}
+        onClick={() => setIncludePayload(!includePayload)}
+        disabled={!isEditor}
+      />
+      <Label>Include webhook payload</Label>
+    </div>
+  );
+}
+
+interface WebhookEditionMessageInputProps {
+  isEditor: boolean;
+}
+
+function WebhookEditionMessageInput({
+  isEditor,
+}: WebhookEditionMessageInputProps) {
+  const { control } = useFormContext<TriggerViewsSheetFormValues>();
+  const { field } = useController({ control, name: "webhook.customPrompt" });
+
+  return (
+    <div className="space-y-1">
+      <Label htmlFor="webhook-prompt">Message (optional)</Label>
+      <p className="text-sm text-muted-foreground">
+        Message for the agent when the trigger runs.
+      </p>
+      <TextArea
+        id="webhook-prompt"
+        minRows={4}
+        disabled={!isEditor}
+        {...field}
+      />
+    </div>
+  );
+}
+
+interface WebhookEditionPodSelectorProps {
+  isEditor: boolean;
+  owner: LightWorkspaceType;
+}
+
+function WebhookEditionPodSelector({
+  isEditor,
+  owner,
+}: WebhookEditionPodSelectorProps) {
+  const { control } = useFormContext<TriggerViewsSheetFormValues>();
+  const { field } = useController({ control, name: "webhook.spaceId" });
+
+  return (
+    <div className="space-y-1">
+      <Label>Where to create this conversation? (optional)</Label>
+      <p className="text-sm text-muted-foreground">
+        Run this trigger's conversation inside a Pod instead.
+      </p>
+      <TriggerPodSelector
+        owner={owner}
+        value={field.value}
+        onChange={field.onChange}
+        disabled={!isEditor}
+      />
+    </div>
+  );
+}
+
+interface WebhookEditionSheetContentProps {
+  owner: LightWorkspaceType;
+  trigger: AgentBuilderWebhookTriggerType | null;
+  agentConfigurationId: string | null;
+  webhookSourceView: WebhookSourceViewType | null;
+  isEditor: boolean;
+}
+
+export function WebhookEditionSheetContent({
+  owner,
+  trigger,
+  agentConfigurationId,
+  webhookSourceView,
+  isEditor,
+}: WebhookEditionSheetContentProps) {
+  const selectedPreset = useMemo((): BaseWebhookPreset | null => {
+    if (!webhookSourceView || webhookSourceView.provider === null) {
+      return null;
+    }
+    return WEBHOOK_PRESETS[webhookSourceView.provider];
+  }, [webhookSourceView]);
+
+  const availableEvents = useMemo(() => {
+    if (!selectedPreset || !webhookSourceView) {
+      return [];
+    }
+
+    return selectedPreset.events.filter((event) =>
+      webhookSourceView.subscribedEvents.includes(event.value)
+    );
+  }, [selectedPreset, webhookSourceView]);
+
+  return (
+    <>
+      {trigger && !isEditor && (
+        <ContentMessage variant="info">
+          You cannot edit this trigger. It is managed by{" "}
+          <span className="font-semibold">
+            {trigger.editorName ?? "another user"}
+          </span>
+          .
+        </ContentMessage>
+      )}
+      <div className="space-y-8">
+        <div className="flex flex-row items-center justify-between gap-4">
+          <WebhookEditionNameInput isEditor={isEditor} />
+          <TriggerStatusToggle name="webhook.status" isEditor={isEditor} />
+        </div>
+
+        <WebhookEditionEventSelector
+          isEditor={isEditor}
+          selectedPreset={selectedPreset}
+          availableEvents={availableEvents}
+        />
+
+        <WebhookEditionFilters
+          isEditor={isEditor}
+          webhookSourceView={webhookSourceView}
+          selectedPreset={selectedPreset}
+          availableEvents={availableEvents}
+          workspace={owner}
+        />
+
+        <Separator />
+
+        <div className="space-y-4">
+          <WebhookEditionMessageInput isEditor={isEditor} />
+          <WebhookEditionIncludePayload isEditor={isEditor} />
+        </div>
+
+        <Separator />
+
+        <TriggerPoolSelector
+          name="webhook.executionMode"
+          currentExecutionMode={trigger?.executionMode ?? null}
+          isEditor={isEditor}
+        />
+
+        <WebhookEditionExecutionLimit isEditor={isEditor} />
+
+        <Separator />
+
+        <WebhookEditionPodSelector isEditor={isEditor} owner={owner} />
+
+        {trigger && (
+          <div className="space-y-1">
+            <RecentWebhookRequests
+              owner={owner}
+              agentConfigurationId={agentConfigurationId}
+              trigger={trigger}
+            />
+          </div>
+        )}
+      </div>
+    </>
+  );
+}

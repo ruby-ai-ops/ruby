@@ -1,0 +1,743 @@
+use crate::cached_request::CachedRequest;
+use crate::project::Project;
+use crate::providers::chat_messages::{AssistantChatMessage, AssistantContentItem, ChatMessage};
+use crate::providers::provider::{provider, with_retryable_back_off, ProviderID};
+use crate::run::Credentials;
+use crate::stores::store::Store;
+use crate::types::tokenizer::TokenizerConfig;
+use crate::utils::ParseError;
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::str::FromStr;
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{error, info};
+
+use crate::providers::sentencepiece::sentencepiece::{
+    mistral_instruct_tokenizer_240216_model_v2_base_singleton,
+    mistral_instruct_tokenizer_240216_model_v3_base_singleton,
+    mistral_tokenizer_model_v1_base_singleton,
+};
+use crate::providers::tiktoken::tiktoken::CoreBPE;
+use crate::providers::tiktoken::tiktoken::{
+    anthropic_base_singleton, cl100k_base_singleton, o200k_base_singleton, p50k_base_singleton,
+    r50k_base_singleton,
+};
+use crate::types::tokenizer::{SentencePieceTokenizerBase, TiktokenTokenizerBase};
+use parking_lot::RwLock;
+use sentencepiece::SentencePieceProcessor;
+use std::sync::Arc;
+
+pub enum TokenizerSingleton {
+    Tiktoken(Arc<RwLock<CoreBPE>>),
+    SentencePiece(Arc<RwLock<SentencePieceProcessor>>),
+}
+
+impl TokenizerSingleton {
+    pub fn from_config(config: &TokenizerConfig) -> Option<Self> {
+        match config {
+            TokenizerConfig::Tiktoken { base } => match base {
+                TiktokenTokenizerBase::O200kBase => {
+                    Some(TokenizerSingleton::Tiktoken(o200k_base_singleton()))
+                }
+                TiktokenTokenizerBase::Cl100kBase => {
+                    Some(TokenizerSingleton::Tiktoken(cl100k_base_singleton()))
+                }
+                TiktokenTokenizerBase::P50kBase => {
+                    Some(TokenizerSingleton::Tiktoken(p50k_base_singleton()))
+                }
+                TiktokenTokenizerBase::R50kBase => {
+                    Some(TokenizerSingleton::Tiktoken(r50k_base_singleton()))
+                }
+                TiktokenTokenizerBase::AnthropicBase => {
+                    Some(TokenizerSingleton::Tiktoken(anthropic_base_singleton()))
+                }
+            },
+            TokenizerConfig::SentencePiece { base } => match base {
+                SentencePieceTokenizerBase::ModelV1 => Some(TokenizerSingleton::SentencePiece(
+                    mistral_tokenizer_model_v1_base_singleton(),
+                )),
+                SentencePieceTokenizerBase::ModelV2 => Some(TokenizerSingleton::SentencePiece(
+                    mistral_instruct_tokenizer_240216_model_v2_base_singleton(),
+                )),
+                SentencePieceTokenizerBase::ModelV3 => Some(TokenizerSingleton::SentencePiece(
+                    mistral_instruct_tokenizer_240216_model_v3_base_singleton(),
+                )),
+            },
+        }
+    }
+
+    pub async fn encode(&self, text: &str) -> Result<Vec<usize>> {
+        match self {
+            TokenizerSingleton::Tiktoken(bpe) => {
+                crate::providers::tiktoken::tiktoken::encode_async(bpe.clone(), text).await
+            }
+            TokenizerSingleton::SentencePiece(spp) => {
+                crate::providers::sentencepiece::sentencepiece::encode_async(spp.clone(), text)
+                    .await
+            }
+        }
+    }
+
+    pub async fn decode(&self, tokens: Vec<usize>) -> Result<String> {
+        match self {
+            TokenizerSingleton::Tiktoken(bpe) => {
+                crate::providers::tiktoken::tiktoken::decode_async(bpe.clone(), tokens).await
+            }
+            TokenizerSingleton::SentencePiece(spp) => {
+                crate::providers::sentencepiece::sentencepiece::decode_async(spp.clone(), tokens)
+                    .await
+            }
+        }
+    }
+
+    pub async fn tokenize(&self, texts: Vec<String>) -> Result<Vec<Vec<(usize, String)>>> {
+        match self {
+            TokenizerSingleton::Tiktoken(bpe) => {
+                crate::providers::tiktoken::tiktoken::batch_tokenize_async(bpe.clone(), texts).await
+            }
+            TokenizerSingleton::SentencePiece(spp) => {
+                crate::providers::sentencepiece::sentencepiece::batch_tokenize_async(
+                    spp.clone(),
+                    texts,
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn batch_count(&self, texts: Vec<String>) -> Result<Vec<usize>> {
+        match self {
+            TokenizerSingleton::Tiktoken(bpe) => {
+                crate::providers::tiktoken::tiktoken::batch_count_async(bpe.clone(), texts).await
+            }
+            TokenizerSingleton::SentencePiece(spp) => {
+                crate::providers::sentencepiece::sentencepiece::batch_count_async(
+                    spp.clone(),
+                    texts,
+                )
+                .await
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Clone, Deserialize)]
+pub struct Tokens {
+    pub text: String,
+    pub tokens: Option<Vec<String>>,
+    pub logprobs: Option<Vec<Option<f32>>>,
+    pub top_logprobs: Option<Vec<Option<HashMap<String, f32>>>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct LLMGeneration {
+    pub created: u64,
+    pub provider: String,
+    pub model: String,
+    pub completions: Vec<Tokens>,
+    pub prompt: Tokens,
+    pub usage: Option<LLMTokenUsage>,
+    pub provider_request_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatMessageRole {
+    System,
+    User,
+    Assistant,
+    Function,
+}
+
+impl ToString for ChatMessageRole {
+    fn to_string(&self) -> String {
+        match self {
+            ChatMessageRole::System => String::from("system"),
+            ChatMessageRole::User => String::from("user"),
+            ChatMessageRole::Assistant => String::from("assistant"),
+            ChatMessageRole::Function => String::from("function"),
+        }
+    }
+}
+
+impl FromStr for ChatMessageRole {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "system" => Ok(ChatMessageRole::System),
+            "user" => Ok(ChatMessageRole::User),
+            "assistant" => Ok(ChatMessageRole::Assistant),
+            "function" => Ok(ChatMessageRole::Function),
+            _ => Err(ParseError::with_message("Unknown ChatMessageRole"))?,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct ChatFunctionCall {
+    pub arguments: String,
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct ChatFunction {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct LLMTokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct LLMChatLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<Vec<TopLogprob>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct LLMChatGeneration {
+    pub created: u64,
+    pub provider: String,
+    pub model: String,
+    pub completions: Vec<AssistantChatMessage>,
+    pub usage: Option<LLMTokenUsage>,
+    pub provider_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Vec<LLMChatLogprob>>,
+}
+
+#[async_trait]
+pub trait LLM {
+    fn id(&self) -> String;
+
+    async fn initialize(&mut self, credentials: Credentials) -> Result<()>;
+
+    fn context_size(&self) -> usize;
+
+    async fn encode(&self, text: &str) -> Result<Vec<usize>>;
+    async fn decode(&self, tokens: Vec<usize>) -> Result<String>;
+    async fn tokenize(&self, texts: Vec<String>) -> Result<Vec<Vec<(usize, String)>>>;
+
+    async fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: Option<i32>,
+        temperature: f32,
+        n: usize,
+        stop: &Vec<String>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        top_p: Option<f32>,
+        top_logprobs: Option<i32>,
+        extras: Option<Value>,
+        event_sender: Option<UnboundedSender<Value>>,
+    ) -> Result<LLMGeneration>;
+
+    async fn chat(
+        &self,
+        messages: &Vec<ChatMessage>,
+        functions: &Vec<ChatFunction>,
+        function_call: Option<String>,
+        temperature: f32,
+        top_p: Option<f32>,
+        n: usize,
+        stop: &Vec<String>,
+        max_tokens: Option<i32>,
+        presence_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        logprobs: Option<bool>,
+        top_logprobs: Option<i32>,
+        extras: Option<Value>,
+        event_sender: Option<UnboundedSender<Value>>,
+    ) -> Result<LLMChatGeneration>;
+}
+
+impl CachedRequest for LLMRequest {
+    /// The version of the cache. This should be incremented whenever the inputs or
+    /// outputs of the request are changed, to ensure that the cached data is invalidated.
+    const VERSION: i32 = 1;
+
+    const REQUEST_TYPE: &'static str = "llm";
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct LLMRequest {
+    hash: String,
+    provider_id: ProviderID,
+    model_id: String,
+    prompt: String,
+    max_tokens: Option<i32>,
+    temperature: f32,
+    n: usize,
+    stop: Vec<String>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    top_p: Option<f32>,
+    top_logprobs: Option<i32>,
+    extras: Option<Value>,
+}
+
+impl LLMRequest {
+    pub fn new(
+        provider_id: ProviderID,
+        model_id: &str,
+        prompt: &str,
+        max_tokens: Option<i32>,
+        temperature: f32,
+        n: usize,
+        stop: &Vec<String>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        top_p: Option<f32>,
+        top_logprobs: Option<i32>,
+        extras: Option<Value>,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(provider_id.to_string().as_bytes());
+        hasher.update(model_id.as_bytes());
+        hasher.update(prompt.as_bytes());
+        hasher.update(LLMRequest::version().to_string().as_bytes());
+
+        if !max_tokens.is_none() {
+            hasher.update(max_tokens.unwrap().to_string().as_bytes());
+        }
+        hasher.update(temperature.to_string().as_bytes());
+        hasher.update(n.to_string().as_bytes());
+        stop.iter().for_each(|s| {
+            hasher.update(s.as_bytes());
+        });
+        if !frequency_penalty.is_none() {
+            hasher.update(frequency_penalty.unwrap().to_string().as_bytes());
+        }
+        if !presence_penalty.is_none() {
+            hasher.update(presence_penalty.unwrap().to_string().as_bytes());
+        }
+        if !top_p.is_none() {
+            hasher.update(top_p.unwrap().to_string().as_bytes());
+        }
+        if !top_logprobs.is_none() {
+            hasher.update(top_logprobs.unwrap().to_string().as_bytes());
+        }
+        if !extras.is_none() {
+            hasher.update(extras.clone().unwrap().to_string().as_bytes());
+        }
+
+        Self {
+            hash: format!("{}", hasher.finalize().to_hex()),
+            provider_id,
+            model_id: String::from(model_id),
+            prompt: String::from(prompt),
+            max_tokens,
+            temperature,
+            n,
+            stop: stop.clone(),
+            frequency_penalty,
+            presence_penalty,
+            top_p,
+            top_logprobs,
+            extras,
+        }
+    }
+
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    pub async fn execute(
+        &self,
+        credentials: Credentials,
+        event_sender: Option<UnboundedSender<Value>>,
+        run_id: String,
+    ) -> Result<LLMGeneration> {
+        let mut llm = provider(self.provider_id).llm(self.model_id.clone(), None);
+        llm.initialize(credentials).await?;
+
+        let out = with_retryable_back_off(
+            || {
+                llm.generate(
+                    self.prompt.as_str(),
+                    self.max_tokens,
+                    self.temperature,
+                    self.n,
+                    &self.stop,
+                    self.frequency_penalty,
+                    self.presence_penalty,
+                    self.top_p,
+                    self.top_logprobs,
+                    self.extras.clone(),
+                    event_sender.clone(),
+                )
+            },
+            |err_msg, sleep, attempts| {
+                info!(
+                    provider_id = self.provider_id.to_string(),
+                    model_id = self.model_id,
+                    attempts = attempts,
+                    sleep = sleep.as_millis(),
+                    err_msg = err_msg,
+                    run_id = run_id,
+                    "Retry querying"
+                );
+            },
+            |err| {
+                error!(
+                    provider_id = self.provider_id.to_string(),
+                    model_id = self.model_id,
+                    err_msg = err.message,
+                    request_id = err.request_id.as_deref().unwrap_or(""),
+                    run_id = run_id,
+                    "LLMRequest ModelError",
+                );
+            },
+        )
+        .await;
+
+        match out {
+            Ok(c) => {
+                info!(
+                    provider_id = self.provider_id.to_string(),
+                    model_id = self.model_id,
+                    prompt_length = self.prompt.len(),
+                    max_tokens = self.max_tokens.unwrap_or(0),
+                    temperature = self.temperature,
+                    prompt_tokens = match c.prompt.logprobs.as_ref() {
+                        None => 0,
+                        Some(logprobs) => logprobs.len(),
+                    },
+                    request_id = c.provider_request_id.as_deref().unwrap_or(""),
+                    run_id = run_id,
+                    completion_tokens = c
+                        .completions
+                        .iter()
+                        .map(|c| c.logprobs.as_ref().unwrap().len().to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    "Success querying"
+                );
+                Ok(c)
+            }
+            Err(e) => Err(anyhow!(
+                "Error querying `{}:{}`: error={}",
+                self.provider_id.to_string(),
+                self.model_id,
+                e.to_string(),
+            )),
+        }
+    }
+
+    pub async fn execute_with_cache(
+        &self,
+        credentials: Credentials,
+        project: Project,
+        store: Box<dyn Store + Send + Sync>,
+        use_cache: bool,
+        run_id: String,
+    ) -> Result<LLMGeneration> {
+        let generation = {
+            match use_cache {
+                false => None,
+                true => {
+                    let mut generations = store.llm_cache_get(&project, self).await?;
+                    match generations.len() {
+                        0 => None,
+                        _ => Some(generations.remove(0)),
+                    }
+                }
+            }
+        };
+
+        match generation {
+            Some(generation) => Ok(generation),
+            None => {
+                let generation = self.execute(credentials, None, run_id).await?;
+                store.llm_cache_store(&project, self, &generation).await?;
+                Ok(generation)
+            }
+        }
+    }
+}
+
+impl CachedRequest for LLMChatRequest {
+    /// The version of the cache. This should be incremented whenever the inputs or
+    /// outputs of the request are changed, to ensure that the cached data is invalidated.
+    const VERSION: i32 = 1;
+
+    const REQUEST_TYPE: &'static str = "chat";
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct LLMChatRequest {
+    hash: String,
+    provider_id: ProviderID,
+    model_id: String,
+    messages: Vec<ChatMessage>,
+    functions: Vec<ChatFunction>,
+    function_call: Option<String>,
+    temperature: f32,
+    top_p: Option<f32>,
+    n: usize,
+    stop: Vec<String>,
+    max_tokens: Option<i32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<i32>,
+    extras: Option<Value>,
+}
+
+impl LLMChatRequest {
+    pub fn new(
+        provider_id: ProviderID,
+        model_id: &str,
+        messages: &Vec<ChatMessage>,
+        functions: &Vec<ChatFunction>,
+        function_call: Option<String>,
+        temperature: f32,
+        top_p: Option<f32>,
+        n: usize,
+        stop: &Vec<String>,
+        max_tokens: Option<i32>,
+        presence_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        logprobs: Option<bool>,
+        top_logprobs: Option<i32>,
+        extras: Option<Value>,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+
+        hasher.update(provider_id.to_string().as_bytes());
+        hasher.update(model_id.as_bytes());
+        hasher.update(LLMChatRequest::version().to_string().as_bytes());
+
+        messages.iter().for_each(|m| {
+            hasher.update(serde_json::to_string(m).unwrap().as_bytes());
+        });
+        functions.iter().for_each(|m| {
+            hasher.update(serde_json::to_string(m).unwrap().as_bytes());
+        });
+        if !function_call.is_none() {
+            hasher.update(function_call.clone().unwrap().as_bytes());
+        }
+        hasher.update(temperature.to_string().as_bytes());
+        if !top_p.is_none() {
+            hasher.update(top_p.unwrap().to_string().as_bytes());
+        }
+        hasher.update(n.to_string().as_bytes());
+        stop.iter().for_each(|s| {
+            hasher.update(s.as_bytes());
+        });
+        if !max_tokens.is_none() {
+            hasher.update(max_tokens.unwrap().to_string().as_bytes());
+        }
+        if !presence_penalty.is_none() {
+            hasher.update(presence_penalty.unwrap().to_string().as_bytes());
+        }
+        if !frequency_penalty.is_none() {
+            hasher.update(frequency_penalty.unwrap().to_string().as_bytes());
+        }
+        if !logprobs.is_none() {
+            hasher.update(logprobs.unwrap().to_string().as_bytes());
+        }
+        if !top_logprobs.is_none() {
+            hasher.update(top_logprobs.unwrap().to_string().as_bytes());
+        }
+        if !extras.is_none() {
+            hasher.update(extras.clone().unwrap().to_string().as_bytes());
+        }
+
+        Self {
+            hash: format!("{}", hasher.finalize().to_hex()),
+            provider_id,
+            model_id: String::from(model_id),
+            messages: messages.clone(),
+            functions: functions.clone(),
+            function_call,
+            temperature,
+            top_p,
+            n,
+            stop: stop.clone(),
+            max_tokens,
+            presence_penalty,
+            frequency_penalty,
+            logprobs,
+            top_logprobs,
+            extras,
+        }
+    }
+
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    pub async fn execute(
+        &self,
+        credentials: Credentials,
+        event_sender: Option<UnboundedSender<Value>>,
+        run_id: String,
+    ) -> Result<LLMChatGeneration> {
+        let mut llm = provider(self.provider_id).llm(self.model_id.clone(), None);
+        llm.initialize(credentials).await?;
+
+        let out = with_retryable_back_off(
+            || {
+                llm.chat(
+                    &self.messages,
+                    &self.functions,
+                    self.function_call.clone(),
+                    self.temperature,
+                    self.top_p,
+                    self.n,
+                    &self.stop,
+                    self.max_tokens,
+                    self.presence_penalty,
+                    self.frequency_penalty,
+                    self.logprobs,
+                    self.top_logprobs,
+                    self.extras.clone(),
+                    event_sender.clone(),
+                )
+            },
+            |err_msg, sleep, attempts| {
+                info!(
+                    provider_id = self.provider_id.to_string(),
+                    model_id = self.model_id,
+                    attempts = attempts,
+                    sleep = sleep.as_millis(),
+                    err_msg = err_msg,
+                    run_id = run_id,
+                    "Retry querying"
+                );
+            },
+            |err| {
+                error!(
+                    provider_id = self.provider_id.to_string(),
+                    model_id = self.model_id,
+                    err_msg = err.message,
+                    request_id = err.request_id.as_deref().unwrap_or(""),
+                    "LLMChatRequest ModelError",
+                );
+            },
+        )
+        .await;
+
+        match out {
+            Ok(mut c) => {
+                // Backfill contents array if it's None but legacy fields are present.
+                for completion in &mut c.completions {
+                    if completion.contents.is_none() {
+                        let mut contents = Vec::new();
+
+                        // Add text content if present.
+                        if let Some(ref content) = completion.content {
+                            if !content.is_empty() {
+                                contents.push(AssistantContentItem::TextContent {
+                                    value: content.clone(),
+                                });
+                            }
+                        }
+
+                        // Add function calls if present.
+                        if let Some(ref function_calls) = completion.function_calls {
+                            for fc in function_calls {
+                                contents
+                                    .push(AssistantContentItem::FunctionCall { value: fc.clone() });
+                            }
+                        }
+
+                        // Only set contents if we actually have items.
+                        if !contents.is_empty() {
+                            completion.contents = Some(contents);
+                        }
+                    }
+                }
+
+                info!(
+                    provider_id = self.provider_id.to_string(),
+                    model_id = self.model_id,
+                    messages_count = self.messages.len(),
+                    temperature = self.temperature,
+                    request_id = c.provider_request_id.as_deref().unwrap_or(""),
+                    run_id = run_id,
+                    completion_message_length = c
+                        .completions
+                        .iter()
+                        .map(|c| c
+                            .content
+                            .as_ref()
+                            .unwrap_or(&String::new())
+                            .len()
+                            .to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    "Success querying",
+                );
+                Ok(c)
+            }
+            Err(e) => Err(anyhow!(
+                "Error querying `{}:{}`: error={}",
+                self.provider_id.to_string(),
+                self.model_id,
+                e.to_string(),
+            )),
+        }
+    }
+
+    pub async fn execute_with_cache(
+        &self,
+        credentials: Credentials,
+        project: Project,
+        store: Box<dyn Store + Send + Sync>,
+        use_cache: bool,
+        run_id: String,
+    ) -> Result<LLMChatGeneration> {
+        let generation = {
+            match use_cache {
+                false => None,
+                true => {
+                    let mut generations = store.llm_chat_cache_get(&project, self).await?;
+                    match generations.len() {
+                        0 => None,
+                        _ => {
+                            let mut generation = generations.remove(0);
+                            generation.usage = None;
+                            Some(generation)
+                        }
+                    }
+                }
+            }
+        };
+
+        match generation {
+            Some(generation) => Ok(generation),
+            None => {
+                let generation = self.execute(credentials, None, run_id).await?;
+                store
+                    .llm_chat_cache_store(&project, self, &generation)
+                    .await?;
+                Ok(generation)
+            }
+        }
+    }
+}

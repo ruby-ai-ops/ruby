@@ -1,0 +1,295 @@
+import logger from "@connectors/logger/logger";
+import { apiError } from "@connectors/logger/withlogging";
+import type { ConnectorsAPIErrorResponse } from "@connectors/types";
+import crypto from "crypto";
+import type { NextFunction, Request, Response } from "express";
+
+const {
+  RUBY_CONNECTORS_SECRET,
+  RUBY_CONNECTORS_WEBHOOKS_SECRET,
+  GITHUB_WEBHOOK_SECRET,
+  INTERCOM_CLIENT_SECRET,
+} = process.env;
+
+if (!RUBY_CONNECTORS_SECRET) {
+  throw new Error("RUBY_CONNECTORS_SECRET is not defined");
+}
+if (!RUBY_CONNECTORS_WEBHOOKS_SECRET) {
+  throw new Error("RUBY_CONNECTORS_WEBHOOKS_SECRET is not defined");
+}
+
+export const authMiddleware = (
+  req: Request,
+  res: Response<ConnectorsAPIErrorResponse>,
+  next: NextFunction
+) => {
+  if (req.path.startsWith("/webhooks")) {
+    if (req.path.endsWith("/github")) {
+      return _authMiddlewareWebhooksGithub(req, res, next);
+    } else if (
+      req.path.endsWith("/intercom") ||
+      req.path.endsWith("/intercom/uninstall")
+    ) {
+      return _authMiddlewareWebhooksIntercom(req, res, next);
+    }
+    return _authMiddlewareWebhooks(req, res, next);
+  }
+
+  return _authMiddlewareAPI(req, res, next);
+};
+
+const _authMiddlewareAPI = (
+  req: Request,
+  res: Response<ConnectorsAPIErrorResponse>,
+  next: NextFunction
+) => {
+  if (!req.headers["authorization"]) {
+    return apiError(req, res, {
+      api_error: {
+        type: "authorization_error",
+        message: "Missing Authorization header",
+      },
+      status_code: 401,
+    });
+  }
+  const authorization = req.headers["authorization"];
+  if (typeof authorization !== "string") {
+    return apiError(req, res, {
+      api_error: {
+        type: "authorization_error",
+        message: "Invalid Authorization header. Should be a string",
+      },
+      status_code: 401,
+    });
+  }
+
+  if (authorization.split(" ")[0] !== "Bearer") {
+    return apiError(req, res, {
+      api_error: {
+        type: "authorization_error",
+        message: "Invalid Authorization header",
+      },
+      status_code: 401,
+    });
+  }
+  const secret = authorization.split(" ")[1];
+  if (!secret) {
+    return apiError(req, res, {
+      api_error: {
+        type: "authorization_error",
+        message: "Missing API key",
+      },
+      status_code: 401,
+    });
+  }
+  if (secret !== RUBY_CONNECTORS_SECRET) {
+    return apiError(req, res, {
+      api_error: {
+        type: "authorization_error",
+        message: "Invalid API key",
+      },
+      status_code: 401,
+    });
+  }
+  next();
+};
+
+const _authMiddlewareWebhooks = (
+  req: Request,
+  res: Response<ConnectorsAPIErrorResponse>,
+  next: NextFunction
+) => {
+  if (req.path.startsWith("/webhooks")) {
+    const parts = req.path.split("/");
+
+    if (parts.includes(RUBY_CONNECTORS_WEBHOOKS_SECRET) === false) {
+      return apiError(req, res, {
+        api_error: {
+          type: "authorization_error",
+          message: "Invalid webhook secret",
+        },
+        status_code: 401,
+      });
+    }
+  }
+  next();
+};
+
+const _authMiddlewareWebhooksGithub = (
+  req: Request,
+  res: Response<ConnectorsAPIErrorResponse>,
+  next: NextFunction
+) => {
+  if (!req.path.split("/").includes(RUBY_CONNECTORS_WEBHOOKS_SECRET)) {
+    logger.error({ path: req.path }, `Invalid webhook secret`);
+    return apiError(req, res, {
+      api_error: {
+        type: "not_found",
+        message: "Not found.",
+      },
+      status_code: 404,
+    });
+  }
+
+  if (!GITHUB_WEBHOOK_SECRET) {
+    logger.error("GITHUB_WEBHOOK_SECRET is not defined");
+    return apiError(req, res, {
+      status_code: 500,
+      api_error: {
+        type: "internal_server_error",
+        message: "Webhook secret is not defined.",
+      },
+    });
+  }
+
+  // check webhook signature
+  // @ts-expect-error -- rawBody is not defined on Request
+  // but it is added by a previous middleware
+  const body = req.rawBody as Buffer;
+
+  if (!req.headers["x-hub-signature-256"]) {
+    logger.error("x-hub-signature-256 header is missing.");
+    return apiError(req, res, {
+      api_error: {
+        type: "not_found",
+        message: "Not found.",
+      },
+      status_code: 404,
+    });
+  }
+
+  const signatureHeader = req.headers["x-hub-signature-256"];
+  const computedSignature = `sha256=${crypto
+    .createHmac("sha256", GITHUB_WEBHOOK_SECRET)
+    .update(body)
+    .digest("hex")}`;
+
+  if (Array.isArray(signatureHeader)) {
+    logger.error(
+      { signatureHeader },
+      `Unexpected x-hub-signature-256 header format`
+    );
+    return apiError(req, res, {
+      api_error: {
+        type: "connector_not_found",
+        message: "Not found.",
+      },
+      status_code: 404,
+    });
+  }
+
+  if (
+    !crypto.timingSafeEqual(
+      Buffer.from(signatureHeader),
+      Buffer.from(computedSignature)
+    )
+  ) {
+    logger.error(
+      { signatureHeader, computedSignature },
+      `x-hub-signature-256 header does not match computed signature`
+    );
+    return apiError(req, res, {
+      api_error: {
+        type: "not_found",
+        message: "Not found.",
+      },
+      status_code: 404,
+    });
+  }
+
+  next();
+};
+
+const _authMiddlewareWebhooksIntercom = (
+  req: Request,
+  res: Response<ConnectorsAPIErrorResponse>,
+  next: NextFunction
+) => {
+  if (!req.path.split("/").includes(RUBY_CONNECTORS_WEBHOOKS_SECRET)) {
+    logger.error({ path: req.path }, `Invalid webhook secret`);
+    return apiError(req, res, {
+      api_error: {
+        type: "not_found",
+        message: "Not found.",
+      },
+      status_code: 404,
+    });
+  }
+
+  if (!INTERCOM_CLIENT_SECRET) {
+    logger.error("INTERCOM_CLIENT_SECRET is not defined");
+    return apiError(req, res, {
+      status_code: 500,
+      api_error: {
+        type: "internal_server_error",
+        message: "Webhook secret is not defined.",
+      },
+    });
+  }
+
+  if (
+    req.path ===
+    `/webhooks/${RUBY_CONNECTORS_WEBHOOKS_SECRET}/intercom/uninstall`
+  ) {
+    // This is a special case for the uninstall webhook whose signature is not documented on
+    // Interom. We solely rely on the webhook secret to authenticate the request.
+    next();
+  } else {
+    // check webhook signature
+    // @ts-expect-error -- rawBody is not defined on Request
+    // but it is added by a previous middleware
+    const body = req.rawBody as Buffer;
+
+    if (!req.headers["x-hub-signature"]) {
+      logger.error("x-hub-signature header is missing.");
+      return apiError(req, res, {
+        api_error: {
+          type: "not_found",
+          message: "Not found.",
+        },
+        status_code: 404,
+      });
+    }
+
+    const signatureHeader = req.headers["x-hub-signature"];
+    const computedSignature = `sha1=${crypto
+      .createHmac("sha1", INTERCOM_CLIENT_SECRET)
+      .update(body)
+      .digest("hex")}`;
+
+    if (Array.isArray(signatureHeader)) {
+      logger.error(
+        { signatureHeader },
+        `Unexpected x-hub-signature header format`
+      );
+      return apiError(req, res, {
+        api_error: {
+          type: "connector_not_found",
+          message: "Not found.",
+        },
+        status_code: 404,
+      });
+    }
+
+    if (
+      !crypto.timingSafeEqual(
+        Buffer.from(signatureHeader),
+        Buffer.from(computedSignature)
+      )
+    ) {
+      logger.error(
+        { signatureHeader, computedSignature },
+        `x-hub-signature header does not match computed signature`
+      );
+      return apiError(req, res, {
+        api_error: {
+          type: "not_found",
+          message: "Not found.",
+        },
+        status_code: 404,
+      });
+    }
+
+    next();
+  }
+};

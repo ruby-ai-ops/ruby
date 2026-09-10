@@ -1,0 +1,86 @@
+"use client";
+
+import { NavigationProvider } from "@viz/app/components/NavigationProvider";
+import {
+  makeSendCrossDocumentMessage,
+  VisualizationWrapperWithErrorBoundary,
+} from "@viz/app/components/VisualizationWrapper";
+import {
+  CacheDataAPI,
+  type PreFetchedFile,
+} from "@viz/app/lib/data-apis/cache-data-api";
+import { HybridDataAPI } from "@viz/app/lib/data-apis/hybrid-data-api";
+import { RPCDataAPI } from "@viz/app/lib/data-apis/rpc-data-api";
+import type { VisualizationConfig } from "@viz/app/lib/visualization-api";
+import { useMemo } from "react";
+
+// Domains that are trusted and don't require user confirmation before navigation.
+// These are Ruby platform domains that are considered safe for automatic navigation.
+const TRUSTED_NAVIGATION_DOMAINS = ["ruby.ad", "eu.ruby.ad"];
+
+interface ServerVisualizationWrapperClientProps {
+  allowedOrigins: string[];
+  identifier: string;
+  isAuthenticatedMember?: boolean;
+  isFullHeight?: boolean;
+  isPdfMode?: boolean;
+  prefetchedCode?: string;
+  prefetchedFiles?: PreFetchedFile[];
+}
+
+/**
+ * Client-side visualization wrapper for server-side rendered visualizations.
+ *
+ * This component runs on the client and:
+ * 1. Receives plain pre-fetched data from the server component (avoids serialization issues)
+ * 2. Creates a CacheDataAPI instance using the pre-fetched code and files
+ * 3. Renders the visualization using the cached data (no network requests needed)
+ *
+ * This is the client counterpart to ServerSideVisualizationWrapper and handles
+ * the React Server Component serialization boundary by accepting plain objects
+ * instead of class instances.
+ */
+export function ServerVisualizationWrapperClient({
+  identifier,
+  allowedOrigins,
+  isAuthenticatedMember = false,
+  isFullHeight = false,
+  isPdfMode = false,
+  prefetchedCode,
+  prefetchedFiles = [],
+}: ServerVisualizationWrapperClientProps) {
+  const dataAPI = useMemo(() => {
+    const cache = new CacheDataAPI(prefetchedFiles, prefetchedCode);
+    if (!isAuthenticatedMember) {
+      return cache;
+    }
+
+    // Authenticated member on a public frame: keep SSR reads from the cache,
+    // route callFunction over RPC.
+    const sendMessage = makeSendCrossDocumentMessage({
+      allowedOrigins,
+      identifier,
+    });
+    return new HybridDataAPI(cache, new RPCDataAPI(sendMessage));
+  }, [
+    prefetchedCode,
+    prefetchedFiles,
+    isAuthenticatedMember,
+    allowedOrigins,
+    identifier,
+  ]);
+
+  const config: VisualizationConfig = {
+    allowedOrigins,
+    dataAPI,
+    identifier,
+    isFullHeight,
+    isPdfMode,
+  };
+
+  return (
+    <NavigationProvider trustedDomains={TRUSTED_NAVIGATION_DOMAINS}>
+      <VisualizationWrapperWithErrorBoundary config={config} />
+    </NavigationProvider>
+  );
+}

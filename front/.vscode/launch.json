@@ -1,0 +1,44 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node-terminal",
+      "name": "Debug front server",
+      "request": "launch",
+      "command": "npm run dev",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env.local"
+    },
+    {
+      "type": "node-terminal",
+      "name": "Debug front worker",
+      "request": "launch",
+      "command": "npm run dev:worker",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env.local"
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Debug current vitest file",
+      "program": "${workspaceFolder}/../node_modules/vitest/vitest.mjs",
+      "args": ["run", "${relativeFile}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "autoAttachChildProcesses": true,
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"],
+      "smartStep": true,
+      "envFile": "${workspaceFolder}/.env.local",
+      "env": {
+        "NODE_ENV": "test",
+        "VITEST_DEBUG": "1",
+        "FRONT_DATABASE_URI": "${env:TEST_FRONT_DATABASE_URI}",
+        "REDIS_URI": "${env:TEST_REDIS_URI}",
+        "REDIS_CACHE_URI": "${env:TEST_REDIS_URI}"
+      }
+    }
+  ]
+}

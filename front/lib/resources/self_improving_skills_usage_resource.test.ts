@@ -1,0 +1,321 @@
+import { MARKUP_MULTIPLIER } from "@app/lib/api/programmatic_usage/common";
+import { SelfImprovingSkillsUsageResource } from "@app/lib/resources/self_improving_skills_usage_resource";
+import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
+import { SkillFactory } from "@app/tests/utils/SkillFactory";
+import { describe, expect, it } from "vitest";
+
+describe("SelfImprovingSkillsUsageResource", () => {
+  it("bulk creates usage rows and sums usage after a date for the workspace", async () => {
+    const { authenticator } = await createResourceTest({ role: "admin" });
+    const { authenticator: otherAuthenticator } = await createResourceTest({
+      role: "admin",
+    });
+
+    const skill = await SkillFactory.create(authenticator, {
+      name: "Usage Test Skill",
+    });
+    const otherWorkspaceSkill = await SkillFactory.create(otherAuthenticator, {
+      name: "Other Workspace Usage Test Skill",
+    });
+
+    const cutoff = new Date("2026-01-02T00:00:00.000Z");
+
+    const usages = await SelfImprovingSkillsUsageResource.bulkCreate(
+      authenticator,
+      [
+        {
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+          skillId: skill.id,
+          conversationId: null,
+          priceMicroUsd: 50,
+          priceAwuCredits: 1,
+        },
+        {
+          createdAt: new Date("2026-01-03T00:00:00.000Z"),
+          skillId: skill.id,
+          conversationId: null,
+          priceMicroUsd: 100,
+          priceAwuCredits: 2,
+        },
+        {
+          createdAt: new Date("2026-01-04T00:00:00.000Z"),
+          skillId: null,
+          conversationId: null,
+          priceMicroUsd: 200,
+          priceAwuCredits: 3,
+        },
+      ]
+    );
+
+    await SelfImprovingSkillsUsageResource.bulkCreate(otherAuthenticator, [
+      {
+        createdAt: new Date("2026-01-04T00:00:00.000Z"),
+        skillId: otherWorkspaceSkill.id,
+        conversationId: null,
+        priceMicroUsd: 500,
+        priceAwuCredits: 50,
+      },
+    ]);
+
+    const sum = await SelfImprovingSkillsUsageResource.getSumSpendAfterDate(
+      authenticator,
+      cutoff
+    );
+
+    expect(usages).toHaveLength(3);
+    expect(
+      usages.every((usage) => usage.workspaceId === skill.workspaceId)
+    ).toBe(true);
+    expect(sum).toEqual({ priceMicroUsd: 300, priceAwuCredits: 5 });
+  });
+
+  it("persists priceAwuCredits when provided and defaults it to 0", async () => {
+    const { authenticator } = await createResourceTest({ role: "admin" });
+    const skill = await SkillFactory.create(authenticator, {
+      name: "AWU Credits Test Skill",
+    });
+
+    const usages = await SelfImprovingSkillsUsageResource.bulkCreate(
+      authenticator,
+      [
+        {
+          createdAt: new Date("2026-01-03T00:00:00.000Z"),
+          skillId: skill.id,
+          conversationId: null,
+          priceMicroUsd: 17_000,
+          priceAwuCredits: 2,
+        },
+        {
+          createdAt: new Date("2026-01-04T00:00:00.000Z"),
+          skillId: skill.id,
+          conversationId: null,
+          priceMicroUsd: 100,
+        },
+      ]
+    );
+
+    expect(usages[0].priceAwuCredits).toBe(2);
+    expect(usages[1].priceAwuCredits).toBe(0);
+  });
+
+  it("includes priceAwuCredits in toLogJSON", async () => {
+    const { authenticator } = await createResourceTest({ role: "admin" });
+    const skill = await SkillFactory.create(authenticator, {
+      name: "Log JSON Test Skill",
+    });
+
+    const usages = await SelfImprovingSkillsUsageResource.bulkCreate(
+      authenticator,
+      [
+        {
+          createdAt: new Date("2026-01-03T00:00:00.000Z"),
+          skillId: skill.id,
+          conversationId: null,
+          priceMicroUsd: 17_000,
+          priceAwuCredits: 2,
+        },
+      ]
+    );
+
+    expect(usages[0].toLogJSON()).toEqual({
+      id: usages[0].id,
+      workspaceId: skill.workspaceId,
+      skillId: skill.id,
+      conversationId: null,
+      priceMicroUsd: 17_000,
+      priceAwuCredits: 2,
+    });
+  });
+
+  it("returns daily spend with markup aggregated by calendar day", async () => {
+    const { authenticator } = await createResourceTest({ role: "admin" });
+    const { authenticator: otherAuthenticator } = await createResourceTest({
+      role: "admin",
+    });
+
+    const skill = await SkillFactory.create(authenticator, {
+      name: "Daily Spend Skill",
+    });
+
+    await SelfImprovingSkillsUsageResource.bulkCreate(authenticator, [
+      {
+        createdAt: new Date("2026-03-10T08:00:00.000Z"),
+        skillId: skill.id,
+        conversationId: null,
+        priceMicroUsd: 100,
+        priceAwuCredits: 1,
+      },
+      {
+        createdAt: new Date("2026-03-10T20:00:00.000Z"),
+        skillId: skill.id,
+        conversationId: null,
+        priceMicroUsd: 200,
+        priceAwuCredits: 2,
+      },
+      {
+        createdAt: new Date("2026-03-12T10:00:00.000Z"),
+        skillId: skill.id,
+        conversationId: null,
+        priceMicroUsd: 500,
+        priceAwuCredits: 5,
+      },
+      // Outside the queried range.
+      {
+        createdAt: new Date("2026-03-09T23:59:59.000Z"),
+        skillId: skill.id,
+        conversationId: null,
+        priceMicroUsd: 999,
+        priceAwuCredits: 99,
+      },
+    ]);
+
+    // Other workspace — should be excluded.
+    const otherSkill = await SkillFactory.create(otherAuthenticator, {
+      name: "Other WS Skill",
+    });
+    await SelfImprovingSkillsUsageResource.bulkCreate(otherAuthenticator, [
+      {
+        createdAt: new Date("2026-03-10T12:00:00.000Z"),
+        skillId: otherSkill.id,
+        conversationId: null,
+        priceMicroUsd: 9999,
+      },
+    ]);
+
+    const result =
+      await SelfImprovingSkillsUsageResource.getDailySpendWithMarkup(
+        authenticator,
+        {
+          startDate: new Date("2026-03-10T00:00:00.000Z"),
+          endDate: new Date("2026-03-15T00:00:00.000Z"),
+        }
+      );
+
+    // The markup applies to micro-USD only; AWU credits already include the
+    // margin.
+    expect(result.get("2026-03-10")).toEqual({
+      priceMicroUsd: 300 * MARKUP_MULTIPLIER,
+      priceAwuCredits: 3,
+    });
+    expect(result.has("2026-03-11")).toBe(false);
+    expect(result.get("2026-03-12")).toEqual({
+      priceMicroUsd: 500 * MARKUP_MULTIPLIER,
+      priceAwuCredits: 5,
+    });
+    expect(result.has("2026-03-09")).toBe(false);
+    expect(result.size).toBe(2);
+  });
+
+  it("sums usage after a date by skill", async () => {
+    const { authenticator } = await createResourceTest({ role: "admin" });
+    const skill = await SkillFactory.create(authenticator, {
+      name: "Usage By Skill Test Skill",
+    });
+    const otherSkill = await SkillFactory.create(authenticator, {
+      name: "Other Usage By Skill Test Skill",
+    });
+
+    const cutoff = new Date("2026-01-02T00:00:00.000Z");
+
+    await SelfImprovingSkillsUsageResource.bulkCreate(authenticator, [
+      {
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        skillId: skill.id,
+        conversationId: null,
+        priceMicroUsd: 50,
+        priceAwuCredits: 1,
+      },
+      {
+        createdAt: new Date("2026-01-03T00:00:00.000Z"),
+        skillId: skill.id,
+        conversationId: null,
+        priceMicroUsd: 100,
+        priceAwuCredits: 2,
+      },
+      {
+        createdAt: new Date("2026-01-04T00:00:00.000Z"),
+        skillId: otherSkill.id,
+        conversationId: null,
+        priceMicroUsd: 200,
+        priceAwuCredits: 3,
+      },
+    ]);
+
+    const sums =
+      await SelfImprovingSkillsUsageResource.getSumSpendAfterDateForSkills(
+        authenticator,
+        { createdAfter: cutoff, skillModelIds: [skill.id, otherSkill.id] }
+      );
+
+    expect(sums.get(skill.id)).toEqual({
+      priceMicroUsd: 100,
+      priceAwuCredits: 2,
+    });
+    expect(sums.get(otherSkill.id)).toEqual({
+      priceMicroUsd: 200,
+      priceAwuCredits: 3,
+    });
+  });
+
+  it("applies markup multiplier in WithMarkup variants", async () => {
+    const { authenticator } = await createResourceTest({ role: "admin" });
+    const skill = await SkillFactory.create(authenticator, {
+      name: "Markup Test Skill",
+    });
+
+    const cutoff = new Date("2026-01-02T00:00:00.000Z");
+
+    await SelfImprovingSkillsUsageResource.bulkCreate(authenticator, [
+      {
+        createdAt: new Date("2026-01-03T00:00:00.000Z"),
+        skillId: skill.id,
+        conversationId: null,
+        priceMicroUsd: 100,
+        priceAwuCredits: 2,
+      },
+      {
+        createdAt: new Date("2026-01-04T00:00:00.000Z"),
+        skillId: null,
+        conversationId: null,
+        priceMicroUsd: 200,
+        priceAwuCredits: 3,
+      },
+    ]);
+
+    const sumWithMarkup =
+      await SelfImprovingSkillsUsageResource.getSumSpendWithMarkupAfterDate(
+        authenticator,
+        cutoff
+      );
+    const sumWithoutMarkup =
+      await SelfImprovingSkillsUsageResource.getSumSpendAfterDate(
+        authenticator,
+        cutoff
+      );
+
+    // The markup applies to micro-USD only; AWU credits already include the
+    // margin.
+    expect(sumWithMarkup).toEqual({
+      priceMicroUsd: sumWithoutMarkup.priceMicroUsd * MARKUP_MULTIPLIER,
+      priceAwuCredits: sumWithoutMarkup.priceAwuCredits,
+    });
+
+    const sumsWithMarkup =
+      await SelfImprovingSkillsUsageResource.getSumSpendWithMarkupAfterDateForSkills(
+        authenticator,
+        { createdAfter: cutoff, skillModelIds: [skill.id] }
+      );
+    const sumsWithoutMarkup =
+      await SelfImprovingSkillsUsageResource.getSumSpendAfterDateForSkills(
+        authenticator,
+        { createdAfter: cutoff, skillModelIds: [skill.id] }
+      );
+
+    expect(sumsWithMarkup.get(skill.id)).toEqual({
+      priceMicroUsd:
+        (sumsWithoutMarkup.get(skill.id)?.priceMicroUsd ?? 0) *
+        MARKUP_MULTIPLIER,
+      priceAwuCredits: sumsWithoutMarkup.get(skill.id)?.priceAwuCredits,
+    });
+  });
+});

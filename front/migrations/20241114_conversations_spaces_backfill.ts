@@ -1,0 +1,64 @@
+import _ from "lodash";
+
+import { Authenticator } from "@app/lib/auth";
+import { GroupResource } from "@app/lib/resources/group_resource";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
+import { makeScript } from "@app/scripts/helpers";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+
+async function backfillWorkspacesGroup(execute: boolean) {
+  const workspaces = await WorkspaceResource.listAll();
+
+  const chunks = _.chunk(workspaces, 16);
+  for (const [i, c] of chunks.entries()) {
+    console.log(
+      `[execute=${execute}] Processing chunk of ${c.length} workspaces... (${
+        i + 1
+      }/${chunks.length})`
+    );
+    if (execute) {
+      await Promise.all(
+        c.map((w) =>
+          (async () => {
+            try {
+              const workspaceGroup =
+                await GroupResource.internalFetchWorkspaceGlobalGroup(w.id);
+              if (!workspaceGroup) {
+                throw new Error("Workspace group not found");
+              }
+              const auth = await Authenticator.internalAdminForWorkspace(w.sId);
+              await SpaceResource.makeNew(
+                auth,
+                {
+                  name: "Conversations",
+                  kind: "conversations",
+                  workspaceId: w.id,
+                },
+                { members: [workspaceGroup] }
+              );
+            } catch (error) {
+              if (
+                error instanceof Error &&
+                error.cause &&
+                error.cause === "enforce_one_conversations_space_per_workspace"
+              ) {
+                console.log(
+                  `Conversation already exists for workspace ${w.id}`
+                );
+              } else {
+                throw error;
+              }
+            }
+          })()
+        )
+      );
+    }
+  }
+
+  console.log(`Done.`);
+}
+
+makeScript({}, async ({ execute }) => {
+  await backfillWorkspacesGroup(execute);
+});

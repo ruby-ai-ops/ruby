@@ -1,0 +1,91 @@
+import config from "@app/lib/api/config";
+import { getConnectorsPrimaryDbConnection } from "@app/lib/production_checks/utils";
+import { getTemporalClientForConnectorsNamespace } from "@app/lib/temporal";
+import type { ConnectorProvider } from "@app/types/data_source";
+import type { ActionLink, CheckFunction } from "@app/types/production_checks";
+import type { Client } from "@temporalio/client";
+import { QueryTypes } from "sequelize";
+
+interface ConnectorBlob {
+  id: number;
+  dataSourceId: string;
+  workspaceId: string;
+  type: ConnectorProvider;
+  pausedAt: Date | null;
+}
+
+async function listPausedConnectors() {
+  const connectors: ConnectorBlob[] =
+    // biome-ignore lint/plugin/noRawSql: production check uses read replica
+    await getConnectorsPrimaryDbConnection().query(
+      `SELECT id, "dataSourceId", "workspaceId", "pausedAt", "type" FROM connectors WHERE "pausedAt" IS NOT NULL AND "type" != 'webcrawler' and "errorType" IS NULL`,
+      {
+        type: QueryTypes.SELECT,
+      }
+    );
+
+  return connectors;
+}
+
+async function areTemporalWorkflowsRunning(
+  client: Client,
+  connector: ConnectorBlob
+) {
+  try {
+    const workflowInfos = client.workflow.list({
+      query: `ExecutionStatus = 'Running' AND connectorId = ${connector.id}`,
+    });
+
+    for await (const _ of workflowInfos) {
+      // workflowInfos is an async iterable, so we need to consume it to actually get the results
+      return true;
+    }
+    return false;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    // biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
+  } catch (err) {
+    return true;
+  }
+}
+
+export const checkExtraneousWorkflows: CheckFunction = async (
+  _checkName,
+  logger,
+  reportSuccess,
+  reportFailure,
+  heartbeat
+) => {
+  const connectors = await listPausedConnectors();
+
+  logger.info(`Found ${connectors.length} paused connectors.`);
+
+  const client = await getTemporalClientForConnectorsNamespace();
+
+  const hasExtraneousWorklows: any[] = [];
+  for (const connector of connectors) {
+    heartbeat();
+
+    const isActive = await areTemporalWorkflowsRunning(client, connector);
+    if (isActive) {
+      hasExtraneousWorklows.push({
+        connectorId: connector.id,
+        workspaceId: connector.workspaceId,
+        dataSourceId: connector.dataSourceId,
+        provider: connector.type,
+      });
+    }
+  }
+
+  if (hasExtraneousWorklows.length > 0) {
+    const actionLinks: ActionLink[] = hasExtraneousWorklows.map((c) => ({
+      label: `${c.provider}: ${c.dataSourceId}`,
+      url: `${config.getPokeAppUrl()}/${c.workspaceId}/data_sources/${c.dataSourceId}`,
+    }));
+    reportFailure(
+      { hasExtraneousWorklows, actionLinks },
+      `Extraneous temporal workflows (connector is paused but workflows are running). Potential resolution: unpause the connector.`
+    );
+  } else {
+    reportSuccess();
+  }
+};

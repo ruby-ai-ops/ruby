@@ -1,0 +1,453 @@
+import { FILE_OFFLOAD_SNIPPET_LENGTH } from "@app/lib/actions/action_output_limits";
+import { MCPError } from "@app/lib/actions/mcp_errors";
+import { USE_SUMMARY_SWITCH } from "@app/lib/actions/mcp_internal_actions/constants";
+import type {
+  BrowseResultResourceType,
+  WebsearchResultResourceType,
+} from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import type {
+  ToolHandlerExtra,
+  ToolHandlers,
+} from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { buildTools } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { summarizeWithLLM } from "@app/lib/actions/mcp_internal_actions/utils/web_summarization";
+import { isAgentLoopRunContext } from "@app/lib/actions/types";
+import { isLightServerSideMCPToolConfiguration } from "@app/lib/actions/types/guards";
+import { WEB_SEARCH_BROWSE_TOOLS_METADATA } from "@app/lib/api/actions/servers/web_search_browse/metadata";
+import { getRefs } from "@app/lib/api/assistant/citations";
+import { writeToToolOutputsFolder } from "@app/lib/api/files/action_output_fs";
+import { makeFileName } from "@app/lib/api/files/action_output_fs/naming";
+import { getLlmCredentials } from "@app/lib/api/provider_credentials";
+import type { WorkspaceMetadata } from "@app/lib/api/workspace";
+import {
+  isWebBrowseProvider,
+  isWebSearchProvider,
+} from "@app/lib/api/workspace";
+import { KillSwitchResource } from "@app/lib/resources/kill_switch_resource";
+import { tokenCountForTexts } from "@app/lib/tokenization";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import {
+  browseUrls,
+  isBrowseScrapeSuccessResponse,
+} from "@app/lib/utils/webbrowse";
+import { webSearch } from "@app/lib/utils/websearch";
+import logger from "@app/logger/logger";
+import { GPT_4O_MODEL_CONFIG } from "@app/types/assistant/models/openai";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { INTERNAL_MIME_TYPES } from "@ruby-ai/client";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+
+const MIN_CHARACTERS_TO_SUMMARIZE = 16_000;
+const BROWSE_MAX_TOKENS_LIMIT = 32_000;
+const DEFAULT_WEBSEARCH_MODEL_CONFIG = GPT_4O_MODEL_CONFIG;
+const AGENT_LESS_DEFAULT_WEBSEARCH_RESULT_COUNT = 10;
+
+async function handleWebsearch(
+  { query }: { query: string },
+  extra: ToolHandlerExtra
+) {
+  const { runContext } = extra;
+
+  const { websearchResultCount, citationsOffset } = isAgentLoopRunContext(
+    runContext
+  )
+    ? runContext.stepContext
+    : {
+        websearchResultCount: AGENT_LESS_DEFAULT_WEBSEARCH_RESULT_COUNT,
+        citationsOffset: 0,
+      };
+
+  const rawSearchProvider = (
+    (extra.auth.getNonNullableWorkspace().metadata as WorkspaceMetadata) ?? {}
+  ).webSearchProvider;
+  if (
+    rawSearchProvider !== undefined &&
+    !isWebSearchProvider(rawSearchProvider)
+  ) {
+    logger.warn(
+      { rawSearchProvider },
+      "Invalid webSearchProvider in workspace metadata"
+    );
+  }
+  const websearchRes = await webSearch({
+    provider: isWebSearchProvider(rawSearchProvider)
+      ? rawSearchProvider
+      : "firecrawl",
+    query,
+    num: websearchResultCount,
+  });
+
+  if (websearchRes.isErr()) {
+    return new Err(
+      new MCPError(`Failed to search: ${websearchRes.error.message}`)
+    );
+  }
+
+  const refs = getRefs().slice(
+    citationsOffset,
+    citationsOffset + websearchResultCount
+  );
+
+  const results: WebsearchResultResourceType[] = [];
+  for (const result of websearchRes.value) {
+    results.push({
+      mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.WEBSEARCH_RESULT,
+      title: result.title,
+      text: result.snippet,
+      uri: result.link,
+      reference: refs.shift() ?? "",
+    });
+  }
+
+  return new Ok(
+    results.map((result) => ({
+      type: "resource" as const,
+      resource: result,
+    }))
+  );
+}
+
+async function handleWebbrowser(
+  {
+    urls,
+    screenshotMode = "none",
+    links,
+  }: {
+    urls: string[];
+    screenshotMode?: "none" | "viewport" | "fullPage";
+    links?: boolean;
+  },
+  extra: ToolHandlerExtra
+) {
+  const { runContext, auth } = extra;
+  const credentials = await getLlmCredentials(auth, {
+    skipEmbeddingApiKeyRequirement: true,
+  });
+  const { toolConfiguration } = runContext;
+  const useSummarization =
+    isLightServerSideMCPToolConfiguration(toolConfiguration) &&
+    toolConfiguration.additionalConfiguration[USE_SUMMARY_SWITCH] === true;
+
+  const isFirecrawlDisabled = await KillSwitchResource.isKillSwitchEnabled(
+    "global_disable_firecrawl"
+  );
+
+  const rawBrowseProvider = (
+    (extra.auth.getNonNullableWorkspace().metadata as WorkspaceMetadata) ?? {}
+  ).webBrowseProvider;
+  if (
+    rawBrowseProvider !== undefined &&
+    !isWebBrowseProvider(rawBrowseProvider)
+  ) {
+    logger.warn(
+      { rawBrowseProvider },
+      "Invalid webBrowseProvider in workspace metadata"
+    );
+  }
+  const browsingProvider = isWebBrowseProvider(rawBrowseProvider)
+    ? rawBrowseProvider
+    : isFirecrawlDisabled
+      ? "spider"
+      : "firecrawl";
+
+  const results = await browseUrls(urls, 8, "markdown", {
+    screenshotMode,
+    links,
+    provider: browsingProvider,
+  });
+
+  if (useSummarization) {
+    if (!isAgentLoopRunContext(runContext)) {
+      return new Err(
+        new MCPError(
+          "Summarization cannot be enabled outside of an agent loop context."
+        )
+      );
+    }
+
+    const runCtx = runContext;
+    const { citationsOffset, websearchResultCount } = runCtx.stepContext;
+    const refs = getRefs().slice(
+      citationsOffset,
+      citationsOffset + websearchResultCount
+    );
+
+    const perUrlContents = await concurrentExecutor(
+      results,
+      async (result) => {
+        const contentBlocks: CallToolResult["content"] = [];
+
+        if (!isBrowseScrapeSuccessResponse(result)) {
+          const errText = `Browse error (${result.status}) for ${result.url}: ${result.error}`;
+          contentBlocks.push({ type: "text", text: errText });
+          return contentBlocks;
+        }
+
+        const { markdown, title } = result;
+        const fileContent = markdown ?? "";
+
+        const startTime = Date.now();
+        const summarizationMethod: "none" | "llm-fastest" | "llm" =
+          fileContent.length <= MIN_CHARACTERS_TO_SUMMARIZE ? "none" : "llm";
+
+        let snippetRes: Result<string, Error> | null = null;
+
+        switch (summarizationMethod) {
+          case "none":
+            snippetRes = new Ok(fileContent);
+            break;
+          case "llm":
+            snippetRes = await summarizeWithLLM({
+              auth,
+              content: fileContent,
+              agentLoopRunContext: runCtx,
+            });
+            break;
+          default:
+            assertNever(summarizationMethod);
+        }
+
+        if (snippetRes.isErr()) {
+          contentBlocks.push({
+            type: "text",
+            text: `Failed to summarize content for ${result.url}: ${snippetRes.error.message}`,
+          });
+          return contentBlocks;
+        }
+
+        logger.info(
+          {
+            url: result.url,
+            summarizationMethod,
+            contentLength: fileContent.length,
+            snippetLength: snippetRes.value.length,
+            duration: Date.now() - startTime,
+          },
+          "Summarized content"
+        );
+
+        const snippet = snippetRes.value.slice(0, FILE_OFFLOAD_SNIPPET_LENGTH);
+
+        const fileTitle = title ?? result.url;
+        const fileName = makeFileName({
+          name: fileTitle,
+          ext: ".txt",
+        });
+
+        const writeResult = await writeToToolOutputsFolder(auth, runCtx, {
+          fileName,
+          content: fileContent,
+          contentType: "text/plain",
+        });
+
+        if (writeResult.isErr()) {
+          throw writeResult.error;
+        }
+
+        const filePathResource = {
+          mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.FILE_PATH,
+          path: writeResult.value,
+          uri: writeResult.value,
+          title: fileTitle,
+          contentType: "text/plain",
+          text: snippet,
+        };
+
+        contentBlocks.push({
+          type: "resource",
+          resource: filePathResource,
+        });
+
+        const ref = refs.shift();
+        if (ref) {
+          const websearchResultResource = {
+            mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.WEBSEARCH_RESULT,
+            title: title ?? result.url,
+            text: `Full web page content archived at ${fileName}`,
+            uri: result.url,
+            reference: ref,
+          };
+
+          contentBlocks.push({
+            type: "resource",
+            resource: websearchResultResource,
+          });
+        }
+
+        return contentBlocks;
+      },
+      { concurrency: 8 }
+    );
+
+    return new Ok(perUrlContents.flatMap((contents) => contents));
+  }
+
+  const toolContent: CallToolResult["content"] = [];
+  for (const result of results) {
+    if (!isBrowseScrapeSuccessResponse(result)) {
+      const errText = `Browse error (${result.status}) for ${result.url}: ${result.error}`;
+      const browseResultResource = {
+        mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.BROWSE_RESULT,
+        requestedUrl: result.url,
+        uri: result.url,
+        text: errText,
+        responseCode: result.status.toString(),
+        errorMessage: result.error,
+      };
+      toolContent.push({
+        type: "resource" as const,
+        resource: browseResultResource,
+      });
+      continue;
+    }
+
+    const {
+      markdown: contentText,
+      title,
+      description,
+      screenshots: allScreenshots,
+      links: outLinks,
+    } = result;
+
+    const tokensRes = await tokenCountForTexts(
+      [contentText ?? ""],
+      {
+        providerId: DEFAULT_WEBSEARCH_MODEL_CONFIG.providerId,
+        modelId: DEFAULT_WEBSEARCH_MODEL_CONFIG.modelId,
+        tokenizer: DEFAULT_WEBSEARCH_MODEL_CONFIG.tokenizer,
+      },
+      credentials
+    );
+
+    if (tokensRes.isErr()) {
+      const browseResultResource = {
+        mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.BROWSE_RESULT,
+        requestedUrl: result.url,
+        uri: result.url,
+        text: "There was an error while browsing the website.",
+        title: title,
+        description: description,
+        responseCode: result.status.toString(),
+        errorMessage: tokensRes.error.message,
+      };
+      toolContent.push({
+        type: "resource" as const,
+        resource: browseResultResource,
+      });
+      continue;
+    }
+
+    const tokensCount = tokensRes.value[0];
+    const avgCharactersPerToken = (contentText?.length ?? 0) / tokensCount;
+    const maxCharacters = BROWSE_MAX_TOKENS_LIMIT * avgCharactersPerToken;
+    let truncatedContent = contentText?.slice(0, maxCharacters);
+
+    if (truncatedContent?.length !== contentText?.length) {
+      truncatedContent += `\n\n[...output truncated to ${BROWSE_MAX_TOKENS_LIMIT} tokens]`;
+    }
+
+    const browseResult: BrowseResultResourceType = {
+      mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.BROWSE_RESULT,
+      requestedUrl: result.url,
+      uri: result.url,
+      text:
+        truncatedContent ?? "There was an error while browsing the website.",
+      title: title,
+      description: description,
+      responseCode: result.status.toString(),
+    };
+
+    toolContent.push({
+      type: "resource" as const,
+      resource: browseResult,
+    });
+
+    if (Array.isArray(outLinks) && outLinks.length > 0) {
+      const browseResultResource = {
+        mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.BROWSE_RESULT,
+        requestedUrl: result.url,
+        uri: result.url,
+        text: `Links (first 50):\n${outLinks.slice(0, 50).join("\n")}`,
+        title: title,
+        description: description,
+        responseCode: result.status.toString(),
+      };
+      toolContent.push({
+        type: "resource" as const,
+        resource: browseResultResource,
+      });
+    }
+
+    if (Array.isArray(allScreenshots) && allScreenshots.length > 0) {
+      for (const raw of allScreenshots) {
+        const isUrl = /^https?:\/\//i.test(raw);
+        let base64 = raw;
+        if (raw.startsWith("data:image")) {
+          base64 = raw.split(",")[1] ?? "";
+        }
+        base64 = base64.replace(/\s+/g, "");
+        const isValidBase64 =
+          base64.length > 0 &&
+          base64.length % 4 === 0 &&
+          /^[A-Za-z0-9+/]+={0,2}$/.test(base64);
+
+        if (isValidBase64) {
+          toolContent.push({
+            type: "image",
+            mimeType: "image/png",
+            data: base64,
+          });
+        } else if (isUrl) {
+          toolContent.push({
+            type: "resource",
+            resource: {
+              mimeType: "image/png",
+              uri: raw,
+              text: "Screenshot (remote URL)",
+            },
+          });
+        } else if (screenshotMode !== "none") {
+          const browseResultResource = {
+            mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.BROWSE_RESULT,
+            requestedUrl: result.url,
+            uri: result.url,
+            text: "Screenshot returned but not valid base64 or URL; skipping upload.",
+            title,
+            description,
+            responseCode: result.status.toString(),
+          };
+          toolContent.push({
+            type: "resource",
+            resource: browseResultResource,
+          });
+        }
+      }
+    } else if (screenshotMode !== "none") {
+      // If screenshot was requested but not returned, surface a diagnostic message
+      const browseResultResource = {
+        mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.BROWSE_RESULT,
+        requestedUrl: result.url,
+        uri: result.url,
+        text: `Screenshot requested (mode=${screenshotMode}) but none was returned by Firecrawl.`,
+        title,
+        description,
+        responseCode: result.status.toString(),
+      };
+      toolContent.push({
+        type: "resource" as const,
+        resource: browseResultResource,
+      });
+    }
+  }
+
+  return new Ok(toolContent);
+}
+
+const handlers: ToolHandlers<typeof WEB_SEARCH_BROWSE_TOOLS_METADATA> = {
+  websearch: handleWebsearch,
+  webbrowser: handleWebbrowser,
+};
+
+export const TOOLS = buildTools(WEB_SEARCH_BROWSE_TOOLS_METADATA, handlers);

@@ -1,0 +1,20 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
+interface QueryTrackerStore {
+  concurrent: number;
+  peak: number;
+}
+
+/**
+ * Tracks the peak number of concurrent Sequelize queries within a single request.
+ *
+ * Usage:
+ * - Hono's `requestInstrumentation` middleware wraps each request in
+ *   `queryTracker.run(store, ...)`.
+ * - `ActivityInboundLogInterceptor` wraps each Temporal activity execution the same way.
+ * - `SequelizeWithComments.query()` increments/decrements `store.concurrent` around
+ *   every query and updates `store.peak`.
+ * - At request/activity completion, `store.peak` is logged as `peakConcurrentQueries`
+ *   to help identify code paths that hold many connections simultaneously.
+ */
+export const queryTracker = new AsyncLocalStorage<QueryTrackerStore>();

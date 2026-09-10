@@ -1,0 +1,141 @@
+import { MicrosoftThrottlingError } from "@connectors/connectors/microsoft/lib/errors";
+import {
+  ExternalOAuthTokenError,
+  ThirdPartyConfigurationError,
+} from "@connectors/lib/error";
+import { GraphError } from "@microsoft/microsoft-graph-client";
+import { ApplicationFailure } from "@temporalio/common";
+import type {
+  ActivityExecuteInput,
+  ActivityInboundCallsInterceptor,
+  Next,
+} from "@temporalio/worker";
+
+const knownMicrosoftSignInErrors = ["AADSTS50173", "AADSTS700016"];
+
+// The SDK does not expose an error class that is rich enough for our use.
+// We'll use this function as a temporary solution for identifying an identified type of error.
+export function isMicrosoftSignInError(err: unknown): err is Error {
+  return (
+    err instanceof Error &&
+    err.message.startsWith(
+      "Error retrieving access token from microsoft: code=provider_access_token_refresh_error"
+    ) &&
+    knownMicrosoftSignInErrors.some((code) => err.message.includes(code))
+  );
+}
+
+export function isThrottlingError(
+  err: unknown
+): err is MicrosoftThrottlingError {
+  return err instanceof MicrosoftThrottlingError;
+}
+
+export function isItemNotFoundError(err: unknown): err is GraphError {
+  return (
+    err instanceof GraphError &&
+    err.statusCode === 404 &&
+    err.code === "itemNotFound"
+  );
+}
+
+// 400 with "malformed" in the message indicates a drive ID that is invalid or
+// refers to a deleted drive. The Graph API returns this instead of a 404 when
+// the drive ID format is recognized but the drive no longer exists.
+export function isMalformedDriveError(err: unknown): err is GraphError {
+  return (
+    err instanceof GraphError &&
+    err.statusCode === 400 &&
+    err.message.includes("malformed")
+  );
+}
+
+// 423 Locked with code "notAllowed" indicates a SharePoint site has been blocked
+// by an administrator. This is an external permission restriction that cannot
+// be resolved in-product.
+export function isAccessBlockedError(err: unknown): err is GraphError {
+  return (
+    err instanceof GraphError &&
+    err.statusCode === 423 &&
+    err.code === "notAllowed"
+  );
+}
+
+// 401 with code "generalException" typically indicates site-level permission changes
+// or revoked access. See https://learn.microsoft.com/en-us/answers/questions/5616949/receiving-general-exception-while-processing-when
+export function isGeneralExceptionError(err: unknown): err is GraphError {
+  return (
+    err instanceof GraphError &&
+    err.statusCode === 401 &&
+    err.code === "generalException"
+  );
+}
+
+// A "... is not found" message indicates the targeted SharePoint site host
+// (e.g. "tenant.sharepoint.com") no longer exists, e.g. "Target
+// 'tenant.sharepoint.com' is not found.". The status code varies, so we match on
+// the message. The site is gone for good, so the sync should skip it gracefully.
+export function isSiteNotFoundError(err: unknown): err is GraphError {
+  return err instanceof GraphError && err.message.includes("is not found");
+}
+
+// "Billing Policy Not Found Or Invalid" errors indicate a Microsoft 365
+// billing/licensing misconfiguration on the customer's tenant. These are not
+// actionable on our side and should be skipped gracefully.
+export function isBillingPolicyError(err: unknown): err is GraphError {
+  return (
+    err instanceof GraphError &&
+    err.message.includes("Billing Policy Not Found Or Invalid")
+  );
+}
+
+export function isMissingSharePointLicenseError(
+  err: unknown
+): err is GraphError {
+  return (
+    err instanceof GraphError &&
+    err.statusCode === 400 &&
+    err.message.includes("Tenant does not have a SPO license")
+  );
+}
+
+// Identifies JSON parsing errors that may occur when Microsoft's API returns
+// malformed JSON or error responses that are not properly formatted.
+export function isJSONParsingError(err: unknown): err is Error {
+  return (
+    err instanceof SyntaxError ||
+    (err instanceof Error &&
+      err.message.includes("JSON") &&
+      (err.message.includes("parse") || err.message.includes("Expected")))
+  );
+}
+
+export class MicrosoftCastKnownErrorsInterceptor
+  implements ActivityInboundCallsInterceptor
+{
+  async execute(
+    input: ActivityExecuteInput,
+    next: Next<ActivityInboundCallsInterceptor, "execute">
+  ): Promise<unknown> {
+    try {
+      return await next(input);
+    } catch (err: unknown) {
+      if (isThrottlingError(err)) {
+        throw ApplicationFailure.create({
+          message: err.message,
+          nextRetryDelay: err.retryAfterMs,
+          cause: err,
+        });
+      }
+      // See https://learn.microsoft.com/en-us/answers/questions/1339560/sign-in-error-code-50173
+      // TODO(2025-02-12): add an error type for Microsoft client errors and catch them at strategic locations (e.g. API call to instantiate a client)
+      if (isMicrosoftSignInError(err)) {
+        throw new ExternalOAuthTokenError(err);
+      }
+      if (isMissingSharePointLicenseError(err)) {
+        throw new ThirdPartyConfigurationError(err);
+      }
+      throw err;
+    }
+  }
+}

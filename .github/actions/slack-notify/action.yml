@@ -1,0 +1,228 @@
+name: "Slack Notification"
+description: "Send deployment notifications to Slack"
+
+inputs:
+  step:
+    description: "Deployment step (start/build_success/failure/spa_start/spa_success/spa_preview_success/spa_production_success)"
+    required: true
+  component:
+    description: "Component being deployed"
+    required: true
+  image_tag:
+    description: "Image tag being deployed"
+    required: true
+  channel:
+    description: "Slack channel"
+    required: true
+  thread_ts:
+    description: "Slack thread timestamp"
+    required: false
+  slack_token:
+    description: "Slack bot token"
+    required: true
+  blocked:
+    description: "Is deployment blocked?"
+    required: false
+  region:
+    description: "Region being deployed to"
+    required: false
+  is_revert:
+    description: "Whether reverting or deploying"
+    required: false
+    default: "false"
+  current_version:
+    description: "Current deployed version for comparison"
+    required: false
+  commit_diff:
+    description: "Commit diff information"
+    required: false
+  commit_count:
+    description: "Number of commits in the diff"
+    required: false
+  preview_url:
+    description: "Preview URL for SPA deployments"
+    required: false
+
+outputs:
+  thread_ts:
+    description: "Slack thread timestamp from the initial message"
+    value: ${{ steps.start_notification.outputs.ts || steps.spa_start_notification.outputs.ts }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Get author info
+      if: inputs.step == 'start' || inputs.step == 'spa_start'
+      id: author
+      shell: bash
+      run: |
+        AUTHOR_NAME="${{ github.actor }}"
+
+        if ! EMAIL=$(grep "^$AUTHOR_NAME: " .authors | cut -d' ' -f2); then
+          echo "GitHub handle $AUTHOR_NAME not found in authors file" >&2
+          exit 1
+        fi
+        echo "email=$EMAIL" >> $GITHUB_OUTPUT
+
+    - name: Lookup by email
+      if: inputs.step == 'start' || inputs.step == 'spa_start'
+      id: email
+      uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      with:
+        errors: false
+        method: users.lookupByEmail
+        token: ${{ inputs.slack_token }}
+        payload: |
+          email: "${{ steps.author.outputs.email }}"
+
+    - name: Get Slack user ID
+      if: (inputs.step == 'start' || inputs.step == 'spa_start') && steps.email.outputs.ok == 'true'
+      id: slack_user
+      shell: bash
+      run: |
+        RESPONSE='${{ steps.email.outputs.response }}'
+        if ! SLACK_ID=$(echo "$RESPONSE" | jq -r '.user.id'); then
+          echo "Failed to extract Slack user ID" >&2
+          exit 0
+        fi
+        echo "id=$SLACK_ID" >> $GITHUB_OUTPUT
+
+    - name: Notify Build And Deploy Start
+      if: inputs.step == 'start'
+      id: start_notification
+      uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_token }}
+        payload: |
+          channel: ${{ inputs.channel }}
+          text: "${{ inputs.is_revert == 'true' && '⏮️ revert' || '🚀' }} `${{ inputs.component }}` <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|`${{ inputs.image_tag }}`> → ${{ inputs.region }} · ${{ steps.slack_user.outputs.id != '' && format('<@{0}>', steps.slack_user.outputs.id) || format('`{0}`', steps.author.outputs.name) }} · <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow>"
+
+    - name: Format and Build Payload
+      if: inputs.step == 'build_success'
+      id: build_payload
+      shell: bash
+      run: |
+        # 1. Build Header Section
+        # Region builds (marketing) say where, cell deploys build once.
+        case "${{ inputs.region }}" in
+          cell-*|all) HEADER_TEXT="🔨 \`${{ inputs.image_tag }}\` built" ;;
+          *) HEADER_TEXT="🔨 \`${{ inputs.image_tag }}\` built for ${{ inputs.region }}" ;;
+        esac
+        MAIN_BLOCK_TEXT="$HEADER_TEXT"
+        if [ -n "${{ inputs.current_version }}" ]; then
+          MAIN_BLOCK_TEXT="${HEADER_TEXT} · \`${{ inputs.current_version }}\` → \`${{ inputs.image_tag }}\`, ${{ inputs.commit_count }} commits"
+        fi
+
+        # 2. Build Changelog Section
+        CHANGELOG_TEXT=""
+        COMMIT_DIFF=$(cat <<'EOF'
+        ${{ inputs.commit_diff }}
+        EOF
+        )
+        if [ -n "$COMMIT_DIFF" ]; then
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              COMMIT_HASH=$(echo "$line" | cut -d' ' -f1)
+              COMMIT_MESSAGE_WITH_AUTHORS=$(echo "$line" | awk -F ' ' '{ for (i = 2; i <= NF; i++) { printf "%s ", $i };}')
+              # Slack format: <url|text>
+              LINK="<${{ github.server_url }}/${{ github.repository }}/commit/${COMMIT_HASH}|${COMMIT_HASH}>"
+              CHANGELOG_TEXT="${CHANGELOG_TEXT}• ${LINK} - ${COMMIT_MESSAGE_WITH_AUTHORS}
+        "
+            fi
+          done <<< "$COMMIT_DIFF"
+        fi
+
+        # 3. Construct JSON Payload
+        # We construct the blocks array manually to be safe.
+
+        # Block 1: Main Info
+        BLOCK1=$(jq -c -n --arg text "$MAIN_BLOCK_TEXT" '{type: "section", text: {type: "mrkdwn", text: $text}}')
+
+        # Block 2: Changelog (only if exists)
+        BLOCKS="[$BLOCK1]"
+        if [ -n "$CHANGELOG_TEXT" ]; then
+           BLOCK2=$(jq -c -n --arg text "$CHANGELOG_TEXT" '{type: "section", text: {type: "mrkdwn", text: $text}}')
+           BLOCKS="[$BLOCK1, $BLOCK2]"
+        fi
+
+        # Final Payload
+        JSON_PAYLOAD=$(jq -c -n \
+          --arg channel "${{ inputs.channel }}" \
+          --arg ts "${{ inputs.thread_ts }}" \
+          --arg text "$HEADER_TEXT" \
+          --argjson blocks "$BLOCKS" \
+          '{
+            channel: $channel,
+            thread_ts: $ts,
+            text: $text,
+            blocks: $blocks,
+            method: "chat.postMessage"
+          }')
+
+        echo "json_payload=$JSON_PAYLOAD" >> $GITHUB_OUTPUT
+
+    - name: Notify Build Success
+      if: inputs.step == 'build_success'
+      uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_token }}
+        payload: ${{ steps.build_payload.outputs.json_payload }}
+
+    - name: Notify SPA Deploy Start
+      if: inputs.step == 'spa_start'
+      id: spa_start_notification
+      uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_token }}
+        payload: |
+          channel: ${{ inputs.channel }}
+          ${{ inputs.thread_ts != '' && format('thread_ts: "{0}"', inputs.thread_ts) || '' }}
+          text: |
+            🚀 Starting deployment of ${{ inputs.component }} `${{ inputs.image_tag }}`
+            ${{ github.ref_name != 'main' && format('• Branch: `{0}`', github.ref_name) || '' }}
+            • Commit: <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ inputs.image_tag }}>
+            • Workflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View build>
+            • Author: ${{ steps.slack_user.outputs.id != '' && format('<@{0}>', steps.slack_user.outputs.id) || format('`{0}`', steps.author.outputs.name) }}
+
+    - name: Notify SPA Preview Uploaded
+      if: inputs.step == 'spa_preview_success'
+      uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_token }}
+        payload: |
+          channel: ${{ inputs.channel }}
+          thread_ts: "${{ inputs.thread_ts }}"
+          text: |
+            📦 ${{ inputs.component }} preview uploaded (deploying to production after API rollout)
+            • URL: <${{ inputs.preview_url }}|${{ inputs.preview_url }}>
+
+    - name: Notify SPA Deployed to Production
+      if: inputs.step == 'spa_production_success'
+      uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_token }}
+        payload: |
+          channel: ${{ inputs.channel }}
+          thread_ts: "${{ inputs.thread_ts }}"
+          text: |
+            ✅ ${{ inputs.component }} deployed to production
+            • URL: <${{ inputs.preview_url }}|${{ inputs.preview_url }}>
+
+    - name: Notify Deploy Failure
+      if: inputs.step == 'failure'
+      uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_token }}
+        payload: |
+          channel: ${{ inputs.channel }}
+          thread_ts: "${{ inputs.thread_ts }}"
+          text: |
+            ❌ ${{ inputs.is_revert == 'true' && 'Revert' || 'Build' }} pipeline failed
+            ${{ inputs.blocked == 'true' && format('Is blocked by channel topic: {0}', inputs.blocked) }}
+            • Check logs: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View details>

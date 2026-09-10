@@ -1,0 +1,46 @@
+import { sendEmail } from "@app/lib/api/email";
+
+/** Send emails to users who canceled their subscription before the automated emails were available */
+const { LIVE, SENDGRID_API_KEY } = process.env;
+
+async function main() {
+  console.log("USING SENDGRID API KEY", SENDGRID_API_KEY);
+  const emails = process.argv.slice(2); // Get command line arguments as emails
+
+  for (let i = 0; i < emails.length; i++) {
+    const email = emails[i];
+    console.log("SENDING EMAIL", email);
+    if (LIVE) {
+      await sendCancelSubscriptionEmail(email);
+    }
+  }
+}
+
+export async function sendCancelSubscriptionEmail(
+  email: string
+): Promise<void> {
+  const cancelMessage = {
+    from: {
+      name: "Ruby team",
+      email: "team@ruby.ad",
+    },
+    subject: `[Ruby] Subscription canceled - important information`,
+    html: `<p>Hello from Ruby,</p>
+      <p>You recently canceled your subscription. It will be terminated at the end of your current billing period. You can reactivate your subscription at any time before then. If you do not reactivate your subscription, you will then be switched back to our free plan:</p>
+      <ul>
+      <li>all users will be removed from the workspace except for the most tenured admin (more about this <a href="https://docs.ruby.ad/docs/subscriptions#what-happens-when-we-cancel-our-ruby-subscription">here</a>);</li>
+      <li>connections will be removed and data safety deleted from Ruby;</li>
+      <li>conversations, custom agents, and data sources will still be accessible with limitations;</li>
+      <li>your usage of Ruby will have the restrictions of the free plan.</li>
+      </ul>
+      <p>More details are available on <a href="https://docs.ruby.ad/docs/subscriptions#what-happens-when-we-cancel-our-ruby-subscription">our subscription cancelling FAQ</a>.</p>
+      <p>Please reply to this email if you have any questions.
+      <p>The Ruby team</p>`,
+  };
+  return sendEmail(email, cancelMessage);
+}
+
+void main().then(() => {
+  console.log("DONE");
+  process.exit(0);
+});

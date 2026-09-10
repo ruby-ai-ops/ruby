@@ -1,0 +1,26 @@
+import type { RegionType } from "@app/types/region";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+
+export const getRegionDisplay = (region: RegionType): string => {
+  switch (region) {
+    case "europe-west1":
+      return "🇪🇺 EU";
+    case "us-central1":
+      return "🇺🇸 US";
+    default:
+      assertNever(region);
+  }
+};
+
+export const getRegionChipColor = (
+  region: RegionType
+): "highlight" | "success" => {
+  switch (region) {
+    case "europe-west1":
+      return "highlight";
+    case "us-central1":
+      return "success";
+    default:
+      assertNever(region);
+  }
+};

@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "es2017",
+    "module": "esnext",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "composite": false,
+    "declaration": false,
+    "noEmit": true,
+    "isolatedModules": true,
+    "outDir": "./build",
+    "rootDir": "../",
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "importHelpers": true,
+    "noImplicitAny": true,
+    "types": ["chrome", "react", "react-dom"],
+    "paths": {
+      "@extension/*": ["./*"],
+      "@app/*": ["../front/*"]
+    }
+  },
+  "include": ["./global.d.ts", "./css.d.ts", "./domino.d.ts", "./shared/**/*", "./platforms/**/*", "./ui/**/*", "./run/**/*"],
+  "exclude": ["node_modules", "build"]
+}

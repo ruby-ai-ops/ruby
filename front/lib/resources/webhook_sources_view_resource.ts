@@ -1,0 +1,585 @@
+import type { Authenticator } from "@app/lib/auth";
+import { RubyError } from "@app/lib/error";
+import { WebhookSourcesViewModel } from "@app/lib/models/agent/triggers/webhook_sources_view";
+import { ResourceWithSpace } from "@app/lib/resources/resource_with_space";
+import { SpaceResource } from "@app/lib/resources/space_resource";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
+import { getResourceIdFromSId, makeSId } from "@app/lib/resources/string_ids";
+import type { ResourceFindOptions } from "@app/lib/resources/types";
+import type { UserResource } from "@app/lib/resources/user_resource";
+import { WebhookSourceResource } from "@app/lib/resources/webhook_source_resource";
+import { normalizeWebhookIcon } from "@app/lib/webhook_source";
+import type { ModelId } from "@app/types/shared/model_id";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type {
+  WebhookSourceViewForAdminType,
+  WebhookSourceViewType,
+} from "@app/types/triggers/webhooks";
+import { formatUserFullName } from "@app/types/user";
+import assert from "assert";
+import type {
+  Attributes,
+  CreationAttributes,
+  ModelStatic,
+  Transaction,
+} from "sequelize";
+import { Op } from "sequelize";
+
+export type GetWebhookSourceViewsListResponseBody = {
+  success: boolean;
+  webhookSourceViews: WebhookSourceViewType[];
+};
+
+// Attributes are marked as read-only to reflect the stateless nature of our Resource.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface WebhookSourcesViewResource
+  extends ReadonlyAttributesType<WebhookSourcesViewModel> {}
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class WebhookSourcesViewResource extends ResourceWithSpace<WebhookSourcesViewModel> {
+  static model: ModelStatic<WebhookSourcesViewModel> = WebhookSourcesViewModel;
+  readonly editedByUser?: Attributes<UserModel>;
+  private _webhookSource: WebhookSourceResource | null = null;
+
+  get webhookSource(): WebhookSourceResource {
+    assert(this._webhookSource, "webhookSource not loaded");
+    return this._webhookSource;
+  }
+
+  constructor(
+    model: ModelStatic<WebhookSourcesViewModel>,
+    blob: Attributes<WebhookSourcesViewModel>,
+    space: SpaceResource,
+    { editedByUser }: { editedByUser?: Attributes<UserModel> } = {}
+  ) {
+    super(WebhookSourcesViewModel, blob, space);
+
+    this.editedByUser = editedByUser;
+  }
+
+  private static async makeNew(
+    auth: Authenticator,
+    blob: Omit<
+      CreationAttributes<WebhookSourcesViewModel>,
+      "editedAt" | "editedByUserId" | "vaultId" | "workspaceId"
+    >,
+    space: SpaceResource,
+    editedByUser?: UserResource,
+    transaction?: Transaction
+  ) {
+    assert(auth.isAdmin(), "Only admins can create a webhook sources view");
+
+    assert(blob.webhookSourceId, "webhookSourceId is required");
+
+    const webhookSource = await WebhookSourceResource.findByPk(
+      auth,
+      blob.webhookSourceId
+    );
+    if (!webhookSource) {
+      throw new RubyError(
+        "webhook_source_not_found",
+        "Webhook source not found for the new view."
+      );
+    }
+
+    const view = await WebhookSourcesViewModel.create(
+      {
+        ...blob,
+        workspaceId: auth.getNonNullableWorkspace().id,
+        editedByUserId: editedByUser?.id ?? null,
+        editedAt: new Date(),
+        vaultId: space.id,
+      },
+      { transaction }
+    );
+
+    const resource = new this(
+      WebhookSourcesViewResource.model,
+      view.get(),
+      space
+    );
+    resource._webhookSource = webhookSource;
+
+    return resource;
+  }
+
+  public static async create(
+    auth: Authenticator,
+    {
+      systemView,
+      space,
+    }: {
+      systemView: WebhookSourcesViewResource;
+      space: SpaceResource;
+    }
+  ) {
+    if (systemView.space.kind !== "system") {
+      throw new Error(
+        "You must pass the system view to create a new webhook sources view"
+      );
+    }
+
+    return this.makeNew(
+      auth,
+      {
+        webhookSourceId: systemView.webhookSourceId,
+        customName: systemView.customName,
+        description: systemView.description,
+        icon: normalizeWebhookIcon(systemView.icon),
+      },
+      space,
+      auth.user() ?? undefined
+    );
+  }
+
+  // Fetching.
+
+  private static async baseFetch(
+    auth: Authenticator,
+    options: ResourceFindOptions<WebhookSourcesViewModel> = {}
+  ) {
+    const views = await this.baseFetchWithAuthorization(auth, {
+      ...options,
+      where: {
+        ...options.where,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+      includes: [
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+        ...(options.includes || []),
+        {
+          model: UserModel,
+          as: "editedByUser",
+        },
+      ],
+    });
+
+    // Batch-fetch all referenced webhook sources.
+    const webhookSourceIds = [
+      ...new Set(removeNulls(views.map((v) => v.webhookSourceId))),
+    ];
+    const webhookSources = await WebhookSourceResource.fetchByModelIds(
+      auth,
+      webhookSourceIds
+    );
+    const webhookSourceByModelId = new Map(
+      webhookSources.map((ws) => [ws.id, ws])
+    );
+
+    // Assign webhook sources; filter out views whose source no longer exists
+    // unless includeDeleted is set.
+    const result: WebhookSourcesViewResource[] = [];
+    for (const view of views) {
+      const ws = webhookSourceByModelId.get(view.webhookSourceId);
+      if (ws) {
+        view._webhookSource = ws;
+        result.push(view);
+      } else if (options.includeDeleted) {
+        result.push(view);
+      }
+    }
+
+    return result;
+  }
+
+  static async fetchById(
+    auth: Authenticator,
+    id: string,
+    options?: ResourceFindOptions<WebhookSourcesViewModel>
+  ): Promise<WebhookSourcesViewResource | null> {
+    const [view] = await this.fetchByIds(auth, [id], options);
+    if (!view || !view.canReadOrAdministrate(auth)) {
+      return null;
+    }
+    return view;
+  }
+
+  static async fetchByIds(
+    auth: Authenticator,
+    ids: string[],
+    options?: ResourceFindOptions<WebhookSourcesViewModel>
+  ): Promise<WebhookSourcesViewResource[]> {
+    const viewModelIds = removeNulls(ids.map((id) => getResourceIdFromSId(id)));
+
+    const views = await this.baseFetch(auth, {
+      ...options,
+      where: {
+        ...options?.where,
+        id: {
+          [Op.in]: viewModelIds,
+        },
+      },
+    });
+
+    return views.filter((view) => view.canReadOrAdministrate(auth));
+  }
+
+  static async fetchByModelIds(auth: Authenticator, ids: ModelId[]) {
+    const views = await this.baseFetch(auth, {
+      where: {
+        id: {
+          [Op.in]: ids,
+        },
+      },
+    }).then((views) =>
+      views.filter((view) => view.canReadOrAdministrate(auth))
+    );
+
+    return views ?? [];
+  }
+
+  // Existence only, ignoring the caller's space access — lets a caller tell
+  // a view it cannot read (still there, just restricted) apart from one
+  // that's actually gone (deleted view, or a view whose webhook source was
+  // deleted — baseFetch already drops those unless includeDeleted is set).
+  static async existsByModelIds(
+    auth: Authenticator,
+    ids: ModelId[]
+  ): Promise<Set<ModelId>> {
+    const views = await this.baseFetch(auth, {
+      where: {
+        id: {
+          [Op.in]: ids,
+        },
+      },
+    });
+
+    return new Set(views.map((view) => view.id));
+  }
+
+  static async listByWorkspace(
+    auth: Authenticator,
+    options?: ResourceFindOptions<WebhookSourcesViewModel>
+  ): Promise<WebhookSourcesViewResource[]> {
+    return this.baseFetch(auth, options);
+  }
+
+  static async listBySpaces(
+    auth: Authenticator,
+    spaces: SpaceResource[],
+    options?: ResourceFindOptions<WebhookSourcesViewModel>
+  ): Promise<WebhookSourcesViewResource[]> {
+    const allowedSpaces = spaces.filter(
+      (space) => auth.can("read", space) || auth.can("admin", space)
+    );
+    if (allowedSpaces.length === 0) {
+      return [];
+    }
+    return this.baseFetch(auth, {
+      ...options,
+      where: {
+        ...options?.where,
+        workspaceId: auth.getNonNullableWorkspace().id,
+        vaultId: allowedSpaces.map((s) => s.id),
+      },
+    });
+  }
+
+  static async listBySpace(
+    auth: Authenticator,
+    space: SpaceResource,
+    options?: ResourceFindOptions<WebhookSourcesViewModel>
+  ): Promise<WebhookSourcesViewResource[]> {
+    if (!auth.can("read", space) && !auth.can("admin", space)) {
+      return [];
+    }
+    return this.listBySpaces(auth, [space], options);
+  }
+
+  static async listByWebhookSource(
+    auth: Authenticator,
+    webhookSourceId: ModelId
+  ): Promise<WebhookSourcesViewResource[]> {
+    return this.baseFetch(auth, {
+      where: { webhookSourceId },
+    }).then((views) =>
+      views.filter((view) => view.canReadOrAdministrate(auth))
+    );
+  }
+
+  static async listByWebhookSourceIds(
+    auth: Authenticator,
+    webhookSourceIds: ModelId[]
+  ): Promise<WebhookSourcesViewResource[]> {
+    if (webhookSourceIds.length === 0) {
+      return [];
+    }
+    const views = await this.baseFetch(auth, {
+      where: { webhookSourceId: { [Op.in]: webhookSourceIds } },
+    });
+    return views.filter((view) => view.canReadOrAdministrate(auth));
+  }
+
+  /**
+   * List all webhook source views for a webhook source without space permission filtering.
+   * This is used internally for webhook trigger processing where authorization
+   * is already established via the webhook URL secret.
+   *
+   * SECURITY: Only use this for internal webhook processing. The webhook secret
+   * in the URL serves as the authorization mechanism for these requests.
+   */
+  static async listByWebhookSourceForInternalProcessing(
+    auth: Authenticator,
+    webhookSourceModelId: ModelId
+  ): Promise<WebhookSourcesViewResource[]> {
+    // baseFetch already ensures we only return views from the same workspace.
+    // We skip the additional canReadOrAdministrate check since the webhook
+    // request was already authorized via the URL secret.
+    return this.baseFetch(auth, {
+      where: { webhookSourceId: webhookSourceModelId },
+    });
+  }
+
+  static async getWebhookSourceViewForSystemSpace(
+    auth: Authenticator,
+    webhookSourceId: string
+  ): Promise<WebhookSourcesViewResource | null> {
+    const webhookSourceModelId = getResourceIdFromSId(webhookSourceId);
+    if (!webhookSourceModelId) {
+      return null;
+    }
+
+    const systemSpace = await SpaceResource.fetchWorkspaceSystemSpace(auth);
+
+    const views = await this.baseFetch(auth, {
+      where: {
+        vaultId: systemSpace.id,
+        webhookSourceId: webhookSourceModelId,
+      },
+    });
+
+    return views[0] ?? null;
+  }
+
+  public async updateName(
+    auth: Authenticator,
+    name: string
+  ): Promise<Result<number, RubyError<"unauthorized">>> {
+    if (!this.canAdministrate(auth)) {
+      return new Err(
+        new RubyError("unauthorized", "Not allowed to update name.")
+      );
+    }
+
+    const [affectedCount] = await this.update({
+      customName: name,
+      editedAt: new Date(),
+      editedByUserId: auth.getNonNullableUser().id,
+    });
+    return new Ok(affectedCount);
+  }
+
+  public static async bulkUpdateName(
+    auth: Authenticator,
+    viewIds: ModelId[],
+    name: string
+  ): Promise<void> {
+    if (viewIds.length === 0) {
+      return;
+    }
+
+    await this.model.update(
+      {
+        customName: name,
+        editedAt: new Date(),
+        editedByUserId: auth.getNonNullableUser().id,
+      },
+      {
+        where: {
+          workspaceId: auth.getNonNullableWorkspace().id,
+          id: {
+            [Op.in]: viewIds,
+          },
+        },
+      }
+    );
+  }
+
+  public static async bulkUpdateDescriptionAndIcon(
+    auth: Authenticator,
+    viewIds: ModelId[],
+    description?: string,
+    icon?: string
+  ): Promise<void> {
+    if (viewIds.length === 0) {
+      return;
+    }
+
+    const updateData: Partial<Attributes<WebhookSourcesViewModel>> = {
+      editedAt: new Date(),
+      editedByUserId: auth.getNonNullableUser().id,
+    };
+
+    if (description !== undefined) {
+      updateData.description = description;
+    }
+    if (icon !== undefined) {
+      updateData.icon = normalizeWebhookIcon(icon);
+    }
+
+    await this.model.update(updateData, {
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        id: {
+          [Op.in]: viewIds,
+        },
+      },
+    });
+  }
+
+  public async updateDescriptionAndIcon(
+    auth: Authenticator,
+    description?: string,
+    icon?: string
+  ): Promise<Result<number, RubyError<"unauthorized">>> {
+    if (!this.canAdministrate(auth)) {
+      return new Err(
+        new RubyError(
+          "unauthorized",
+          "Not allowed to update description and icon."
+        )
+      );
+    }
+
+    const updateData: Partial<Attributes<WebhookSourcesViewModel>> = {
+      editedAt: new Date(),
+      editedByUserId: auth.getNonNullableUser().id,
+    };
+
+    if (description !== undefined) {
+      updateData.description = description;
+    }
+    if (icon !== undefined) {
+      updateData.icon = normalizeWebhookIcon(icon);
+    }
+
+    const [affectedCount] = await this.update(updateData);
+    return new Ok(affectedCount);
+  }
+
+  // Deletion.
+
+  protected async softDelete(
+    auth: Authenticator,
+    transaction?: Transaction
+  ): Promise<Result<number, Error>> {
+    assert(auth.isAdmin(), "Only the admin can delete a webhook sources view");
+    assert(
+      auth.getNonNullableWorkspace().id === this.workspaceId,
+      "Can only delete webhook sources views for the current workspace"
+    );
+
+    const deletedCount = await WebhookSourcesViewModel.destroy({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        id: this.id,
+      },
+      transaction,
+      hardDelete: false,
+    });
+
+    return new Ok(deletedCount);
+  }
+
+  async hardDelete(
+    auth: Authenticator,
+    transaction?: Transaction
+  ): Promise<Result<number, Error>> {
+    const deletedCount = await WebhookSourcesViewModel.destroy({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        id: this.id,
+      },
+      transaction,
+      // Use 'hardDelete: true' to ensure the record is permanently deleted from the database,
+      // bypassing the soft deletion in place.
+      hardDelete: true,
+    });
+
+    return new Ok(deletedCount);
+  }
+
+  get sId(): string {
+    return WebhookSourcesViewResource.modelIdToSId({
+      id: this.id,
+      workspaceId: this.workspaceId,
+    });
+  }
+
+  get name(): string {
+    return this.customName ?? this.webhookSource.name;
+  }
+
+  static modelIdToSId({
+    id,
+    workspaceId,
+  }: {
+    id: ModelId;
+    workspaceId: ModelId;
+  }): string {
+    return makeSId("webhook_sources_view", {
+      id,
+      workspaceId,
+    });
+  }
+
+  private makeEditedBy(
+    editedByUser: Attributes<UserModel> | undefined,
+    editedAt: Date | undefined
+  ) {
+    if (!editedByUser || !editedAt) {
+      return null;
+    }
+
+    return {
+      editedAt: editedAt.getTime(),
+      fullName: formatUserFullName(editedByUser),
+      imageUrl: editedByUser.imageUrl,
+      email: editedByUser.email,
+      userId: editedByUser.sId,
+    };
+  }
+
+  toJSON(): WebhookSourceViewType {
+    return {
+      id: this.id,
+      sId: this.sId,
+      customName: this.name,
+      description: this.description,
+      icon: normalizeWebhookIcon(this.icon),
+      provider: this.webhookSource.provider,
+      subscribedEvents: this.webhookSource.subscribedEvents,
+      createdAt: this.createdAt.getTime(),
+      updatedAt: this.updatedAt.getTime(),
+      spaceId: this.space.sId,
+      webhookSource: this.webhookSource.toJSON(),
+      editedByUser: this.makeEditedBy(
+        this.editedByUser,
+        this.webhookSource.updatedAt
+      ),
+    };
+  }
+
+  // Serialization.
+  toJSONForAdmin(): WebhookSourceViewForAdminType {
+    return {
+      id: this.id,
+      sId: this.sId,
+      customName: this.name,
+      description: this.description,
+      icon: normalizeWebhookIcon(this.icon),
+      provider: this.webhookSource.provider,
+      subscribedEvents: this.webhookSource.subscribedEvents,
+      createdAt: this.createdAt.getTime(),
+      updatedAt: this.updatedAt.getTime(),
+      spaceId: this.space.sId,
+      webhookSource: this.webhookSource.toJSONForAdmin(),
+      editedByUser: this.makeEditedBy(
+        this.editedByUser,
+        this.webhookSource.updatedAt
+      ),
+    };
+  }
+}

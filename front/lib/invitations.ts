@@ -1,0 +1,171 @@
+// Maximum allowed number of unconsumed invitations per workspace per day.
+
+import type { ConfirmDataType } from "@app/components/Confirm";
+import { clientFetch } from "@app/lib/egress/client";
+import type {
+  PostInvitationRequestBody,
+  PostInvitationResponseBody,
+} from "@app/types/api/invitation";
+import type { MembershipInvitationType } from "@app/types/membership_invitation";
+import type { MembershipSeatType } from "@app/types/memberships";
+import { isString } from "@app/types/shared/utils/general";
+import type { ActiveRoleType, WorkspaceType } from "@app/types/user";
+import { toAssignableRole } from "@app/types/user";
+import type { NotificationType } from "@ruby-ai/sparkle";
+import { mutate } from "swr";
+
+export const MAX_UNCONSUMED_INVITATIONS_PER_WORKSPACE_PER_DAY = 300;
+
+// Matches the invitations list regardless of query params (e.g. `?includeExpired=true`).
+export async function mutateWorkspaceInvitations(owner: WorkspaceType) {
+  const invitationsPath = `/api/w/${owner.sId}/invitations`;
+  await mutate((key) => isString(key) && key.split("?")[0] === invitationsPath);
+}
+
+export async function updateInvitation({
+  owner,
+  invitation,
+  newRole,
+  sendNotification,
+  confirm,
+}: {
+  owner: WorkspaceType;
+  invitation: MembershipInvitationType;
+  newRole?: ActiveRoleType; // Optional parameter for role change
+  sendNotification: (notificationData: NotificationType) => void;
+  confirm?: (confirmData: ConfirmDataType) => Promise<boolean>;
+}) {
+  if (!newRole && confirm) {
+    const confirmation = await confirm({
+      title: "Revoke invitation",
+      message: `Are you sure you want to revoke the invitation for ${invitation.inviteEmail}?`,
+      validateLabel: "Yes, revoke",
+      validateVariant: "warning",
+    });
+    if (!confirmation) {
+      return;
+    }
+  }
+
+  const body = {
+    status: newRole ? invitation.status : "revoked",
+    initialRole: toAssignableRole(newRole ?? invitation.initialRole),
+  };
+
+  const res = await clientFetch(
+    `/api/w/${owner.sId}/invitations/${invitation.sId}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }
+  );
+
+  if (!res.ok) {
+    const error: { error: { message: string } } = await res.json();
+    const message = newRole
+      ? error.error.message
+      : "Failed to update member's invitation.";
+    sendNotification({
+      type: "error",
+      title: `${newRole ? "Role Update Failed" : "Revoke Failed"}`,
+      description: message,
+    });
+    return;
+  }
+
+  const successMessage = newRole
+    ? `Invitation updated to ${newRole}`
+    : "Invitation revoked";
+  sendNotification({
+    type: "success",
+    title: `${newRole ? "Role updated" : "Invitation Revoked"}`,
+    description: `${successMessage} for ${invitation.inviteEmail}.`,
+  });
+  await mutateWorkspaceInvitations(owner);
+}
+
+export async function sendInvitations({
+  owner,
+  emails,
+  invitationRole,
+  seatType,
+  sendNotification,
+  isNewInvitation,
+}: {
+  owner: WorkspaceType;
+  emails: string[];
+  invitationRole: ActiveRoleType;
+  seatType?: MembershipSeatType | null;
+  sendNotification: any;
+  isNewInvitation: boolean;
+}) {
+  const body: PostInvitationRequestBody = emails.map((email) => ({
+    email,
+    // A pending invitation may still carry the deprecated `builder` role; resend it as `user`.
+    role: toAssignableRole(invitationRole),
+    seatType: seatType ?? null,
+  }));
+
+  const res = await clientFetch(`/api/w/${owner.sId}/invitations`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    let data: any = {};
+    try {
+      data = await res.json();
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      // biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
+    } catch (e) {
+      // ignore
+    }
+    if (data?.error?.type === "invitation_already_sent_recently") {
+      sendNotification({
+        type: "error",
+        title: emails.length === 1 ? "Invite failed" : "Invites failed",
+        description:
+          (emails.length === 1 ? "This user has" : "These users have") +
+          " already been invited in the last 24 hours. Please wait before sending another invite.",
+      });
+    }
+
+    const errorMessage =
+      // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+      data?.error?.message || "Failed to invite new members to workspace";
+
+    sendNotification({
+      type: "error",
+      title: "Invite failed",
+      description: errorMessage,
+    });
+  } else {
+    const result: PostInvitationResponseBody = await res.json();
+    const failures = result.filter((r) => !r.success);
+
+    if (failures.length > 0) {
+      sendNotification({
+        type: "error",
+        title: "Some invites failed",
+        description: result
+          .filter((r) => r.error_message)
+          .map((r) => r.error_message)
+          .join(", "),
+      });
+    } else {
+      sendNotification({
+        type: "success",
+        title: "Invites sent",
+        description: isNewInvitation
+          ? `${emails.length} new ${emails.length === 1 ? "invite" : "invites"} sent.`
+          : `Sent ${emails.length} ${emails.length === 1 ? "invite" : "invites"} again.`,
+      });
+    }
+  }
+}

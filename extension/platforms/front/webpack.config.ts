@@ -1,0 +1,192 @@
+import type { Environment } from "@extension/config/env";
+import { getImportMetaEnv } from "@extension/config/webpack_env";
+import { execSync } from "child_process";
+import Dotenv from "dotenv-webpack";
+import fs from "fs";
+import HtmlWebpackPlugin from "html-webpack-plugin";
+import path from "path";
+import TerserPlugin from "terser-webpack-plugin";
+import webpack from "webpack";
+import ZipPlugin from "zip-webpack-plugin";
+
+// Get git commit hash
+const getCommitHash = () => {
+  try {
+    return execSync("git rev-parse --short HEAD").toString().trim();
+  } catch (e) {
+    console.error(e);
+    return "development";
+  }
+};
+
+export const getConfig = ({ env }: { env: Environment }) => {
+  const isDevelopment = env === "development";
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, "../../package.json"), "utf8")
+  );
+  const version = packageJson.version;
+
+  const packageDirPath = path.resolve(
+    path.resolve(__dirname),
+    "../../packages"
+  );
+
+  return {
+    mode: isDevelopment ? "development" : "production",
+    entry: path.resolve(__dirname, "./main.tsx"),
+    output: {
+      filename: "main.js",
+      path: path.resolve(__dirname, "./build"),
+      publicPath: "/",
+    },
+    module: {
+      rules: [
+        {
+          test: /\.tsx?$/,
+          use: {
+            loader: "ts-loader",
+            options: {
+              configFile: path.resolve(__dirname, "../../tsconfig.json"),
+              transpileOnly: true,
+            },
+          },
+          exclude: /node_modules/,
+        },
+        {
+          test: /\.woff2$/i,
+          type: "asset/resource",
+          generator: {
+            filename: "static/fonts/[name][ext]",
+          },
+        },
+        {
+          test: /\.css$/,
+          use: [
+            "style-loader",
+            {
+              loader: "css-loader",
+              options: {
+                modules: {
+                  auto: true,
+                  namedExport: false,
+                },
+              },
+            },
+            {
+              loader: "postcss-loader",
+              options: {
+                postcssOptions: {
+                  config: path.resolve(
+                    __dirname,
+                    "../../config/postcss.config.js"
+                  ),
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+    optimization: {
+      minimize: !isDevelopment,
+      minimizer: [
+        new TerserPlugin({
+          extractComments: false,
+          terserOptions: {
+            output: {
+              ascii_only: true,
+            },
+          },
+        }),
+      ],
+    },
+    resolve: {
+      extensions: [".tsx", ".ts", ".js"],
+      alias: {
+        "@extension": path.resolve(__dirname, "../../"),
+        "@app/logger/logger": path.resolve(
+          __dirname,
+          "../../../front/logger/datadogLogger.ts"
+        ),
+        "@app/lib/platform": path.resolve(__dirname, "../../shared/platform"),
+        "@app": path.resolve(__dirname, "../../../front"),
+      },
+      fallback: {
+        http: require.resolve("stream-http"),
+        https: require.resolve("https-browserify"),
+        stream: require.resolve("stream-browserify"),
+        buffer: require.resolve("buffer/"),
+        url: require.resolve("url/"),
+        zlib: false,
+        assert: require.resolve("assert"),
+      },
+    },
+    plugins: [
+      new HtmlWebpackPlugin({
+        template: path.resolve(__dirname, "../../ui/main.html"),
+        filename: "index.html",
+      }),
+      new webpack.ProvidePlugin({
+        Buffer: ["buffer", "Buffer"],
+      }),
+      new webpack.DefinePlugin({
+        // Expose VITE_* vars on `import.meta.env` so the shared `front`
+        // CellProvider can resolve the cell API base URL in the webpack
+        // build (Vite only injects these in the SPA).
+        "import.meta.env": JSON.stringify(
+          getImportMetaEnv(
+            path.resolve(
+              __dirname,
+              isDevelopment ? "../../.env.development" : "../../.env.production"
+            )
+          )
+        ),
+      }),
+
+      new webpack.EnvironmentPlugin({
+        BUILD_DATE: process.env.COMMIT_HASH || Math.floor(Date.now() / 1000),
+        COMMIT_HASH: process.env.COMMIT_HASH || getCommitHash(),
+        DATADOG_CLIENT_TOKEN: process.env.DATADOG_CLIENT_TOKEN || "",
+        DATADOG_ENV: isDevelopment ? "dev" : "prod",
+        RUBY_EXTENSION_VERSION: `front-${version}`,
+        NEXT_PUBLIC_RUBY_APP_URL: process.env.NEXT_PUBLIC_RUBY_APP_URL || "",
+        NEXT_PUBLIC_RUBY_API_URL: process.env.NEXT_PUBLIC_RUBY_API_URL || "",
+        NEXT_PUBLIC_RUBY_STATIC_WEBSITE_URL:
+          process.env.NEXT_PUBLIC_RUBY_STATIC_WEBSITE_URL || "",
+        NEXT_PUBLIC_VIRTUOSO_LICENSE_KEY:
+          process.env.NEXT_PUBLIC_VIRTUOSO_LICENSE_KEY || "",
+        VIZ_PUBLIC_URL: process.env.VIZ_PUBLIC_URL || "",
+      }),
+      new Dotenv({
+        path: isDevelopment
+          ? path.resolve(__dirname, "../../.env.development")
+          : path.resolve(__dirname, "../../.env.production"),
+      }),
+      packageDirPath
+        ? new ZipPlugin({
+            path: packageDirPath,
+            filename: `Ruby_Extension_Front.${env}.v${version}.zip`,
+          })
+        : null,
+    ].filter(Boolean),
+    devServer: {
+      port: 3012,
+      hot: true,
+      static: {
+        directory: path.resolve(__dirname, "./build"),
+      },
+      historyApiFallback: true,
+      client: {
+        overlay: {
+          // Disable the runtime error overlay. The ResizeObserver "loop
+          // completed with undelivered notifications" error is benign but
+          // fires constantly in the Frontapp iframe context, and the overlay
+          // can't be filtered selectively here because webpack-dev-server
+          // reconstructs filter functions via `new Function`, which Frontapp's
+          // parent-page CSP blocks. Runtime errors still appear in the console.
+          runtimeErrors: false,
+        },
+      },
+    },
+  };
+};

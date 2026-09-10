@@ -1,0 +1,251 @@
+import type { ServerMetadata } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import { z } from "zod";
+
+export const MICROSOFT_EXCEL_SERVER_NAME = "microsoft_excel" as const;
+
+export const MICROSOFT_EXCEL_TOOLS_METADATA = [
+  {
+    name: "list_excel_files",
+    description:
+      "List and find Excel files (.xlsx, .xlsm) accessible in your organization.",
+    schema: {
+      query: z
+        .string()
+        .describe("Search query to filter Excel files by name or content."),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Listing Microsoft Excel files",
+      done: "List Microsoft Excel files",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "get_worksheets",
+    description:
+      "Get a list of all worksheets (sheets/tabs) in an Excel workbook.",
+    schema: {
+      itemId: z
+        .string()
+        .describe("The ID of the Excel file to get worksheets from."),
+      driveId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the drive containing the file. Takes priority over siteId if provided."
+        ),
+      siteId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the SharePoint site containing the file. Used if driveId is not provided."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Getting Excel worksheets",
+      done: "Get Excel worksheets",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "read_worksheet",
+    description:
+      "Read cell values from an Excel worksheet. Returns data as CSV. Reads the used range by default; use the range parameter to read a specific subset.",
+    schema: {
+      itemId: z.string().describe("The ID of the Excel file to read from."),
+      driveId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the drive containing the file. Takes priority over siteId if provided."
+        ),
+      siteId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the SharePoint site containing the file. Used if driveId is not provided."
+        ),
+      worksheetName: z
+        .string()
+        .describe("Name of the worksheet to read from (e.g., 'Sheet1')"),
+      range: z
+        .string()
+        .optional()
+        .describe(
+          "Cell range in A1 notation (e.g., 'A1:D10'). If omitted, reads the entire used range. Maximum 100,000 cells — if the worksheet exceeds this limit, a range must be specified."
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Reading Excel worksheet",
+      done: "Read Excel worksheet",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "write_worksheet",
+    description: "Write data to a specific range in an Excel worksheet.",
+    schema: {
+      itemId: z.string().describe("The ID of the Excel file to write to."),
+      driveId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the drive containing the file. Takes priority over siteId if provided."
+        ),
+      siteId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the SharePoint site containing the file. Used if driveId is not provided."
+        ),
+      worksheetName: z
+        .string()
+        .describe("Name of the worksheet to write to (e.g., 'Sheet1')"),
+      range: z
+        .string()
+        .describe(
+          "Target range in A1 notation. Can be either a single cell (e.g., 'A1', 'B5') or a full range (e.g., 'A1:C10'). Data dimensions must match the range size."
+        ),
+      data: z
+        .array(
+          z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
+        )
+        .describe(
+          "2D array of data to write. Each inner array represents a row, and all rows must have the same length. Example: [['Name', 'Age'], ['John', 30], ['Jane', 25]]"
+        ),
+    },
+    stake: "high",
+    displayLabels: {
+      running: "Writing to Excel worksheet",
+      done: "Write to Excel worksheet",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "create_worksheet",
+    description: "Create a new worksheet (sheet/tab) in an Excel workbook.",
+    schema: {
+      itemId: z
+        .string()
+        .describe("The ID of the Excel file to create a worksheet in."),
+      driveId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the drive containing the file. Takes priority over siteId if provided."
+        ),
+      siteId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the SharePoint site containing the file. Used if driveId is not provided."
+        ),
+      worksheetName: z
+        .string()
+        .describe("Name for the new worksheet (e.g., 'Q4 Results')"),
+    },
+    stake: "low",
+    displayLabels: {
+      running: "Creating Excel worksheet",
+      done: "Create Excel worksheet",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+  {
+    name: "clear_range",
+    description: "Clear data from a specific range in an Excel worksheet.",
+    schema: {
+      itemId: z
+        .string()
+        .describe("The ID of the Excel file to clear the range in."),
+      driveId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the drive containing the file. Takes priority over siteId if provided."
+        ),
+      siteId: z
+        .string()
+        .optional()
+        .describe(
+          "The ID of the SharePoint site containing the file. Used if driveId is not provided."
+        ),
+      worksheetName: z
+        .string()
+        .describe("Name of the worksheet (e.g., 'Sheet1')"),
+      range: z
+        .string()
+        .describe("Cell range to clear in A1 notation (e.g., 'A1:D10')"),
+      applyTo: z
+        .enum(["All", "Contents", "Formats"])
+        .default("Contents")
+        .describe(
+          "What to clear: 'All' (values and formatting), 'Contents' (values only), 'Formats' (formatting only)"
+        ),
+    },
+    stake: "high",
+    displayLabels: {
+      running: "Clearing Excel range",
+      done: "Clear Excel range",
+    },
+    toolCostCategory: "advanced",
+    freeUsage: false,
+  },
+] as const;
+
+export const MICROSOFT_EXCEL_SERVER = {
+  serverInfo: {
+    name: MICROSOFT_EXCEL_SERVER_NAME,
+    version: "1.0.0",
+    description:
+      "Read and write Excel spreadsheets in Microsoft OneDrive and SharePoint.",
+    icon: "MicrosoftExcelLogo",
+    authorization: {
+      provider: "microsoft_tools",
+      supported_use_cases: ["personal_actions"],
+      scope: "User.Read Files.ReadWrite.All Sites.Read.All offline_access",
+      availableScopes: [
+        {
+          value: "Files.Read.All",
+          label: "Read files",
+          description: "Read Excel files in OneDrive and SharePoint.",
+          impliedBy: "Files.ReadWrite.All",
+          required: true,
+        },
+        {
+          value: "Files.ReadWrite.All",
+          label: "Write files",
+          fallbackScope: "Files.Read.All",
+          description:
+            "Modify Excel files. Required for writing, creating, and clearing worksheets.",
+        },
+        {
+          value: "Sites.Read.All",
+          label: "Read SharePoint sites",
+          description: "Search for Excel files across SharePoint sites.",
+        },
+        {
+          value: "User.Read",
+          label: "Read user profile",
+          description: "Read basic profile information of the signed-in user.",
+          required: true,
+        },
+        {
+          value: "offline_access",
+          label: "Offline access",
+          description: "Maintain access without requiring re-authentication.",
+          required: true,
+        },
+      ],
+    },
+    documentationUrl: null,
+  },
+  tools: MICROSOFT_EXCEL_TOOLS_METADATA,
+} as const satisfies ServerMetadata;

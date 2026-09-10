@@ -1,0 +1,731 @@
+import type { FileSystemEntry } from "@app/types/api/file_system/types";
+import {
+  frameSlideshowContentType,
+  getFileFormatCategory,
+  isFrameV2ContentType,
+  isInteractiveContentType,
+  isMarkdownContentType,
+  isPdfContentType,
+  isSandboxFunctionContentType,
+  stripMimeParameters,
+} from "@app/types/files";
+import { TOOL_OUTPUTS_FOLDER_NAME } from "@app/types/mount_path";
+
+const VIEWER_CONTENT_TYPES = new Set<string>([
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+]);
+
+const CODE_PREVIEW_CONTENT_TYPES = new Set<string>([
+  "application/javascript",
+  "application/typescript",
+]);
+
+const TEXT_PREVIEW_CONTENT_TYPES = new Set<string>([
+  "application/json",
+  "application/vnd.ruby.section.json",
+  "application/x-ndjson",
+  "application/xml",
+  "application/yaml",
+  "message/rfc822",
+]);
+
+function isViewerCompatible(contentType: string): boolean {
+  return VIEWER_CONTENT_TYPES.has(contentType);
+}
+
+export type FilePreviewCategory =
+  | "frame"
+  | "code"
+  | "text"
+  | "pdf"
+  | "viewer"
+  | "audio"
+  | "markdown"
+  | "delimited"
+  | "image"
+  | "unsupported";
+
+interface FilePreviewConfig {
+  category: FilePreviewCategory;
+  needsProcessedVersion: boolean;
+  supportsExternalViewer: boolean;
+  supportsCopyContent: boolean;
+}
+
+function isTextPreviewContentType(contentType: string): boolean {
+  return (
+    contentType.startsWith("text/") ||
+    contentType.endsWith("+json") ||
+    contentType.endsWith("+xml") ||
+    TEXT_PREVIEW_CONTENT_TYPES.has(contentType)
+  );
+}
+
+export function getFilePreviewConfig(
+  rawContentType: string
+): FilePreviewConfig {
+  const contentType = stripMimeParameters(rawContentType);
+  const category = getFileFormatCategory(contentType);
+
+  if (isInteractiveContentType(contentType)) {
+    return {
+      category: "frame",
+      needsProcessedVersion: false,
+      supportsExternalViewer: false,
+      supportsCopyContent: false,
+    };
+  }
+
+  if (isPdfContentType(contentType)) {
+    return {
+      category: "pdf",
+      needsProcessedVersion: true,
+      supportsExternalViewer: true,
+      supportsCopyContent: false,
+    };
+  }
+
+  if (isViewerCompatible(contentType)) {
+    return {
+      category: "viewer",
+      needsProcessedVersion: true,
+      supportsExternalViewer: true,
+      supportsCopyContent: false,
+    };
+  }
+
+  if (isMarkdownContentType(contentType)) {
+    return {
+      category: "markdown",
+      needsProcessedVersion: false,
+      supportsExternalViewer: false,
+      supportsCopyContent: true,
+    };
+  }
+
+  if (
+    category === "code" ||
+    isSandboxFunctionContentType(contentType) ||
+    CODE_PREVIEW_CONTENT_TYPES.has(contentType)
+  ) {
+    return {
+      category: "code",
+      needsProcessedVersion: false,
+      supportsExternalViewer: false,
+      supportsCopyContent: true,
+    };
+  }
+
+  if (isTextPreviewContentType(contentType)) {
+    return {
+      category: "text",
+      needsProcessedVersion: false,
+      supportsExternalViewer: false,
+      supportsCopyContent: true,
+    };
+  }
+
+  if (category === "audio") {
+    return {
+      category: "audio",
+      needsProcessedVersion: true,
+      supportsExternalViewer: false,
+      supportsCopyContent: false,
+    };
+  }
+
+  if (category === "delimited") {
+    return {
+      category: "delimited",
+      needsProcessedVersion: false,
+      supportsExternalViewer: false,
+      supportsCopyContent: false,
+    };
+  }
+
+  if (category === "image") {
+    return {
+      category: "image",
+      needsProcessedVersion: false,
+      supportsExternalViewer: false,
+      supportsCopyContent: false,
+    };
+  }
+
+  return {
+    category: "unsupported",
+    needsProcessedVersion: false,
+    supportsExternalViewer: false,
+    supportsCopyContent: false,
+  };
+}
+
+export function isFilePreviewableContentType(contentType: string): boolean {
+  return getFilePreviewConfig(contentType).category !== "unsupported";
+}
+
+import type {
+  FileEntry,
+  FileExplorerBucket,
+  FileExplorerEntry,
+  FileExplorerPathEntry,
+  FileExplorerSortMode,
+  FileExplorerVirtualScopeRoot,
+  FilePanelCategory,
+  FileSystemDirectoryTreeNode,
+  FileSystemTreeNode,
+  FramePackageEntry,
+} from "./types";
+
+export const MIN_FILES_FOR_SEARCH = 10;
+
+export const ROOT_FOLDER_LABEL = "All files";
+
+/**
+ * Category display configuration, ordered by priority.
+ */
+export const CATEGORY_CONFIG: {
+  value: FilePanelCategory;
+  singular: string;
+  plural: string;
+}[] = [
+  { value: "frame", singular: "Frame", plural: "Frames" },
+  { value: "slideshow", singular: "Slideshow", plural: "Slideshows" },
+  { value: "image", singular: "Image", plural: "Images" },
+  { value: "document", singular: "Document", plural: "Documents" },
+  { value: "pdf", singular: "PDF", plural: "PDFs" },
+  { value: "table", singular: "Table", plural: "Tables" },
+  { value: "audio", singular: "Audio", plural: "Audio" },
+  { value: "knowledge", singular: "Knowledge", plural: "Knowledge" },
+  { value: "other", singular: "File", plural: "Other" },
+];
+
+/**
+ * Maps a tree node (file or folder) to its explorer filter bucket. Audio files (and any other
+ * unmapped type) return null and only surface under the "All" chip.
+ */
+export function getFileExplorerBucket(
+  node: FileSystemTreeNode
+): FileExplorerBucket | null {
+  if (node.isDirectory) {
+    return "folders";
+  }
+
+  const contentType = node.contentType;
+  if (!contentType) {
+    return null;
+  }
+
+  if (
+    isInteractiveContentType(contentType) ||
+    isFrameV2ContentType(contentType)
+  ) {
+    return "frames";
+  }
+
+  const previewConfig = getFilePreviewConfig(contentType);
+  switch (previewConfig.category) {
+    case "image":
+      return "images";
+
+    case "code":
+      return "code";
+
+    case "text":
+      return "texts";
+
+    case "delimited":
+      return "tables";
+
+    case "pdf":
+    case "viewer":
+    case "markdown":
+      return "texts";
+
+    case "frame":
+      return "frames";
+
+    case "unsupported":
+      return null;
+
+    default:
+      return null;
+  }
+}
+
+/**
+ * Whether mount-relative move (drag-and-drop, "Move to…") is allowed in the file explorer.
+ *
+ * Frames and slideshows are still keyed by `fileId` (canonical storage at
+ * `files/w/{wId}/{fileId}/…`), not mount-path relocation. Until they are fully on the mount
+ * filesystem, disable move for those entries.
+ */
+export function isFileExplorerMovableFile(entry: FileEntry): boolean {
+  if (isInteractiveContentType(entry.contentType)) {
+    return false;
+  }
+  return true;
+}
+
+function getEntryLastModifiedMs(entry: FileExplorerEntry | undefined): number {
+  if (!entry || entry.kind === "folder") {
+    return 0;
+  }
+  return entry.lastModifiedMs ?? 0;
+}
+
+/** Display order: Company Data refs, then folders, then GCS files. */
+function getExplorerNodeSortRank(
+  node: FileSystemTreeNode,
+  entryByRelativePath: Map<string, FileExplorerEntry>
+): number {
+  if (entryByRelativePath.get(node.path)?.kind === "node") {
+    return 0;
+  }
+  if (node.isDirectory) {
+    return 1;
+  }
+  return 2;
+}
+
+/**
+ * Compare nodes for the explorer sort modes. Always groups entries as: connected data (content
+ * nodes), then folders, then files; within each group the selected sort mode applies.
+ */
+export function compareTreeNodesForSort(
+  a: FileSystemTreeNode,
+  b: FileSystemTreeNode,
+  sortMode: FileExplorerSortMode,
+  entryByRelativePath: Map<string, FileExplorerEntry>
+): number {
+  const rankDiff =
+    getExplorerNodeSortRank(a, entryByRelativePath) -
+    getExplorerNodeSortRank(b, entryByRelativePath);
+  if (rankDiff !== 0) {
+    return rankDiff;
+  }
+
+  switch (sortMode) {
+    case "name-asc":
+      return a.name.localeCompare(b.name);
+
+    case "name-desc":
+      return b.name.localeCompare(a.name);
+
+    case "last-modified": {
+      // Folders have no timestamp on the tree (they're inferred from file paths). Among files,
+      // sort by recency; tie-break by name.
+      const ta = getEntryLastModifiedMs(entryByRelativePath.get(a.path));
+      const tb = getEntryLastModifiedMs(entryByRelativePath.get(b.path));
+      if (tb !== ta) {
+        return tb - ta;
+      }
+
+      return a.name.localeCompare(b.name);
+    }
+
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Human-readable singular category for a file MIME type (Image, Frame, PDF, …).
+ * Aligns with {@link getCategoryFromContentType}.
+ */
+export function getSingularFileCategoryLabelForContentType(
+  contentType: string
+): string {
+  const category: FilePanelCategory = isInteractiveContentType(contentType)
+    ? contentType === frameSlideshowContentType
+      ? "slideshow"
+      : "frame"
+    : getCategoryFromContentType(contentType);
+  const config = CATEGORY_CONFIG.find((c) => c.value === category);
+  return config?.singular ?? "File";
+}
+
+/**
+ * Categorize a file by its content type alone (used for sandbox/mounted files).
+ */
+export function getCategoryFromContentType(
+  contentType: string
+): FilePanelCategory {
+  const previewConfig = getFilePreviewConfig(contentType);
+
+  switch (previewConfig.category) {
+    case "pdf":
+      return "pdf";
+    case "image":
+      return "image";
+    case "audio":
+      return "audio";
+    case "delimited":
+      return "table";
+    case "code":
+    case "text":
+    case "viewer":
+    case "markdown":
+      return "document";
+    case "frame":
+      return "frame";
+    case "unsupported":
+      return "other";
+    default:
+      return "other";
+  }
+}
+
+function ensureDirectoryNode(
+  nodeMap: Map<string, FileSystemTreeNode>,
+  root: FileSystemTreeNode[],
+  path: string,
+  name: string,
+  canonicalPath: string
+): void {
+  if (nodeMap.has(path)) {
+    return;
+  }
+
+  const dirNode: FileSystemTreeNode = {
+    name,
+    path,
+    isDirectory: true,
+    canonicalPath,
+    contentType: null,
+    fileId: null,
+    children: [],
+  };
+  nodeMap.set(path, dirNode);
+
+  const parentPath = path.substring(0, path.lastIndexOf("/"));
+  const parent = parentPath ? nodeMap.get(parentPath) : undefined;
+  if (parent) {
+    parent.children.push(dirNode);
+  } else {
+    root.push(dirNode);
+  }
+}
+
+/** Explorer navigation path: `virtualPath` when set, else mount-relative path. */
+export function getExplorerRelativePath(
+  entry: Pick<FileSystemEntry, "path"> & { virtualPath?: string }
+): string {
+  if (entry.virtualPath !== undefined) {
+    return entry.virtualPath;
+  }
+  return getScopedRelativePath(entry.path);
+}
+
+/** Attach a UI-only path prefix for merged multi-scope explorers. */
+export function withVirtualExplorerPath(
+  entry: FileSystemEntry,
+  scopeLabel: string
+): FileExplorerPathEntry {
+  return {
+    ...entry,
+    virtualPath: `${scopeLabel}/${getScopedRelativePath(entry.path)}`,
+  };
+}
+
+/** Top-level scope folders shown at the virtual root (includes empty scopes). */
+export function getVirtualScopeRootNodes(
+  tree: FileSystemTreeNode[],
+  scopeRoots: readonly FileExplorerVirtualScopeRoot[]
+): FileSystemDirectoryTreeNode[] {
+  const topLevelDirs = new Map<string, FileSystemDirectoryTreeNode>();
+  for (const node of tree) {
+    if (node.isDirectory && !node.path.includes("/")) {
+      topLevelDirs.set(node.path, node);
+    }
+  }
+
+  return scopeRoots.map((scopeRoot) => {
+    const existingNode = topLevelDirs.get(scopeRoot.path);
+    return existingNode
+      ? { ...existingNode, canonicalPath: scopeRoot.canonicalPath }
+      : {
+          name: scopeRoot.path,
+          path: scopeRoot.path,
+          canonicalPath: scopeRoot.canonicalPath,
+          isDirectory: true,
+          contentType: null,
+          fileId: null,
+          children: [],
+        };
+  });
+}
+
+/** Search result card title: explorer path with the current folder prefix stripped. */
+export function getFileExplorerSearchResultTitle(
+  entry: Pick<FileExplorerPathEntry, "path"> & { virtualPath?: string },
+  currentFolderPath: string
+): string {
+  const explorerPath = getExplorerRelativePath(entry);
+  if (!currentFolderPath) {
+    return explorerPath;
+  }
+
+  const prefix = `${currentFolderPath}/`;
+  if (explorerPath.startsWith(prefix)) {
+    return explorerPath.slice(prefix.length);
+  }
+
+  return explorerPath;
+}
+
+/** All file leaves in a tree (folders excluded). */
+function collectAllFileTreeNodes(
+  nodes: FileSystemTreeNode[]
+): FileSystemTreeNode[] {
+  return nodes.flatMap((node) =>
+    node.isDirectory ? collectAllFileTreeNodes(node.children) : [node]
+  );
+}
+
+/** File leaves at `folderPath` and in descendant folders (empty path = entire tree). */
+export function collectFileTreeNodesAtOrBelow(
+  tree: FileSystemTreeNode[],
+  folderPath: string
+): FileSystemTreeNode[] {
+  const allFiles = collectAllFileTreeNodes(tree);
+  if (!folderPath) {
+    return allFiles;
+  }
+
+  const prefix = `${folderPath}/`;
+  return allFiles.filter((node) => node.path.startsWith(prefix));
+}
+
+export function isFileExplorerNodeHidden(node: FileSystemTreeNode): boolean {
+  return node.name.startsWith(".") && node.name !== TOOL_OUTPUTS_FOLDER_NAME;
+}
+
+/** Match file name or explorer-relative path (query must be lowercased). */
+export function fileExplorerNodeMatchesSearch(
+  node: FileSystemTreeNode,
+  q: string
+): boolean {
+  return (
+    node.name.toLowerCase().includes(q) || node.path.toLowerCase().includes(q)
+  );
+}
+
+/**
+ * Build a tree from flat file entries by inferring directories from paths.
+ * Uses `virtualPath` when set; otherwise strips the scoped prefix from `path`.
+ */
+export function buildFileSystemTree(
+  entries: (FileExplorerPathEntry | FramePackageEntry)[]
+): FileSystemTreeNode[] {
+  const root: FileSystemTreeNode[] = [];
+  const nodeMap = new Map<string, FileSystemTreeNode>();
+
+  for (const entry of entries) {
+    const relativePath = getExplorerRelativePath(entry);
+
+    if (!relativePath) {
+      continue;
+    }
+
+    const parts = relativePath.split("/");
+    const canonicalPath =
+      "sourceFolderCanonicalPath" in entry
+        ? entry.sourceFolderCanonicalPath
+        : entry.path;
+    const canonicalParts = canonicalPath.split("/");
+    const canonicalPartOffset = canonicalParts.length - parts.length;
+
+    const getCanonicalPathAtDepth = (depth: number): string =>
+      canonicalParts.slice(0, canonicalPartOffset + depth).join("/");
+
+    if (entry.isDirectory) {
+      if (nodeMap.has(relativePath)) {
+        continue;
+      }
+
+      let currentPath = "";
+      for (let i = 0; i < parts.length; i++) {
+        currentPath = currentPath ? `${currentPath}/${parts[i]!}` : parts[i]!;
+        ensureDirectoryNode(
+          nodeMap,
+          root,
+          currentPath,
+          parts[i]!,
+          getCanonicalPathAtDepth(i + 1)
+        );
+      }
+      continue;
+    }
+
+    let currentPath = "";
+    for (let i = 0; i < parts.length - 1; i++) {
+      currentPath = currentPath ? `${currentPath}/${parts[i]!}` : parts[i]!;
+      ensureDirectoryNode(
+        nodeMap,
+        root,
+        currentPath,
+        parts[i]!,
+        getCanonicalPathAtDepth(i + 1)
+      );
+    }
+
+    const fileNode: FileSystemTreeNode = {
+      name: parts[parts.length - 1]!,
+      path: relativePath,
+      isDirectory: false,
+      canonicalPath,
+      contentType: entry.contentType,
+      fileId: entry.fileId,
+      children: [],
+    };
+    nodeMap.set(relativePath, fileNode);
+
+    const parentPath = relativePath.substring(0, relativePath.lastIndexOf("/"));
+    const parent = parentPath ? nodeMap.get(parentPath) : undefined;
+    if (parent) {
+      parent.children.push(fileNode);
+    } else {
+      root.push(fileNode);
+    }
+  }
+
+  return root;
+}
+
+/** Strip the scoped prefix (e.g. `project/`) from a mount path. */
+export function getScopedRelativePath(scopedPath: string): string {
+  const slashIdx = scopedPath.indexOf("/");
+  return slashIdx >= 0 ? scopedPath.slice(slashIdx + 1) : scopedPath;
+}
+
+/** Parent folder path within the mount, or empty string for the root. */
+export function getParentFolderRelativePath(relativeFilePath: string): string {
+  const lastSlash = relativeFilePath.lastIndexOf("/");
+  return lastSlash >= 0 ? relativeFilePath.slice(0, lastSlash) : "";
+}
+
+/** Join a parent folder path and file name within a mount (no scope prefix). */
+export function joinMountRelativePath(
+  parentRelativePath: string,
+  fileName: string
+): string {
+  return parentRelativePath ? `${parentRelativePath}/${fileName}` : fileName;
+}
+
+function filterDirectoryNodes(
+  nodes: FileSystemTreeNode[]
+): FileSystemTreeNode[] {
+  return nodes
+    .filter((node) => node.isDirectory)
+    .map((node) => ({
+      ...node,
+      children: filterDirectoryNodes(node.children),
+    }));
+}
+
+/** Folder-only view of the sandbox tree (no files). */
+export function buildFolderTree(
+  entries: FileExplorerPathEntry[]
+): FileSystemTreeNode[] {
+  return filterDirectoryNodes(buildFileSystemTree(entries));
+}
+
+export function countFoldersInTree(nodes: FileSystemTreeNode[]): number {
+  return nodes.reduce(
+    (count, node) => count + 1 + countFoldersInTree(node.children),
+    0
+  );
+}
+
+/** Human-readable breadcrumb for a folder path in the move dialog. */
+export function formatFolderDestinationLabel(
+  folderPath: string,
+  folderTree: FileSystemTreeNode[]
+): string {
+  if (!folderPath) {
+    return ROOT_FOLDER_LABEL;
+  }
+
+  const labels = [ROOT_FOLDER_LABEL];
+  let nodes = folderTree;
+  let current = "";
+  for (const part of folderPath.split("/")) {
+    current = current ? `${current}/${part}` : part;
+    const node = nodes.find((n) => n.path === current);
+    if (!node) {
+      labels.push(part);
+      break;
+    }
+    labels.push(node.name);
+    nodes = node.children;
+  }
+  return labels.join(" / ");
+}
+
+/** Paths of every ancestor folder, for expanding the tree to a location. */
+export function getAncestorFolderPaths(folderPath: string): Set<string> {
+  if (!folderPath) {
+    return new Set();
+  }
+
+  const paths = new Set<string>();
+  let current = "";
+  for (const part of folderPath.split("/")) {
+    current = current ? `${current}/${part}` : part;
+    paths.add(current);
+  }
+  return paths;
+}
+
+/** Breadcrumb segments for a folder path (e.g. `reports/q1` → two segments). */
+export function getFolderBreadcrumbSegments(
+  folderPath: string
+): { label: string; path: string }[] {
+  if (!folderPath) {
+    return [];
+  }
+
+  const segments: { label: string; path: string }[] = [];
+  let current = "";
+  for (const part of folderPath.split("/")) {
+    current = current ? `${current}/${part}` : part;
+    segments.push({ label: part, path: current });
+  }
+  return segments;
+}
+
+export function findTreeNodeByPath(
+  nodes: FileSystemTreeNode[],
+  path: string
+): FileSystemTreeNode | undefined {
+  for (const node of nodes) {
+    if (node.path === path) {
+      return node;
+    }
+
+    const found = findTreeNodeByPath(node.children, path);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
+/** Children of a folder in the sandbox tree; root when `folderPath` is empty. */
+export function getChildrenAtFolderPath(
+  tree: FileSystemTreeNode[],
+  folderPath: string
+): FileSystemTreeNode[] {
+  if (!folderPath) {
+    return tree;
+  }
+
+  const folder = findTreeNodeByPath(tree, folderPath);
+  return folder?.isDirectory ? folder.children : [];
+}

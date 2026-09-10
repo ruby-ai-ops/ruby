@@ -1,0 +1,171 @@
+import {
+  getCloudflareAccessConfig,
+  getPokeRolesForUserViaCloudflareAccess,
+  resolveCloudflareAccessToken,
+  verifyCloudflareAccessJwt,
+} from "@app/lib/api/poke/cloudflare_access";
+import { Authenticator, isRubyInternalEmail } from "@app/lib/auth";
+import { ALL_ROLES } from "@app/lib/poke/roles";
+import logger from "@app/logger/logger";
+import { isDevelopment } from "@app/types/shared/env";
+import type { PokeCtx } from "@front-api/middlewares/ctx";
+import { resolveSession } from "@front-api/middlewares/session_resolution";
+import { apiError } from "@front-api/middlewares/utils";
+import { getCookie } from "hono/cookie";
+import { createMiddleware } from "hono/factory";
+
+/**
+ * Authenticates a Poke (super-user) request and stashes an unscoped
+ * `Authenticator` on the Hono context. Apply once at the `/api/poke` root;
+ * workspace-scoped routes layer `withPokeWorkspace` on top.
+ *
+ * Prefers a validated Cloudflare Access JWT (`Cf-Access-Jwt-Assertion` /
+ * `CF_Authorization`) so poke operators do not need a provisioned Ruby user
+ * with `isRubySuperUser` on every deployment. Outside development, a missing
+ * Access token is rejected. In development only, falls back to the WorkOS
+ * super-user session path when no Access token is present.
+ *
+ * Super-user privilege is an Authenticator flag set only by poke factories
+ * (`fromRubySuperUser` / `fromSuperUserSession`), not by the DB column alone.
+ */
+export const pokeAuth = createMiddleware<PokeCtx>(async (ctx, next) => {
+  const accessConfig = getCloudflareAccessConfig();
+  const accessToken = resolveCloudflareAccessToken({
+    headerToken: ctx.req.header("cf-access-jwt-assertion"),
+    cookieToken: getCookie(ctx, "CF_Authorization"),
+  });
+
+  if (accessConfig && accessToken) {
+    const identity = await verifyCloudflareAccessJwt(accessToken);
+    if (!identity) {
+      return apiError(ctx, {
+        status_code: 401,
+        api_error: {
+          type: "not_authenticated",
+          message: "Invalid Cloudflare Access token.",
+        },
+      });
+    }
+
+    // Note: we should maybe remove this check and fully trust the Cloudflare Access token.
+    // Kept for now to be symmetric with the WorkOS fallback.
+    if (!isRubyInternalEmail(identity.email)) {
+      logger.warn(
+        {
+          email: identity.email,
+        },
+        "[Poke Auth] Cloudflare Access token user is not a Ruby internal email"
+      );
+      return apiError(ctx, {
+        status_code: 401,
+        api_error: {
+          type: "not_authenticated",
+          message: "The user does not have permission",
+        },
+      });
+    }
+
+    const auth = await Authenticator.fromRubySuperUser({
+      pokePrincipal: {
+        email: identity.email,
+        name: identity.name,
+      },
+    });
+
+    logger.info(
+      { email: identity.email },
+      "[Poke Auth] User logged in Poke via Cloudflare Access token"
+    );
+
+    const pokeRoles = await getPokeRolesForUserViaCloudflareAccess(accessToken);
+    ctx.set("auth", auth);
+    ctx.set("pokeRoles", pokeRoles);
+    await next();
+    return;
+  } else if (accessConfig && !accessToken) {
+    if (!isDevelopment()) {
+      logger.warn(
+        "[Poke Auth] Request missing Cloudflare Access token; rejececting request"
+      );
+    } else {
+      logger.info(
+        "[Poke Auth] Request missing Cloudflare Access token in development; falling back to WorkOS super-user session"
+      );
+
+      const sessionResult = await resolveSession(ctx);
+      if (sessionResult instanceof Response) {
+        return sessionResult;
+      }
+
+      const user = await Authenticator.userFromSession(sessionResult);
+      // WorkOS fallback still requires a provisioned Ruby user
+      if (user) {
+        const auth = await Authenticator.fromRubySuperUser({ user });
+        logger.info(
+          {
+            userId: user.sId,
+            email: user.email,
+          },
+          "[Poke Auth] User logged in Poke via WorkOS in development."
+        );
+
+        ctx.set("auth", auth);
+        ctx.set("pokeRoles", ALL_ROLES);
+        await next();
+        return;
+      } else {
+        logger.warn(
+          "[Poke Auth] WorkOS fallback user not found; rejecting request"
+        );
+      }
+    }
+  }
+
+  return apiError(ctx, {
+    status_code: 401,
+    api_error: {
+      type: "not_authenticated",
+      message: "The user does not have permission",
+    },
+  });
+});
+
+/**
+ * Re-scopes the existing Poke `Authenticator` to the `:wId` workspace from
+ * the route and 404s if the workspace cannot be resolved. Apply after
+ * `pokeAuth` so the unscoped super-user `auth` is already on the context.
+ */
+export const withPokeWorkspace = createMiddleware<PokeCtx>(
+  async (ctx, next) => {
+    const wId = ctx.req.param("wId");
+    if (!wId) {
+      return apiError(ctx, {
+        status_code: 404,
+        api_error: {
+          type: "workspace_not_found",
+          message: "The workspace was not found.",
+        },
+      });
+    }
+
+    const current = ctx.get("auth");
+    const auth = await Authenticator.fromRubySuperUser({
+      user: current.user(),
+      wId,
+      pokePrincipal: current.getPokePrincipal(),
+    });
+
+    if (!auth.workspace()) {
+      return apiError(ctx, {
+        status_code: 404,
+        api_error: {
+          type: "workspace_not_found",
+          message: "The workspace was not found.",
+        },
+      });
+    }
+
+    ctx.set("auth", auth);
+    await next();
+  }
+);

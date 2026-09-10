@@ -1,0 +1,561 @@
+import { useAgentBuilderContext } from "@app/components/agent_builder/AgentBuilderContext";
+import type { AgentBuilderFormData } from "@app/components/agent_builder/AgentBuilderFormContext";
+import { BlockInsertDropdown } from "@app/components/agent_builder/instructions/BlockInsertDropdown";
+import { InstructionsMenuBar } from "@app/components/agent_builder/instructions/InstructionsMenuBar";
+import { useBlockInsertDropdown } from "@app/components/agent_builder/instructions/useBlockInsertDropdown";
+import { useSidekickSuggestions } from "@app/components/agent_builder/sidekick/SidekickSuggestionsContext";
+import { SuggestionBubbleMenu } from "@app/components/agent_builder/sidekick/SuggestionBubbleMenu";
+import { AgentInstructionDiffExtension } from "@app/components/editor/extensions/agent_builder/AgentInstructionDiffExtension";
+import { BlockInsertExtension } from "@app/components/editor/extensions/agent_builder/BlockInsertExtension";
+import { InstructionBlockExtension } from "@app/components/editor/extensions/agent_builder/InstructionBlockExtension";
+import {
+  getActiveSuggestions,
+  InstructionSuggestionExtension,
+} from "@app/components/editor/extensions/agent_builder/InstructionSuggestionExtension";
+import { CodeExtension } from "@app/components/editor/extensions/CodeExtension";
+import { EmojiExtension } from "@app/components/editor/extensions/EmojiExtension";
+import { HeadingExtension } from "@app/components/editor/extensions/HeadingExtension";
+import { KeyboardShortcutsExtension } from "@app/components/editor/extensions/input_bar/KeyboardShortcutsExtension";
+import { BlockIdExtension } from "@app/components/editor/extensions/instructions/BlockIdExtension";
+import { InstructionsDocumentExtension } from "@app/components/editor/extensions/instructions/InstructionsDocumentExtension";
+import { InstructionsRootExtension } from "@app/components/editor/extensions/instructions/InstructionsRootExtension";
+import { ListItemExtension } from "@app/components/editor/extensions/ListItemExtension";
+import { MentionExtension } from "@app/components/editor/extensions/MentionExtension";
+import {
+  cleanupPastedHTML,
+  stripHtmlAttributes,
+} from "@app/components/editor/input_bar/cleanupPastedHTML";
+import { LinkExtension } from "@app/components/editor/input_bar/LinkExtension";
+import { createMentionSuggestion } from "@app/components/editor/input_bar/mentionSuggestion";
+import { preprocessMarkdownForEditor } from "@app/components/editor/lib/preprocessMarkdownForEditor";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import { ContainerWithTopBar, cn, markdownStyles } from "@ruby-ai/sparkle";
+import type { Editor as CoreEditor, Extensions } from "@tiptap/core";
+import { CharacterCount, Placeholder } from "@tiptap/extensions";
+import { Markdown } from "@tiptap/markdown";
+import type { Editor as ReactEditor } from "@tiptap/react";
+import { EditorContent, useEditor } from "@tiptap/react";
+import { StarterKit } from "@tiptap/starter-kit";
+import { cva } from "class-variance-authority";
+import debounce from "lodash/debounce";
+import type { ReactNode } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
+import { useController } from "react-hook-form";
+import { BLUR_EVENT_NAME, INSTRUCTIONS_DEBOUNCE_MS } from "./constants";
+
+export const INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT = 120_000;
+
+/**
+ * Base rendering extensions for the agent instructions editor.
+ * Used by the full editor and by read-only preview pages (e.g. poke).
+ */
+export function buildAgentInstructionsReadOnlyExtensions(): Extensions {
+  return [
+    Markdown,
+    InstructionsDocumentExtension,
+    StarterKit.configure({
+      document: false, // Disabled, we use a custom document to enforce a single instructions root node.
+      heading: false, // Disabled, we use a custom one, see below.
+      hardBreak: false, // Disabled, we use custom EmptyLineParagraphExtension instead.
+      paragraph: {
+        HTMLAttributes: {
+          class: markdownStyles.paragraph(),
+        },
+      },
+      orderedList: {
+        HTMLAttributes: {
+          class: markdownStyles.orderedList(),
+        },
+      },
+      listItem: false, // Disabled, we use ListItemExtension to fix nested list marker parsing.
+      link: false, // we use custom LinkExtension instead
+      bulletList: {
+        HTMLAttributes: {
+          class: markdownStyles.unorderedList(),
+        },
+      },
+      blockquote: false,
+      horizontalRule: false,
+      strike: false,
+      undoRedo: {
+        depth: 100,
+      },
+      code: false, // Disabled, we use custom CodeExtension to handle escaped backticks.
+      codeBlock: {
+        HTMLAttributes: {
+          class: markdownStyles.codeBlock(),
+        },
+      },
+    }),
+    CodeExtension.configure({
+      HTMLAttributes: {
+        class: markdownStyles.codeInline(),
+      },
+    }),
+    ListItemExtension.configure({
+      HTMLAttributes: {
+        class: markdownStyles.list(),
+      },
+    }),
+    InstructionsRootExtension,
+    BlockIdExtension,
+    InstructionBlockExtension,
+    HeadingExtension.configure({
+      levels: [1, 2, 3, 4, 5, 6],
+      HTMLAttributes: { class: "mt-4 mb-3" },
+    }),
+    EmojiExtension,
+    LinkExtension.configure({
+      HTMLAttributes: {
+        class: "text-blue-600 hover:underline hover:text-blue-800",
+      },
+      autolink: false,
+      openOnClick: false,
+    }),
+  ];
+}
+
+const editorVariants = cva(
+  [
+    "overflow-auto p-2 resize-y min-h-60 max-h-[2048px]",
+    "transition-all duration-200",
+  ],
+  {
+    variants: {
+      embedded: {
+        true: [
+          "rounded-b-xl border-0 bg-transparent",
+          "focus:ring-0 focus:outline-hidden focus:border-0",
+        ],
+        false: [
+          "border rounded-xl",
+          "bg-muted-background",
+          "focus:ring-highlight-300",
+          "focus:outline-highlight-200",
+          "focus:border-highlight-300",
+        ],
+      },
+      error: {
+        true: [
+          "border-warning-500",
+          "focus:ring-warning-500",
+          "focus:outline-warning-500",
+          "focus:border-warning-500",
+        ],
+        false: [
+          "border-border",
+          "focus:ring-highlight-300",
+          "focus:outline-highlight-200",
+          "focus:border-highlight-300",
+        ],
+      },
+    },
+    defaultVariants: {
+      embedded: false,
+      error: false,
+    },
+  }
+);
+
+function ToolbarSlot({ children }: { children: ReactNode }) {
+  return <>{children}</>;
+}
+
+interface AgentBuilderInstructionsEditorProps {
+  compareVersion?: LightAgentConfigurationType | null;
+  isInstructionDiffMode?: boolean;
+  children?: ReactNode;
+}
+
+export function AgentBuilderInstructionsEditor({
+  compareVersion,
+  isInstructionDiffMode = false,
+  children,
+}: AgentBuilderInstructionsEditorProps = {}) {
+  const { owner } = useAgentBuilderContext();
+
+  const { field } = useController<AgentBuilderFormData, "instructions">({
+    name: "instructions",
+  });
+  const { field: instructionsHtmlField } = useController<
+    AgentBuilderFormData,
+    "instructionsHtml"
+  >({
+    name: "instructionsHtml",
+  });
+  const editorRef = useRef<ReactEditor | null>(null);
+  const blockDropdown = useBlockInsertDropdown(editorRef);
+  const suggestionHandler = blockDropdown.suggestionOptions;
+  const initialContentSetRef = useRef(false);
+
+  const suggestionsContext = useSidekickSuggestions();
+
+  const editorWrapperRef = useRef<HTMLDivElement>(null);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: owner.sId is intentional — owner is a SWR-deserialized object that gets a new reference on every revalidation (revalidateOnFocus). Using owner.sId (a stable primitive) prevents extensions from changing identity and the editor from being needlessly recreated.
+  const extensions = useMemo(() => {
+    const extensions: Extensions = [
+      ...buildAgentInstructionsReadOnlyExtensions(),
+      KeyboardShortcutsExtension,
+      AgentInstructionDiffExtension,
+      InstructionSuggestionExtension,
+      BlockInsertExtension.configure({
+        suggestion: suggestionHandler,
+      }),
+      Placeholder.configure({
+        placeholder: ({ editor }) => {
+          // Hide placeholder when suggestions are being displayed.
+          if (getActiveSuggestions(editor.state).size > 0) {
+            return "";
+          }
+
+          // Don't show placeholder inside instruction blocks.
+          const { selection } = editor.state;
+          const $pos = selection.$anchor;
+          for (let depth = $pos.depth; depth > 0; depth--) {
+            if ($pos.node(depth).type.name === "instructionBlock") {
+              return "";
+            }
+          }
+
+          return "What is the purpose of the agent? How should it behave?";
+        },
+        emptyNodeClass:
+          "first:before:text-muted-foreground first:before:italic first:before:content-[attr(data-placeholder)] first:before:pointer-events-none first:before:absolute",
+      }),
+      CharacterCount.configure({
+        limit: INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT,
+      }),
+      MentionExtension.configure({
+        owner,
+        HTMLAttributes: {
+          class:
+            "min-w-0 px-0 py-0 border-none outline-hidden focus:outline-hidden focus:border-none ring-0 focus:ring-0 text-highlight-500 font-semibold",
+        },
+        suggestion: createMentionSuggestion({
+          owner,
+          conversationId: null,
+          includeCurrentUser: true,
+          select: {
+            agents: false,
+            users: true,
+          },
+        }),
+      }),
+    ];
+
+    return extensions;
+  }, [owner.sId, suggestionHandler]);
+
+  // Debounce serialization to prevent performance issues
+  const debouncedUpdate = useMemo(
+    () =>
+      debounce((editor: CoreEditor | ReactEditor) => {
+        if (!isInstructionDiffMode && !editor.isDestroyed) {
+          field.onChange(editor.getMarkdown());
+          // Strip style/class/id attributes to store clean HTML structure.
+          instructionsHtmlField.onChange(stripHtmlAttributes(editor.getHTML()));
+        }
+      }, INSTRUCTIONS_DEBOUNCE_MS),
+    [field, instructionsHtmlField, isInstructionDiffMode]
+  );
+
+  const editor = useEditor(
+    {
+      extensions,
+      // Don't set content here - it can cause race conditions in Safari
+      // Content will be set in a separate useEffect after the editor is ready
+      contentType: "markdown",
+      onUpdate: ({ editor, transaction }) => {
+        if (transaction.docChanged) {
+          debouncedUpdate(editor);
+        }
+      },
+      onBlur: () => {
+        window.dispatchEvent(new CustomEvent(BLUR_EVENT_NAME));
+        return false;
+      },
+      editorProps: {
+        // Cleans up incoming HTML to remove Chrome-specific wrapper tags (e.g., <b style="font-weight:normal">)
+        // that interfere with instruction block parsing
+        transformPastedHTML(html: string) {
+          return cleanupPastedHTML(html);
+        },
+      },
+      immediatelyRender: false,
+    },
+    [extensions]
+  );
+
+  // Set initial content after editor is created, then focus
+  // This is separated from useEditor() to avoid Safari race conditions
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) {
+      return;
+    }
+
+    // Skip if this exact editor instance was already initialized.
+    if (initialContentSetRef.current && editorRef.current === editor) {
+      return;
+    }
+
+    editorRef.current = editor;
+    // Mark as set immediately to prevent race conditions
+    initialContentSetRef.current = true;
+
+    // Use requestAnimationFrame to ensure DOM is fully ready
+    // This fixes "Applying a mismatched transaction" error in Safari/iOS
+    requestAnimationFrame(() => {
+      if (!editor || editor.isDestroyed) {
+        return;
+      }
+
+      // Prefer HTML content if available (preserves block IDs for sidekick targeting).
+      // Fall back to markdown for agents without stored HTML.
+      if (instructionsHtmlField.value) {
+        editor.commands.setContent(instructionsHtmlField.value, {
+          emitUpdate: false,
+        });
+      } else if (field.value) {
+        editor.commands.setContent(preprocessMarkdownForEditor(field.value), {
+          emitUpdate: false,
+          contentType: "markdown",
+        });
+      }
+
+      // Then focus after content is set
+      // Use a second RAF to ensure content setting is complete
+      requestAnimationFrame(() => {
+        if (editor && !editor.isDestroyed) {
+          // Sync instructionsHtml field with current editor state.
+          // For HTML loads, this preserves existing IDs; for markdown loads, this generates new ones.
+          instructionsHtmlField.onChange(stripHtmlAttributes(editor.getHTML()));
+          editor.commands.focus("end");
+
+          // Register with the suggestions context now that content is fully set.
+          if (suggestionsContext) {
+            suggestionsContext.registerEditor(editor);
+          }
+        }
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor]); // Only run when editor is created, not when field.value changes
+
+  useEffect(() => {
+    return () => {
+      debouncedUpdate.cancel();
+    };
+  }, [debouncedUpdate]);
+
+  const currentCharacterCount =
+    editor?.storage.characterCount.characters() ?? 0;
+  const displayError =
+    currentCharacterCount >= INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT;
+
+  useEffect(() => {
+    if (!editor) {
+      return;
+    }
+
+    editor.setOptions({
+      editorProps: {
+        attributes: {
+          class: editorVariants({
+            embedded: true,
+            error: displayError,
+          }),
+        },
+        // Preserve the transformPastedHTML handler when updating editorProps
+        transformPastedHTML(html: string) {
+          return cleanupPastedHTML(html);
+        },
+      },
+    });
+  }, [editor, displayError]);
+
+  useEffect(() => {
+    if (
+      !editor ||
+      field.value === undefined ||
+      editor.isDestroyed ||
+      !initialContentSetRef.current
+    ) {
+      return;
+    }
+
+    if (editor.isFocused) {
+      return;
+    }
+
+    // Skip while the editor is in diff mode — the diff mode effect handles
+    // content sync after exiting diff to guarantee correct ordering.
+    if (editor.storage.agentInstructionDiff?.isDiffMode) {
+      return;
+    }
+
+    const currentContent = editor.getMarkdown();
+    if (currentContent !== field.value) {
+      // Use requestAnimationFrame to ensure DOM is ready (Safari fix).
+      requestAnimationFrame(() => {
+        if (editor && !editor.isDestroyed) {
+          // Prefer HTML content if available (preserves block IDs for sidekick targeting).
+          // Fall back to markdown for agents without stored HTML.
+          if (instructionsHtmlField.value) {
+            editor.commands.setContent(instructionsHtmlField.value, {
+              emitUpdate: false,
+            });
+          } else {
+            editor.commands.setContent(
+              preprocessMarkdownForEditor(field.value),
+              {
+                emitUpdate: false,
+                contentType: "markdown",
+              }
+            );
+          }
+        }
+      });
+    }
+  }, [editor, field.value, instructionsHtmlField.value]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) {
+      return;
+    }
+
+    // Use requestAnimationFrame to defer editor commands outside the React
+    // lifecycle. Tiptap internally calls flushSync when processing commands,
+    // which is not allowed inside useEffect.
+    requestAnimationFrame(() => {
+      if (!editor || editor.isDestroyed) {
+        return;
+      }
+
+      if (isInstructionDiffMode && compareVersion) {
+        if (editor.storage.agentInstructionDiff?.isDiffMode) {
+          editor.commands.exitDiff();
+        }
+
+        const currentText = editor.getMarkdown();
+        const compareText = compareVersion.instructions ?? "";
+
+        editor.commands.applyDiff(compareText, currentText);
+        editor.setEditable(false);
+      } else if (!isInstructionDiffMode) {
+        if (editor.storage.agentInstructionDiff?.isDiffMode) {
+          editor.commands.exitDiff();
+          editor.setEditable(true);
+
+          // After exiting diff, sync editor content with the current form
+          // value. The regular content sync effect skips while the editor is in
+          // diff mode, so we handle content restoration here.
+          if (field.value !== undefined) {
+            const currentContent = editor.getMarkdown();
+            if (currentContent !== field.value) {
+              editor.commands.setContent(
+                preprocessMarkdownForEditor(field.value),
+                { emitUpdate: false, contentType: "markdown" }
+              );
+              // Regenerate the HTML field with fresh block IDs.
+              instructionsHtmlField.onChange(
+                stripHtmlAttributes(editor.getHTML())
+              );
+            }
+          }
+        }
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isInstructionDiffMode, compareVersion, editor]);
+
+  const toolbarExtra =
+    React.Children.toArray(children).find(
+      (child): child is React.ReactElement<{ children: ReactNode }> =>
+        React.isValidElement(child) && child.type === ToolbarSlot
+    )?.props?.children ?? null;
+
+  const pendingInstructionSuggestions = suggestionsContext
+    ? suggestionsContext.pendingSuggestions.filter(
+        (s) => s.kind === "instructions"
+      )
+    : [];
+  const hasPendingInstructionSuggestions =
+    pendingInstructionSuggestions.length > 0;
+
+  const handleAcceptAll = () => {
+    void suggestionsContext.acceptAllInstructionSuggestions();
+  };
+  const handleRejectAll = () => {
+    void suggestionsContext.rejectAllInstructionSuggestions();
+  };
+
+  const editorContent = (
+    <div
+      ref={editorWrapperRef}
+      className="relative flex min-h-0 flex-1 flex-col overflow-hidden p-px"
+    >
+      <EditorContent editor={editor} />
+      {editor && (
+        <SuggestionBubbleMenu editor={editor} containerRef={editorWrapperRef} />
+      )}
+    </div>
+  );
+
+  return (
+    <div className="flex h-full flex-col gap-1">
+      <ContainerWithTopBar
+        error={displayError}
+        topBar={
+          <InstructionsMenuBar
+            editor={editor}
+            onAcceptAll={handleAcceptAll}
+            onRejectAll={handleRejectAll}
+            showSuggestionActions={hasPendingInstructionSuggestions}
+            toolbarExtra={toolbarExtra}
+          />
+        }
+      >
+        {editorContent}
+      </ContainerWithTopBar>
+      {editor && (
+        <CharacterCountDisplay
+          count={currentCharacterCount}
+          maxCount={INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT}
+        />
+      )}
+      <BlockInsertDropdown blockDropdownState={blockDropdown} />
+    </div>
+  );
+}
+
+AgentBuilderInstructionsEditor.ToolbarSlot = ToolbarSlot;
+
+interface CharacterCountDisplayProps {
+  count: number;
+  maxCount: number;
+}
+
+const CharacterCountDisplay = ({
+  count,
+  maxCount,
+}: CharacterCountDisplayProps) => {
+  if (count <= maxCount / 2) {
+    return null;
+  }
+
+  const isOverLimit = count >= maxCount;
+
+  return (
+    <span
+      className={cn(
+        "text-end text-xs",
+        isOverLimit ? "text-warning" : "text-muted-foreground"
+      )}
+    >
+      {count} / {maxCount} characters
+    </span>
+  );
+};

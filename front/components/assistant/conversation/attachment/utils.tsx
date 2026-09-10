@@ -1,0 +1,279 @@
+import type {
+  Attachment,
+  AttachmentCitation,
+  FileAttachmentCitation,
+  MCPAttachmentCitation,
+  NodeAttachmentCitation,
+} from "@app/components/assistant/conversation/attachment/types";
+import {
+  getDisplayDateFromPastedFileId,
+  getDisplayNameFromPastedFileId,
+  isPastedFile,
+} from "@app/components/assistant/conversation/input_bar/pasted_utils";
+import type { MCPReferenceCitation } from "@app/components/markdown/MCPReferenceCitation";
+import {
+  getIcon,
+  isCustomResourceIconType,
+  isInternalAllowedIcon,
+} from "@app/components/resources/resources_icons";
+import { useTheme } from "@app/components/sparkle/ThemeContext";
+import { CONNECTOR_CONFIGURATIONS } from "@app/lib/connector_providers";
+import { getConnectorProviderLogoWithFallback } from "@app/lib/connector_providers_ui";
+import { getFileTypeIcon } from "@app/lib/file_icon_utils";
+import type { ContentFragmentType } from "@app/types/content_fragment";
+import {
+  isContentNodeContentFragment,
+  isFileContentFragment,
+} from "@app/types/content_fragment";
+import type { ContentNodeType } from "@app/types/core/content_node";
+import type { ConnectorProvider } from "@app/types/data_source";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import {
+  DoubleIcon,
+  DoubleQuotes,
+  FaviconIcon,
+  File02,
+  Folder,
+  Icon,
+  Image01,
+  Table,
+  VolumeMax,
+} from "@ruby-ai/sparkle";
+import type { ReactNode } from "react";
+// biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
+import React from "react";
+
+export const isAudioContentType = (attachmentCitation: AttachmentCitation) => {
+  if (attachmentCitation.type === "node") {
+    return false;
+  }
+  const ct = attachmentCitation.contentType;
+  return ct.startsWith("audio/");
+};
+
+export const IconForAttachmentCitation = ({
+  provider,
+  nodeType,
+  contentType,
+  sourceUrl,
+  iconName,
+  fileName,
+  size = "md",
+}: {
+  provider?: string;
+  nodeType?: ContentNodeType;
+  contentType?: string;
+  sourceUrl?: string;
+  iconName?: string;
+  /** Improves icons for some MIME types (e.g. extension → frame). */
+  fileName?: string;
+  size?: "md" | "sm" | "lg";
+}): ReactNode => {
+  const { isDark } = useTheme();
+
+  if (provider === "webcrawler") {
+    return (
+      <div className="flex h-3 w-3 items-center justify-center">
+        <FaviconIcon size={size} websiteUrl={sourceUrl} />
+      </div>
+    );
+  }
+
+  if (provider && provider in CONNECTOR_CONFIGURATIONS) {
+    const providerLogo = getConnectorProviderLogoWithFallback({
+      provider: provider as ConnectorProvider,
+      isDark,
+    });
+
+    const mainIcon =
+      nodeType === "table" ? Table : nodeType === "folder" ? Folder : File02;
+    return (
+      <DoubleIcon
+        mainIcon={mainIcon}
+        secondaryIcon={providerLogo}
+        size={size}
+      />
+    );
+  }
+
+  if (contentType) {
+    const isImageType = contentType.startsWith("image/");
+    if (isImageType) {
+      return <Icon visual={Image01} size={size} />;
+    }
+    const isAudioType = contentType.startsWith("audio/");
+    if (isAudioType) {
+      return <Icon visual={VolumeMax} size={size} />;
+    }
+    if (isPastedFile(contentType)) {
+      return <Icon visual={DoubleQuotes} size={size} />;
+    }
+  }
+
+  if (
+    iconName &&
+    (isCustomResourceIconType(iconName) || isInternalAllowedIcon(iconName))
+  ) {
+    return (
+      <DoubleIcon
+        mainIcon={File02}
+        secondaryIcon={getIcon(iconName)}
+        size={size}
+      />
+    );
+  }
+
+  if (contentType) {
+    const FileIcon = getFileTypeIcon(contentType, fileName);
+    return <Icon visual={FileIcon} size={size} />;
+  }
+
+  return <Icon visual={File02} size={size} />;
+};
+
+export function contentFragmentToAttachmentCitation(
+  contentFragment: ContentFragmentType
+): FileAttachmentCitation | NodeAttachmentCitation {
+  // Handle expired content fragments
+  if (contentFragment.expiredReason) {
+    return {
+      type: "file",
+      id: contentFragment.sId,
+      title: `${contentFragment.title} (no longer available)`,
+      visual: (
+        <IconForAttachmentCitation
+          contentType={contentFragment.contentType}
+          fileName={contentFragment.title}
+        />
+      ),
+      fileId:
+        contentFragment.contentFragmentType === "file"
+          ? contentFragment.fileId
+          : null,
+      contentType: contentFragment.contentType,
+      attachmentCitationType: "fragment",
+      sourceUrl: contentFragment.sourceUrl,
+      description: null,
+    };
+  }
+
+  if (isContentNodeContentFragment(contentFragment)) {
+    const { provider, nodeType } = contentFragment.contentNodeData;
+
+    return {
+      type: "node",
+      id: contentFragment.sId,
+      title: contentFragment.title,
+      sourceUrl: contentFragment.sourceUrl,
+      visual: (
+        <IconForAttachmentCitation
+          provider={provider ?? undefined}
+          nodeType={nodeType}
+          contentType={contentFragment.contentType}
+          fileName={contentFragment.title}
+          sourceUrl={contentFragment.sourceUrl ?? undefined}
+        />
+      ),
+      provider: provider ?? undefined,
+      spaceName: contentFragment.contentNodeData.spaceName,
+      attachmentCitationType: "fragment",
+    };
+  }
+
+  if (isFileContentFragment(contentFragment)) {
+    // Compute custom title/description for pasted files
+    const isPasted = isPastedFile(contentFragment.contentType);
+    const title = isPasted
+      ? getDisplayNameFromPastedFileId(contentFragment.title)
+      : contentFragment.title;
+    const description = isPasted
+      ? getDisplayDateFromPastedFileId(contentFragment.title)
+      : undefined;
+    return {
+      type: "file",
+      id: contentFragment.sId,
+      title,
+      sourceUrl: contentFragment.sourceUrl,
+      visual: (
+        <IconForAttachmentCitation
+          contentType={contentFragment.contentType}
+          fileName={contentFragment.title}
+          iconName={contentFragment.sourceIcon ?? undefined}
+        />
+      ),
+      description: description ?? null,
+      fileId: contentFragment.fileId,
+      filePath: contentFragment.path ?? undefined,
+      contentType: contentFragment.contentType,
+      attachmentCitationType: "fragment",
+      provider: contentFragment.sourceProvider ?? undefined,
+    };
+  }
+
+  assertNever(contentFragment);
+}
+
+export function attachmentToAttachmentCitation(
+  attachment: Attachment
+): FileAttachmentCitation | NodeAttachmentCitation {
+  if (attachment.type === "file") {
+    return {
+      type: "file",
+      id: attachment.id,
+      title: attachment.title,
+      sourceUrl: attachment.sourceUrl ?? null,
+      isUploading: attachment.isUploading,
+      size: attachment.size,
+      visual: (
+        <IconForAttachmentCitation
+          contentType={attachment.contentType}
+          fileName={attachment.title}
+          iconName={attachment.iconName}
+        />
+      ),
+      description: attachment.description ?? null,
+      fileId: attachment.fileId,
+      contentType: attachment.contentType,
+      onRemove: attachment.onRemove,
+      attachmentCitationType: "inputBar",
+      provider: attachment.provider,
+    };
+  } else {
+    return {
+      type: "node",
+      id: attachment.id,
+      title: attachment.title,
+      spaceName: attachment.spaceName,
+      spaceIcon: attachment.spaceIcon,
+      path: attachment.path,
+      visual: attachment.visual,
+      sourceUrl: attachment.url,
+      onRemove: attachment.onRemove,
+      attachmentCitationType: "inputBar",
+    };
+  }
+}
+
+export function markdownCitationToAttachmentCitation(
+  citation: MCPReferenceCitation
+): MCPAttachmentCitation {
+  return {
+    id: citation.fileId ?? citation.ref ?? citation.title,
+    fileId: citation.fileId ?? null,
+    attachmentCitationType: "mcp",
+    contentType: citation.contentType,
+    sourceUrl: citation.href ?? null,
+    description: citation.description,
+    title: citation.title,
+    type: "file",
+    visual: (
+      <IconForAttachmentCitation
+        provider={citation.provider}
+        contentType={citation.contentType}
+        sourceUrl={citation.href}
+      />
+    ),
+    provider: citation.provider,
+    isUploading: false,
+  };
+}

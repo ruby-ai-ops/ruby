@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex" />
+    <title>Ruby</title>
+
+    <!-- PWA: web app manifest enables installation and standalone (no browser chrome) launch. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#FBFAF9" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#191715" media="(prefers-color-scheme: dark)" />
+
+    <!-- PWA: iOS Safari standalone support ("Add to Home Screen"). -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Ruby" />
+    <link rel="apple-touch-icon" href="/static/AppIcon_180.png" />
+    <link rel="preload" href="/static/fonts/GeistVariable.woff2" as="font" type="font/woff2" crossorigin />
+    <!-- Datadog RUM (Real User Monitoring) -->
+    <script>
+      (function (h, o, u, n, d) {
+        h = h[d] = h[d] || {
+          q: [],
+          onReady: function (c) {
+            h.q.push(c);
+          },
+        };
+        d = o.createElement(u);
+        d.async = 1;
+        d.src = n;
+        n = o.getElementsByTagName(u)[0];
+        n.parentNode.insertBefore(d, n);
+      })(
+        window,
+        document,
+        "script",
+        "https://www.datadoghq-browser-agent.com/eu1/v6/datadog-rum.js",
+        "DD_RUM"
+      );
+    </script>
+  </head>
+  <body>
+    <!-- Google Tag Manager (noscript) -->
+    <noscript>
+      <iframe
+        src="https://www.googletagmanager.com/ns.html?id=%VITE_GTM_TRACKING_ID%"
+        height="0"
+        width="0"
+        style="display: none; visibility: hidden"
+      ></iframe>
+    </noscript>
+
+    <script>
+      (function () {
+        try {
+          var theme = localStorage.getItem("theme") || "system";
+          var isDark =
+            theme === "dark" ||
+            (theme === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (isDark) {
+            document.documentElement.classList.add("dark");
+          }
+        } catch (e) {}
+      })();
+    </script>
+
+      <style>
+      #loading {
+        --loading-sidebar-width: 320px;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 9999;
+        display: flex;
+        opacity: 1;
+        pointer-events: none;
+        background-color: rgb(251, 250, 249);
+      }
+      #loading.hidden {
+        display: none;
+      }
+      #loading-sidebar {
+        box-sizing: border-box;
+        width: var(--loading-sidebar-width);
+        border-right: 1px solid transparent;
+        flex-shrink: 0;
+        display: none;
+      }
+      #loading-main {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: rgb(255, 255, 255);
+      }
+
+      @media (min-width: 768px) {
+        #loading-main {
+          border: 1px solid rgb(245, 245, 244);
+          border-radius: 12px;
+          margin: 0.5rem;
+          margin-inline-start: 0;
+          }
+
+        #loading-sidebar {
+          display: block;
+        }
+      }
+
+      #loading-spinner {
+        opacity: 0;
+        animation: loading-spinner-reveal 0.2s ease-out 3s forwards;
+      }
+      @keyframes loading-spinner-reveal {
+        to {
+          opacity: 1;
+        }
+      }
+      #loading-spinner .loading-spinner-track {
+        stroke: #eeeeec;
+      }
+      .dark #loading-spinner .loading-spinner-track {
+        stroke: #44403b;
+      }
+      #loading-spinner .loading-spinner-arc {
+        stroke: #79716b;
+        animation: loading-spinner-dash 2.2s ease-in-out infinite;
+      }
+      #loading-spinner .loading-spinner-spin {
+        transform-origin: 12px 12px;
+        animation: loading-spinner-spin 2.2s linear infinite;
+      }
+      @keyframes loading-spinner-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @keyframes loading-spinner-dash {
+        0% {
+          stroke-dasharray: 2 98;
+          stroke-dashoffset: 0;
+        }
+        50% {
+          stroke-dasharray: 70 30;
+          stroke-dashoffset: -48;
+        }
+        100% {
+          stroke-dasharray: 2 98;
+          stroke-dashoffset: -100;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #loading-spinner .loading-spinner-spin,
+        #loading-spinner .loading-spinner-arc {
+          animation: none;
+        }
+      }
+      .dark #loading {
+        background-color: rgb(25, 23, 21);
+      }
+      .dark #loading-main {
+        background-color: rgb(31, 28, 25);
+        border-color: rgb(38, 34, 33);
+      }
+      
+
+    </style>
+    <div id="root">
+    </div>
+    <div id="loading">
+      <div id="loading-sidebar"></div>
+      <div id="loading-main">
+        <svg
+          id="loading-spinner"
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+          shape-rendering="geometricPrecision"
+          role="status"
+          aria-label="Loading"
+        >
+          <circle class="loading-spinner-track" cx="12" cy="12" r="9" stroke-width="2.4" />
+          <g class="loading-spinner-spin">
+            <circle
+              class="loading-spinner-arc"
+              cx="12"
+              cy="12"
+              r="9"
+              stroke-width="2.4"
+              stroke-linecap="round"
+              pathLength="100"
+            />
+          </g>
+        </svg>
+      </div>
+    </div>
+    <script type="module" src="/src/app/main.tsx"></script>
+
+    <!-- Privacy mask initialization script -->
+    <script>
+      (function () {
+        // Initialize privacy mask state from localStorage on page load.
+        function initPrivacyMask() {
+          var stored = localStorage.getItem("privacy-mask");
+          var isEnabled = stored === "true";
+
+          if (isEnabled) {
+            document.body.classList.add("privacy-mask-enabled");
+          }
+        }
+
+        // Run on DOM ready.
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", initPrivacyMask);
+        } else {
+          initPrivacyMask();
+        }
+      })();
+    </script>
+  </body>
+</html>

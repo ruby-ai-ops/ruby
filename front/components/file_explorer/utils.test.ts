@@ -1,0 +1,446 @@
+import type {
+  FileEntry,
+  FileSystemFileTreeNode,
+  FileSystemTreeNode,
+} from "@app/components/file_explorer/types";
+import {
+  buildFileSystemTree,
+  buildFolderTree,
+  findTreeNodeByPath,
+  getCategoryFromContentType,
+  getChildrenAtFolderPath,
+  getExplorerRelativePath,
+  getFileExplorerBucket,
+  getFileExplorerSearchResultTitle,
+  getFilePreviewConfig,
+  getVirtualScopeRootNodes,
+  isFileExplorerMovableFile,
+  isFilePreviewableContentType,
+  withVirtualExplorerPath,
+} from "@app/components/file_explorer/utils";
+import type { FileSystemEntry } from "@app/types/api/file_system/types";
+import { frameContentType, frameSlideshowContentType } from "@app/types/files";
+import { describe, expect, it } from "vitest";
+
+function mountFile(
+  relativePath: string,
+  useCase: "project" | "conversation" = "project"
+): FileSystemEntry {
+  return {
+    isDirectory: false,
+    fileName: relativePath.split("/").pop() ?? relativePath,
+    path: `${useCase}/${relativePath}`,
+    contentType: "text/plain",
+    fileId: "file-1",
+    sizeBytes: 100,
+    lastModifiedMs: 0,
+    thumbnailUrl: null,
+  };
+}
+
+function mountDir(
+  relativePath: string,
+  useCase: "project" | "conversation" = "project"
+): FileSystemEntry {
+  return {
+    isDirectory: true,
+    fileName: relativePath.split("/").pop() ?? relativePath,
+    path: `${useCase}/${relativePath}`,
+    sizeBytes: 0,
+    lastModifiedMs: 0,
+  };
+}
+
+function collectTreeNodes(nodes: FileSystemTreeNode[]): FileSystemTreeNode[] {
+  return nodes.flatMap((node) => [node, ...collectTreeNodes(node.children)]);
+}
+
+function sortedNodePaths(nodes: FileSystemTreeNode[]): string[] {
+  return collectTreeNodes(nodes)
+    .map((n) => `${n.isDirectory ? "d" : "f"}:${n.path}`)
+    .sort();
+}
+
+function makeFileEntry(contentType: string): FileEntry {
+  return {
+    kind: "file",
+    path: "project/foo.txt",
+    fileName: "foo.txt",
+    contentType,
+    fileId: "file-1",
+    isDirectory: false,
+    lastModifiedMs: 0,
+    sizeBytes: 0,
+    thumbnailUrl: null,
+  };
+}
+
+describe("file preview configuration", () => {
+  it.each([
+    "application/zip",
+    "application/octet-stream",
+    "application/x-tar",
+    "font/woff",
+  ])("marks %s as download-only", (contentType) => {
+    expect(getFilePreviewConfig(contentType).category).toBe("unsupported");
+    expect(isFilePreviewableContentType(contentType)).toBe(false);
+    expect(getCategoryFromContentType(contentType)).toBe("other");
+  });
+
+  it.each([
+    "text/plain; charset=utf-8",
+    "text/x-diff",
+    "application/javascript",
+    "application/json",
+    "application/problem+json",
+    "application/pdf",
+    "image/png",
+    "audio/mpeg",
+    "text/csv",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ])("keeps %s previewable", (contentType) => {
+    expect(getFilePreviewConfig(contentType).category).not.toBe("unsupported");
+    expect(isFilePreviewableContentType(contentType)).toBe(true);
+  });
+
+  it.each([
+    "text/javascript",
+    "application/javascript",
+    "text/typescript",
+  ])("classifies %s as code", (contentType) => {
+    expect(getFilePreviewConfig(contentType).category).toBe("code");
+  });
+
+  it.each([
+    "text/plain",
+    "text/x-diff",
+    "application/json",
+    "application/problem+json",
+  ])("classifies %s as text", (contentType) => {
+    expect(getFilePreviewConfig(contentType).category).toBe("text");
+  });
+
+  it("keeps code and text in separate explorer filters", () => {
+    const node: FileSystemFileTreeNode = {
+      name: "file",
+      path: "file",
+      isDirectory: false,
+      canonicalPath: "project/file",
+      contentType: "text/javascript",
+      fileId: "file-1",
+      children: [],
+    };
+
+    expect(getFileExplorerBucket(node)).toBe("code");
+    expect(
+      getFileExplorerBucket({
+        ...node,
+        contentType: "text/plain",
+      })
+    ).toBe("texts");
+  });
+});
+
+describe("isFileExplorerMovableFile", () => {
+  it("returns false for fileId-backed frames and slideshows", () => {
+    expect(isFileExplorerMovableFile(makeFileEntry(frameContentType))).toBe(
+      false
+    );
+    expect(
+      isFileExplorerMovableFile(makeFileEntry(frameSlideshowContentType))
+    ).toBe(false);
+  });
+
+  it("returns true for mount-addressed files with a fileId", () => {
+    expect(isFileExplorerMovableFile(makeFileEntry("text/plain"))).toBe(true);
+  });
+
+  it("returns true for path-only files without a fileId", () => {
+    expect(
+      isFileExplorerMovableFile({
+        ...makeFileEntry("text/plain"),
+        fileId: null,
+      })
+    ).toBe(true);
+  });
+});
+
+describe("buildFileSystemTree", () => {
+  it("returns an empty tree for no entries", () => {
+    expect(buildFileSystemTree([])).toEqual([]);
+  });
+
+  it("places a root-level file without inferring directories", () => {
+    const tree = buildFileSystemTree([mountFile("readme.txt")]);
+
+    expect(tree).toHaveLength(1);
+    expect(tree[0]).toMatchObject({
+      name: "readme.txt",
+      path: "readme.txt",
+      isDirectory: false,
+    });
+  });
+
+  it("infers ancestor directories from nested file paths", () => {
+    const tree = buildFileSystemTree([mountFile("reports/q1/summary.pdf")]);
+
+    const reports = findTreeNodeByPath(tree, "reports");
+    const q1 = findTreeNodeByPath(tree, "reports/q1");
+    const summary = findTreeNodeByPath(tree, "reports/q1/summary.pdf");
+
+    expect(reports).toMatchObject({
+      isDirectory: true,
+      canonicalPath: "project/reports",
+    });
+    expect(q1).toMatchObject({
+      isDirectory: true,
+      canonicalPath: "project/reports/q1",
+    });
+    expect(summary?.isDirectory).toBe(false);
+    expect(q1?.children.map((n) => n.path)).toEqual(["reports/q1/summary.pdf"]);
+  });
+
+  it("adds empty folders from directory entries", () => {
+    const tree = buildFileSystemTree([mountDir("archive")]);
+
+    const archive = findTreeNodeByPath(tree, "archive");
+    expect(archive).toMatchObject({
+      isDirectory: true,
+      canonicalPath: "project/archive",
+    });
+    expect(archive?.children).toEqual([]);
+  });
+
+  it("creates nested empty folders without files", () => {
+    const tree = buildFileSystemTree([mountDir("a/b")]);
+
+    expect(findTreeNodeByPath(tree, "a")?.isDirectory).toBe(true);
+    expect(findTreeNodeByPath(tree, "a/b")?.isDirectory).toBe(true);
+    expect(getChildrenAtFolderPath(tree, "a").map((n) => n.path)).toEqual([
+      "a/b",
+    ]);
+  });
+
+  it("merges inferred folders with empty sibling directory entries", () => {
+    const tree = buildFileSystemTree([
+      mountFile("docs/guide.txt"),
+      mountDir("docs/drafts"),
+    ]);
+
+    const docs = findTreeNodeByPath(tree, "docs");
+    expect(docs?.children.map((n) => n.path).sort()).toEqual([
+      "docs/drafts",
+      "docs/guide.txt",
+    ]);
+  });
+
+  it("skips directory entries when the path was already inferred from files", () => {
+    const withPlaceholder = buildFileSystemTree([
+      mountDir("reports"),
+      mountFile("reports/annual.pdf"),
+    ]);
+    const inferredOnly = buildFileSystemTree([mountFile("reports/annual.pdf")]);
+
+    expect(sortedNodePaths(withPlaceholder)).toEqual(
+      sortedNodePaths(inferredOnly)
+    );
+  });
+
+  it("produces the same tree regardless of entry order", () => {
+    const filesFirst = [
+      mountFile("a/x.txt"),
+      mountFile("b/y.txt"),
+      mountDir("a/empty"),
+      mountDir("c"),
+    ];
+    const dirsFirst = [
+      mountDir("c"),
+      mountDir("a/empty"),
+      mountFile("b/y.txt"),
+      mountFile("a/x.txt"),
+    ];
+    const mixed = [
+      mountFile("b/y.txt"),
+      mountDir("a/empty"),
+      mountFile("a/x.txt"),
+      mountDir("c"),
+    ];
+
+    const expected = sortedNodePaths(buildFileSystemTree(dirsFirst));
+    expect(sortedNodePaths(buildFileSystemTree(filesFirst))).toEqual(expected);
+    expect(sortedNodePaths(buildFileSystemTree(mixed))).toEqual(expected);
+  });
+
+  it("strips the scoped use-case prefix from paths", () => {
+    const tree = buildFileSystemTree([
+      mountFile("sandbox/out.txt", "conversation"),
+    ]);
+
+    expect(findTreeNodeByPath(tree, "sandbox/out.txt")).toBeDefined();
+    expect(findTreeNodeByPath(tree, "conversation/sandbox/out.txt")).toBe(
+      undefined
+    );
+  });
+
+  it("ignores entries with no path beyond the use-case prefix", () => {
+    const tree = buildFileSystemTree([
+      {
+        isDirectory: false,
+        fileName: "",
+        path: "project/",
+        contentType: "text/plain",
+        fileId: null,
+        sizeBytes: 0,
+        lastModifiedMs: 0,
+        thumbnailUrl: null,
+      },
+      mountFile("ok.txt"),
+    ]);
+
+    expect(tree).toHaveLength(1);
+    expect(tree[0]?.path).toBe("ok.txt");
+  });
+
+  it("supports navigation helpers at inferred and explicit folders", () => {
+    const tree = buildFileSystemTree([
+      mountDir("shared"),
+      mountFile("shared/one.txt"),
+      mountFile("shared/two.txt"),
+    ]);
+
+    expect(getChildrenAtFolderPath(tree, "").map((n) => n.path)).toEqual([
+      "shared",
+    ]);
+    expect(
+      getChildrenAtFolderPath(tree, "shared")
+        .map((n) => n.path)
+        .sort()
+    ).toEqual(["shared/one.txt", "shared/two.txt"]);
+  });
+});
+
+describe("buildFolderTree", () => {
+  it("returns only directory nodes", () => {
+    const tree = buildFolderTree([
+      mountDir("docs"),
+      mountFile("docs/readme.txt"),
+      mountFile("notes.txt"),
+    ]);
+
+    expect(collectTreeNodes(tree).every((n) => n.isDirectory)).toBe(true);
+    expect(findTreeNodeByPath(tree, "docs/readme.txt")).toBeUndefined();
+    expect(findTreeNodeByPath(tree, "docs")?.isDirectory).toBe(true);
+  });
+});
+
+describe("getExplorerRelativePath", () => {
+  it("uses virtualPath when set", () => {
+    expect(
+      getExplorerRelativePath({
+        path: "conversation-abc/report.pdf",
+        virtualPath: "conversation/report.pdf",
+      })
+    ).toBe("conversation/report.pdf");
+  });
+
+  it("falls back to stripping the scoped prefix from path", () => {
+    expect(getExplorerRelativePath({ path: "pod-xyz/data.csv" })).toBe(
+      "data.csv"
+    );
+  });
+});
+
+describe("getFileExplorerSearchResultTitle", () => {
+  it("strips the current folder prefix from the explorer path", () => {
+    expect(
+      getFileExplorerSearchResultTitle(
+        {
+          path: "conversation-c1/reports/q1/summary.txt",
+          virtualPath: "conversation/reports/q1/summary.txt",
+        },
+        "conversation"
+      )
+    ).toBe("reports/q1/summary.txt");
+  });
+
+  it("returns the full explorer path at the virtual root", () => {
+    expect(
+      getFileExplorerSearchResultTitle(
+        {
+          path: "pod-p1/archive/readme.md",
+          virtualPath: "pod/archive/readme.md",
+        },
+        ""
+      )
+    ).toBe("pod/archive/readme.md");
+  });
+
+  it("falls back to mount-relative path when virtualPath is unset", () => {
+    expect(
+      getFileExplorerSearchResultTitle({ path: "pod-xyz/data.csv" }, "")
+    ).toBe("data.csv");
+  });
+});
+
+describe("withVirtualExplorerPath", () => {
+  it("prefixes the mount-relative path with a scope label", () => {
+    const entry = withVirtualExplorerPath(
+      mountFile("reports/q1.pdf", "conversation"),
+      "conversation"
+    );
+    expect(entry.virtualPath).toBe("conversation/reports/q1.pdf");
+    expect(entry.path).toBe("conversation/reports/q1.pdf");
+  });
+});
+
+describe("buildFileSystemTree with virtualPath", () => {
+  it("builds a merged tree with conversation and pod scope folders", () => {
+    const tree = buildFileSystemTree([
+      withVirtualExplorerPath(
+        mountFile("notes.txt", "conversation"),
+        "conversation"
+      ),
+      withVirtualExplorerPath(mountFile("shared/readme.md"), "pod"),
+    ]);
+
+    expect(
+      getChildrenAtFolderPath(tree, "")
+        .map((n) => n.path)
+        .sort()
+    ).toEqual(["conversation", "pod"]);
+    expect(
+      getChildrenAtFolderPath(tree, "conversation").map((n) => n.path)
+    ).toEqual(["conversation/notes.txt"]);
+    expect(
+      getChildrenAtFolderPath(tree, "pod/shared").map((n) => n.path)
+    ).toEqual(["pod/shared/readme.md"]);
+    expect(findTreeNodeByPath(tree, "conversation")).toMatchObject({
+      canonicalPath: "conversation",
+      path: "conversation",
+    });
+    expect(findTreeNodeByPath(tree, "pod/shared")).toMatchObject({
+      canonicalPath: "project/shared",
+      path: "pod/shared",
+    });
+  });
+});
+
+describe("getVirtualScopeRootNodes", () => {
+  it("includes empty scope folders missing from the tree", () => {
+    const tree = buildFileSystemTree([
+      withVirtualExplorerPath(mountFile("a.txt"), "pod"),
+    ]);
+
+    const roots = getVirtualScopeRootNodes(tree, [
+      { path: "conversation", canonicalPath: "conversation-c1" },
+      { path: "pod", canonicalPath: "pod-p1" },
+    ]);
+    expect(roots.map((n) => n.path)).toEqual(["conversation", "pod"]);
+    expect(roots.map((n) => n.canonicalPath)).toEqual([
+      "conversation-c1",
+      "pod-p1",
+    ]);
+    expect(roots[0]?.children).toEqual([]);
+    expect(roots[1]?.children).toHaveLength(1);
+  });
+});

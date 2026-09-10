@@ -1,0 +1,548 @@
+import { renderAllMessages } from "@app/lib/api/assistant/conversation_rendering/message_rendering";
+import type { Authenticator } from "@app/lib/auth";
+import type {
+  AgentMessageType,
+  CompactionMessageType,
+  ConversationType,
+  ConversationWithoutContentType,
+  UserMessageType,
+} from "@app/types/assistant/conversation";
+import type { ModelConfigurationType } from "@app/types/assistant/models/types";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// These cases exercise message ordering and visibility, not attachments, so the capability lookup
+// is stubbed out rather than backed by a workspace.
+vi.mock(
+  import("@app/lib/api/assistant/conversation/attachment_capabilities"),
+  () => ({
+    getAttachmentCapabilityContext: vi
+      .fn()
+      .mockResolvedValue({ isNewFileExplorer: false, hasSandboxTools: false }),
+  })
+);
+
+// Mock the helpers module
+vi.mock(import("./helpers"), async (importOriginal) => {
+  const mod = await importOriginal();
+  return {
+    ...mod,
+    getSteps: vi.fn(),
+    renderContentFragment: vi.fn(),
+    renderUserMessage: vi.fn(),
+  };
+});
+
+import type { UserMessageTypeModel } from "@app/types/assistant/generation";
+
+import { getSteps, renderContentFragment, renderUserMessage } from "./helpers";
+
+describe("renderAllMessages", () => {
+  let auth: Authenticator;
+  let model: ModelConfigurationType;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    auth = {} as Authenticator;
+    model = {
+      providerId: "openai",
+      modelId: "gpt-4",
+    } as unknown as ModelConfigurationType;
+
+    vi.mocked(renderUserMessage).mockImplementation(
+      (conversation: ConversationWithoutContentType, m: UserMessageType) =>
+        ({
+          role: "user",
+          name: m.context.username,
+          content: [{ type: "text", text: m.content }],
+        }) satisfies UserMessageTypeModel
+    );
+
+    vi.mocked(getSteps).mockResolvedValue([
+      {
+        contents: [{ type: "text_content", value: "Agent response" }],
+        actions: [],
+      },
+    ]);
+
+    vi.mocked(renderContentFragment).mockResolvedValue(null);
+  });
+
+  function createConversation(
+    messages: Array<
+      | {
+          type: "user";
+          visibility: "visible" | "deleted";
+        }
+      | {
+          type: "agent";
+          visibility: "visible" | "deleted";
+        }
+      | {
+          type: "compaction";
+          visibility: "visible" | "deleted";
+          status: CompactionMessageType["status"];
+          content: string | null;
+        }
+    >
+  ): ConversationType {
+    const content = messages.map((msg, idx) => {
+      if (msg.type === "user") {
+        return [
+          {
+            id: idx + 1,
+            created: Date.now(),
+            type: "user_message" as const,
+            sId: `user_msg_${idx}`,
+            visibility: msg.visibility,
+            version: 1,
+            rank: idx * 2,
+            branchId: null,
+            user: null,
+            mentions: [],
+            richMentions: [],
+            content: `Message ${idx}`,
+            context: {
+              username: "testuser",
+              timezone: "UTC",
+              fullName: null,
+              email: null,
+              profilePictureUrl: null,
+              origin: "web",
+            },
+            reactions: [],
+            requestedModel: null,
+          } satisfies UserMessageType,
+        ];
+      }
+
+      if (msg.type === "agent") {
+        return [
+          {
+            id: idx + 1,
+            agentMessageId: idx + 1,
+            created: Date.now(),
+            type: "agent_message" as const,
+            sId: `agent_msg_${idx}`,
+            version: 1,
+            rank: idx * 2 + 1,
+            branchId: null,
+            completedTs: null,
+            parentMessageId: `user_msg_${idx}`,
+            parentAgentMessageId: null,
+            status: "succeeded" as const,
+            content: null,
+            chainOfThought: null,
+            error: null,
+            visibility: msg.visibility,
+            configuration: {
+              sId: "agent_config_1",
+              name: "Test Agent",
+              pictureUrl: "",
+              status: "active" as const,
+              canRead: true,
+            } as AgentMessageType["configuration"],
+            skipToolsValidation: false,
+            actions: [],
+            contents: [],
+            modelInteractionDurationMs: null,
+            richMentions: [],
+            completionDurationMs: null,
+            reactions: [],
+            costCredits: null,
+            resolvedModel: null,
+            modelResolutionMethod: null,
+          } satisfies AgentMessageType,
+        ];
+      }
+
+      return [
+        {
+          id: idx + 1,
+          compactionMessageId: idx + 1,
+          created: Date.now(),
+          type: "compaction_message" as const,
+          sId: `compaction_msg_${idx}`,
+          visibility: msg.visibility,
+          version: 1,
+          rank: idx * 2 + 1,
+          branchId: null,
+          status: msg.status,
+          content: msg.content,
+        } satisfies CompactionMessageType,
+      ];
+    });
+
+    return {
+      id: 1,
+      created: Date.now(),
+      updated: Date.now(),
+      unread: false,
+      lastReadMs: Date.now(),
+      actionRequired: false,
+      hasError: false,
+      sId: "conv_1",
+      title: "Test Conversation",
+      spaceId: null,
+      depth: 0,
+      requestedSpaceIds: [],
+      owner: {
+        sId: "workspace_123",
+        name: "Test Workspace",
+      } as ConversationType["owner"],
+      visibility: "unlisted",
+      content: content as ConversationType["content"],
+      triggerId: null,
+      metadata: {},
+      isRunningAgentLoop: false,
+      isParticipant: false,
+    } as ConversationType;
+  }
+
+  it("should include visible user messages", async () => {
+    const conversation = createConversation([
+      { type: "user", visibility: "visible" },
+    ]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result).toHaveLength(1);
+    expect(renderUserMessage).toHaveBeenCalledTimes(1);
+    expect(result[0].role).toBe("user");
+  });
+
+  it("should skip deleted user messages", async () => {
+    const conversation = createConversation([
+      { type: "user", visibility: "visible" },
+      { type: "user", visibility: "deleted" },
+    ]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result).toHaveLength(1);
+    expect(renderUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("should include visible agent messages", async () => {
+    const conversation = createConversation([
+      { type: "agent", visibility: "visible" },
+    ]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result).toHaveLength(1);
+    expect(getSteps).toHaveBeenCalledTimes(1);
+    expect(result[0].role).toBe("assistant");
+  });
+
+  it("should skip deleted agent messages", async () => {
+    const conversation = createConversation([
+      { type: "agent", visibility: "visible" },
+      { type: "agent", visibility: "deleted" },
+    ]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result).toHaveLength(1);
+    expect(getSteps).toHaveBeenCalledTimes(1);
+  });
+
+  it("should handle mixed visible and deleted messages", async () => {
+    const conversation = createConversation([
+      { type: "user", visibility: "visible" },
+      { type: "user", visibility: "deleted" },
+      { type: "agent", visibility: "visible" },
+      { type: "agent", visibility: "deleted" },
+    ]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result).toHaveLength(2);
+    expect(renderUserMessage).toHaveBeenCalledTimes(1);
+    expect(getSteps).toHaveBeenCalledTimes(1);
+  });
+
+  it("should handle conversation with only deleted messages", async () => {
+    const conversation = createConversation([
+      { type: "user", visibility: "deleted" },
+      { type: "agent", visibility: "deleted" },
+    ]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result).toHaveLength(0);
+    expect(renderUserMessage).not.toHaveBeenCalled();
+    expect(getSteps).not.toHaveBeenCalled();
+  });
+
+  it("should handle empty conversation", async () => {
+    const conversation = createConversation([]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result).toHaveLength(0);
+  });
+
+  it("should skip messages before the last succeeded compaction boundary", async () => {
+    const conversation = createConversation([
+      { type: "user", visibility: "visible" },
+      { type: "agent", visibility: "visible" },
+      {
+        type: "compaction",
+        visibility: "visible",
+        status: "succeeded",
+        content: "Old summary",
+      },
+      { type: "user", visibility: "visible" },
+      { type: "agent", visibility: "visible" },
+      {
+        type: "compaction",
+        visibility: "visible",
+        status: "failed",
+        content: null,
+      },
+      {
+        type: "compaction",
+        visibility: "visible",
+        status: "succeeded",
+        content: "Latest summary",
+      },
+      { type: "user", visibility: "visible" },
+      { type: "agent", visibility: "visible" },
+    ]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result).toHaveLength(3);
+    expect(result.map((m) => m.role)).toEqual([
+      "compaction",
+      "user",
+      "assistant",
+    ]);
+    expect(renderUserMessage).toHaveBeenCalledTimes(1);
+    expect(getSteps).toHaveBeenCalledTimes(1);
+    const compactionMessage = result[0];
+    expect(compactionMessage?.role).toBe("compaction");
+    if (!compactionMessage || compactionMessage.role !== "compaction") {
+      throw new Error("Expected a compaction message.");
+    }
+    expect(compactionMessage.content).toContain("Latest summary");
+    expect(compactionMessage.content).not.toContain("Old summary");
+  });
+
+  describe("excludeActions", () => {
+    it("should filter out function_call contents when excludeActions is true", async () => {
+      const conversation = createConversation([
+        { type: "agent", visibility: "visible" },
+      ]);
+
+      // Mock getSteps to return a step with both text_content and function_call
+      vi.mocked(getSteps).mockResolvedValue([
+        {
+          contents: [
+            { type: "text_content", value: "Agent response" },
+            {
+              type: "function_call",
+              value: {
+                id: "toolu_123",
+                name: "some_tool",
+                arguments: "{}",
+              },
+            },
+          ],
+          actions: [
+            {
+              call: { id: "toolu_123", name: "some_tool", arguments: "{}" },
+              result: {
+                role: "function" as const,
+                name: "some_tool",
+                function_call_id: "toolu_123",
+                content: "result",
+              },
+              enabledSkillMessages: [],
+            },
+          ],
+        },
+      ]);
+
+      const result = await renderAllMessages(auth, {
+        conversation,
+        enabledSkills: [],
+        model,
+        excludeActions: true,
+        onMissingAction: "skip",
+      });
+
+      expect(result).toHaveLength(1);
+      expect(result[0].role).toBe("assistant");
+      // Verify function_call is filtered out from contents
+      const assistantMsg = result[0] as { contents: Array<{ type: string }> };
+      expect(
+        assistantMsg.contents.some((c) => c.type === "function_call")
+      ).toBe(false);
+      expect(assistantMsg.contents.some((c) => c.type === "text_content")).toBe(
+        true
+      );
+    });
+
+    it("should include function_call contents when excludeActions is false", async () => {
+      const conversation = createConversation([
+        { type: "agent", visibility: "visible" },
+      ]);
+
+      // Mock getSteps to return a step with both text_content and function_call
+      vi.mocked(getSteps).mockResolvedValue([
+        {
+          contents: [
+            { type: "text_content", value: "Agent response" },
+            {
+              type: "function_call",
+              value: {
+                id: "toolu_123",
+                name: "some_tool",
+                arguments: "{}",
+              },
+            },
+          ],
+          actions: [
+            {
+              call: { id: "toolu_123", name: "some_tool", arguments: "{}" },
+              result: {
+                role: "function" as const,
+                name: "some_tool",
+                function_call_id: "toolu_123",
+                content: "result",
+              },
+              enabledSkillMessages: [],
+            },
+          ],
+        },
+      ]);
+
+      const result = await renderAllMessages(auth, {
+        conversation,
+        enabledSkills: [],
+        model,
+        excludeActions: false,
+        onMissingAction: "skip",
+      });
+
+      // With excludeActions: false, we get the assistant message with function_calls
+      // plus the function result message
+      expect(result.length).toBeGreaterThanOrEqual(1);
+      // The assistant message should have function_calls in its structure
+      const assistantMessage = result.find((m) => m.role === "assistant");
+      expect(assistantMessage).toBeDefined();
+    });
+  });
+
+  it("renders enabled skill messages after tool results", async () => {
+    const conversation = createConversation([
+      { type: "agent", visibility: "visible" },
+    ]);
+
+    vi.mocked(getSteps).mockResolvedValue([
+      {
+        contents: [
+          {
+            type: "function_call",
+            value: {
+              id: "toolu_enable_skill",
+              name: "skill_management__enable_skill",
+              arguments: '{"skillName":"commit"}',
+            },
+          },
+        ],
+        actions: [
+          {
+            call: {
+              id: "toolu_enable_skill",
+              name: "skill_management__enable_skill",
+              arguments: '{"skillName":"commit"}',
+            },
+            enabledSkillMessages: [
+              {
+                role: "user",
+                name: "system",
+                content: [
+                  {
+                    type: "text",
+                    text: "<ruby_system>Enabled skill instructions</ruby_system>",
+                  },
+                ],
+              },
+            ],
+            result: {
+              role: "function",
+              name: "skill_management__enable_skill",
+              function_call_id: "toolu_enable_skill",
+              content: 'Skill "commit" has been enabled.',
+            },
+          },
+        ],
+      },
+    ]);
+
+    const result = await renderAllMessages(auth, {
+      conversation,
+      enabledSkills: [],
+      model,
+      onMissingAction: "skip",
+    });
+
+    expect(result.map((m) => m.role)).toEqual([
+      "assistant",
+      "function",
+      "user",
+    ]);
+    const enabledSkillMessage = result[2];
+    expect(enabledSkillMessage?.role).toBe("user");
+    if (!enabledSkillMessage || enabledSkillMessage.role !== "user") {
+      throw new Error("Expected a follow-up user message.");
+    }
+    expect(enabledSkillMessage.content[0]).toEqual({
+      type: "text",
+      text: "<ruby_system>Enabled skill instructions</ruby_system>",
+    });
+  });
+});

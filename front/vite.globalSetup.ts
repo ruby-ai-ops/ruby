@@ -1,0 +1,75 @@
+import { exec } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execAsync = promisify(exec);
+const FRONT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+export default async function setup() {
+  // Naive system to make sure we are running on a test db
+  if (!process.env.FRONT_DATABASE_URI?.includes("test")) {
+    throw new Error(
+      `FRONT_DATABASE_URI must be set to a test DB (value: ${process.env.FRONT_DATABASE_URI}). Action: make sure your have the correct environment variable set.`
+    );
+  }
+
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error(
+      `NODE_ENV must be set to "test" (value: ${process.env.NODE_ENV}). Action: make sure your have the correct environment variable set.`
+    );
+  }
+
+  process.env = {
+    // Keep essential Node vars
+    NODE_ENV: process.env.NODE_ENV,
+    PATH: process.env.PATH,
+
+    // Add any other essential vars you need to keep
+    FRONT_DATABASE_URI: process.env.FRONT_DATABASE_URI,
+    NOVU_SECRET_KEY: "test-secret-key",
+    RUBY_PRIVATE_UPLOADS_BUCKET: "test-private-bucket",
+    RUBY_UPLOAD_BUCKET: "test-public-bucket",
+    EGRESS_PROXY_POLICY_BUCKET: "test-egress-policy-bucket",
+    REDIS_CACHE_URI: process.env.REDIS_CACHE_URI,
+    REDIS_URI: process.env.REDIS_URI,
+    NEXT_PUBLIC_RUBY_API_URL: "http://fake-url",
+    NEXT_PUBLIC_RUBY_STATIC_WEBSITE_URL: "http://fake-url",
+    NEXT_PUBLIC_RUBY_APP_URL: "http://fake-url",
+    ENABLE_BOT_CRAWLING: process.env.ENABLE_BOT_CRAWLING,
+    RUBY_US_URL: "http://fake-url",
+    LOG_LEVEL: process.env.TEST_LOG_LEVEL ?? "silent",
+    VIZ_JWT_SECRET: "viz-secret-for-tests",
+    VIZ_PUBLIC_URL: "http://fake-viz-url",
+    RUBY_SANDBOX_JWT_SECRET: "sandbox-secret-for-tests",
+    RUBY_DEVELOPERS_SECRETS_SECRET: "test-developer-secret",
+    REGION: "us-central1",
+    CELL: "cell-00000",
+    RUBY_MCP_SERVER_CREDENTIALS_SECRET: "test-secret",
+    WORKOS_CLIENT_ID: "test-workos-client-id",
+    WORKOS_AUTHKIT_DOMAIN: "https://test.authkit.app",
+    OAUTH_API: process.env.OAUTH_API ?? "http://fake-oauth-api",
+    CORE_API: "http://fake-core-api",
+    CONNECTORS_API: "http://fake-connectors-api",
+    RUBY_CONNECTORS_SECRET: "fake-connectors-secret",
+    RUBY_CONNECTORS_WEBHOOKS_SECRET: "fake-connectors-webhooks-secret",
+
+    // Variables that modify the behavior of certain tests
+    UPDATE_MCP_METADATA_SNAPSHOT: process.env.UPDATE_MCP_METADATA_SNAPSHOT,
+    UPDATE_INTERNAL_MCP_AVAILABILITY_SNAPSHOT:
+      process.env.UPDATE_INTERNAL_MCP_AVAILABILITY_SNAPSHOT,
+  };
+
+  // Execute the db migration script
+  // I tried to sync models directly but I kept getting errors about foreign key (that do not exist) constraints.
+  const { stderr } = await execAsync(
+    "FRONT_DATABASE_URI=$FRONT_DATABASE_URI npx tsx admin/db.ts",
+    { cwd: FRONT_DIR }
+  );
+
+  if (stderr.toLowerCase().includes("error")) {
+    throw new Error(
+      `Failed to execute db migration script: ${JSON.stringify(stderr)}`
+    );
+  }
+}

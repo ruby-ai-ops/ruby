@@ -1,0 +1,158 @@
+import type { ModelConfigurationType } from "./types";
+
+// Pointing to mistral large 3 as of 2025-12-05
+// https://docs.mistral.ai/models/mistral-large-3-25-12
+export const MISTRAL_LARGE_MODEL_ID = "mistral-large-latest" as const;
+// Pointing to mistral medium 3.1 as of 2025-12-05
+// https://docs.mistral.ai/models/mistral-medium-3-1-25-08
+export const MISTRAL_MEDIUM_MODEL_ID = "mistral-medium" as const;
+// Pointing to mistral medium 3.5 as of 2026-05-19
+// https://docs.mistral.ai/models/model-cards/mistral-medium-3-5-26-04
+export const MISTRAL_MEDIUM_3_5_MODEL_ID = "mistral-medium-3-5" as const;
+// Pointing to mistral small 3.2 as of 2025-12-05
+// https://docs.mistral.ai/models/mistral-small-3-2-25-06
+export const MISTRAL_SMALL_MODEL_ID = "mistral-small-latest" as const;
+export const MISTRAL_CODESTRAL_MODEL_ID = "codestral-latest" as const;
+export const MISTRAL_LARGE_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "mistral",
+  modelId: MISTRAL_LARGE_MODEL_ID,
+  displayName: "Mistral Large",
+  contextSize: 256_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 56, // 28_672
+  largeModel: true,
+  description: "Mistral's `large` model (256k context).",
+  shortDescription: "Mistral's large model.",
+  isLegacy: false,
+  isLatest: true,
+  generationTokensCount: 2048,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: true,
+    light: false,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "none",
+  tokenizer: { type: "sentence_piece", base: "model_v2" },
+  supportsBatchProcessing: true,
+  regionalAvailability: {
+    "us-central1": false,
+    "europe-west1": true,
+  },
+};
+export const MISTRAL_MEDIUM_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "mistral",
+  modelId: MISTRAL_MEDIUM_MODEL_ID,
+  displayName: "Mistral Medium",
+  contextSize: 128_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 56, // 28_672
+  largeModel: true,
+  description: "Mistral's `medium` model (128k context).",
+  shortDescription: "Mistral's legacy model.",
+  isLegacy: true,
+  isLatest: false,
+  generationTokensCount: 2048,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: true,
+    light: false,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "none",
+  tokenizer: { type: "sentence_piece", base: "model_v2" },
+  supportsBatchProcessing: true,
+  regionalAvailability: {
+    "us-central1": false,
+    "europe-west1": true,
+  },
+};
+export const MISTRAL_MEDIUM_3_5_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "mistral",
+  modelId: MISTRAL_MEDIUM_3_5_MODEL_ID,
+  displayName: "Mistral Medium 3.5",
+  contextSize: 256_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 56, // 28_672
+  largeModel: true,
+  description:
+    "Mistral's `medium 3.5` model, multimodal and optimized for agentic and coding use cases (256k context).",
+  shortDescription: "Mistral's flagship medium model.",
+  isLegacy: false,
+  isLatest: true,
+  generationTokensCount: 2048,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: true,
+    light: false,
+    medium: false,
+    high: true,
+  },
+  defaultReasoningEffort: "none",
+  tokenizer: { type: "sentence_piece", base: "model_v2" },
+  supportsBatchProcessing: true,
+  supportsResponseFormat: true,
+  regionalAvailability: {
+    "us-central1": false,
+    "europe-west1": true,
+  },
+};
+export const MISTRAL_SMALL_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "mistral",
+  modelId: MISTRAL_SMALL_MODEL_ID,
+  displayName: "Mistral Small",
+  contextSize: 128_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 56, // 28_672
+  largeModel: false,
+  description: "Mistral's `small` model (128k context).",
+  shortDescription: "Mistral's cost-effective model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 2048,
+  supportsVision: true,
+  supportedReasoningEfforts: {
+    none: true,
+    light: false,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "none",
+  tokenizer: { type: "sentence_piece", base: "model_v2" },
+  supportsBatchProcessing: true,
+  regionalAvailability: {
+    "us-central1": false,
+    "europe-west1": true,
+  },
+};
+export const MISTRAL_CODESTRAL_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "mistral",
+  modelId: MISTRAL_CODESTRAL_MODEL_ID,
+  displayName: "Mistral Codestral",
+  contextSize: 128_000,
+  recommendedTopK: 16,
+  recommendedExhaustiveTopK: 56, // 28_672
+  largeModel: false,
+  description:
+    "Mistral's `codestral` model, specifically designed and optimized for code generation tasks.",
+  shortDescription: "Mistral's code model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 2048,
+  supportsVision: false,
+  supportedReasoningEfforts: {
+    none: true,
+    light: false,
+    medium: false,
+    high: false,
+  },
+  defaultReasoningEffort: "none",
+  tokenizer: { type: "sentence_piece", base: "model_v2" },
+  supportsBatchProcessing: true,
+  regionalAvailability: {
+    "us-central1": false,
+    "europe-west1": true,
+  },
+};

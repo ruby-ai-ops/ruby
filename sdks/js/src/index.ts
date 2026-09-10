@@ -1,0 +1,2458 @@
+import { createParser } from "eventsource-parser";
+import type { z } from "zod";
+
+import { errorToString, normalizeError } from "./error_utils";
+import { AgentsAPI } from "./high_level/agents";
+import { ConversationsAPI } from "./high_level/conversations";
+import { FilesAPI } from "./high_level/files";
+import type { RubyAPIOptions } from "./high_level/types";
+import { encodeUtf8HeaderValue } from "./http_headers";
+import type {
+  AgentConfigurationViewType,
+  AgentMessageEventData,
+  AgentMessagePublicType,
+  AnswerUserQuestionRequestBodyType,
+  AnswerUserQuestionResponseType,
+  APIError,
+  AppsCheckRequestType,
+  BlockedActionsResponseType,
+  CancelMessageGenerationRequestType,
+  ContentNodeType,
+  ConversationEventData,
+  ConversationPublicType,
+  CreateConversationResponseType,
+  DataSourceContentNodeType,
+  DataSourceViewType,
+  RubyAPICredentials,
+  RubyAppConfigType,
+  RubyAppRunBlockExecutionEvent,
+  RubyAppRunBlockStatusEvent,
+  RubyAppRunErroredEvent,
+  RubyAppRunFinalEvent,
+  RubyAppRunFunctionCallArgumentsTokensEvent,
+  RubyAppRunFunctionCallEvent,
+  RubyAppRunReasoningItemEvent,
+  RubyAppRunReasoningTokensEvent,
+  RubyAppRunRunStatusEvent,
+  RubyAppRunTokensEvent,
+  FileUploadUrlRequestType,
+  HeartbeatMCPResponseType,
+  LoggerInterface,
+  PatchConversationRequestType,
+  PatchDataSourceViewRequestType,
+  PostMCPResultsResponseType,
+  PublicHeartbeatMCPRequestBody,
+  PublicPostContentFragmentRequestBody,
+  PublicPostConversationsRequestBody,
+  PublicPostMCPResultsRequestBody,
+  PublicPostMessageFeedbackRequestBody,
+  PublicPostMessagesRequestBody,
+  PublicRegisterMCPRequestBody,
+  RegisterMCPResponseType,
+  Result,
+  SearchRequestBodyType,
+  SearchWarningCode,
+  SpaceType,
+  ValidateActionRequestBodyType,
+  ValidateActionResponseType,
+} from "./types";
+import {
+  AnswerUserQuestionResponseSchema,
+  APIErrorSchema,
+  AppsCheckResponseSchema,
+  BlockedActionsResponseSchema,
+  CancelMessageGenerationResponseSchema,
+  CreateConversationResponseSchema,
+  DataSourceViewResponseSchema,
+  DeleteFolderResponseSchema,
+  Err,
+  FileUploadRequestResponseSchema,
+  GetActiveMemberEmailsInWorkspaceResponseSchema,
+  GetAgentConfigurationsResponseSchema,
+  GetAppsResponseSchema,
+  GetAutoGroupIdsForSpacesResponseSchema,
+  GetConversationResponseSchema,
+  GetConversationsResponseSchema,
+  GetDataSourcesResponseSchema,
+  GetFeedbacksResponseSchema,
+  GetMCPServerViewsResponseSchema,
+  GetMentionSuggestionsResponseBodySchema,
+  GetProjectFilesResponseSchema,
+  GetSpaceConversationIdsResponseSchema,
+  GetSpaceConversationsForDataSourceResponseSchema,
+  GetSpaceMetadataResponseSchema,
+  GetSpacesResponseSchema,
+  GetWorkspaceExistsResponseSchema,
+  GetWorkspaceFeatureFlagsResponseSchema,
+  GetWorkspaceVerifiedDomainsResponseSchema,
+  HeartbeatMCPResponseSchema,
+  MeResponseSchema,
+  Ok,
+  ParseMentionsRequestBodySchema,
+  ParseMentionsResponseBodySchema,
+  PatchConversationResponseSchema,
+  PostContentFragmentResponseSchema,
+  PostMCPResultsResponseSchema,
+  PostMessageFeedbackResponseSchema,
+  PostUserMessageResponseSchema,
+  PostWorkspaceSearchResponseBodySchema,
+  RegisterMCPResponseSchema,
+  RetryMessageResponseSchema,
+  RunAppResponseSchema,
+  SearchDataSourceViewsResponseSchema,
+  TokenizeResponseSchema,
+  UpsertFolderResponseSchema,
+  ValidateActionResponseSchema,
+} from "./types";
+
+export * from "./error_utils";
+export * from "./errors/errors";
+export * from "./high_level";
+export * from "./http_headers";
+export * from "./internal_mime_types";
+export * from "./mcp_transport";
+export * from "./output_schemas";
+export * from "./types";
+
+interface RubyResponse {
+  status: number;
+  ok: boolean;
+  url: string;
+  body: ReadableStream<Uint8Array> | string;
+}
+
+// Detects whether an error corresponds to a terminated/aborted stream.
+function isStreamTerminationError(e: unknown): boolean {
+  if (!e) {
+    return false;
+  }
+  const err = normalizeError(e);
+  const msg = err.message;
+  const name = err.name || "";
+
+  // Common patterns from undici/fetch when a stream is cut or aborted.
+  const patterns = [
+    /terminated/i,
+    /aborted/i,
+    /The operation was aborted/i,
+    /network.*(error|changed|lost)/i,
+    /socket hang up/i,
+  ];
+
+  if (name === "AbortError") {
+    return true;
+  }
+  if (name === "TypeError" && /terminated|aborted/i.test(msg)) {
+    return true;
+  }
+  return patterns.some((p) => p.test(msg));
+}
+
+// Detects a fetch() rejection caused by the connection dying before any response
+// bytes were received (typically a pooled keep-alive socket the server closed while
+// our request was in flight). Distinct from isStreamTerminationError, which covers
+// mid-stream/post-response failures and includes aborts (never retryable here).
+function isConnectionClosedError(e: unknown): boolean {
+  if (!(e instanceof TypeError)) {
+    return false;
+  }
+  const cause = "cause" in e ? e.cause : undefined;
+  if (!(cause instanceof Error)) {
+    return false;
+  }
+  const code = "code" in cause ? cause.code : undefined;
+  return (
+    code === "UND_ERR_SOCKET" ||
+    code === "ECONNRESET" ||
+    code === "EPIPE" ||
+    /other side closed|socket hang up/i.test(cause.message)
+  );
+}
+
+// Delay before the single retry in _fetchWithError — yields a full event-loop
+// turn so undici processes pending FINs and evicts stale pooled sockets first.
+const CONNECTION_CLOSED_RETRY_DELAY_MS = 100;
+
+function isTransientHttpStatus(status: number): boolean {
+  // Only retry on explicit transient statuses; do NOT retry on 5xx.
+  return status === 408 || status === 429;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+// Copied from front/hooks/useEventSource.ts
+const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
+const DEFAULT_RECONNECT_DELAY = 5000;
+
+export type AgentEvent = AgentMessageEventData;
+
+export type ConversationEvent = ConversationEventData;
+
+const textFromResponse = async (response: RubyResponse): Promise<string> => {
+  if (typeof response.body === "string") {
+    return response.body;
+  }
+
+  // Convert ReadableStream to string
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let result = "";
+
+  try {
+    let done = false;
+    while (!done) {
+      const { value, done: doneReading } = await reader.read();
+      done = doneReading;
+      if (value) {
+        result += decoder.decode(value, { stream: true });
+      }
+    }
+
+    result += decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+
+  return result;
+};
+
+type RequestMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+type RequestArgsType = {
+  method: RequestMethod;
+  path: string;
+  query?: URLSearchParams;
+  body?: Record<string, unknown>;
+  overrideWorkspaceId?: string;
+  signal?: AbortSignal;
+  headers?: Record<string, string>;
+  stream?: boolean;
+};
+
+function isRubyAPIOptions(obj: unknown): obj is RubyAPIOptions {
+  return (
+    typeof obj === "object" &&
+    obj !== null &&
+    "workspaceId" in obj &&
+    "apiKey" in obj
+  );
+}
+
+export class RubyAPI {
+  _url: string;
+  _credentials: RubyAPICredentials;
+  _logger: LoggerInterface;
+  _urlOverride: string | undefined | null;
+
+  private _agents?: AgentsAPI;
+  private _conversations?: ConversationsAPI;
+  private _files?: FilesAPI;
+  private _options?: RubyAPIOptions;
+
+  constructor(options: RubyAPIOptions);
+  constructor(
+    config: { url: string },
+    credentials: RubyAPICredentials,
+    logger: LoggerInterface,
+    urlOverride?: string | undefined | null
+  );
+  constructor(
+    configOrOptions: { url: string } | RubyAPIOptions,
+    credentials?: RubyAPICredentials,
+    logger?: LoggerInterface,
+    urlOverride?: string | undefined | null
+  ) {
+    if (isRubyAPIOptions(configOrOptions)) {
+      this._url = configOrOptions.baseUrl ?? "https://ruby.ad";
+      this._credentials = {
+        workspaceId: configOrOptions.workspaceId,
+        apiKey: configOrOptions.apiKey,
+        extraHeaders: configOrOptions.extraHeaders,
+      };
+      this._logger = configOrOptions.logger ?? console;
+      this._urlOverride = null;
+      this._options = configOrOptions;
+    } else {
+      // Legacy constructor
+      this._url = configOrOptions.url;
+      this._credentials = credentials!;
+      this._logger = logger!;
+      this._urlOverride = urlOverride;
+    }
+  }
+
+  get agents(): AgentsAPI {
+    if (!this._agents) {
+      this._agents = new AgentsAPI(this, this._options);
+    }
+    return this._agents;
+  }
+
+  get conversations(): ConversationsAPI {
+    if (!this._conversations) {
+      this._conversations = new ConversationsAPI(this);
+    }
+    return this._conversations;
+  }
+
+  get files(): FilesAPI {
+    if (!this._files) {
+      this._files = new FilesAPI(this);
+    }
+    return this._files;
+  }
+
+  workspaceId(): string {
+    return this._credentials.workspaceId;
+  }
+
+  setWorkspaceId(workspaceId: string) {
+    this._credentials.workspaceId = workspaceId;
+  }
+
+  apiUrl(): string {
+    return this._urlOverride ? this._urlOverride : this._url;
+  }
+
+  async getApiKey(): Promise<string | null> {
+    if (typeof this._credentials.apiKey === "function") {
+      return this._credentials.apiKey();
+    }
+    return this._credentials.apiKey;
+  }
+
+  async baseHeaders() {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${await this.getApiKey()}`,
+    };
+    if (this._credentials.extraHeaders) {
+      // Header values must fit in ISO-8859-1 or fetch throws; non-Latin-1
+      // values are carried as RFC 2047 encoded-words (decoded server-side).
+      for (const [key, value] of Object.entries(
+        this._credentials.extraHeaders
+      )) {
+        headers[key] = encodeUtf8HeaderValue(value);
+      }
+    }
+    return headers;
+  }
+
+  /**
+   * Fetches the current user's information from the API.
+   *
+   * This method sends a GET request to the `/api/v1/me` endpoint with the necessary authorization
+   * headers. It then processes the response to extract the user information.  Note that this will
+   * only work if you are using an OAuth2 token. It will always fail with a workspace API key.
+   *
+   * @returns {Promise<Result<User, Error>>} A promise that resolves to a Result object containing
+   * either the user information or an error.
+   */
+  async me() {
+    // This method call directly _fetchWithError and _resultFromResponse as it's a little special:
+    // it doesn't live under the workspace resource.
+    const headers: RequestInit["headers"] = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${await this.getApiKey()}`,
+    };
+
+    const res = await this._fetchWithError(`${this.apiUrl()}/api/v1/me`, {
+      method: "GET",
+      headers,
+    });
+
+    const r = await this._resultFromResponse(MeResponseSchema, res);
+
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.user);
+  }
+
+  async request(args: RequestArgsType) {
+    // Conveniently clean path from any leading "/" just in case
+    args.path = args.path.replace(/^\/+/, "");
+
+    let url = `${this.apiUrl()}/api/v1/w/${
+      args.overrideWorkspaceId ?? this.workspaceId()
+    }/${args.path}`;
+
+    if (args.query) {
+      url += `?${args.query.toString()}`;
+    }
+
+    const headers = { ...(await this.baseHeaders()), ...args.headers };
+    headers["Content-Type"] = "application/json";
+
+    if (args.stream) {
+      headers["Accept"] = "text/event-stream";
+    }
+
+    const res = await this._fetchWithError(url, {
+      method: args.method,
+      headers,
+      body: args.body ? JSON.stringify(args.body) : undefined,
+      signal: args.signal,
+      stream: args.stream,
+    });
+
+    return res;
+  }
+
+  /**
+   * This functions talks directly to the Ruby production API to create a run.
+   *
+   * @param app RubyAppType the app to run streamed
+   * @param config RubyAppConfigType the app config
+   * @param inputs any[] the app inputs
+   */
+  async runApp(
+    {
+      workspaceId,
+      appId,
+      appHash,
+      appSpaceId,
+    }: {
+      workspaceId: string;
+      appId: string;
+      appSpaceId: string;
+      appHash: string;
+    },
+    config: RubyAppConfigType,
+    inputs: unknown[],
+    { useWorkspaceCredentials }: { useWorkspaceCredentials: boolean } = {
+      useWorkspaceCredentials: false,
+    }
+  ) {
+    const res = await this.request({
+      overrideWorkspaceId: workspaceId,
+      path: `spaces/${appSpaceId}/apps/${appId}/runs`,
+      query: new URLSearchParams({
+        use_workspace_credentials: useWorkspaceCredentials ? "true" : "false",
+      }),
+      method: "POST",
+      body: {
+        specification_hash: appHash,
+        config,
+        stream: false,
+        blocking: true,
+        inputs,
+      },
+    });
+
+    const r = await this._resultFromResponse(RunAppResponseSchema, res);
+
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.run);
+  }
+
+  /**
+   * This functions talks directly to the Ruby production API to create a streamed run.
+   *
+   * @param app RubyAppType the app to run streamed
+   * @param config RubyAppConfigType the app config
+   * @param inputs any[] the app inputs
+   */
+  async runAppStreamed(
+    {
+      workspaceId,
+      appId,
+      appHash,
+      appSpaceId,
+    }: {
+      workspaceId: string;
+      appId: string;
+      appSpaceId: string;
+      appHash: string;
+    },
+    config: RubyAppConfigType,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    inputs: any[],
+    { useWorkspaceCredentials }: { useWorkspaceCredentials: boolean } = {
+      useWorkspaceCredentials: false,
+    }
+  ) {
+    const res = await this.request({
+      overrideWorkspaceId: workspaceId,
+      path: `spaces/${appSpaceId}/apps/${appId}/runs`,
+      query: new URLSearchParams({
+        use_workspace_credentials: useWorkspaceCredentials ? "true" : "false",
+      }),
+      method: "POST",
+      body: {
+        specification_hash: appHash,
+        config,
+        stream: true,
+        blocking: false,
+        inputs,
+      },
+      stream: true,
+    });
+
+    if (res.isErr()) {
+      return res;
+    }
+
+    /**
+     * This help functions process a streamed response in the format of the Ruby API for running
+     * streamed apps.
+     *
+     * @param res an HTTP response ready to be consumed as a stream
+     */
+    async function processStreamedRunResponse(
+      res: RubyResponse,
+      logger: LoggerInterface
+    ) {
+      if (!res.ok || !res.body) {
+        const text = await textFromResponse(res);
+        return new Err({
+          type: "ruby_api_error",
+          message: `Error running streamed app: status_code=${res.status} body=${text}`,
+        });
+      }
+
+      let hasRunId = false;
+      let rejectRubyRunIdPromise: (err: Error) => void;
+      let resolveRubyRunIdPromise: (runId: string) => void;
+      const rubyRunIdPromise = new Promise<string>((resolve, reject) => {
+        rejectRubyRunIdPromise = reject;
+        resolveRubyRunIdPromise = resolve;
+      });
+
+      let pendingEvents: (
+        | RubyAppRunErroredEvent
+        | RubyAppRunRunStatusEvent
+        | RubyAppRunBlockStatusEvent
+        | RubyAppRunBlockExecutionEvent
+        | RubyAppRunTokensEvent
+        | RubyAppRunReasoningTokensEvent
+        | RubyAppRunReasoningItemEvent
+        | RubyAppRunFunctionCallEvent
+        | RubyAppRunFunctionCallArgumentsTokensEvent
+        | RubyAppRunFinalEvent
+      )[] = [];
+
+      const parser = createParser((event) => {
+        if (event.type === "event") {
+          if (event.data) {
+            try {
+              const data = JSON.parse(event.data);
+
+              switch (data.type) {
+                case "error": {
+                  pendingEvents.push({
+                    type: "error",
+                    content: {
+                      code: data.content.code,
+                      message: data.content.message,
+                    },
+                  } as RubyAppRunErroredEvent);
+                  break;
+                }
+                case "run_status": {
+                  pendingEvents.push({
+                    type: data.type,
+                    content: data.content,
+                  });
+                  break;
+                }
+                case "block_status": {
+                  pendingEvents.push({
+                    type: data.type,
+                    content: data.content,
+                  });
+                  break;
+                }
+                case "block_execution": {
+                  pendingEvents.push({
+                    type: data.type,
+                    content: data.content,
+                  });
+                  break;
+                }
+                case "tokens": {
+                  pendingEvents.push({
+                    type: "tokens",
+                    content: data.content,
+                  } as RubyAppRunTokensEvent);
+                  break;
+                }
+
+                case "reasoning_tokens": {
+                  pendingEvents.push({
+                    type: "reasoning_tokens",
+                    content: data.content,
+                  } as RubyAppRunReasoningTokensEvent);
+                  break;
+                }
+
+                case "reasoning_item": {
+                  pendingEvents.push({
+                    type: "reasoning_item",
+                    content: data.content,
+                  } as RubyAppRunReasoningItemEvent);
+                  break;
+                }
+
+                case "function_call": {
+                  pendingEvents.push({
+                    type: "function_call",
+                    content: data.content,
+                  } as RubyAppRunFunctionCallEvent);
+                  break;
+                }
+                case "function_call_arguments_tokens": {
+                  pendingEvents.push({
+                    type: "function_call_arguments_tokens",
+                    content: data.content,
+                  } as RubyAppRunFunctionCallArgumentsTokensEvent);
+                  break;
+                }
+                case "final": {
+                  pendingEvents.push({
+                    type: "final",
+                  } as RubyAppRunFinalEvent);
+                  break;
+                }
+              }
+              if (data.content?.run_id && !hasRunId) {
+                hasRunId = true;
+                resolveRubyRunIdPromise(data.content.run_id);
+              }
+            } catch (err) {
+              logger.error(
+                { error: err },
+                "Failed parsing chunk from Ruby API"
+              );
+            }
+          }
+        }
+      });
+
+      const streamEvents = async function* () {
+        if (!res.body || typeof res.body === "string") {
+          throw new Error(
+            "Expected a stream response, but got a string or null"
+          );
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+
+            if (value) {
+              parser.feed(decoder.decode(value, { stream: true }));
+
+              for (const event of pendingEvents) {
+                yield event;
+              }
+
+              pendingEvents = [];
+            }
+
+            if (done) {
+              break;
+            }
+          }
+
+          if (!hasRunId) {
+            // Once the stream is entirely consumed, if we haven't received a run id, reject the
+            // promise.
+            setImmediate(() => {
+              logger.error({}, "No run id received.");
+              rejectRubyRunIdPromise(new Error("No run id received"));
+            });
+          }
+        } catch (e) {
+          logger.error(
+            {
+              error: e,
+              errorStr: JSON.stringify(e),
+              errorSource: "processStreamedRunResponse",
+            },
+            "RubyAPI error: streaming chunks"
+          );
+          yield {
+            type: "error",
+            content: {
+              code: "stream_error",
+              message: "Error streaming chunks",
+            },
+          } as RubyAppRunErroredEvent;
+        }
+      };
+
+      return new Ok({
+        eventStream: streamEvents(),
+        rubyRunId: rubyRunIdPromise,
+      });
+    }
+
+    return processStreamedRunResponse(res.value.response, this._logger);
+  }
+
+  /**
+   * This actions talks to the Ruby production API to retrieve the list of data sources of the
+   * current workspace.
+   */
+  async getDataSources() {
+    const res = await this.request({
+      method: "GET",
+      path: "data_sources",
+    });
+
+    const r = await this._resultFromResponse(GetDataSourcesResponseSchema, res);
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.data_sources);
+  }
+
+  async getAgentConfigurations({
+    view,
+    includes = [],
+  }: {
+    view?: AgentConfigurationViewType;
+    includes?: "authors"[];
+  }) {
+    // Function to generate query parameters.
+    function getQueryString() {
+      const params = new URLSearchParams();
+      if (typeof view === "string") {
+        params.append("view", view);
+      }
+      if (includes.includes("authors")) {
+        params.append("withAuthors", "true");
+      }
+
+      return params.toString();
+    }
+
+    const queryString = view || includes.length > 0 ? getQueryString() : null;
+    const path = queryString
+      ? `assistant/agent_configurations?${queryString}`
+      : "assistant/agent_configurations";
+
+    const res = await this.request({
+      path,
+      method: "GET",
+    });
+
+    const r = await this._resultFromResponse(
+      GetAgentConfigurationsResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.agentConfigurations);
+  }
+
+  /**
+   * Parses mentions in markdown text and converts them to the proper mention format.
+   * Matches @agentName or @userName patterns against available agents and users.
+   *
+   * @param markdown - Markdown text containing @ mentions to parse
+   * @returns A promise that resolves to a Result containing the parsed markdown with mentions converted to proper format
+   */
+  async parseForMentions({ markdown }: { markdown: string }) {
+    const body = ParseMentionsRequestBodySchema.parse({ markdown });
+
+    const res = await this.request({
+      method: "POST",
+      path: "assistant/mentions/parse",
+      body,
+    });
+
+    const r = await this._resultFromResponse(
+      ParseMentionsResponseBodySchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.markdown);
+  }
+
+  /**
+   * Get suggestions for mentions (agents and users) based on a query string.
+   *
+   * @param query - Search query string to filter suggestions
+   * @param select - Optional array of mention types to include. Can be "agents", "users", or both.
+   * @param conversationId - Optional conversation ID to scope suggestions to a specific conversation
+   * @param current - Optional boolean to include the current user in the suggestions
+   * @returns A promise that resolves to a Result containing an array of mention suggestions
+   */
+  async getMentionsSuggestions({
+    query,
+    select,
+    conversationId,
+    current,
+  }: {
+    query: string;
+    select?: "agents" | "users" | ("agents" | "users")[];
+    conversationId?: string;
+    current?: boolean;
+  }) {
+    const queryParams = new URLSearchParams({ query });
+    if (select) {
+      if (Array.isArray(select)) {
+        select.forEach((s) => queryParams.append("select", s));
+      } else {
+        queryParams.append("select", select);
+      }
+    }
+    if (current !== undefined) {
+      queryParams.append("current", current ? "true" : "false");
+    }
+
+    const path = conversationId
+      ? `assistant/conversations/${conversationId}/mentions/suggestions`
+      : "assistant/mentions/suggestions";
+
+    const res = await this.request({
+      method: "GET",
+      path,
+      query: queryParams.toString() ? queryParams : undefined,
+    });
+
+    const r = await this._resultFromResponse(
+      GetMentionSuggestionsResponseBodySchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.suggestions);
+  }
+
+  async postContentFragment({
+    conversationId,
+    contentFragment,
+    signal,
+  }: {
+    conversationId: string;
+    contentFragment: PublicPostContentFragmentRequestBody;
+    signal?: AbortSignal;
+  }) {
+    const res = await this.request({
+      method: "POST",
+      path: `assistant/conversations/${conversationId}/content_fragments`,
+      body: { ...contentFragment },
+      signal,
+    });
+
+    const r = await this._resultFromResponse(
+      PostContentFragmentResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.contentFragment);
+  }
+
+  // When creating a conversation with a user message, the API returns only after the user message
+  // was created (and if applicable the associated agent messages).
+  async createConversation({
+    title,
+    visibility,
+    depth,
+    message,
+    contentFragment,
+    contentFragments,
+    blocking = false,
+    skipToolsValidation = false,
+    spaceId,
+    params,
+    signal,
+  }: PublicPostConversationsRequestBody & {
+    params?: Record<string, string>;
+    signal?: AbortSignal;
+  }): Promise<Result<CreateConversationResponseType, APIError>> {
+    const queryParams = new URLSearchParams(params);
+
+    const res = await this.request({
+      method: "POST",
+      path: "assistant/conversations",
+      query: queryParams.toString() ? queryParams : undefined,
+      body: {
+        title,
+        visibility,
+        depth,
+        message,
+        contentFragment,
+        contentFragments,
+        blocking,
+        skipToolsValidation,
+        spaceId,
+      },
+      signal,
+    });
+
+    return this._resultFromResponse(CreateConversationResponseSchema, res);
+  }
+
+  async postUserMessage({
+    conversationId,
+    message,
+    signal,
+  }: {
+    conversationId: string;
+    message: PublicPostMessagesRequestBody;
+    signal?: AbortSignal;
+  }) {
+    const res = await this.request({
+      method: "POST",
+      path: `assistant/conversations/${conversationId}/messages`,
+      body: { ...message },
+      signal,
+    });
+
+    const r = await this._resultFromResponse(
+      PostUserMessageResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.message);
+  }
+
+  // Wait for the parent user message to move to `visible` when the agent message is not direclty
+  // found in the conversation. This provides natural suoport for steering through the SDK.
+  async waitForAgentMessage({
+    conversation,
+    parentUserMessageId,
+    signal,
+  }: {
+    conversation: ConversationPublicType;
+    parentUserMessageId: string;
+    signal?: AbortSignal;
+  }): Promise<
+    Result<
+      AgentMessagePublicType | null,
+      { type: string; message: string } | Error
+    >
+  > {
+    let agentMessage =
+      conversation.content
+        .map((versions) => versions[versions.length - 1])
+        .find((message): message is AgentMessagePublicType => {
+          return (
+            message?.type === "agent_message" &&
+            message.parentMessageId === parentUserMessageId
+          );
+        }) ?? null;
+    if (agentMessage) {
+      return new Ok(agentMessage);
+    }
+
+    const streamRes = await this.streamConversationEvents({
+      conversationId: conversation.sId,
+      signal,
+    });
+    if (streamRes.isErr()) {
+      return streamRes;
+    }
+
+    for await (const event of streamRes.value.eventStream) {
+      if (
+        event.type === "user_message_new" &&
+        event.messageId === parentUserMessageId &&
+        event.message.visibility === "visible"
+      ) {
+        break;
+      }
+
+      if (
+        event.type === "user_message_promoted" &&
+        event.messageId === parentUserMessageId
+      ) {
+        break;
+      }
+    }
+
+    const conversationRes = await this.getConversation({
+      conversationId: conversation.sId,
+    });
+    if (conversationRes.isErr()) {
+      return conversationRes;
+    }
+
+    agentMessage =
+      conversationRes.value.content
+        .map((versions) => versions[versions.length - 1])
+        .find((message): message is AgentMessagePublicType => {
+          return (
+            message?.type === "agent_message" &&
+            message.parentMessageId === parentUserMessageId
+          );
+        }) ?? null;
+
+    return new Ok(agentMessage);
+  }
+
+  async streamAgentAnswerEvents({
+    conversation,
+    userMessageId,
+    signal,
+    options = {
+      maxReconnectAttempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
+      reconnectDelay: DEFAULT_RECONNECT_DELAY,
+      autoReconnect: true,
+    },
+  }: {
+    conversation: ConversationPublicType;
+    userMessageId: string;
+    signal?: AbortSignal;
+    options?: {
+      maxReconnectAttempts?: number;
+      reconnectDelay?: number;
+      autoReconnect?: boolean;
+    };
+  }): Promise<
+    Result<
+      {
+        eventStream: AsyncGenerator<AgentEvent, void, unknown>;
+      },
+      { type: string; message: string } | Error
+    >
+  > {
+    const agentMessageRes = await this.waitForAgentMessage({
+      conversation,
+      parentUserMessageId: userMessageId,
+      signal,
+    });
+    if (agentMessageRes.isErr()) {
+      return agentMessageRes;
+    }
+
+    const agentMessage = agentMessageRes.value;
+
+    if (agentMessage === null) {
+      return new Err(new Error("Failed to retrieve agent message"));
+    }
+
+    return this.streamAgentMessageEvents({
+      conversationId: conversation.sId,
+      agentMessageId: agentMessage.sId,
+      signal,
+      options: {
+        maxReconnectAttempts:
+          options.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS,
+        reconnectDelay: options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY,
+        autoReconnect: options.autoReconnect ?? true,
+      },
+    });
+  }
+
+  async streamConversationEvents({
+    conversationId,
+    signal,
+    options = {
+      maxReconnectAttempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
+      reconnectDelay: DEFAULT_RECONNECT_DELAY,
+      autoReconnect: true,
+    },
+  }: {
+    conversationId: string;
+    signal?: AbortSignal;
+    options?: {
+      maxReconnectAttempts?: number;
+      reconnectDelay?: number;
+      autoReconnect?: boolean;
+    };
+  }): Promise<
+    Result<
+      {
+        eventStream: AsyncGenerator<ConversationEvent, void, unknown>;
+      },
+      { type: string; message: string } | Error
+    >
+  > {
+    const createRequest = async (lastId?: string | null) => {
+      let path = `assistant/conversations/${conversationId}/events`;
+      if (lastId) {
+        path += `?lastEventId=${lastId}`;
+      }
+
+      return this.request({
+        method: "GET",
+        path,
+        signal,
+        stream: true,
+      });
+    };
+
+    return new Ok({
+      eventStream: this._streamEventsWithReconnection({
+        createRequest,
+        signal,
+        options: {
+          maxReconnectAttempts:
+            options.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS,
+          reconnectDelay: options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY,
+          autoReconnect: options.autoReconnect ?? true,
+        },
+        parseEvent: (eventData) => {
+          if (!isRecord(eventData)) {
+            return null;
+          }
+          const { data } = eventData;
+          return isRecord(data) ? (data as ConversationEvent) : null;
+        },
+      }),
+    });
+  }
+
+  async streamAgentMessageEvents({
+    conversationId,
+    agentMessageId,
+    signal,
+    options,
+  }: {
+    conversationId: string;
+    agentMessageId: string;
+    signal?: AbortSignal;
+    options: {
+      maxReconnectAttempts: number;
+      reconnectDelay: number;
+      autoReconnect: boolean;
+    };
+  }): Promise<
+    Result<
+      {
+        eventStream: AsyncGenerator<AgentEvent, void, unknown>;
+      },
+      { type: string; message: string }
+    >
+  > {
+    const terminalEventTypes: AgentEvent["type"][] = [
+      "agent_message_success",
+      "agent_message_gracefully_stopped",
+      "agent_error",
+      "agent_generation_cancelled",
+      "user_message_error",
+    ];
+
+    const createRequest = async (lastId?: string | null) => {
+      let path = `assistant/conversations/${conversationId}/messages/${agentMessageId}/events`;
+      if (lastId) {
+        path += `?lastEventId=${lastId}`;
+      }
+
+      return this.request({
+        method: "GET",
+        path,
+        signal,
+        stream: true,
+      });
+    };
+
+    let receivedTerminalEvent = false;
+
+    return new Ok({
+      eventStream: this._streamEventsWithReconnection({
+        createRequest,
+        signal,
+        options,
+        parseEvent: (eventData) => {
+          if (!isRecord(eventData)) {
+            return null;
+          }
+          const { data } = eventData;
+          return isRecord(data) ? (data as AgentEvent) : null;
+        },
+        onEvent: (event) => {
+          if (terminalEventTypes.includes(event.type)) {
+            receivedTerminalEvent = true;
+          }
+        },
+        shouldReconnect: () => !receivedTerminalEvent,
+      }),
+    });
+  }
+
+  private async *_streamEventsWithReconnection<T>({
+    createRequest,
+    signal,
+    options,
+    parseEvent,
+    onEvent,
+    shouldReconnect = () => true,
+  }: {
+    createRequest: (
+      lastEventId?: string | null
+    ) => Promise<
+      Result<{ response: RubyResponse; duration: number }, APIError>
+    >;
+    signal?: AbortSignal;
+    options: {
+      maxReconnectAttempts: number;
+      reconnectDelay: number;
+      autoReconnect: boolean;
+    };
+    parseEvent: (eventData: unknown) => T | null;
+    onEvent?: (event: T) => void;
+    shouldReconnect?: () => boolean;
+  }): AsyncGenerator<T, void, unknown> {
+    const { maxReconnectAttempts, reconnectDelay, autoReconnect } = options;
+
+    const logger = this._logger;
+    let lastEventId: string | null = null;
+    let reconnectAttempts = 0;
+
+    while (true) {
+      if (signal?.aborted) {
+        return;
+      }
+
+      const res = await createRequest(lastEventId);
+
+      if (res.isErr()) {
+        // Treat request errors as transient and apply reconnection policy when enabled.
+        if (autoReconnect) {
+          reconnectAttempts += 1;
+          if (reconnectAttempts >= maxReconnectAttempts) {
+            throw new Error(
+              `Exceeded maximum reconnection attempts (request error): ${res.error.message}`
+            );
+          }
+          await new Promise((resolve) => setTimeout(resolve, reconnectDelay));
+          continue;
+        }
+        const error = res.error;
+        throw new Error(`Error requesting event stream: ${error.message}`);
+      }
+
+      if (!res.value.response.ok || !res.value.response.body) {
+        if (autoReconnect && isTransientHttpStatus(res.value.response.status)) {
+          reconnectAttempts += 1;
+          if (reconnectAttempts >= maxReconnectAttempts) {
+            throw new Error(
+              `Exceeded maximum reconnection attempts (http ${res.value.response.status})`
+            );
+          }
+          await new Promise((resolve) => setTimeout(resolve, reconnectDelay));
+          continue;
+        }
+        throw new Error(
+          `Error requesting event stream: status_code=${res.value.response.status}`
+        );
+      }
+
+      let pendingEvents: T[] = [];
+      let receivedEventsInThisConnection = false;
+
+      const parser = createParser((event) => {
+        if (event.type === "event" && event.data && event.data !== "done") {
+          try {
+            const eventData: unknown = JSON.parse(event.data);
+
+            if (isRecord(eventData) && typeof eventData.eventId === "string") {
+              lastEventId = eventData.eventId;
+            }
+
+            const parsedEvent = parseEvent(eventData);
+
+            if (parsedEvent) {
+              pendingEvents.push(parsedEvent);
+            }
+          } catch (err) {
+            logger.error({ error: err }, "Failed parsing chunk from Ruby API");
+          }
+        }
+      });
+
+      if (
+        !res.value.response.body ||
+        typeof res.value.response.body === "string"
+      ) {
+        throw new Error("Expected a stream response, but got a string or null");
+      }
+
+      const reader = res.value.response.body.getReader();
+      const decoder = new TextDecoder();
+
+      let streamEndedWithError = false;
+
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (value) {
+            parser.feed(decoder.decode(value, { stream: true }));
+
+            for (const event of pendingEvents) {
+              yield event;
+              receivedEventsInThisConnection = true;
+              onEvent?.(event);
+            }
+            pendingEvents = [];
+          }
+
+          if (done) {
+            break;
+          }
+        }
+      } catch (e) {
+        logger.error({ error: e }, "Failed processing event stream");
+        streamEndedWithError = true;
+
+        // Respect caller-initiated aborts.
+        if (signal?.aborted) {
+          return;
+        }
+        // Apply reconnection policy on stream termination or abort; otherwise propagate.
+        if (!isStreamTerminationError(e)) {
+          throw new Error(`Error processing event stream: ${e}`);
+        }
+        // Do not throw; flow continues to reconnection block below.
+      } finally {
+        reader.releaseLock();
+      }
+
+      // Stream ended; check whether we need to reconnect.
+      if (shouldReconnect() && autoReconnect) {
+        if (streamEndedWithError || !receivedEventsInThisConnection) {
+          // Increment on errors and empty clean closures from stale or finished streams.
+          reconnectAttempts += 1;
+        } else {
+          // Successful connections with events reset the counter like EventSource onopen.
+          reconnectAttempts = 0;
+        }
+
+        if (reconnectAttempts >= maxReconnectAttempts) {
+          throw new Error("Exceeded maximum reconnection attempts");
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, reconnectDelay));
+        continue;
+      }
+
+      // Exit the generator after a terminal event or when auto-reconnect is disabled.
+      return;
+    }
+  }
+
+  async cancelMessageGeneration({
+    conversationId,
+    messageIds,
+  }: {
+    conversationId: string;
+    messageIds: string[];
+  }) {
+    const res = await this.request({
+      method: "POST",
+      path: `assistant/conversations/${conversationId}/cancel`,
+      body: {
+        messageIds,
+      } as CancelMessageGenerationRequestType,
+    });
+
+    const r = await this._resultFromResponse(
+      CancelMessageGenerationResponseSchema,
+      res
+    );
+
+    if (r.isErr()) {
+      return r;
+    } else {
+      return new Ok(r.value);
+    }
+  }
+
+  async markAsRead({ conversationId }: { conversationId: string }) {
+    const res = await this.request({
+      method: "PATCH",
+      path: `assistant/conversations/${conversationId}`,
+      body: {
+        read: true,
+      } as PatchConversationRequestType,
+    });
+
+    const r = await this._resultFromResponse(
+      PatchConversationResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.success);
+  }
+
+  async getConversations() {
+    const res = await this.request({
+      method: "GET",
+      path: `assistant/conversations`,
+    });
+
+    const r = await this._resultFromResponse(
+      GetConversationsResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.conversations);
+  }
+
+  async getConversation({
+    conversationId,
+    signal,
+  }: {
+    conversationId: string;
+    signal?: AbortSignal;
+  }) {
+    const res = await this.request({
+      method: "GET",
+      path: `assistant/conversations/${conversationId}`,
+      signal,
+    });
+
+    const r = await this._resultFromResponse(
+      GetConversationResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.conversation);
+  }
+
+  async getConversationFeedback({
+    conversationId,
+  }: {
+    conversationId: string;
+  }) {
+    const res = await this.request({
+      method: "GET",
+      path: `assistant/conversations/${conversationId}/feedbacks`,
+    });
+
+    const r = await this._resultFromResponse(GetFeedbacksResponseSchema, res);
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.feedbacks);
+  }
+
+  async getSpaceConversationsForDataSource({
+    spaceId,
+    updatedSince,
+  }: {
+    spaceId: string;
+    updatedSince?: number | null;
+  }) {
+    const query = new URLSearchParams();
+    if (updatedSince !== undefined && updatedSince !== null) {
+      query.append("updatedSince", String(updatedSince));
+    }
+
+    const res = await this.request({
+      method: "GET",
+      path: `spaces/${spaceId}/conversations`,
+      query,
+    });
+
+    return this._resultFromResponse(
+      GetSpaceConversationsForDataSourceResponseSchema,
+      res
+    );
+  }
+
+  async getSpaceConversationIds({ spaceId }: { spaceId: string }) {
+    const res = await this.request({
+      method: "GET",
+      path: `spaces/${spaceId}/conversation_ids`,
+    });
+
+    return this._resultFromResponse(GetSpaceConversationIdsResponseSchema, res);
+  }
+
+  async getSpaceMetadata({ spaceId }: { spaceId: string }) {
+    const res = await this.request({
+      method: "GET",
+      path: `spaces/${spaceId}/project_metadata`,
+    });
+
+    return this._resultFromResponse(GetSpaceMetadataResponseSchema, res);
+  }
+
+  async getSpaceProjectFiles({
+    spaceId,
+    updatedSince,
+  }: {
+    spaceId: string;
+    updatedSince?: number | null;
+  }) {
+    const query = new URLSearchParams();
+    if (updatedSince !== undefined && updatedSince !== null) {
+      query.append("updatedSince", String(updatedSince));
+    }
+
+    const res = await this.request({
+      method: "GET",
+      path: `spaces/${spaceId}/project_files`,
+      query,
+    });
+
+    return this._resultFromResponse(GetProjectFilesResponseSchema, res);
+  }
+
+  async postFeedback(
+    conversationId: string,
+    messageId: string,
+    feedback: PublicPostMessageFeedbackRequestBody
+  ) {
+    const res = await this.request({
+      method: "POST",
+      path: `assistant/conversations/${conversationId}/messages/${messageId}/feedbacks`,
+      body: feedback,
+    });
+
+    return this._resultFromResponse(PostMessageFeedbackResponseSchema, res);
+  }
+
+  async deleteFeedback(conversationId: string, messageId: string) {
+    const res = await this.request({
+      method: "DELETE",
+      path: `assistant/conversations/${conversationId}/messages/${messageId}/feedbacks`,
+    });
+
+    return this._resultFromResponse(PostMessageFeedbackResponseSchema, res);
+  }
+
+  async tokenize(
+    text: string,
+    dataSourceId: string,
+    opts?: { signal?: AbortSignal }
+  ) {
+    const res = await this.request({
+      method: "POST",
+      path: `data_sources/${dataSourceId}/tokenize`,
+      body: { text },
+      signal: opts?.signal,
+    });
+
+    const r = await this._resultFromResponse(TokenizeResponseSchema, res);
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.tokens);
+  }
+
+  async upsertFolder({
+    dataSourceId,
+    folderId,
+    timestamp,
+    title,
+    parentId,
+    parents,
+    mimeType,
+    sourceUrl,
+    providerVisibility,
+  }: {
+    dataSourceId: string;
+    folderId: string;
+    timestamp: number;
+    title: string;
+    parentId: string | null;
+    parents: string[];
+    mimeType: string;
+    sourceUrl: string | null;
+    providerVisibility: "public" | "private" | null;
+  }) {
+    const res = await this.request({
+      method: "POST",
+      path: `data_sources/${dataSourceId}/folders/${encodeURIComponent(
+        folderId
+      )}`,
+      body: {
+        timestamp: Math.floor(timestamp),
+        title,
+        parent_id: parentId,
+        parents,
+        mime_type: mimeType,
+        source_url: sourceUrl,
+        provider_visibility: providerVisibility,
+      },
+    });
+
+    const r = await this._resultFromResponse(UpsertFolderResponseSchema, res);
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value);
+  }
+
+  async deleteFolder({
+    dataSourceId,
+    folderId,
+  }: {
+    dataSourceId: string;
+    folderId: string;
+  }) {
+    const res = await this.request({
+      method: "DELETE",
+      path: `data_sources/${dataSourceId}/folders/${encodeURIComponent(
+        folderId
+      )}`,
+    });
+
+    const r = await this._resultFromResponse(DeleteFolderResponseSchema, res);
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value);
+  }
+
+  private _validateRedirectUrl(url: string): boolean {
+    const urlObj = new URL(url);
+    if (
+      urlObj.protocol !== "https:" ||
+      urlObj.hostname !== "storage.googleapis.com"
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  async downloadFile({ fileID }: { fileID: string }) {
+    const res = await this.request({
+      method: "GET",
+      path: `files/${fileID}?action=download`,
+    });
+
+    if (res.isErr()) {
+      return res;
+    }
+
+    // Handle redirect response (the API redirects to a signed URL)
+    if (res.value.response.status >= 200 && res.value.response.status < 400) {
+      const redirectUrl = res.value.response.url;
+
+      // Validate the redirect URL format to prevent SSRF attacks
+      if (!this._validateRedirectUrl(redirectUrl)) {
+        return new Err({
+          type: "unexpected_network_error",
+          message: `Invalid redirect URL format. Expected format: https://storage.googleapis.com/... Got: ${redirectUrl}`,
+        });
+      }
+
+      // Fetch the actual file content from the signed URL
+      try {
+        const fileResponse = await fetch(redirectUrl);
+        if (!fileResponse.ok) {
+          return new Err({
+            type: "unexpected_network_error",
+            message: `Failed to download file from signed URL: ${fileResponse.status}`,
+          });
+        }
+
+        const buffer = Buffer.from(await fileResponse.arrayBuffer());
+        return new Ok(buffer);
+      } catch (error) {
+        return new Err({
+          type: "unexpected_network_error",
+          message: `Failed to download file: ${error}`,
+        });
+      }
+    }
+  }
+
+  async getFileContent({
+    fileId,
+    version = "original",
+  }: {
+    fileId: string;
+    version?: "original" | "processed";
+  }) {
+    const res = await this.request({
+      method: "GET",
+      path: `files/${fileId}?action=view&version=${version}`,
+      stream: true,
+    });
+
+    if (res.isErr()) {
+      return res;
+    }
+
+    const { body } = res.value.response;
+    if (typeof body === "string") {
+      return new Ok(new Blob([body]));
+    }
+
+    return new Ok(await new Response(body).blob());
+  }
+
+  async uploadFile({
+    contentType,
+    fileName,
+    fileSize,
+    useCase,
+    useCaseMetadata,
+    fileObject,
+    signal,
+  }: FileUploadUrlRequestType & { fileObject: File; signal?: AbortSignal }) {
+    const res = await this.request({
+      method: "POST",
+      path: "files",
+      body: {
+        contentType,
+        fileName,
+        fileSize,
+        useCase,
+        useCaseMetadata,
+      },
+      signal,
+    });
+
+    const fileRes = await this._resultFromResponse(
+      FileUploadRequestResponseSchema,
+      res
+    );
+
+    if (fileRes.isErr()) {
+      return fileRes;
+    }
+
+    const { file } = fileRes.value;
+
+    const formData = new FormData();
+    formData.append("file", fileObject);
+
+    // Upload file to the obtained URL.
+    try {
+      const headers = await this.baseHeaders();
+
+      const response = await fetch(file.uploadUrl, {
+        method: "POST",
+        headers,
+        body: formData,
+        signal,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        return new Err(
+          new Error(
+            errorData?.error?.message ||
+              `Failed to upload file: ${response.status}`
+          )
+        );
+      }
+
+      const responseData = await response.json();
+      return new Ok(responseData.file);
+    } catch (err) {
+      return new Err(
+        new Error(err instanceof Error ? err.message : "Unknown error")
+      );
+    }
+  }
+
+  async deleteFile({ fileID }: { fileID: string }) {
+    const res = await this.request({
+      method: "DELETE",
+      path: `files/${fileID}`,
+    });
+
+    return res;
+  }
+
+  async getActiveMemberEmailsInWorkspace() {
+    const res = await this.request({
+      method: "GET",
+      path: "members/emails",
+      query: new URLSearchParams({ activeOnly: "true" }),
+    });
+
+    const r = await this._resultFromResponse(
+      GetActiveMemberEmailsInWorkspaceResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value.emails);
+  }
+
+  /**
+   * Probes the workspace behind the credentials. Errors when the workspace
+   * does not exist, has been relocated or is in maintenance. The endpoint does
+   * no work beyond authentication, so this is the cheapest availability check
+   * available on the public API.
+   */
+  async exists() {
+    const res = await this.request({
+      method: "GET",
+      path: "exists",
+    });
+
+    const r = await this._resultFromResponse(
+      GetWorkspaceExistsResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value.exists);
+  }
+
+  async getWorkspaceVerifiedDomains() {
+    const res = await this.request({
+      method: "GET",
+      path: "verified_domains",
+    });
+
+    const r = await this._resultFromResponse(
+      GetWorkspaceVerifiedDomainsResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value.verified_domains);
+  }
+
+  async getWorkspaceFeatureFlags() {
+    const res = await this.request({
+      method: "GET",
+      path: "feature_flags",
+    });
+
+    const r = await this._resultFromResponse(
+      GetWorkspaceFeatureFlagsResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value.feature_flags);
+  }
+
+  async searchDataSourceViews(searchParams: URLSearchParams) {
+    const res = await this.request({
+      method: "GET",
+      path: "data_source_views/search",
+      query: searchParams,
+    });
+
+    const r = await this._resultFromResponse(
+      SearchDataSourceViewsResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value.data_source_views);
+  }
+
+  async patchDataSourceView(
+    dataSourceView: DataSourceViewType,
+    patch: PatchDataSourceViewRequestType
+  ) {
+    const res = await this.request({
+      method: "PATCH",
+      path: `spaces/${dataSourceView.spaceId}/data_source_views/${dataSourceView.sId}`,
+      body: patch,
+    });
+
+    const r = await this._resultFromResponse(DataSourceViewResponseSchema, res);
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value.dataSourceView);
+  }
+
+  async exportApps({ appSpaceId }: { appSpaceId: string }) {
+    const res = await this.request({
+      method: "GET",
+      path: `spaces/${appSpaceId}/apps/export`,
+    });
+
+    const r = await this._resultFromResponse(GetAppsResponseSchema, res);
+
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.apps);
+  }
+
+  async checkApps(apps: AppsCheckRequestType, appSpaceId: string) {
+    const res = await this.request({
+      method: "POST",
+      path: `spaces/${appSpaceId}/apps/check`,
+      body: apps,
+    });
+
+    const r = await this._resultFromResponse(AppsCheckResponseSchema, res);
+
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.apps);
+  }
+
+  async getAutoGroupIdsForSpaces({ spaceIds }: { spaceIds: string[] }) {
+    const res = await this.request({
+      method: "GET",
+      path: "spaces/groups",
+      query: new URLSearchParams({ spaceIds: spaceIds.join(",") }),
+    });
+
+    const r = await this._resultFromResponse(
+      GetAutoGroupIdsForSpacesResponseSchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+
+    return new Ok(r.value.groupIds);
+  }
+
+  async getSpaces(options?: { kinds?: SpaceType["kind"][] }) {
+    const res = await this.request({
+      method: "GET",
+      path: "spaces",
+      query: options?.kinds
+        ? new URLSearchParams({ kinds: options.kinds.join(",") })
+        : undefined,
+    });
+
+    const r = await this._resultFromResponse(GetSpacesResponseSchema, res);
+
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.spaces);
+  }
+
+  async getMCPServerViews(spaceId: string, includeAuto = false) {
+    const res = await this.request({
+      method: "GET",
+      path: `spaces/${spaceId}/mcp_server_views`,
+      query: new URLSearchParams({ includeAuto: includeAuto.toString() }),
+    });
+
+    const r = await this._resultFromResponse(
+      GetMCPServerViewsResponseSchema,
+      res
+    );
+
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.serverViews);
+  }
+
+  async searchNodes(searchParams: SearchRequestBodyType) {
+    const res = await this.request({
+      method: "POST",
+      path: "search",
+      body: searchParams,
+    });
+
+    const r = await this._resultFromResponse(
+      PostWorkspaceSearchResponseBodySchema,
+      res
+    );
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.nodes);
+  }
+
+  /**
+   * Unified search with SSE streaming for both knowledge and tool results.
+   * Returns a Result containing an async generator that yields search results as they arrive.
+   *
+   * @param params Search parameters
+   * @returns Promise resolving to Result with eventStream AsyncGenerator
+   */
+  async searchUnified({
+    query,
+    limit = 25,
+    cursor,
+    viewType = "all",
+    spaceIds,
+    includeDataSources = true,
+    searchSourceUrls = false,
+    includeTools = true,
+  }: {
+    query: string;
+    limit?: number;
+    cursor?: string | null;
+    viewType?: "all" | "documents" | "tables";
+    spaceIds?: string[];
+    includeDataSources?: boolean;
+    searchSourceUrls?: boolean;
+    includeTools?: boolean;
+  }) {
+    const params = new URLSearchParams();
+    params.append("query", query);
+    params.append("limit", limit.toString());
+    params.append("viewType", viewType);
+    params.append("includeDataSources", includeDataSources.toString());
+    params.append("searchSourceUrls", searchSourceUrls.toString());
+    params.append("includeTools", includeTools.toString());
+
+    if (spaceIds && spaceIds.length > 0) {
+      params.append("spaceIds", spaceIds.join(","));
+    }
+
+    if (cursor) {
+      params.append("cursor", cursor);
+    }
+
+    const res = await this.request({
+      method: "GET",
+      path: `search?${params.toString()}`,
+      stream: true,
+    });
+
+    if (res.isErr()) {
+      return new Err({
+        type: "search_error",
+        message: `Search request failed: ${res.error.message}`,
+      });
+    }
+
+    if (typeof res.value.response.body === "string") {
+      return new Err({
+        type: "search_error",
+        message: "Expected stream body but got string",
+      });
+    }
+
+    const logger = this._logger;
+
+    const streamSearchResults = async function* () {
+      if (
+        !res.value.response.body ||
+        typeof res.value.response.body === "string"
+      ) {
+        throw new Error("Expected a stream response, but got a string or null");
+      }
+
+      const reader = res.value.response.body.getReader();
+      const decoder = new TextDecoder();
+
+      try {
+        let pendingChunks: Array<{
+          knowledgeResults?: {
+            nodes: DataSourceContentNodeType[];
+            warningCode: SearchWarningCode | null;
+            nextPageCursor: string | null;
+            resultsCount: number | null;
+          };
+          toolResults?: Array<{
+            internalId: string;
+            externalId: string;
+            title: string;
+            type: ContentNodeType["type"];
+            mimeType: string;
+            serverName: string;
+            serverIcon: string;
+            serverViewId: string;
+            sourceUrl: string | null;
+            url?: string;
+            score?: number;
+          }>;
+        }> = [];
+
+        const parser = createParser((event) => {
+          if (event.type === "event") {
+            if (event.data) {
+              try {
+                const chunk = JSON.parse(event.data);
+                pendingChunks.push(chunk);
+              } catch (err) {
+                logger.error(
+                  {
+                    error: normalizeError(err),
+                  },
+                  "Error parsing search stream chunk"
+                );
+              }
+            }
+          }
+        });
+
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (value) {
+            parser.feed(decoder.decode(value, { stream: true }));
+
+            for (const chunk of pendingChunks) {
+              yield chunk;
+            }
+            pendingChunks = [];
+          }
+          if (done) {
+            break;
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    };
+
+    return new Ok({ eventStream: streamSearchResults() });
+  }
+
+  async retryMessage({
+    conversationId,
+    messageId,
+    blockedOnly = false,
+  }: {
+    conversationId: string;
+    messageId: string;
+    blockedOnly?: boolean;
+  }) {
+    const query = blockedOnly
+      ? new URLSearchParams({ blocked_only: "true" })
+      : undefined;
+
+    const res = await this.request({
+      method: "POST",
+      path: `assistant/conversations/${conversationId}/messages/${messageId}/retry`,
+      query,
+    });
+
+    const r = await this._resultFromResponse(RetryMessageResponseSchema, res);
+    if (r.isErr()) {
+      return r;
+    }
+    return new Ok(r.value.message);
+  }
+
+  // MCP Related.
+
+  async getBlockedActions({
+    conversationId,
+  }: {
+    conversationId: string;
+  }): Promise<Result<BlockedActionsResponseType, APIError>> {
+    const res = await this.request({
+      method: "GET",
+      path: `assistant/conversations/${conversationId}/actions/blocked`,
+    });
+
+    return this._resultFromResponse(BlockedActionsResponseSchema, res);
+  }
+
+  async validateAction({
+    conversationId,
+    messageId,
+    actionId,
+    approved,
+    signal,
+  }: ValidateActionRequestBodyType & {
+    conversationId: string;
+    messageId: string;
+    signal?: AbortSignal;
+  }): Promise<Result<ValidateActionResponseType, APIError>> {
+    const res = await this.request({
+      method: "POST",
+      path: `assistant/conversations/${conversationId}/messages/${messageId}/validate-action`,
+      body: {
+        actionId,
+        approved,
+      },
+      signal,
+    });
+
+    return this._resultFromResponse(ValidateActionResponseSchema, res);
+  }
+
+  async answerUserQuestion({
+    conversationId,
+    messageId,
+    actionId,
+    answer,
+    signal,
+  }: AnswerUserQuestionRequestBodyType & {
+    conversationId: string;
+    messageId: string;
+    signal?: AbortSignal;
+  }): Promise<Result<AnswerUserQuestionResponseType, APIError>> {
+    const res = await this.request({
+      method: "POST",
+      path: `assistant/conversations/${conversationId}/messages/${messageId}/answer-question`,
+      body: {
+        actionId,
+        answer,
+      },
+      signal,
+    });
+
+    return this._resultFromResponse(AnswerUserQuestionResponseSchema, res);
+  }
+
+  async registerMCPServer({
+    serverName,
+  }: {
+    serverName: string;
+  }): Promise<Result<RegisterMCPResponseType, APIError>> {
+    const body: PublicRegisterMCPRequestBody = {
+      serverName,
+    };
+
+    const res = await this.request({
+      method: "POST",
+      path: "mcp/register",
+      body,
+    });
+
+    return this._resultFromResponse(RegisterMCPResponseSchema, res);
+  }
+
+  async heartbeatMCPServer({
+    serverId,
+  }: {
+    serverId: string;
+  }): Promise<Result<HeartbeatMCPResponseType, APIError>> {
+    const body: PublicHeartbeatMCPRequestBody = {
+      serverId,
+    };
+
+    const res = await this.request({
+      method: "POST",
+      path: "mcp/heartbeat",
+      body,
+    });
+
+    return this._resultFromResponse(HeartbeatMCPResponseSchema, res);
+  }
+
+  async postMCPResults({
+    result,
+    serverId,
+  }: PublicPostMCPResultsRequestBody & { serverId: string }): Promise<
+    Result<PostMCPResultsResponseType, APIError>
+  > {
+    const body: PublicPostMCPResultsRequestBody = {
+      result,
+      serverId,
+    };
+
+    const res = await this.request({
+      method: "POST",
+      path: "mcp/results",
+      body,
+    });
+
+    return this._resultFromResponse(PostMCPResultsResponseSchema, res);
+  }
+
+  async getMCPRequestsConnectionDetails({
+    serverId,
+    lastEventId,
+  }: {
+    serverId: string;
+    lastEventId?: string | null;
+  }): Promise<
+    Result<{ url: string; headers: Record<string, string> }, APIError>
+  > {
+    const url = `${this.apiUrl()}/api/v1/w/${this.workspaceId()}/mcp/requests`;
+    const params = new URLSearchParams({
+      serverId,
+      ...(lastEventId ? { lastEventId } : {}),
+    });
+
+    const headers = await this.baseHeaders();
+
+    return new Ok({
+      url: `${url}?${params.toString()}`,
+      headers,
+    });
+  }
+
+  private async _fetchWithError(
+    url: string,
+    {
+      method = "GET",
+      headers = {},
+      body,
+      signal,
+      stream = false,
+    }: {
+      method?: RequestMethod;
+      headers?: HeadersInit;
+      body?: string;
+      signal?: AbortSignal;
+      stream?: boolean;
+    } = {}
+  ): Promise<Result<{ response: RubyResponse; duration: number }, APIError>> {
+    const now = Date.now();
+    const init = { method, headers, body, signal };
+    try {
+      let res: Response;
+      try {
+        res = await fetch(url, init);
+      } catch (e) {
+        // Single retry when the connection died before any response bytes were
+        // received (stale keep-alive socket closed by the server). fetch() can
+        // only reject before response headers, so the server cannot have started
+        // responding and the string body is safe to re-send.
+        if (!isConnectionClosedError(e) || signal?.aborted) {
+          throw e;
+        }
+        this._logger.warn(
+          { url, method, error: e },
+          "RubyAPI retrying fetch after connection closed before response"
+        );
+        await new Promise((resolve) =>
+          setTimeout(resolve, CONNECTION_CLOSED_RETRY_DELAY_MS)
+        );
+        res = await fetch(url, init);
+      }
+
+      const responseBody = stream && res.body ? res.body : await res.text();
+
+      const response: RubyResponse = {
+        status: res.status,
+        url: res.url,
+        body: responseBody,
+        ok: res.ok,
+      };
+
+      return new Ok({ response, duration: Date.now() - now });
+    } catch (e) {
+      const duration = Date.now() - now;
+      const err: APIError = {
+        type: "unexpected_network_error",
+        message: `Unexpected network error from RubyAPI: ${errorToString(e)}`,
+      };
+      this._logger.error(
+        {
+          rubyError: err,
+          url,
+          duration,
+          connectorsError: err,
+          error: e,
+        },
+        "RubyAPI error"
+      );
+      return new Err(err);
+    }
+  }
+
+  private async _resultFromResponse<T extends z.ZodTypeAny>(
+    schema: T,
+    res: Result<
+      {
+        response: RubyResponse;
+        duration: number;
+      },
+      APIError
+    >
+  ): Promise<Result<z.infer<T>, APIError>> {
+    if (res.isErr()) {
+      return res;
+    }
+
+    if (res.value.response.status === 413) {
+      const err: APIError = {
+        type: "content_too_large",
+        message:
+          "Your request content is too large, please try again with a shorter content.",
+      };
+      this._logger.error(
+        {
+          rubyError: err,
+          status: res.value.response.status,
+          url: res.value.response.url,
+          duration: res.value.duration,
+        },
+        "RubyAPI error"
+      );
+      return new Err(err);
+    }
+
+    // We get the text and attempt to parse so that we can log the raw text in case of error (the
+    // body is already consumed by response.json() if used otherwise).
+    const text = await textFromResponse(res.value.response);
+
+    try {
+      const response = JSON.parse(text);
+      const r = schema.safeParse(response);
+      // This assume that safe parsing means a 200 status.
+      if (r.success) {
+        return new Ok(r.data as z.infer<T>);
+      } else {
+        // We couldn't parse the response directly, maybe it's an error
+        const rErr = APIErrorSchema.safeParse(response["error"]);
+        if (rErr.success) {
+          // Successfully parsed an error
+          this._logger.error(
+            {
+              rubyError: rErr.data,
+              status: res.value.response.status,
+              url: res.value.response.url,
+              duration: res.value.duration,
+            },
+            "RubyAPI error"
+          );
+          return new Err(rErr.data);
+        } else {
+          // Unexpected response format (neither an error nor a valid response)
+          const err: APIError = {
+            type: "unexpected_response_format",
+            message:
+              `Unexpected response format from RubyAPI calling ` +
+              `${res.value.response.url} : ${r.error.message}`,
+          };
+          this._logger.error(
+            {
+              rubyError: err,
+              parseError: r.error.message,
+              rawText: text,
+              status: res.value.response.status,
+              url: res.value.response.url,
+              duration: res.value.duration,
+            },
+            "RubyAPI error"
+          );
+          return new Err(err);
+        }
+      }
+    } catch (e) {
+      const err: APIError = {
+        type: "unexpected_response_format",
+        message:
+          `Fail to parse response from RubyAPI calling ` +
+          `${res.value.response.url} : ${e}`,
+      };
+      this._logger.error(
+        {
+          rubyError: err,
+          error: e,
+          rawText: text,
+          status: res.value.response.status,
+          url: res.value.response.url,
+          duration: res.value.duration,
+        },
+        "RubyAPI error"
+      );
+      return new Err(err);
+    }
+  }
+}

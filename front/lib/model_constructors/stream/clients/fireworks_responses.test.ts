@@ -1,0 +1,278 @@
+// @vitest-environment node
+
+import { RubyThinkingMachinesInklingGlobalFireworksStream } from "@app/lib/llms/stream/endpoints/thinking_machines_inkling_global_fireworks";
+import { MoonshotAiKimiK3GlobalFireworksStream } from "@app/lib/model_constructors/stream/endpoints/moonshot_ai_kimi_k3_global_fireworks";
+import { ThinkingMachinesInklingGlobalFireworksStream } from "@app/lib/model_constructors/stream/endpoints/thinking_machines_inkling_global_fireworks";
+import { APIConnectionError, APIError } from "openai";
+import { describe, expect, it } from "vitest";
+
+const TOOLS = [
+  {
+    name: "calculator",
+    description: "Calculate an expression",
+    inputSchema: {
+      type: "object",
+      properties: { expression: { type: "string" } },
+      required: ["expression"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_weather",
+    description: "Get the weather",
+    inputSchema: {
+      type: "object",
+      properties: { city: { type: "string" } },
+      required: ["city"],
+      additionalProperties: false,
+    },
+  },
+];
+
+describe("FireworksResponsesStream", () => {
+  it("disables SDK retries so the agent loop owns retry attempts", () => {
+    const endpoint = new MoonshotAiKimiK3GlobalFireworksStream({
+      FIREWORKS_API_KEY: "test",
+    });
+
+    expect(Reflect.get(endpoint, "client")).toMatchObject({ maxRetries: 0 });
+  });
+
+  it("replays reasoning and tool calls as Responses input items", () => {
+    const endpoint = new MoonshotAiKimiK3GlobalFireworksStream({
+      FIREWORKS_API_KEY: "test",
+    });
+    const payload = endpoint.buildRequestPayload(
+      {
+        conversation: {
+          system: [
+            {
+              role: "system",
+              type: "text",
+              content: { value: "Be concise." },
+            },
+          ],
+          messages: [
+            {
+              role: "user",
+              type: "text",
+              content: { value: "What is 2 + 3?" },
+            },
+            {
+              role: "assistant",
+              type: "reasoning",
+              content: { value: "I should use the calculator." },
+              signature: "rs_123",
+            },
+            {
+              role: "assistant",
+              type: "tool_call_request",
+              content: {
+                callId: "call_123",
+                toolName: "calculator",
+                arguments: '{"expression":"2 + 3"}',
+              },
+            },
+            {
+              role: "user",
+              type: "tool_call_result",
+              content: {
+                callId: "call_123",
+                toolName: "calculator",
+                parts: [{ type: "text", text: "5" }],
+                isError: false,
+              },
+            },
+          ],
+        },
+      },
+      MoonshotAiKimiK3GlobalFireworksStream.configSchema.parse({ tools: TOOLS })
+    );
+
+    expect(payload).toMatchObject({
+      model: "accounts/fireworks/models/kimi-k3",
+      service_tier: "priority",
+      store: false,
+      stream: true,
+      input: [
+        {
+          role: "system",
+          content: [{ type: "input_text", text: "Be concise." }],
+        },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "What is 2 + 3?" }],
+        },
+        {
+          id: "rs_123",
+          type: "reasoning",
+          summary: [
+            {
+              type: "summary_text",
+              text: "I should use the calculator.",
+            },
+          ],
+        },
+        {
+          type: "function_call",
+          call_id: "call_123",
+          name: "calculator",
+          arguments: '{"expression":"2 + 3"}',
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_123",
+          output: "5",
+        },
+      ],
+    });
+  });
+
+  it("forces a function while keeping the complete tool list stable", () => {
+    const endpoint = new MoonshotAiKimiK3GlobalFireworksStream({
+      FIREWORKS_API_KEY: "test",
+    });
+    const payload = endpoint.buildRequestPayload(
+      { conversation: { system: [], messages: [] } },
+      MoonshotAiKimiK3GlobalFireworksStream.configSchema.parse({
+        tools: TOOLS,
+        forceTool: "calculator",
+      })
+    );
+
+    expect(payload.tool_choice).toEqual({
+      type: "allowed_tools",
+      mode: "required",
+      tools: [{ type: "function", name: "calculator" }],
+    });
+    expect(payload.tools).toEqual([
+      expect.objectContaining({ type: "function", name: "calculator" }),
+      expect.objectContaining({ type: "function", name: "get_weather" }),
+    ]);
+  });
+
+  it("preserves optional tool parameters without strict mode", () => {
+    const endpoint = new MoonshotAiKimiK3GlobalFireworksStream({
+      FIREWORKS_API_KEY: "test",
+    });
+    const inputSchema = {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        nextPageCursor: { type: "string" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    };
+    const payload = endpoint.buildRequestPayload(
+      { conversation: { system: [], messages: [] } },
+      MoonshotAiKimiK3GlobalFireworksStream.configSchema.parse({
+        tools: [
+          {
+            name: "search",
+            description: "Search documents",
+            inputSchema,
+          },
+        ],
+      })
+    );
+
+    expect(payload.tools).toEqual([
+      {
+        type: "function",
+        name: "search",
+        description: "Search documents",
+        strict: false,
+        parameters: inputSchema,
+      },
+    ]);
+  });
+
+  it("lets Inkling choose a completion limit within its context budget", () => {
+    const endpoint = new ThinkingMachinesInklingGlobalFireworksStream({
+      FIREWORKS_API_KEY: "test",
+    });
+    const payload = endpoint.buildRequestPayload(
+      { conversation: { system: [], messages: [] } },
+      ThinkingMachinesInklingGlobalFireworksStream.configSchema.parse({})
+    );
+
+    expect(payload).not.toHaveProperty("max_output_tokens");
+  });
+
+  it("keeps Ruby's lower Inkling completion limit", () => {
+    const endpoint = new RubyThinkingMachinesInklingGlobalFireworksStream({
+      FIREWORKS_API_KEY: "test",
+    });
+    const payload = endpoint.buildRequestPayload(
+      { conversation: { system: [], messages: [] } },
+      RubyThinkingMachinesInklingGlobalFireworksStream.configSchema.parse({})
+    );
+
+    expect(payload.max_output_tokens).toBe(64_000);
+  });
+
+  it.each([
+    {
+      error: new APIError(401, {}, "invalid key", undefined),
+      type: "authentication_error",
+      message: "Authentication failed for Fireworks",
+    },
+    {
+      error: new APIError(429, {}, "slow down", undefined),
+      type: "rate_limit_error",
+      message: "Rate limit exceeded for Fireworks",
+    },
+    {
+      error: new APIError(500, {}, "provider failure", undefined),
+      type: "server_error",
+      message: "Server error from Fireworks",
+    },
+    {
+      error: new APIConnectionError({ message: "connection reset" }),
+      type: "network_error",
+      message: "Network error connecting to Fireworks",
+    },
+  ])("attributes $type errors to Fireworks", ({ error, type, message }) => {
+    const endpoint = new MoonshotAiKimiK3GlobalFireworksStream({
+      FIREWORKS_API_KEY: "test",
+    });
+
+    expect(
+      endpoint.streamErrorToErrorEvent(endpoint.metadata(), error)
+    ).toMatchObject({
+      content: {
+        type,
+        message: expect.stringContaining(message),
+      },
+    });
+  });
+
+  it("rejects OpenAI hosted tool search", () => {
+    expect(() =>
+      MoonshotAiKimiK3GlobalFireworksStream.configSchema.parse({
+        tools: TOOLS,
+        toolSearchEnabled: true,
+      })
+    ).toThrow();
+  });
+
+  it("does not add deferred-loading fields when tool search is disabled", () => {
+    const endpoint = new MoonshotAiKimiK3GlobalFireworksStream({
+      FIREWORKS_API_KEY: "test",
+    });
+    const payload = endpoint.buildRequestPayload(
+      { conversation: { system: [], messages: [] } },
+      MoonshotAiKimiK3GlobalFireworksStream.configSchema.parse({
+        tools: TOOLS.map((tool) => ({ ...tool, eager: false })),
+        toolSearchEnabled: false,
+      })
+    );
+
+    expect(payload.tools).toHaveLength(2);
+    expect(payload.tools).toEqual([
+      expect.not.objectContaining({ defer_loading: expect.anything() }),
+      expect.not.objectContaining({ defer_loading: expect.anything() }),
+    ]);
+  });
+});

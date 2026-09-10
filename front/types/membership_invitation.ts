@@ -1,0 +1,32 @@
+import type { CellType } from "./cell";
+import type { MembershipSeatType } from "./memberships";
+import type { ModelId } from "./shared/model_id";
+import type { ActiveRoleType } from "./user";
+
+export type MembershipInvitationType = {
+  sId: string;
+  id: ModelId;
+  status: "pending" | "consumed" | "revoked";
+  inviteEmail: string;
+  initialRole: ActiveRoleType;
+  createdAt: number;
+  reminderSentAt: number | null;
+  expiresAt: number;
+  isExpired: boolean;
+  seatType: MembershipSeatType | null;
+};
+
+export type MembershipInvitationTypeWithLink = MembershipInvitationType & {
+  inviteLink: string;
+};
+
+export interface PendingInvitationOption {
+  token: string;
+  workspaceName: string;
+  initialRole: ActiveRoleType;
+  createdAt: number;
+  isExpired: boolean;
+  cell?: CellType;
+}
+
+// Types for the invite form in Poke.

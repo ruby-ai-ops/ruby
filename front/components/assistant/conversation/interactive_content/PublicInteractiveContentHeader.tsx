@@ -1,0 +1,103 @@
+import { AppLayoutTitle } from "@app/components/sparkle/AppLayoutTitle";
+import config from "@app/lib/api/config";
+import { LinkWrapper } from "@app/lib/platform";
+import { TRACKING_AREAS, withTracking } from "@app/lib/tracking";
+import type { UserTypeWithWorkspaces } from "@app/types/user";
+import {
+  Button,
+  cn,
+  RubyLogo,
+  MessageCircle01,
+  Rocket02,
+  SpaceClosed,
+} from "@ruby-ai/sparkle";
+
+interface PublicInteractiveContentHeaderProps {
+  title: string;
+  user: UserTypeWithWorkspaces | null;
+  conversationUrl: string | null;
+  projectUrl: string | null;
+  logoUrl?: string | null;
+  showSignUpCta?: boolean;
+}
+
+const UTM_PARAM = `utm_source=public-frames`;
+
+// Applying flex & justify-center to the title won't make it centered in the header
+// since it has the logo on the left (and will soon have buttons on the right).
+// To make it perfectly centered, we need to set the same flex basis for both the right and left
+// elements.
+export function PublicInteractiveContentHeader({
+  title,
+  user,
+  conversationUrl,
+  projectUrl,
+  logoUrl,
+  showSignUpCta = false,
+}: PublicInteractiveContentHeaderProps) {
+  const staticWebsiteUrl = config.getStaticWebsiteUrl();
+  return (
+    <AppLayoutTitle className="h-12 bg-primary-50 px-4 @container">
+      <div className="flex h-full min-w-0 max-w-full items-center">
+        <div className="grow-1 flex shrink-0 basis-12 items-center md:basis-60">
+          {logoUrl ? (
+            <img
+              src={logoUrl}
+              alt="Workspace logo"
+              className="h-[32px] max-w-[120px] object-contain"
+            />
+          ) : (
+            <LinkWrapper
+              href={`${staticWebsiteUrl}/home${user ? "" : `?${UTM_PARAM}`}`}
+            >
+              <RubyLogo className="h-[20px] w-[80px]" />
+            </LinkWrapper>
+          )}
+        </div>
+
+        <div className="flex flex-1 justify-center">
+          <span
+            className={cn(
+              "min-w-0 truncate text-sm font-normal",
+              "text-primary"
+            )}
+          >
+            {title}
+          </span>
+        </div>
+
+        <div className="grow-1 flex basis-12 justify-end md:basis-60">
+          {!user && showSignUpCta && (
+            <Button
+              label="Try it yourself"
+              href={`${staticWebsiteUrl}/?${UTM_PARAM}`}
+              variant="outline"
+              icon={Rocket02}
+              onClick={withTracking(TRACKING_AREAS.FRAMES, "sign_up")}
+              className="hidden sm:flex"
+            />
+          )}
+          {user && conversationUrl && (
+            <Button
+              label="Go to conversation"
+              href={conversationUrl}
+              variant="outline"
+              icon={MessageCircle01}
+              className="hidden sm:flex"
+            />
+          )}
+          {user && projectUrl && (
+            <Button
+              label="Go to Pod"
+              href={projectUrl}
+              variant="outline"
+              // TODO(projects) this does not show the correct icon for open projects.
+              icon={SpaceClosed}
+              className="hidden sm:flex"
+            />
+          )}
+        </div>
+      </div>
+    </AppLayoutTitle>
+  );
+}

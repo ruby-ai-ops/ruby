@@ -1,0 +1,281 @@
+import { buildSkillAggregationPrompt } from "@app/lib/reinforcement/aggregate_suggestions";
+import type { SkillType } from "@app/types/assistant/skill_configuration";
+import type { SkillSuggestionType } from "@app/types/suggestions/skill_suggestion";
+import { describe, expect, it } from "vitest";
+
+function makeSkill(overrides: Partial<SkillType> = {}): SkillType {
+  return {
+    id: 1,
+    sId: "skl_abc123",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    editedBy: null,
+    status: "active",
+    name: "TestSkill",
+    agentFacingDescription: "A test skill",
+    userFacingDescription: "A test skill for users",
+    instructions: null,
+    instructionsHtml: null,
+    icon: null,
+    source: null,
+    sourceMetadata: null,
+    reinforcement: "auto",
+    selfImprovementLock: false,
+    selfImprovementCostsCapMicroUsd: null,
+    selfImprovementCostsCapAwuCredits: null,
+    requestedSpaceIds: [],
+    tools: [],
+    fileAttachments: [],
+    canRead: true,
+    canAdministrate: true,
+    canWrite: true,
+    isDefault: false,
+    availability: "workspace_users",
+    ...overrides,
+  };
+}
+
+function makeInstructionSuggestion(
+  overrides: Partial<SkillSuggestionType> = {}
+): SkillSuggestionType {
+  return {
+    sId: "sug-1",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    skillConfigurationId: "skl_abc123",
+    analysis: "Instructions could be more specific",
+    title: null,
+    state: "pending",
+    source: "synthetic",
+    sourceConversationsCount: 0,
+    kind: "edit",
+    suggestion: {
+      instructionEdits: [
+        {
+          targetBlockId: "abc12345",
+          content: "<p>Always verify data before responding</p>",
+          type: "replace",
+        },
+      ],
+    },
+    ...overrides,
+  } as SkillSuggestionType;
+}
+
+function makeAgentFacingDescriptionSuggestion(
+  overrides: Partial<SkillSuggestionType> = {}
+): SkillSuggestionType {
+  return {
+    sId: "sug-3",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    skillConfigurationId: "skl_abc123",
+    analysis: "Description is misleading the agent on routing",
+    title: null,
+    state: "pending",
+    source: "synthetic",
+    sourceConversationsCount: 0,
+    kind: "edit",
+    suggestion: {
+      agentFacingDescriptionEdit: {
+        content: "Use this skill when answering pricing questions.",
+      },
+    },
+    ...overrides,
+  } as SkillSuggestionType;
+}
+
+describe("buildSkillAggregationPrompt", () => {
+  it("includes the skill name in the user message", () => {
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill({ name: "DataLookup" }),
+      [makeInstructionSuggestion()],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).toContain('name="DataLookup"');
+  });
+
+  it("formats instruction suggestions with skillId and edits", () => {
+    const suggestion = makeInstructionSuggestion({
+      skillConfigurationId: "skl_target",
+      suggestion: {
+        instructionEdits: [
+          {
+            targetBlockId: "abc12345",
+            content: "<p>New improved instructions.</p>",
+            type: "replace",
+          },
+        ],
+      },
+    } as Partial<SkillSuggestionType>);
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [suggestion],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).toContain('kind="edit"');
+    expect(userMessage).toContain("<skillId>skl_target</skillId>");
+    expect(userMessage).toContain("New improved instructions.");
+  });
+
+  it("shows N/A when analysis is null", () => {
+    const suggestion = makeInstructionSuggestion({ analysis: null });
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [suggestion],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).toContain("<analysis>N/A</analysis>");
+  });
+
+  it("numbers multiple suggestions sequentially", () => {
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [
+        makeInstructionSuggestion(),
+        makeAgentFacingDescriptionSuggestion({ sId: "sug-2" }),
+      ],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).toContain("### Suggestion 1");
+    expect(userMessage).toContain("### Suggestion 2");
+  });
+
+  it("includes pending suggestions section when non-empty", () => {
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [makeInstructionSuggestion()],
+      { pending: [makeAgentFacingDescriptionSuggestion()], rejected: [] }
+    );
+
+    expect(userMessage).toContain(
+      "## Existing pending suggestions (do NOT duplicate these)"
+    );
+  });
+
+  it("omits pending suggestions section when empty", () => {
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [makeInstructionSuggestion()],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).not.toContain("Existing pending suggestions");
+  });
+
+  it("includes rejected suggestions section when non-empty", () => {
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [makeInstructionSuggestion()],
+      { pending: [], rejected: [makeAgentFacingDescriptionSuggestion()] }
+    );
+
+    expect(userMessage).toContain(
+      "## Previously rejected suggestions (do NOT recreate similar ones)"
+    );
+  });
+
+  it("omits rejected suggestions section when empty", () => {
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [makeInstructionSuggestion()],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).not.toContain("Previously rejected suggestions");
+  });
+
+  it("system prompt mentions inline tool references", () => {
+    const { systemPrompt } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [makeInstructionSuggestion()],
+      { pending: [], rejected: [] }
+    );
+
+    expect(systemPrompt).toContain("edit_skill");
+    expect(systemPrompt).toContain("inline <tool>");
+  });
+
+  it("formats agent-facing description edits with the new content", () => {
+    const suggestion = makeAgentFacingDescriptionSuggestion({
+      suggestion: {
+        agentFacingDescriptionEdit: {
+          content: "Use for pricing questions only.",
+        },
+      },
+    });
+
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [suggestion],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).toContain("<agentFacingDescriptionEdit>");
+    expect(userMessage).toContain("Use for pricing questions only.");
+    expect(userMessage).toContain("</agentFacingDescriptionEdit>");
+  });
+
+  it("does not emit an empty agentFacingDescriptionEdit element for instruction-only suggestions", () => {
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [makeInstructionSuggestion()],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).not.toContain("agentFacingDescriptionEdit");
+  });
+
+  it("system prompt requires the aggregator to author a title per suggestion", () => {
+    const { systemPrompt } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [makeInstructionSuggestion()],
+      { pending: [], rejected: [] }
+    );
+
+    expect(systemPrompt).toContain('"title"');
+    // Must guide toward short, user-facing, distinct titles.
+    expect(systemPrompt.toLowerCase()).toContain("title");
+    expect(systemPrompt).toMatch(/distinct title/i);
+  });
+
+  it("does not include synthetic draft titles in the formatted XML", () => {
+    // Drafts don't carry titles; even if a title slips in, formatSuggestion
+    // must not surface it to the aggregator.
+    const suggestion = makeInstructionSuggestion({
+      title: "Should not leak to aggregator",
+    });
+    const { userMessage } = buildSkillAggregationPrompt(
+      makeSkill(),
+      [suggestion],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).not.toContain("Should not leak to aggregator");
+    expect(userMessage).not.toContain("<title>");
+  });
+
+  it("does not include skill tools as a separate user message block", () => {
+    const skill = makeSkill({
+      tools: [
+        {
+          sId: "tool-ws",
+          name: "web_search",
+        } as SkillType["tools"][number],
+      ],
+    });
+    const { userMessage } = buildSkillAggregationPrompt(
+      skill,
+      [makeInstructionSuggestion()],
+      { pending: [], rejected: [] }
+    );
+
+    expect(userMessage).not.toContain("<tools>");
+    expect(userMessage).not.toContain('name="web_search"');
+    expect(userMessage).not.toContain('sId="tool-ws"');
+  });
+});

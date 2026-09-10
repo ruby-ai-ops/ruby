@@ -1,0 +1,27 @@
+import Foundation
+
+enum SpaceService {
+    static func fetchPods(
+        workspaceId: String,
+        tokenProvider: TokenProvider
+    ) async throws -> [Space] {
+        let endpoint = AppConfig.Endpoints.spacesSummary(workspaceId: workspaceId)
+        let response: SpaceSummaryResponse = try await APIClient.authenticatedGet(
+            endpoint, tokenProvider: tokenProvider, snakeCase: false
+        )
+        return response.summary
+            .map(\.space)
+            .filter { $0.kind == "project" }
+    }
+
+    static func fetchGlobalSpaces(
+        workspaceId: String,
+        tokenProvider: TokenProvider
+    ) async throws -> [Space] {
+        let endpoint = AppConfig.Endpoints.spaces(workspaceId: workspaceId)
+        let response: SpacesResponse = try await APIClient.authenticatedGet(
+            endpoint, tokenProvider: tokenProvider, snakeCase: false
+        )
+        return response.spaces.filter { $0.kind == "global" }
+    }
+}

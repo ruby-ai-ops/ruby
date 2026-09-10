@@ -1,0 +1,158 @@
+import { CreateOrEditSpaceModal } from "@app/components/spaces/CreateOrEditSpaceModal";
+import SpaceSideBarMenu from "@app/components/spaces/SpaceSideBarMenu";
+import {
+  useSetContentWidth,
+  useSetNavChildren,
+} from "@app/components/sparkle/AppLayoutContext";
+import { useAuth, useWorkspace } from "@app/lib/auth/AuthContext";
+import { isEnterprisePlanPrefix } from "@app/lib/plans/plan_codes";
+import { useAppRouter, usePathParams } from "@app/lib/platform";
+import { isPrivateSpacesLimitReached } from "@app/lib/spaces";
+import { useSpaceInfo, useSpacesAsAdmin } from "@app/lib/swr/spaces";
+import {
+  Chip,
+  Dialog,
+  DialogContainer,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  InfoCircle,
+  Page,
+  Spinner,
+} from "@ruby-ai/sparkle";
+import type React from "react";
+import { useCallback, useMemo, useState } from "react";
+
+interface SpaceLayoutProps {
+  children: React.ReactNode;
+}
+
+export function SpaceLayout({ children }: SpaceLayoutProps) {
+  const params = usePathParams();
+  const spaceId = params.spaceId;
+
+  const owner = useWorkspace();
+  const { subscription, isAdmin } = useAuth();
+  const plan = subscription.plan;
+
+  const router = useAppRouter();
+
+  const [spaceCreationModalState, setSpaceCreationModalState] = useState({
+    isOpen: false,
+    defaultRestricted: false,
+  });
+
+  const {
+    spaceInfo: space,
+    canReadInSpace,
+    isSpaceInfoLoading,
+  } = useSpaceInfo({
+    workspaceId: owner.sId,
+    spaceId: spaceId ?? null,
+  });
+
+  const { spaces } = useSpacesAsAdmin({
+    workspaceId: owner.sId,
+    disabled: plan.limits.vaults.maxVaults === 0 || !isAdmin,
+  });
+
+  const isLimitReached = isPrivateSpacesLimitReached(spaces, plan);
+  const isEnterprise = isEnterprisePlanPrefix(plan.code);
+
+  const closeSpaceCreationModal = useCallback(() => {
+    setSpaceCreationModalState((prev) => ({ ...prev, isOpen: false }));
+  }, []);
+
+  const openSpaceCreationModal = useCallback(
+    ({ defaultRestricted }: { defaultRestricted: boolean }) => {
+      setSpaceCreationModalState({ defaultRestricted, isOpen: true });
+    },
+    []
+  );
+
+  const navChildren = useMemo(
+    () => (
+      <SpaceSideBarMenu
+        owner={owner}
+        isAdmin={isAdmin}
+        openSpaceCreationModal={openSpaceCreationModal}
+      />
+    ),
+    [owner, isAdmin, openSpaceCreationModal]
+  );
+
+  useSetContentWidth("wide");
+  useSetNavChildren(navChildren);
+
+  return (
+    <>
+      {isSpaceInfoLoading || !space ? (
+        <div className="flex h-full items-center justify-center">
+          <Spinner />
+        </div>
+      ) : (
+        <div className="flex w-full flex-col mb-4">
+          <Page.Vertical gap="lg" align="stretch">
+            {
+              // Message to admins that are not members of the space.
+              // No need to show it for system space since it's a no-member space.
+              !canReadInSpace && space.kind !== "system" && (
+                <div>
+                  <Chip
+                    color="warning"
+                    label="You are not a member of this space."
+                    size="sm"
+                    icon={InfoCircle}
+                  />
+                </div>
+              )
+            }
+            {children}
+          </Page.Vertical>
+        </div>
+      )}
+
+      {isAdmin && !isLimitReached && (
+        <CreateOrEditSpaceModal
+          isAdmin={isAdmin}
+          owner={owner}
+          isOpen={!isLimitReached && spaceCreationModalState.isOpen}
+          onClose={closeSpaceCreationModal}
+          onCreated={(space) => {
+            void router.push(`/w/${owner.sId}/spaces/${space.sId}`);
+          }}
+          defaultRestricted={spaceCreationModalState.defaultRestricted}
+        />
+      )}
+      {isAdmin && isLimitReached && (
+        <Dialog
+          open={isLimitReached && spaceCreationModalState.isOpen}
+          onOpenChange={(open) => {
+            if (!open) {
+              closeSpaceCreationModal();
+            }
+          }}
+        >
+          <DialogContent size="md" isAlertDialog>
+            <DialogHeader hideButton>
+              <DialogTitle>You can't create more spaces.</DialogTitle>
+            </DialogHeader>
+            <DialogContainer>
+              {isEnterprise
+                ? "We're going to make changes to data permissions spaces soon and are limiting the creation of spaces for that reason. Reach out to us to learn more."
+                : "The maximum number of spaces for this workspace has been reached. Please reach out at support@ruby.ad to learn more."}
+            </DialogContainer>
+            <DialogFooter
+              rightButtonProps={{
+                label: "Ok",
+                variant: "outline",
+                onClick: closeSpaceCreationModal,
+              }}
+            />
+          </DialogContent>
+        </Dialog>
+      )}
+    </>
+  );
+}

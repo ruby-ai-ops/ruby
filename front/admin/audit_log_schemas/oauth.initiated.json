@@ -1,0 +1,13 @@
+{
+  "action": "oauth.initiated",
+  "targets": [
+    {
+      "type": "workspace"
+    }
+  ],
+  "metadata": {
+    "provider": "string",
+    "connection_id": "string",
+    "actor_type": "string"
+  }
+}

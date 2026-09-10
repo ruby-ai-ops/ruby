@@ -1,0 +1,49 @@
+import config from "@app/lib/api/config";
+import type { BaseOAuthStrategyProvider } from "@app/lib/api/oauth/providers/base_oauth_stragegy_provider";
+import {
+  finalizeUriForProvider,
+  getStringFromQuery,
+} from "@app/lib/api/oauth/utils";
+import type {
+  ExtraConfigType,
+  OAuthConnectionType,
+  OAuthUseCase,
+} from "@app/types/oauth/lib";
+import type { ParsedUrlQuery } from "querystring";
+
+export class FathomOAuthProvider implements BaseOAuthStrategyProvider {
+  setupUri({
+    connection,
+  }: {
+    connection: OAuthConnectionType;
+    useCase: OAuthUseCase;
+  }) {
+    const scopes = ["public_api"];
+
+    return (
+      `https://fathom.video/external/v1/oauth2/authorize` +
+      `?client_id=${config.getOAuthFathomClientId()}` +
+      `&redirect_uri=${encodeURIComponent(finalizeUriForProvider("fathom"))}` +
+      `&scope=${encodeURIComponent(scopes.join(" "))}` +
+      `&state=${connection.connection_id}` +
+      `&response_type=code`
+    );
+  }
+
+  codeFromQuery(query: ParsedUrlQuery) {
+    return getStringFromQuery(query, "code");
+  }
+
+  connectionIdFromQuery(query: ParsedUrlQuery) {
+    return getStringFromQuery(query, "state");
+  }
+
+  isExtraConfigValid(extraConfig: ExtraConfigType, useCase: OAuthUseCase) {
+    if (useCase === "personal_actions") {
+      return (
+        Object.keys(extraConfig).length === 1 && "mcp_server_id" in extraConfig
+      );
+    }
+    return Object.keys(extraConfig).length === 0;
+  }
+}

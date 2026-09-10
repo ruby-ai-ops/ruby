@@ -1,0 +1,844 @@
+import { updateWorkOSOrganizationName } from "@app/lib/api/workos/organization";
+import { countActiveSeatsForWorkspace } from "@app/lib/api/workspace_seats";
+import type { Authenticator } from "@app/lib/auth";
+import { MAX_SEARCH_EMAILS } from "@app/lib/memberships";
+import { updateMetronomeCustomerName } from "@app/lib/metronome/client";
+import { PlanModel, SubscriptionModel } from "@app/lib/models/plan";
+import { getStripeSubscription } from "@app/lib/plans/stripe";
+import { getUsageToReportForSubscriptionItem } from "@app/lib/plans/usage";
+import { REPORT_USAGE_METADATA_KEY } from "@app/lib/plans/usage/types";
+import { ExtensionConfigurationResource } from "@app/lib/resources/extension";
+import { MembershipInvitationResource } from "@app/lib/resources/membership_invitation_resource";
+import type { MembershipsPaginationParams } from "@app/lib/resources/membership_resource";
+import { MembershipResource } from "@app/lib/resources/membership_resource";
+import { UserModel } from "@app/lib/resources/storage/models/user";
+import type { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
+import { WorkspaceHasDomainModel } from "@app/lib/resources/storage/models/workspace_has_domain";
+import type { SearchMembersPaginationParams } from "@app/lib/resources/user_resource";
+import { UserResource } from "@app/lib/resources/user_resource";
+import type { WorkspaceConversationKillSwitchValue } from "@app/lib/resources/workspace_resource";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import type { EmailProviderType } from "@app/lib/utils/email_provider_detection";
+import { renderLightWorkspaceType } from "@app/lib/workspace";
+import logger from "@app/logger/logger";
+import { launchDeleteWorkspaceWorkflow } from "@app/poke/temporal/client";
+import type {
+  GroupGrantableRole,
+  UserVisibleGroupKind,
+} from "@app/types/groups";
+import type {
+  MembershipOriginType,
+  MembershipRoleType,
+} from "@app/types/memberships";
+import type { SubscriptionType } from "@app/types/plan";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import { md5 } from "@app/types/shared/utils/encryption";
+import { removeNulls } from "@app/types/shared/utils/general";
+import type {
+  ActiveRoleType,
+  LightUserTypeWithWorkspace,
+  LightWorkspaceType,
+  RoleType,
+  UserTypeWithWorkspace,
+  UserTypeWithWorkspaces,
+  WorkspaceSegmentationType,
+  WorkspaceType,
+} from "@app/types/user";
+import { ACTIVE_ROLES } from "@app/types/user";
+import type { WorkspaceDomain } from "@app/types/workspace";
+import type { Transaction } from "sequelize";
+import { Op } from "sequelize";
+
+import { GroupResource } from "../resources/group_resource";
+import { frontSequelize } from "../resources/storage";
+
+export async function getWorkspaceInfos(
+  wId: string
+): Promise<LightWorkspaceType | null> {
+  const workspace = await WorkspaceResource.fetchById(wId);
+
+  if (!workspace) {
+    return null;
+  }
+
+  return renderLightWorkspaceType({ workspace });
+}
+
+/**
+ * Rename a workspace and propagate the new name to external systems
+ * (WorkOS organization, Metronome customer). All three updates must
+ * stay in sync — callers should always go through this helper.
+ */
+export async function renameWorkspace(
+  workspace: LightWorkspaceType,
+  newName: string
+): Promise<Result<void, Error>> {
+  const updateRes = await WorkspaceResource.updateName(workspace.id, newName);
+  if (updateRes.isErr()) {
+    return updateRes;
+  }
+
+  const renamedWorkspace = { ...workspace, name: newName };
+
+  const workOSRes = await updateWorkOSOrganizationName(renamedWorkspace);
+  const metronomeRes = await updateMetronomeCustomerName(renamedWorkspace);
+
+  if (workOSRes.isErr()) {
+    return new Err(
+      new Error(
+        `Failed to update WorkOS organization name: ${workOSRes.error.message}`
+      )
+    );
+  }
+
+  if (metronomeRes.isErr()) {
+    return new Err(
+      new Error(
+        `Failed to update Metronome customer name: ${metronomeRes.error.message}`
+      )
+    );
+  }
+
+  return new Ok(undefined);
+}
+
+export async function removeAllWorkspaceDomains(
+  workspace: LightWorkspaceType
+): Promise<void> {
+  await WorkspaceHasDomainModel.destroy({
+    where: {
+      workspaceId: workspace.id,
+    },
+  });
+}
+
+export async function getWorkspaceCreationDate(
+  workspaceId: string
+): Promise<Date> {
+  const workspace = await WorkspaceResource.fetchById(workspaceId);
+
+  if (!workspace) {
+    throw new Error("Workspace not found.");
+  }
+
+  return workspace.createdAt;
+}
+
+export async function setInternalWorkspaceSegmentation(
+  auth: Authenticator,
+  segmentation: WorkspaceSegmentationType
+): Promise<LightWorkspaceType> {
+  const owner = auth.workspace();
+  const user = auth.user();
+
+  if (!owner || !user || !auth.isRubySuperUser()) {
+    throw new Error("Forbidden update to workspace segmentation.");
+  }
+
+  const workspace = await WorkspaceResource.fetchByModelId(owner.id);
+
+  if (!workspace) {
+    throw new Error("Could not find workspace.");
+  }
+
+  await workspace.updateSegmentation(segmentation);
+
+  return renderLightWorkspaceType({ workspace });
+}
+
+/**
+ * Returns the users members of the workspace associated with the authenticator (without listing
+ * their own workspaces).
+ * @param auth Authenticator
+ * @param role RoleType optional filter on role
+ * @param paginationParams PaginationParams optional pagination parameters
+ * @returns An object containing an array of UserTypeWithWorkspaces and the total count of members.
+ */
+export async function getMembers(
+  auth: Authenticator,
+  {
+    roles,
+    activeOnly,
+    transaction,
+  }: {
+    roles?: MembershipRoleType[];
+    activeOnly?: boolean;
+    transaction?: Transaction;
+  } = {},
+  paginationParams?: MembershipsPaginationParams
+): Promise<{
+  members: UserTypeWithWorkspaces[];
+  total: number;
+  nextPageParams?: MembershipsPaginationParams;
+}> {
+  const owner = auth.workspace();
+  if (!owner) {
+    return { members: [], total: 0 };
+  }
+
+  const { memberships, total, nextPageParams } = activeOnly
+    ? await MembershipResource.getActiveMemberships({
+        workspace: owner,
+        roles,
+        paginationParams,
+        transaction,
+      })
+    : await MembershipResource.getLatestMemberships({
+        workspace: owner,
+        roles,
+        paginationParams,
+        transaction,
+      });
+
+  // Batch-fetch users that weren't preloaded to avoid N+1 queries.
+  const missingUserModelIds = memberships
+    .filter((m) => !m.user)
+    .map((m) => m.userId);
+  const fetchedUsers = missingUserModelIds.length
+    ? await UserResource.fetchByModelIds(missingUserModelIds, { transaction })
+    : [];
+  const userByModelId = new Map(fetchedUsers.map((u) => [u.id, u]));
+
+  const usersWithWorkspaces = memberships.map((m) => {
+    let role = "none" as RoleType;
+    let origin: MembershipOriginType | undefined = undefined;
+    if (!m.isRevoked()) {
+      switch (m.role) {
+        case "admin":
+        case "manager":
+        case "builder":
+        case "user":
+          role = m.role;
+          break;
+        default:
+          role = "none";
+      }
+    }
+    origin = m.origin;
+
+    const user = m.user
+      ? new UserResource(UserModel, m.user)
+      : (userByModelId.get(m.userId) ?? null);
+
+    if (!user) {
+      return null;
+    }
+
+    return {
+      ...user.toJSON(),
+      workspaces: [{ ...owner, role, flags: null }],
+      origin,
+      seatType: m.seatType,
+    };
+  });
+
+  return {
+    members: removeNulls(usersWithWorkspaces),
+    total,
+    nextPageParams,
+  };
+}
+
+export async function getActiveAdminEmails(
+  auth: Authenticator
+): Promise<string[]> {
+  const { members } = await getMembers(auth, {
+    roles: ["admin"],
+    activeOnly: true,
+  });
+
+  return Array.from(new Set(members.map((member) => member.email)));
+}
+
+/**
+ * Returns true if any user with this email has an active membership in the
+ * workspace. The same email can be attached to multiple users, so we fan out
+ * to all of them and ask `MembershipResource.getActiveMemberships` in a
+ * single query.
+ */
+export async function hasActiveMemberByEmail({
+  email,
+  workspace,
+}: {
+  email: string;
+  workspace: LightWorkspaceType;
+}): Promise<boolean> {
+  const users = await UserResource.listByEmail(email);
+  if (!users.length) {
+    return false;
+  }
+
+  const { total } = await MembershipResource.getActiveMemberships({
+    users,
+    workspace,
+  });
+
+  return total > 0;
+}
+
+/**
+ * For a given group, return the workspace members that belong to it. Members
+ * are returned as `UserTypeWithWorkspaces` (matching `getMembers`) so callers
+ * have the workspace context. Users in the group who are not workspace
+ * members are filtered out.
+ */
+export async function getGroupMembersWithWorkspaces(
+  auth: Authenticator,
+  group: GroupResource
+): Promise<UserTypeWithWorkspaces[]> {
+  const groupMembers = await group.getActiveMembers(auth);
+  const { members } = await getMembers(auth);
+
+  const memberById = new Map(members.map((m) => [m.sId, m]));
+
+  return groupMembers.flatMap((user) => {
+    const member = memberById.get(user.sId);
+    return member ? [member] : [];
+  });
+}
+
+// The user search index has no role field, so a role filter is resolved from the
+// active memberships and handed to Elasticsearch as a user allowlist.
+async function resolveRoleFilterUserIds({
+  workspace,
+  role,
+}: {
+  workspace: LightWorkspaceType;
+  role: ActiveRoleType;
+}): Promise<string[]> {
+  const { memberships } = await MembershipResource.getActiveMemberships({
+    workspace,
+    roles: [role],
+  });
+
+  // The query's filter make sure `user` is never null, so nothing
+  // is dropped here.
+  return removeNulls(memberships.map((m) => m.user?.sId));
+}
+
+export async function searchMembers(
+  auth: Authenticator,
+  options: {
+    searchTerm?: string;
+    searchEmails?: string[];
+    groupKind?: UserVisibleGroupKind;
+    role?: ActiveRoleType;
+  },
+  paginationParams: SearchMembersPaginationParams
+): Promise<{ members: UserTypeWithWorkspace[]; total: number }> {
+  const owner = auth.workspace();
+  if (!owner) {
+    return { members: [], total: 0 };
+  }
+
+  let restrictToUserIds: string[] | undefined;
+  if (options.role) {
+    restrictToUserIds = await resolveRoleFilterUserIds({
+      workspace: owner,
+      role: options.role,
+    });
+    if (restrictToUserIds.length === 0) {
+      return { members: [], total: 0 };
+    }
+  }
+
+  let users: UserResource[];
+  let total: number;
+
+  if (options.searchEmails) {
+    if (options.searchEmails.length > MAX_SEARCH_EMAILS) {
+      logger.error("Too many emails provided.");
+      return { members: [], total: 0 };
+    }
+
+    users = await UserResource.listUserWithExactEmails(
+      owner,
+      options.searchEmails
+    );
+    if (restrictToUserIds) {
+      const allowedUserIds = new Set(restrictToUserIds);
+      users = users.filter((u) => allowedUserIds.has(u.sId));
+    }
+    total = users.length;
+  } else {
+    const results = await UserResource.searchUsers(auth, {
+      searchTerm: options.searchTerm ?? "",
+      offset: paginationParams.offset,
+      limit: paginationParams.limit,
+      restrictToUserIds,
+    });
+
+    if (results.isErr()) {
+      logger.error({ err: results.error }, "Error searching users");
+      return { members: [], total: 0 };
+    }
+
+    users = results.value.users;
+    total = results.value.total;
+  }
+
+  const usersWithWorkspace = await concurrentExecutor(
+    users,
+    async (u) => {
+      const [m] = u.memberships ?? [];
+      let role: RoleType = "none";
+      let groups: string[] | undefined;
+      let origin: MembershipOriginType | undefined = undefined;
+
+      if (m) {
+        const membership = new MembershipResource(
+          MembershipResource.model,
+          m.get()
+        );
+
+        role = !membership.isRevoked()
+          ? ACTIVE_ROLES.includes(membership.role)
+            ? membership.role
+            : "none"
+          : "none";
+
+        origin = membership.origin;
+      }
+
+      if (options.groupKind) {
+        const groupsResult = await GroupResource.listUserGroupsInWorkspace({
+          auth,
+          user: u,
+          groupKinds: [options.groupKind],
+        });
+
+        groups = groupsResult.map((g) => g.toJSON()).map((g) => g.name);
+      }
+
+      return {
+        ...u.toJSON(),
+        workspace: { ...owner, role, groups, flags: null },
+        origin,
+      };
+    },
+    { concurrency: 5 }
+  );
+
+  return {
+    members: usersWithWorkspace,
+    total,
+  };
+}
+
+export async function checkWorkspaceSeatAvailabilityUsingAuth(
+  auth: Authenticator
+): Promise<boolean> {
+  const owner = auth.workspace();
+  const subscription = auth.subscription();
+  if (!owner || !subscription) {
+    return false;
+  }
+
+  return evaluateWorkspaceSeatAvailability(owner, subscription);
+}
+
+export async function evaluateWorkspaceSeatAvailability(
+  workspace: WorkspaceType | WorkspaceModel | WorkspaceResource,
+  subscription: SubscriptionType
+): Promise<boolean> {
+  const { maxUsers } = subscription.plan.limits.users;
+  if (maxUsers === -1) {
+    return true;
+  }
+
+  const lightWorkspace = renderLightWorkspaceType({ workspace });
+  const [activeMembersCount, pendingInvitationsCount] = await Promise.all([
+    MembershipResource.getMembersCountForWorkspace({
+      workspace: lightWorkspace,
+      activeOnly: true,
+    }),
+    MembershipInvitationResource.getPendingInvitationsCountForWorkspace({
+      workspace: lightWorkspace,
+    }),
+  ]);
+
+  return activeMembersCount + pendingInvitationsCount < maxUsers;
+}
+
+export async function unsafeGetWorkspacesByModelId(
+  modelIds: number[]
+): Promise<LightWorkspaceType[]> {
+  if (modelIds.length === 0) {
+    return [];
+  }
+  const workspaces = await WorkspaceResource.fetchByModelIds(modelIds);
+  return workspaces.map((w) => renderLightWorkspaceType({ workspace: w }));
+}
+
+export async function areAllSubscriptionsCanceled(
+  workspace: LightWorkspaceType
+): Promise<boolean> {
+  const subscriptions = await SubscriptionModel.findAll({
+    where: {
+      workspaceId: workspace.id,
+      stripeSubscriptionId: {
+        [Op.not]: null,
+      },
+    },
+  });
+
+  // If the workspace had a subscription, it must be canceled.
+  if (subscriptions.length > 0) {
+    for (const sub of subscriptions) {
+      if (!sub.stripeSubscriptionId) {
+        continue;
+      }
+
+      const stripeSubscription = await getStripeSubscription(
+        sub.stripeSubscriptionId
+      );
+
+      if (!stripeSubscription) {
+        continue;
+      }
+
+      if (stripeSubscription.status !== "canceled") {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+export async function deleteWorkspace(
+  owner: LightWorkspaceType,
+  {
+    workspaceHasBeenRelocated = false,
+  }: { workspaceHasBeenRelocated?: boolean } = {}
+): Promise<Result<void, Error>> {
+  // If the workspace has not been relocated, we expect all subscriptions to be canceled.
+  if (!workspaceHasBeenRelocated) {
+    const allSubscriptionsCanceled = await areAllSubscriptionsCanceled(owner);
+    if (!allSubscriptionsCanceled) {
+      return new Err(
+        new Error(
+          "The workspace cannot be deleted because there are active subscriptions."
+        )
+      );
+    }
+  }
+
+  const res = await launchDeleteWorkspaceWorkflow({
+    workspaceId: owner.sId,
+    workspaceHasBeenRelocated,
+  });
+
+  if (res.isErr()) {
+    return new Err(res.error);
+  }
+
+  return new Ok(undefined);
+}
+
+type WorkspaceKillSwitchValue =
+  | typeof WorkspaceResource.FULL_WORKSPACE_KILL_SWITCH_VALUE
+  | WorkspaceConversationKillSwitchValue;
+
+export const WEB_SEARCH_PROVIDERS = ["exa", "firecrawl"] as const;
+export type WebSearchProvider = (typeof WEB_SEARCH_PROVIDERS)[number];
+
+export const WEB_BROWSE_PROVIDERS = ["exa", "firecrawl", "spider"] as const;
+export type WebBrowseProvider = (typeof WEB_BROWSE_PROVIDERS)[number];
+
+export function isWebSearchProvider(
+  value: unknown
+): value is WebSearchProvider {
+  return WEB_SEARCH_PROVIDERS.includes(value as WebSearchProvider);
+}
+
+export function isWebBrowseProvider(
+  value: unknown
+): value is WebBrowseProvider {
+  return WEB_BROWSE_PROVIDERS.includes(value as WebBrowseProvider);
+}
+
+export interface WorkspaceMetadata {
+  maintenance?: "relocation" | "relocation-done";
+  skillImportGithubConnection?: {
+    connectionId: string;
+    connectedBy: string;
+  };
+  killSwitched?: WorkspaceKillSwitchValue;
+  allowContentCreationFileSharing?: boolean;
+  allowEmailAgents?: boolean;
+  // When false, conversation unread email and Slack are not sent. Missing or
+  // true keeps per-user prefs. In-app notifications are not affected.
+  allowConversationExternalNotifications?: boolean;
+  emailBlacklistedAgentIds?: string[];
+  allowVoiceTranscription?: boolean;
+  allowOpenProjects?: boolean;
+  allowManualProjectKnowledgeManagement?: boolean;
+  allowReinforcement?: boolean;
+  allowReinforcementBatchMode?: boolean;
+  privateConversationUrlsByDefault?: boolean;
+  autoCreateSpaceForProvisionedGroups?: boolean;
+  disableManualInvitations?: boolean;
+  disableExtensionMcpTools?: boolean;
+  rubyMcpServerDisabled?: boolean;
+  rubyMcpServerAcceptAllRedirectUris?: boolean;
+  rubyMcpServerAllowedRedirectUris?: string[];
+  disableAuditLogs?: boolean;
+  disableWorkspaceAnalytics?: boolean;
+  // Absent means automatic archival is off.
+  inactiveAgentArchivalThresholdDays?: number;
+  isBusiness?: boolean;
+  phoneCountry?: string;
+  sandboxAllowAgentEgressRequests?: boolean;
+  // Caps for self-improving skills.
+  // USD are the legacy ones, AWU are the new ones for workspaces
+  // billed by metronome.
+  reinforcementCapMicroUsd?: number;
+  selfImprovementCapPerSkillMicroUsd?: number;
+  reinforcementCapAwuCredits?: number;
+  selfImprovementCapPerSkillAwuCredits?: number;
+  webSearchProvider?: WebSearchProvider;
+  webBrowseProvider?: WebBrowseProvider;
+  workspaceDefaultAgentId?: string;
+  slackPersonalAllowFooterRemoval?: boolean;
+}
+
+export async function updateWorkspaceMetadata(
+  owner: LightWorkspaceType,
+  metadata: WorkspaceMetadata
+): Promise<Result<void, Error>> {
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+  const previousMetadata = owner.metadata || {};
+  const newMetadata = { ...previousMetadata, ...metadata };
+  return WorkspaceResource.updateMetadata(owner.id, newMetadata);
+}
+
+export async function setWorkspaceRelocating(
+  owner: LightWorkspaceType
+): Promise<Result<void, Error>> {
+  return updateWorkspaceMetadata(owner, { maintenance: "relocation" });
+}
+
+export async function setWorkspaceRelocated(
+  owner: LightWorkspaceType
+): Promise<Result<void, Error>> {
+  return updateWorkspaceMetadata(owner, { maintenance: "relocation-done" });
+}
+
+export function isWorkspaceRelocationDone(owner: LightWorkspaceType): boolean {
+  return owner.metadata?.maintenance === "relocation-done";
+}
+
+export async function updateExtensionConfiguration(
+  auth: Authenticator,
+  blacklistedDomains: string[]
+): Promise<Result<void, Error>> {
+  const config = await ExtensionConfigurationResource.fetchForWorkspace(auth);
+
+  if (config) {
+    await config.updateBlacklistedDomains(auth, { blacklistedDomains });
+  } else {
+    await ExtensionConfigurationResource.makeNew(
+      { blacklistedDomains },
+      auth.getNonNullableWorkspace().id
+    );
+  }
+
+  return new Ok(undefined);
+}
+
+export async function setWorkspaceBusinessPlanWhitelist(
+  auth: Authenticator,
+  workspace: LightWorkspaceType,
+  shouldWhitelist: boolean
+): Promise<Result<void, Error>> {
+  if (!auth.isRubySuperUser()) {
+    throw new Error(
+      "Cannot update workspace business plan whitelist: not allowed."
+    );
+  }
+
+  const isCurrentlyWhitelisted = workspace.metadata?.isBusiness === true;
+
+  // Check if already in desired state
+  if (isCurrentlyWhitelisted === shouldWhitelist) {
+    return new Err(
+      new Error(
+        `Workspace is ${shouldWhitelist ? "already" : "not"} whitelisted for Enterprise seat based plan.`
+      )
+    );
+  }
+
+  return WorkspaceResource.updateMetadata(workspace.id, {
+    ...workspace.metadata,
+    isBusiness: shouldWhitelist,
+  });
+}
+
+export async function checkSeatCountForWorkspace(
+  workspace: LightWorkspaceType
+): Promise<Result<string, Error>> {
+  const subscription = await SubscriptionModel.findOne({
+    where: {
+      workspaceId: workspace.id,
+      status: "active",
+    },
+    include: [PlanModel],
+  });
+  if (!subscription) {
+    return new Err(new Error("Workspace has no active subscription."));
+  }
+  if (!subscription.stripeSubscriptionId) {
+    return new Err(new Error("No Stripe subscription ID found."));
+  }
+
+  const stripeSubscription = await getStripeSubscription(
+    subscription.stripeSubscriptionId
+  );
+  if (!stripeSubscription) {
+    return new Err(
+      new Error(
+        `Cannot check usage in subscription: Stripe subscription ${subscription.stripeSubscriptionId} not found.`
+      )
+    );
+  }
+  const { data: subscriptionItems } = stripeSubscription.items;
+
+  const activeSeats = await countActiveSeatsForWorkspace(workspace.sId);
+
+  for (const item of subscriptionItems) {
+    const usageToReportRes = getUsageToReportForSubscriptionItem(item);
+    if (usageToReportRes.isErr()) {
+      return new Err(usageToReportRes.error);
+    }
+
+    const usageToReport = usageToReportRes.value;
+    if (!usageToReport) {
+      continue;
+    }
+
+    switch (usageToReport) {
+      case "FIXED":
+      case "MAU_1":
+      case "MAU_5":
+      case "MAU_10":
+        return new Err(new Error("Subscription is not PER_SEAT-based."));
+      case "PER_SEAT":
+        const currentQuantity = item.quantity;
+
+        if (currentQuantity !== activeSeats) {
+          return new Err(
+            new Error(
+              `Incorrect quantity on Stripe: ${currentQuantity}, correct value: ${activeSeats}.`
+            )
+          );
+        }
+        break;
+
+      default:
+        assertNever(usageToReport);
+    }
+    return new Ok(`Correctly found ${activeSeats} active seats on Stripe.`);
+  }
+  return new Err(new Error(`${REPORT_USAGE_METADATA_KEY} metadata not found.`));
+}
+
+/**
+ * Advisory lock to be used in admin related request on workspace
+ *
+ * To avoid deadlocks when using Postgresql advisory locks, please make sure to not issue any other
+ * SQL query outside of the transaction `t` that is holding the lock.
+ * Otherwise, the other query will be competing for a connection in the database connection pool,
+ * resulting in a potential deadlock when the pool is fully occupied.
+ */
+export async function getWorkspaceAdministrationVersionLock(
+  workspace: WorkspaceType,
+  t: Transaction
+) {
+  const now = new Date();
+
+  const hash = md5(`workspace_administration_${workspace.id}`);
+  const lockKey = parseInt(hash, 16) % 9999999999;
+  // OK because we need to setup a lock
+  // biome-ignore lint/plugin/noRawSql: advisory lock requires raw SQL
+  await frontSequelize.query("SELECT pg_advisory_xact_lock(:key)", {
+    transaction: t,
+    replacements: { key: lockKey },
+  });
+
+  logger.info(
+    {
+      workspaceId: workspace.id,
+      duration: new Date().getTime() - now.getTime(),
+      lockKey,
+    },
+    "[WORKSPACE_TRACE] Advisory lock acquired"
+  );
+}
+
+export async function findWorkspaceByWorkOSOrganizationId(
+  workOSOrganizationId: string
+): Promise<LightWorkspaceType | null> {
+  const workspace =
+    await WorkspaceResource.fetchByWorkOSOrganizationId(workOSOrganizationId);
+
+  if (!workspace) {
+    return null;
+  }
+
+  return renderLightWorkspaceType({ workspace });
+}
+
+export type GetWorkspaceLookupResponseBody = {
+  workspace: LightWorkspaceType;
+  status: "auto-join-disabled" | "revoked";
+  workspaceVerifiedDomain: string | null;
+};
+
+export type GetSeatAvailabilityResponseBody = {
+  hasAvailableSeats: boolean;
+};
+
+export type GetMembersResponseBody = {
+  members: UserTypeWithWorkspaces[];
+  total: number;
+  nextPageUrl?: string;
+};
+
+export type GetWorkspaceSeatsCountResponseBody = {
+  seatsCount: number;
+};
+
+export type GetWorkspaceVerifiedDomainsResponseBody = {
+  verifiedDomains: WorkspaceDomain[];
+};
+
+export type GetWorkspaceGrantedRolesResponseBody = {
+  // Distinct workspace roles granted by at least one group in the workspace
+  // (a subset of ["admin", "manager"]). When non-empty, member roles are
+  // (partly) managed through group membership and manual role editing is
+  // restricted.
+  grantedRoles: GroupGrantableRole[];
+};
+
+export type GetWelcomeResponseBody = {
+  isFirstAdmin: boolean;
+  emailProvider: EmailProviderType;
+};
+
+export type GetWorkspaceResponseBody = {
+  workspace: WorkspaceType;
+};
+
+export type SearchMembersResponseBody = {
+  members: LightUserTypeWithWorkspace[];
+  total: number;
+};
+
+export type SearchMembersAdminResponseBody = {
+  members: UserTypeWithWorkspace[];
+  total: number;
+};

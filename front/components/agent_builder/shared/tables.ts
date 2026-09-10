@@ -1,0 +1,110 @@
+import type {
+  GetContentNodesOrChildrenRequestBodyType,
+  GetDataSourceViewContentNodes,
+} from "@app/lib/api/data_source_view";
+import type { FetcherWithBodyFn } from "@app/lib/swr/fetcher";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import logger from "@app/logger/logger";
+import type { LightContentNode } from "@app/types/api/public/spaces";
+import type { DataSourceType } from "@app/types/data_source";
+import type { DataSourceViewType } from "@app/types/data_source_view";
+import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+import type { LightWorkspaceType } from "@app/types/user";
+
+export function getTableIdForContentNode(
+  dataSource: DataSourceType,
+  contentNode: LightContentNode
+): string {
+  if (contentNode.type !== "table") {
+    throw new Error(`ContentNode type ${contentNode.type} is not supported`);
+  }
+
+  // We specify whether the connector supports TableQuery as a safeguard in case somehow a non-table node was selected.
+  switch (dataSource.connectorProvider) {
+    // For static tables, the tableId is the contentNode internalId.
+    case null:
+    case "bigquery":
+    case "microsoft":
+    case "notion":
+    case "salesforce":
+    case "snowflake":
+    case "google_drive":
+    case "ruby_project":
+      return contentNode.internalId;
+
+    case "confluence":
+    case "github":
+    case "gong":
+    case "intercom":
+    case "microsoft_bot":
+    case "slack":
+    case "slack_bot":
+    case "webcrawler":
+    case "zendesk":
+    case "discord_bot":
+      throw new Error(
+        `Provider ${dataSource.connectorProvider} is not supported`
+      );
+
+    default:
+      assertNeverAndIgnore(dataSource.connectorProvider);
+      throw new Error(
+        `Provider ${dataSource.connectorProvider} is not supported`
+      );
+  }
+}
+
+async function expandFolderToTables(
+  owner: LightWorkspaceType,
+  dataSourceView: DataSourceViewType,
+  folderNode: LightContentNode,
+  fetcherWithBody: FetcherWithBodyFn
+): Promise<LightContentNode[]> {
+  try {
+    const url = `/api/w/${owner.sId}/spaces/${dataSourceView.spaceId}/data_source_views/${dataSourceView.sId}/content-nodes`;
+    const body: GetContentNodesOrChildrenRequestBodyType = {
+      internalIds: undefined,
+      parentId: folderNode.internalId,
+      viewType: "table",
+      sorting: undefined,
+    };
+
+    const result: GetDataSourceViewContentNodes = await fetcherWithBody([
+      url,
+      body,
+      "POST",
+    ]);
+
+    return result.nodes.filter((child) => child.type === "table");
+  } catch (error) {
+    logger.error(
+      {
+        error: normalizeError(error),
+        folderId: folderNode.internalId,
+        workspaceId: owner.sId,
+        dataSourceViewId: dataSourceView.sId,
+      },
+      "Failed to fetch children for folder"
+    );
+    throw new Error(
+      `Failed to fetch children for folder ${folderNode.internalId}`
+    );
+  }
+}
+
+export async function expandFoldersToTables(
+  owner: LightWorkspaceType,
+  dataSourceView: DataSourceViewType,
+  folderNodes: LightContentNode[],
+  fetcherWithBody: FetcherWithBodyFn
+): Promise<LightContentNode[]> {
+  const tablesArrays = await concurrentExecutor(
+    folderNodes,
+    (folderNode) =>
+      expandFolderToTables(owner, dataSourceView, folderNode, fetcherWithBody),
+    { concurrency: 5 }
+  );
+
+  return tablesArrays.flat();
+}
